@@ -1,7 +1,0 @@
-services:
-  silo-a:
-    image: "shardlite"
-  silo-b:
-    image: "shardlite"
-  silo-c:
-    image: "shardlite"
