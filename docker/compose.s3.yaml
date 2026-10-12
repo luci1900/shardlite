@@ -1,0 +1,20 @@
+# The S3 emulator the S3 tests run against: RustFS, pinned to an exact release.
+# It honours If-None-Match and If-Match on PUT with the right status codes, and
+# user metadata.
+#
+#   docker compose -f docker/compose.s3.yaml up -d
+#   export SHARDLITE_TEST_S3_ENDPOINT=http://127.0.0.1:19000 SHARDLITE_TEST_S3_BUCKET=shardlite-test \
+#          AWS_ACCESS_KEY_ID=shardlite AWS_SECRET_ACCESS_KEY=shardlite-secret AWS_REGION=us-east-1
+#   go test -tags fault ./...                 # E2E_BACKEND=s3 also runs the node tests on it
+#   docker compose -f docker/compose.s3.yaml down
+#
+# The tests create the bucket themselves (S3.EnsureBucket). Data lives inside the
+# container and goes with it on `down`.
+services:
+  rustfs:
+    image: rustfs/rustfs:1.0.1
+    command: /data
+    ports: ["127.0.0.1:19000:9000"]
+    environment:
+      RUSTFS_ACCESS_KEY: shardlite
+      RUSTFS_SECRET_KEY: shardlite-secret

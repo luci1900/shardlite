@@ -1,0 +1,215 @@
+package node
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/signal"
+	"regexp"
+	"strings"
+	"sync/atomic"
+	"syscall"
+	"time"
+)
+
+// DefaultIdleTimeout is how long a shard stays active without requests when
+// neither the kinds file nor the environment says otherwise.
+const DefaultIdleTimeout = 10 * time.Minute
+
+// Kind is a category of shards with shared settings (design.md, Shard kinds).
+type Kind struct {
+	Name        string
+	Sync        bool          // durability gates hold responses until the writes before them are in blob storage ("sync": "on", the default)
+	IdleTimeout time.Duration // how long an unused shard stays active
+	Public      bool          // clients may name it; otherwise only calls from the app reach it
+	// Ephemeral kinds ship nothing: no capture, journal or snapshots, and their output
+	// is never held. The local file is deleted at deactivation and after a crash.
+	// Sync is ignored for them.
+	Ephemeral bool
+}
+
+var (
+	// ErrUnknownKind: the kind isn't declared in the kinds file.
+	ErrUnknownKind = errors.New("shard kind is not declared")
+	// ErrNotPublic: a client named a kind that isn't public. It is answered as
+	// ErrUnknownKind is, and only the node's journal says which it was.
+	ErrNotPublic = errors.New("shard kind is not public")
+	// ErrBadTarget: not a kind/id.
+	ErrBadTarget = errors.New("bad shard name")
+)
+
+var kindName = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,31}$`)
+
+const maxIDLen = 128
+
+var idName = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+
+// ParseTarget splits a Shardlite-Target value into its kind and id, at the
+// first "/". Ids are restricted to ASCII letters, digits, "-" and "_", up to
+// maxIDLen bytes (enough for any UUID, ULID or number), so they go into object
+// keys, file paths and headers as they are, with nothing to escape.
+func ParseTarget(target string) (kind, id string, err error) {
+	kind, id, ok := strings.Cut(target, "/")
+	if !ok {
+		return "", "", fmt.Errorf("%w: %q is not kind/id", ErrBadTarget, target)
+	}
+	if !kindName.MatchString(kind) {
+		return "", "", fmt.Errorf("%w: %q has no valid kind", ErrBadTarget, target)
+	}
+	if !idName.MatchString(id) {
+		return "", "", fmt.Errorf("%w: %q needs an id of 1 to %d letters, digits, - or _", ErrBadTarget, target, maxIDLen)
+	}
+	return kind, id, nil
+}
+
+type kindJSON struct {
+	Sync        string `json:"sync"` // "on" (the default) or "off": a string, like Shardlite-Sync, so more modes can follow
+	IdleTimeout string `json:"idle_timeout"`
+	Public      bool   `json:"public"`
+	Ephemeral   bool   `json:"ephemeral"`
+}
+
+type kindsJSON struct {
+	Kinds map[string]kindJSON `json:"kinds"`
+}
+
+// ParseKinds parses a kinds file. defaultIdle is used for kinds without an
+// idle_timeout of their own: a kind's own setting wins.
+func ParseKinds(data []byte, defaultIdle time.Duration) (map[string]Kind, error) {
+	var f kindsJSON
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&f); err != nil {
+		return nil, fmt.Errorf("kinds file: %w", err)
+	}
+	if f.Kinds == nil {
+		return nil, errors.New(`kinds file: no "kinds" object`)
+	}
+	out := make(map[string]Kind, len(f.Kinds))
+	for name, k := range f.Kinds {
+		if !kindName.MatchString(name) {
+			return nil, fmt.Errorf("kinds file: %q is not a valid kind name (lowercase letters, digits, - and _, starting with a letter)", name)
+		}
+		if name == ephemeralDir {
+			return nil, fmt.Errorf("kinds file: %q is not a valid kind name (the node keeps the files of ephemeral shards in a directory of that name)", name)
+		}
+		idle := defaultIdle
+		if k.IdleTimeout != "" {
+			d, err := time.ParseDuration(k.IdleTimeout)
+			if err != nil || d <= 0 {
+				return nil, fmt.Errorf("kinds file: %s: bad idle_timeout %q", name, k.IdleTimeout)
+			}
+			idle = d
+		}
+		var sync bool
+		switch k.Sync {
+		case "", "on":
+			sync = true
+		case "off":
+		default:
+			return nil, fmt.Errorf(`kinds file: %s: sync is "on" or "off", not %q`, name, k.Sync)
+		}
+		out[name] = Kind{Name: name, Sync: sync, IdleTimeout: idle, Public: k.Public, Ephemeral: k.Ephemeral}
+	}
+	return out, nil
+}
+
+// Kinds is the node's view of the kinds file. A reload that fails keeps the
+// kinds that were loaded and marks the node not ready (Valid is false) until a
+// reload succeeds.
+type Kinds struct {
+	path        string
+	defaultIdle time.Duration
+	cur         atomic.Pointer[map[string]Kind]
+	valid       atomic.Bool
+}
+
+// LoadKinds reads the kinds file. The first load must succeed.
+func LoadKinds(path string, defaultIdle time.Duration) (*Kinds, error) {
+	if defaultIdle <= 0 {
+		defaultIdle = DefaultIdleTimeout
+	}
+	k := &Kinds{path: path, defaultIdle: defaultIdle}
+	if err := k.Reload(); err != nil {
+		return nil, err
+	}
+	return k, nil
+}
+
+// Reload reads the file again. New activations and new responses see the
+// result.
+func (k *Kinds) Reload() error {
+	data, err := os.ReadFile(k.path)
+	var m map[string]Kind
+	if err == nil {
+		m, err = ParseKinds(data, k.defaultIdle)
+	}
+	if err != nil {
+		k.valid.Store(false)
+		return err
+	}
+	k.cur.Store(&m)
+	k.valid.Store(true)
+	return nil
+}
+
+// Valid reports whether the last load succeeded. The node reports ready only
+// while it is true.
+func (k *Kinds) Valid() bool { return k.valid.Load() }
+
+// Lookup returns the settings of a kind: ErrUnknownKind if it isn't declared.
+func (k *Kinds) Lookup(name string) (Kind, error) {
+	m := *k.cur.Load()
+	kind, ok := m[name]
+	if !ok {
+		return Kind{}, fmt.Errorf("%w: %q", ErrUnknownKind, name)
+	}
+	return kind, nil
+}
+
+// CheckPublic is for a target a client named: a kind that isn't public gets
+// the same error as an undeclared one, so clients can't tell it exists. Other
+// errors (a bad target, an undeclared kind) are left to Lookup.
+func (k *Kinds) CheckPublic(target string) error {
+	kind, _, err := ParseTarget(target)
+	if err != nil {
+		return err
+	}
+	if c, ok := (*k.cur.Load())[kind]; ok && !c.Public {
+		return fmt.Errorf("%w: %q", ErrNotPublic, kind)
+	}
+	return nil
+}
+
+// Names returns the declared kinds.
+func (k *Kinds) Names() []string {
+	var out []string
+	for n := range *k.cur.Load() {
+		out = append(out, n)
+	}
+	return out
+}
+
+// RunReloadOnSIGHUP reloads the file whenever the process gets SIGHUP, until
+// ctx ends. It is meant to run as a child of whoever owns the node.
+func (k *Kinds) RunReloadOnSIGHUP(ctx context.Context, logger *slog.Logger) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGHUP)
+	defer signal.Stop(ch)
+	for {
+		select {
+		case <-ch:
+			if err := k.Reload(); err != nil {
+				logger.Error("kinds file not reloaded, keeping the kinds already loaded and reporting not ready", "path", k.path, "err", err)
+			} else {
+				logger.Info("kinds file reloaded", "path", k.path)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}

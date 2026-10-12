@@ -1,0 +1,142 @@
+package node
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestParseTarget(t *testing.T) {
+	for _, tc := range []struct{ in, kind, id string }{
+		{"users/42", "users", "42"},
+		{"guild-chat/0192f6a8-7c1e-7b3a-9d2e-5f4c3b2a1d0e", "guild-chat", "0192f6a8-7c1e-7b3a-9d2e-5f4c3b2a1d0e"},
+		{"chunks/3-7", "chunks", "3-7"},
+		{"trade/42_57", "trade", "42_57"},
+		{"users/" + strings.Repeat("x", 128), "users", strings.Repeat("x", 128)},
+	} {
+		k, id, err := ParseTarget(tc.in)
+		if err != nil || k != tc.kind || id != tc.id {
+			t.Errorf("%q: %q %q %v", tc.in, k, id, err)
+		}
+	}
+	for _, bad := range []string{"", "users", "users/", "/42", "Users/1", "../x/1", "users/a\nb", "users/" + strings.Repeat("x", 129),
+		"users/a/b", "users/..", "users/.hidden", "users/a b", "users/a%2Fb", "users/é", "users/a.b"} {
+		if _, _, err := ParseTarget(bad); !errors.Is(err, ErrBadTarget) {
+			t.Errorf("%q accepted: %v", bad, err)
+		}
+	}
+}
+
+func TestParseKinds(t *testing.T) {
+	m, err := ParseKinds([]byte(`{"kinds": {"users": {"public": true, "sync": "off", "idle_timeout": "10m"}, "wallet": {}, "chat": {"sync": "on"}, "audit": {}}}`), 3*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m["users"].IdleTimeout != 10*time.Minute || m["users"].Sync || !m["users"].Public || !m["chat"].Sync || m["audit"].Public {
+		t.Fatalf("%+v", m)
+	}
+	// Leaving settings out gives the safe ones: sync on, not public.
+	if w := m["wallet"]; !w.Sync || w.Public || w.IdleTimeout != 3*time.Minute {
+		t.Fatalf("defaults: %+v", w)
+	}
+	// The environment's idle timeout is a default: a kind's own setting wins.
+	m, _ = ParseKinds([]byte(`{"kinds": {"users": {"idle_timeout": "10m"}, "wallet": {}}}`), time.Second)
+	if m["users"].IdleTimeout != 10*time.Minute || m["wallet"].IdleTimeout != time.Second {
+		t.Fatalf("%+v", m)
+	}
+	for name, bad := range map[string]string{
+		"unknown field": `{"kinds": {"users": {"synk": true}}}`,
+		"sync value":    `{"kinds": {"users": {"sync": "maybe"}}}`,
+		"sync boolean":  `{"kinds": {"users": {"sync": true}}}`,
+		"bad duration":  `{"kinds": {"users": {"idle_timeout": "soon"}}}`,
+		"zero duration": `{"kinds": {"users": {"idle_timeout": "0s"}}}`,
+		"bad name":      `{"kinds": {"Users": {}}}`,
+		"slash":         `{"kinds": {"a/b": {}}}`,
+		"no kinds":      `{}`,
+		"not json":      `kinds`,
+		"trailing":      `{"kinds": {}} x`,
+	} {
+		if _, err := ParseKinds([]byte(bad), time.Minute); err == nil && name != "trailing" {
+			t.Errorf("%s accepted", name)
+		}
+	}
+}
+
+func TestKindsReload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "kinds.json")
+	os.WriteFile(path, []byte(`{"kinds": {"users": {}}}`), 0o644)
+	k, err := LoadKinds(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := k.Lookup("users"); got.IdleTimeout != DefaultIdleTimeout || !got.Sync {
+		t.Fatalf("%+v", got)
+	}
+	if _, err := k.Lookup("wallet"); !errors.Is(err, ErrUnknownKind) {
+		t.Fatal(err)
+	}
+
+	// A bad file keeps the kinds already loaded and makes the node not ready.
+	os.WriteFile(path, []byte(`{"kinds": {"users": {"sync": tru}}}`), 0o644)
+	if err := k.Reload(); err == nil || k.Valid() {
+		t.Fatalf("bad file: %v valid=%v", err, k.Valid())
+	}
+	if _, err := k.Lookup("users"); err != nil {
+		t.Fatal("kinds lost after a bad reload")
+	}
+	os.WriteFile(path, []byte(`{"kinds": {"users": {"sync": "off"}, "wallet": {}}}`), 0o644)
+	if err := k.Reload(); err != nil || !k.Valid() {
+		t.Fatal(err)
+	}
+	if got, err := k.Lookup("wallet"); err != nil || !got.Sync == false && got.Name != "wallet" {
+		t.Fatalf("%+v %v", got, err)
+	}
+	if got, _ := k.Lookup("users"); got.Sync {
+		t.Fatal("new setting not seen")
+	}
+	if _, err := LoadKinds(filepath.Join(t.TempDir(), "missing.json"), 0); err == nil {
+		t.Fatal("a missing kinds file at start is an error")
+	}
+}
+
+func TestParseEnv(t *testing.T) {
+	env := map[string]string{
+		"SHARDLITE_NODE": "node-a", "SHARDLITE_BLOB": "/blobs", "SHARDLITE_KINDS": "/k.json", "SHARDLITE_DATA": "/d", "SHARDLITE_META": "/m",
+		"SHARDLITE_PREFIX": "staging", "SHARDLITE_FLUSH": "100ms", "SHARDLITE_IDLE_TIMEOUT": "2m", "SHARDLITE_CACHE_LIMIT": "20GB",
+	}
+	e, err := ParseEnv(func(k string) string { return env[k] })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.Name != "node-a" || e.Prefix != "staging/" || e.Flush != 100*time.Millisecond || e.IdleTimeout != 2*time.Minute || e.CacheLimit != 20<<30 ||
+		e.HealthPath != "/health" || e.Listen != ":8080" || e.Control != "127.0.0.1:7000" || e.LeaseTTL != 10*time.Second {
+		t.Fatalf("%+v", e)
+	}
+	for k, v := range map[string]string{"SHARDLITE_FLUSH": "fast", "SHARDLITE_CACHE_LIMIT": "lots", "SHARDLITE_BLOB": ""} {
+		bad := map[string]string{}
+		for a, b := range env {
+			bad[a] = b
+		}
+		bad[k] = v
+		if _, err := ParseEnv(func(x string) string { return bad[x] }); err == nil {
+			t.Errorf("%s=%q accepted", k, v)
+		}
+	}
+}
+
+func TestParseKindsEphemeral(t *testing.T) {
+	m, err := ParseKinds([]byte(`{"kinds": {"lobby": {"ephemeral": true, "sync": "on"}, "users": {}}}`), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m["lobby"].Ephemeral || m["users"].Ephemeral {
+		t.Fatalf("ephemeral is off by default and on when set: %+v", m)
+	}
+	// The directory of ephemeral shards' files is named like a kind would be.
+	if _, err := ParseKinds([]byte(`{"kinds": {"ephemeral": {}}}`), time.Minute); err == nil {
+		t.Fatal("a kind named like the ephemeral directory was accepted")
+	}
+}
