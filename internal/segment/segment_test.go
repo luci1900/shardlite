@@ -7,15 +7,20 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/superfly/ltx"
 
+	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/spool"
 )
 
 // testLTX builds a small valid LTX file for txid.
@@ -38,20 +43,17 @@ func testLTX(t testing.TB, txid ltx.TXID, fill byte) []byte {
 	return buf.Bytes()
 }
 
-// testStore is a Store over a local backend, with the backend's fault hook within reach.
+// testStore is a Store over a memory backend, with the backend's fault hook within reach.
 type testStore struct {
 	*blob.Store
-	L *blob.Local
+	L *blob.Hooked
 }
 
 func (s testStore) SetHook(h blob.Hook) { s.L.SetHook(h) }
 
 func newStore(t *testing.T) testStore {
 	t.Helper()
-	l, err := blob.NewLocal(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	l := blob.WithHook(blob.NewMemory())
 	return testStore{blob.NewStore(l, "n1", 1, blob.Options{Backoff: time.Millisecond}), l}
 }
 
@@ -67,19 +69,19 @@ func wait(t *testing.T, ch <-chan error) error {
 }
 
 func TestManyGoroutinesOneSegment(t *testing.T) {
+	t.Parallel()
 	store, ctx := newStore(t), context.Background()
 	w := NewWriter(store.Store, "n1", Options{Interval: time.Hour}) // flush by hand
 	defer w.Close()
 
 	const n = 100
 	var chans [n]<-chan error
-	var wg sync.WaitGroup
+	var wg errgroup.Group
 	for i := range n {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() error {
 			chans[i] = w.Append(fmt.Sprintf("users/%d", i), "g", uint64(i+1), testLTX(t, ltx.TXID(i+1), byte(i)))
-		}()
+			return nil
+		})
 	}
 	wg.Wait()
 	if err := w.Flush(ctx); err != nil {
@@ -123,6 +125,7 @@ func TestManyGoroutinesOneSegment(t *testing.T) {
 }
 
 func TestWaitersReleasedAfterPut(t *testing.T) {
+	t.Parallel()
 	store, ctx := newStore(t), context.Background()
 	release := make(chan struct{})
 	var inPut atomic.Bool
@@ -136,13 +139,11 @@ func TestWaitersReleasedAfterPut(t *testing.T) {
 	w := NewWriter(store.Store, "n1", Options{Interval: 10 * time.Millisecond})
 	defer w.Close()
 	ch := w.Append("users/1", "g", 1, testLTX(t, 1, 1))
-	for !inPut.Load() {
-		time.Sleep(time.Millisecond)
-	}
-	select {
+	apptest.Eventually(t, 5*time.Second, "the PUT to start", inPut.Load)
+	select { // the PUT is held in the hook, so the waiter cannot have been released
 	case <-ch:
 		t.Fatal("waiter released before the PUT finished")
-	case <-time.After(50 * time.Millisecond):
+	default:
 	}
 	close(release)
 	if err := wait(t, ch); err != nil {
@@ -154,6 +155,7 @@ func TestWaitersReleasedAfterPut(t *testing.T) {
 }
 
 func TestSlowPutDelaysNextSegment(t *testing.T) {
+	t.Parallel()
 	store := newStore(t)
 	var cur, max atomic.Int32
 	store.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
@@ -209,6 +211,7 @@ func TestSlowPutDelaysNextSegment(t *testing.T) {
 }
 
 func TestErrExistsFencesWriter(t *testing.T) {
+	t.Parallel()
 	store, ctx := newStore(t), context.Background()
 	// A newer writer already took segment 1 (here, as a fence).
 	store.Create(ctx, Key("n1", 1), strings.NewReader(""))
@@ -227,6 +230,7 @@ func TestErrExistsFencesWriter(t *testing.T) {
 }
 
 func TestFenceRecognised(t *testing.T) {
+	t.Parallel()
 	store, ctx := newStore(t), context.Background()
 	store.Create(ctx, Key("n1", 7), strings.NewReader(""))
 	if _, err := ReadFooter(ctx, store.Store, "n1", 7); !errors.Is(err, ErrFence) {
@@ -238,6 +242,7 @@ func TestFenceRecognised(t *testing.T) {
 // nothing newer is written ahead of it, and it goes out under the same number
 // once storage is back.
 func TestFailedSegmentIsRetriedNotDropped(t *testing.T) {
+	t.Parallel()
 	store, ctx := newStore(t), context.Background()
 	var fail atomic.Bool
 	fail.Store(true)
@@ -286,6 +291,7 @@ func TestFailedSegmentIsRetriedNotDropped(t *testing.T) {
 // A long run of lost responses and failed requests ends with the segment
 // written once, under its own number, and no fence.
 func TestLongRunOfFaultsWritesSegmentOnce(t *testing.T) {
+	t.Parallel()
 	store, ctx := newStore(t), context.Background()
 	// 60 requests fail before they happen (some as timeouts of the read that checks
 	// ownership). Then one is applied and its response lost, and the reads that
@@ -337,6 +343,7 @@ func TestLongRunOfFaultsWritesSegmentOnce(t *testing.T) {
 
 // Close fails the waiters of a segment still being retried.
 func TestCloseFailsWaitersOfUnknownSegment(t *testing.T) {
+	t.Parallel()
 	store := newStore(t)
 	store.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
 		if op == blob.OpCreate && !after {
@@ -359,6 +366,7 @@ func TestCloseFailsWaitersOfUnknownSegment(t *testing.T) {
 
 // A fence found while retrying fails the waiters, including those queued behind.
 func TestFenceFoundWhileRetrying(t *testing.T) {
+	t.Parallel()
 	store, ctx := newStore(t), context.Background()
 	var down atomic.Bool
 	down.Store(true)
@@ -392,6 +400,7 @@ func TestFenceFoundWhileRetrying(t *testing.T) {
 // A PUT that succeeds but whose response is lost must not fence the writer:
 // blob.Store retries, finds its own write id on the object and succeeds.
 func TestLostResponseIsNotAFence(t *testing.T) {
+	t.Parallel()
 	store, ctx := newStore(t), context.Background()
 	var lost, creates atomic.Int32
 	store.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
@@ -430,6 +439,7 @@ func TestLostResponseIsNotAFence(t *testing.T) {
 // to that create is lost, the fence is still recognised as its own. If a
 // zombie's segment took the number first, the adopter moves on.
 func TestAdopterFence(t *testing.T) {
+	t.Parallel()
 	store, ctx := newStore(t), context.Background()
 	zombie := blob.NewStore(store.L, "dead", 7, blob.Options{})
 	zombie.Create(ctx, Key("dead", 5), strings.NewReader("a zombie's segment"))
@@ -476,6 +486,7 @@ func TestAdopterFence(t *testing.T) {
 }
 
 func TestNextSeq(t *testing.T) {
+	t.Parallel()
 	store, ctx := newStore(t), context.Background()
 	if n, err := NextSeq(ctx, store.Store, "n1"); err != nil || n != 1 {
 		t.Fatalf("empty: %d %v", n, err)
@@ -489,6 +500,7 @@ func TestNextSeq(t *testing.T) {
 }
 
 func TestBounds(t *testing.T) {
+	t.Parallel()
 	store, ctx := newStore(t), context.Background()
 	if lo, hi, err := Bounds(ctx, store.Store, "n1"); err != nil || lo != 0 || hi != 0 {
 		t.Fatalf("empty: %d %d %v", lo, hi, err)
@@ -502,6 +514,7 @@ func TestBounds(t *testing.T) {
 }
 
 func TestCheckStopsAcknowledgements(t *testing.T) {
+	t.Parallel()
 	store, ctx := newStore(t), context.Background()
 	var bad atomic.Pointer[error]
 	errLease := errors.New("lease expired")
@@ -543,7 +556,7 @@ type failCreate struct {
 	err atomic.Pointer[error]
 }
 
-func (f *failCreate) Create(ctx context.Context, key string, body io.Reader, id blob.WriteID) (blob.ETag, error) {
+func (f *failCreate) Create(ctx context.Context, key string, body io.ReadSeeker, id blob.WriteID) (blob.ETag, error) {
 	if e := f.err.Load(); e != nil && strings.HasPrefix(key, "journal/") {
 		return "", *e
 	}
@@ -577,11 +590,8 @@ func (r *recorder) errors() int {
 }
 
 func TestErrorsRetryingCannotFixAreLogged(t *testing.T) {
-	l, err := blob.NewLocal(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	fc := &failCreate{Backend: l}
+	t.Parallel()
+	fc := &failCreate{Backend: blob.NewMemory()}
 	denied := errors.New("permission denied")
 	fc.err.Store(&denied)
 	store := blob.NewStore(fc, "n1", 1, blob.Options{Backoff: time.Millisecond})
@@ -590,13 +600,7 @@ func TestErrorsRetryingCannotFixAreLogged(t *testing.T) {
 	defer w.Close()
 
 	ch := w.Append("users/1", "g", 1, testLTX(t, 1, 1))
-	deadline := time.Now().Add(5 * time.Second)
-	for rec.errors() < 3 {
-		if time.Now().After(deadline) {
-			t.Fatalf("only %d error logs", rec.errors())
-		}
-		time.Sleep(time.Millisecond)
-	}
+	apptest.Eventually(t, 5*time.Second, "three error logs", func() bool { return rec.errors() >= 3 })
 	select {
 	case err := <-ch:
 		t.Fatalf("the segment was given up on: %v", err)
@@ -613,6 +617,7 @@ func TestErrorsRetryingCannotFixAreLogged(t *testing.T) {
 }
 
 func TestTransientTroubleIsNotLoggedAsUnfixable(t *testing.T) {
+	t.Parallel()
 	store := newStore(t)
 	var fails atomic.Int32
 	store.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
@@ -629,5 +634,92 @@ func TestTransientTroubleIsNotLoggedAsUnfixable(t *testing.T) {
 	}
 	if n := rec.errors(); n != 0 {
 		t.Fatalf("%d error logs for failures that retrying fixes", n)
+	}
+}
+
+// Segments and the files in them are built in temporary files once they are
+// larger than the spool limit, and read back the same. Nothing is left behind
+// when the segment is written, or when the writer is closed with files pending.
+func TestLargeSegmentsGoThroughTemporaryFiles(t *testing.T) {
+	t.Parallel()
+	store, ctx := newStore(t), context.Background()
+	dir := t.TempDir()
+	left := func() int {
+		ents, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(ents)
+	}
+	w := NewWriter(store.Store, "n1", Options{Interval: time.Hour, TempDir: dir, SpoolLimit: 100})
+	defer w.Close()
+
+	var seen atomic.Int32
+	store.SetHook(func(_ context.Context, op blob.Op, key string, after bool) error {
+		if op == blob.OpCreate && !after {
+			seen.Store(int32(left()))
+		}
+		return nil
+	})
+	// Two files, each larger than the limit and held in a file of their own.
+	var files []*spool.File
+	for i := range 2 {
+		f, err := spool.Collect(dir, 100, bytes.NewReader(testLTX(t, ltx.TXID(i+1), byte(i+1))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !f.InFile() {
+			t.Fatal("test file is small")
+		}
+		files = append(files, f)
+	}
+	chans := []<-chan error{w.AppendFile("users/1", "g", 1, files[0]), w.AppendFile("users/2", "g", 1, files[1])}
+	for _, f := range files {
+		f.Close() // the writer holds its own references
+	}
+	if left() != 2 {
+		t.Fatalf("%d temporary files with two queued, want 2", left())
+	}
+	if err := w.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, ch := range chans {
+		if err := wait(t, ch); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// While the upload ran, the segment had a file of its own.
+	if seen.Load() != 1 {
+		t.Fatalf("%d temporary files during the upload, want the segment's", seen.Load())
+	}
+	if left() != 0 {
+		t.Fatalf("%d temporary files after the segment was written", left())
+	}
+	entries, err := ReadFooter(ctx, store.Store, "n1", 1)
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("%v %v", entries, err)
+	}
+	for i, e := range entries {
+		got, err := ReadEntryFile(ctx, store.Store, "n1", 1, e, dir, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := got.Bytes()
+		if !bytes.Equal(b, testLTX(t, ltx.TXID(i+1), byte(i+1))) {
+			t.Fatalf("entry %d read back differently", i)
+		}
+		got.Close()
+	}
+
+	// Closed with a file still queued.
+	f, _ := spool.Collect(dir, 100, bytes.NewReader(testLTX(t, 3, 3)))
+	ch := w.AppendFile("users/3", "g", 1, f)
+	f.Close()
+	w.Close()
+	if err := wait(t, ch); !errors.Is(err, ErrClosed) {
+		t.Fatalf("got %v, want ErrClosed", err)
+	}
+	if left() != 0 {
+		t.Fatalf("%d temporary files after the writer was closed", left())
 	}
 }

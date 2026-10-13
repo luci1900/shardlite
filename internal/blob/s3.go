@@ -1,7 +1,6 @@
 package blob
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -166,15 +165,20 @@ const (
 	kindDelete
 )
 
-// classify maps the SDK's error onto the outcomes of a Backend (design.md,
+// classify maps the SDK's error onto the outcomes of a Backend (docs/internals.md,
 // Coordination):
 //
 //   - 412 is ErrExists for a create and ErrConflict for an update; 404 is ErrNotFound;
 //   - 409 ConditionalRequestConflict (two conditional writes racing), 429 and
-//     503 are ErrNotApplied: the store did nothing, so the retry sees the real answer;
+//     503 SlowDown are ErrNotApplied: the store did nothing, so the retry sees the real
+//     answer. Any other 503 (ServiceUnavailable, or no code) is ErrUnknown: RustFS
+//     answers ServiceUnavailable for a write that missed its quorum, which can
+//     follow a partly applied commit whose rollback was incomplete;
 //   - 500 and other server errors, timeouts, truncated responses and dropped
 //     connections after the request was sent are ErrUnknown;
-//   - a request that was never fully sent (connection refused, DNS, TLS) is ErrNotApplied;
+//   - a request that was never fully sent (connection refused, DNS, TLS, a context
+//     that ended first) is ErrNotApplied, and one that was fully sent when the
+//     context ended is ErrUnknown;
 //   - other 4xx (access denied, bad request) are plain errors, which are not retried.
 func classify(err error, k kind, wasSent bool) error {
 	if err == nil {
@@ -189,11 +193,13 @@ func classify(err error, k kind, wasSent bool) error {
 			}
 			return fmt.Errorf("%w: %v", ErrNotApplied, err)
 		}
-		if wasSent || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			// The store may have the object. Keep the context's own error findable too.
+		// A cancelled context or a passed deadline is unknown only if the request was
+		// fully written; otherwise the store never had it. Either way the context's
+		// own error stays findable.
+		if wasSent {
 			return fmt.Errorf("%w: %w", ErrUnknown, err)
 		}
-		return fmt.Errorf("%w: %v", ErrNotApplied, err)
+		return fmt.Errorf("%w: %w", ErrNotApplied, err)
 	}
 	var re *awshttp.ResponseError
 	if errors.As(err, &re) {
@@ -215,7 +221,7 @@ func classify(err error, k kind, wasSent bool) error {
 			return fmt.Errorf("%w: %v", ErrConflict, err)
 		case status == http.StatusConflict && code == "ConditionalRequestConflict",
 			status == http.StatusTooManyRequests,
-			status == http.StatusServiceUnavailable && (code == "SlowDown" || code == "ServiceUnavailable" || code == ""):
+			status == http.StatusServiceUnavailable && code == "SlowDown":
 			return fmt.Errorf("%w: %v", ErrNotApplied, err)
 		case status == http.StatusRequestTimeout, code == "RequestTimeout", status >= 500, status < 400:
 			// (a status under 400 here is a good response the SDK could not read)
@@ -230,22 +236,25 @@ func classify(err error, k kind, wasSent bool) error {
 	return fmt.Errorf("blob: s3: %w", err)
 }
 
-func bodyBytes(body io.Reader) ([]byte, error) {
-	if b, ok := body.(*bytes.Reader); ok {
-		out := make([]byte, b.Len())
-		_, err := io.ReadFull(b, out)
-		return out, err
+// bodySize is the length of body, which a request sends from its start without
+// holding it in memory (the SDK rewinds it to hash and to send). The body is
+// left at its start.
+func bodySize(body io.ReadSeeker) (int64, error) {
+	n, err := body.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, err
 	}
-	return io.ReadAll(body)
+	_, err = body.Seek(0, io.SeekStart)
+	return n, err
 }
 
-func (s *S3) put(ctx context.Context, k kind, key string, body io.Reader, id WriteID, in *s3.PutObjectInput) (ETag, error) {
-	data, err := bodyBytes(body)
+func (s *S3) put(ctx context.Context, k kind, key string, body io.ReadSeeker, id WriteID, in *s3.PutObjectInput) (ETag, error) {
+	n, err := bodySize(body)
 	if err != nil {
-		return "", fmt.Errorf("%w: reading the body: %v", ErrNotApplied, err)
+		return "", fmt.Errorf("%w: sizing the body: %v", ErrNotApplied, err)
 	}
-	in.Bucket, in.Key, in.Body = aws.String(s.bucket), aws.String(key), bytes.NewReader(data)
-	in.ContentLength = aws.Int64(int64(len(data)))
+	in.Bucket, in.Key, in.Body = aws.String(s.bucket), aws.String(key), body
+	in.ContentLength = aws.Int64(n)
 	if !id.IsZero() {
 		in.Metadata = map[string]string{writeMeta: encodeWriteID(id)}
 	}
@@ -258,12 +267,12 @@ func (s *S3) put(ctx context.Context, k kind, key string, body io.Reader, id Wri
 }
 
 // Create is a PUT with If-None-Match: *.
-func (s *S3) Create(ctx context.Context, key string, body io.Reader, id WriteID) (ETag, error) {
+func (s *S3) Create(ctx context.Context, key string, body io.ReadSeeker, id WriteID) (ETag, error) {
 	return s.put(ctx, kindCreate, key, body, id, &s3.PutObjectInput{IfNoneMatch: aws.String("*")})
 }
 
 // Update is a PUT with If-Match.
-func (s *S3) Update(ctx context.Context, key string, body io.Reader, expected ETag, id WriteID) (ETag, error) {
+func (s *S3) Update(ctx context.Context, key string, body io.ReadSeeker, expected ETag, id WriteID) (ETag, error) {
 	return s.put(ctx, kindUpdate, key, body, id, &s3.PutObjectInput{IfMatch: quoteETag(expected)})
 }
 

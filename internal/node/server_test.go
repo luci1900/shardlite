@@ -39,6 +39,10 @@ type srig struct {
 
 	omu    sync.Mutex
 	opened map[string]bool
+
+	baseTr *transport    // the transport the server installed
+	hook   intakeHookFn  // wraps the intake, kept across restarts
+	hookN  *atomic.Int64 // counts the intakes that reached the hook
 }
 
 func newSRig(t *testing.T) *srig { return newSRigWith(t, nil) }
@@ -74,7 +78,11 @@ func newSRigWith(t *testing.T, mutate func(*ManagerOptions)) *srig {
 
 func (r *srig) startServer() {
 	u, _ := url.Parse(r.fake.URL)
-	r.srv = NewServer(r.m, ServerOptions{App: u, HealthEvery: 20 * time.Millisecond})
+	srv := NewServer(r.m, ServerOptions{App: u, HealthEvery: 20 * time.Millisecond})
+	r.srv = srv
+	tr := *r.m.msgs.send.Load()
+	r.baseTr = &tr
+	r.applyHook()
 	pub, _ := net.Listen("tcp", "127.0.0.1:0")
 	ctl, _ := net.Listen("tcp", "127.0.0.1:0")
 	// Unix socket paths are short (104 bytes on macOS): not t.TempDir().
@@ -91,8 +99,8 @@ func (r *srig) startServer() {
 	r.pub, r.ctl = "http://"+pub.Addr().String(), "http://"+ctl.Addr().String()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { r.srv.Serve(ctx, pub, ctl, sock); close(done) }()
-	r.t.Cleanup(func() { cancel(); <-done; r.srv.Close() })
+	go func() { srv.Serve(ctx, pub, ctl, sock); close(done) }()
+	r.t.Cleanup(func() { cancel(); <-done; srv.Close() })
 	eventually(r.t, "the app to be seen as healthy", func() bool { ok, _ := r.srv.Ready(); return ok })
 }
 
@@ -142,6 +150,7 @@ func (r *srig) req(method, base, path string, hdr map[string]string, body string
 }
 
 func TestServerRouting(t *testing.T) {
+	t.Parallel()
 	r := newSRig(t)
 	var last atomic.Pointer[http.Request]
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
@@ -228,6 +237,7 @@ func TestServerRouting(t *testing.T) {
 }
 
 func TestServerControlAPI(t *testing.T) {
+	t.Parallel()
 	r := newSRig(t)
 	var last atomic.Pointer[http.Request]
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
@@ -293,6 +303,7 @@ func TestServerControlAPI(t *testing.T) {
 }
 
 func TestServerDeleteEndpoint(t *testing.T) {
+	t.Parallel()
 	r := newSRig(t)
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		r.commit(q.Header.Get("Shardlite-Path"))
@@ -321,7 +332,16 @@ func TestServerDeleteEndpoint(t *testing.T) {
 
 // Server-sent events leave the node chunk by chunk.
 func TestServerStreamsWithoutBuffering(t *testing.T) {
+	t.Parallel()
 	r := newSRig(t)
+	// The app holds back the second event until the test has the first. A proxy
+	// that buffers never delivers it, and the safety timer lets go.
+	gate := make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(gate) }) }
+	var buffered atomic.Bool
+	safety := time.AfterFunc(10*time.Second, func() { buffered.Store(true); release() })
+	defer safety.Stop()
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fl := w.(http.Flusher)
@@ -329,7 +349,7 @@ func TestServerStreamsWithoutBuffering(t *testing.T) {
 			fmt.Fprintf(w, "data: %d\n\n", i)
 			fl.Flush()
 			select {
-			case <-time.After(250 * time.Millisecond):
+			case <-gate:
 			case <-q.Context().Done():
 				return
 			}
@@ -337,7 +357,6 @@ func TestServerStreamsWithoutBuffering(t *testing.T) {
 	})
 	q, _ := http.NewRequest("GET", r.pub+"/events", nil)
 	q.Header.Set("Shardlite-Target", "slow/sse")
-	start := time.Now()
 	resp, err := r.client.Do(q)
 	if err != nil {
 		t.Fatal(err)
@@ -348,9 +367,10 @@ func TestServerStreamsWithoutBuffering(t *testing.T) {
 	if err != nil || line != "data: 1\n" {
 		t.Fatalf("%q %v", line, err)
 	}
-	if d := time.Since(start); d > 200*time.Millisecond {
-		t.Fatalf("the first event took %v: the proxy buffers", d)
+	if buffered.Load() {
+		t.Fatal("the first event came only when the app finished: the proxy buffers")
 	}
+	release()
 	// While the stream is open the shard is held and stays active.
 	if !r.m.IsActive("slow/sse") {
 		t.Fatal("not active during the stream")
@@ -363,6 +383,7 @@ func TestServerStreamsWithoutBuffering(t *testing.T) {
 
 // An upgraded connection (a WebSocket) is a byte stream the node copies.
 func TestServerUpgrade(t *testing.T) {
+	t.Parallel()
 	r := newSRig(t)
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		if q.Header.Get("Upgrade") != "websocket" || q.Header.Get("Shardlite-Target") != "slow/ws" {
@@ -415,8 +436,17 @@ func TestServerUpgrade(t *testing.T) {
 
 // gRPC: h2c to the app, trailers passed through, streaming without buffering.
 func TestServerGRPC(t *testing.T) {
+	t.Parallel()
 	r := newSRig(t)
 	var proto atomic.Int32
+	// The app holds back its second frame until the test has the first. A node
+	// that buffers the response never delivers it, and the safety timer lets go.
+	gate := make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(gate) }) }
+	var buffered atomic.Bool
+	safety := time.AfterFunc(10*time.Second, func() { buffered.Store(true); release() })
+	defer safety.Stop()
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		proto.Store(int32(q.ProtoMajor))
 		if q.Header.Get("Te") != "trailers" || q.Header.Get("Shardlite-Target") != "slow/rpc" {
@@ -428,7 +458,7 @@ func TestServerGRPC(t *testing.T) {
 		w.Header().Set("Trailer", "Grpc-Status, Grpc-Message, Shardlite-Trailer")
 		w.Write([]byte("frame1"))
 		w.(http.Flusher).Flush()
-		time.Sleep(250 * time.Millisecond)
+		<-gate
 		w.Write([]byte("frame2"))
 		w.Header().Set("Grpc-Status", "0")
 		w.Header().Set("Grpc-Message", "fine")
@@ -438,7 +468,6 @@ func TestServerGRPC(t *testing.T) {
 	q.Header.Set("Content-Type", "application/grpc")
 	q.Header.Set("Te", "trailers")
 	q.Header.Set("Shardlite-Target", "slow/rpc")
-	start := time.Now()
 	resp, err := r.h2c.Do(q) // the client reaches the node over h2c too
 	if err != nil {
 		t.Fatal(err)
@@ -451,9 +480,10 @@ func TestServerGRPC(t *testing.T) {
 	if _, err := io.ReadFull(resp.Body, buf); err != nil || string(buf) != "frame1" {
 		t.Fatalf("%q %v", buf, err)
 	}
-	if d := time.Since(start); d > 200*time.Millisecond {
-		t.Fatalf("first frame after %v: buffered", d)
+	if buffered.Load() {
+		t.Fatal("the first frame came only when the app finished: buffered")
 	}
+	release()
 	rest, _ := io.ReadAll(resp.Body)
 	if string(rest) != "frame2" {
 		t.Fatalf("rest %q", rest)
@@ -481,6 +511,7 @@ func TestServerGRPC(t *testing.T) {
 }
 
 func TestServerAppDown(t *testing.T) {
+	t.Parallel()
 	r := newSRig(t)
 	r.fake.Close()
 	if resp, _ := r.req("GET", r.pub, "/x", map[string]string{"Shardlite-Target": "slow/d1"}, ""); resp.StatusCode != 502 {
@@ -496,6 +527,7 @@ func TestServerAppDown(t *testing.T) {
 }
 
 func TestServerReadiness(t *testing.T) {
+	t.Parallel()
 	r := newSRig(t)
 	var unhealthy atomic.Bool
 	h := http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {})
@@ -544,6 +576,7 @@ func TestServerReadiness(t *testing.T) {
 // A kind that isn't public is reached by calls from the app only. A client that
 // names it gets exactly what it would get for an undeclared kind.
 func TestOnlyPublicKindsForClients(t *testing.T) {
+	t.Parallel()
 	r := newSRig(t)
 	if err := writeFile(r.kindsPath, `{"kinds": {"users": {"public": true, "sync": "off"}, "secret": {"sync": "off"}}}`); err != nil {
 		t.Fatal(err)

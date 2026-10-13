@@ -1,7 +1,6 @@
 package blob
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -15,6 +14,10 @@ import (
 type Options struct {
 	Attempts int           // attempts per call, 4 if zero
 	Backoff  time.Duration // wait before the first retry, doubling each time; 25 ms if zero
+	// Settle bounds the read-back that tells whether a write of unknown outcome
+	// landed. It runs on a context detached from the caller's, so a caller that
+	// has given up still learns. 5 s if zero.
+	Settle time.Duration
 }
 
 // Store is the one type every caller writes through. It tags each write with
@@ -39,6 +42,9 @@ func NewStore(b Backend, node string, epoch uint64, opts Options) *Store {
 	}
 	if opts.Backoff <= 0 {
 		opts.Backoff = 25 * time.Millisecond
+	}
+	if opts.Settle <= 0 {
+		opts.Settle = 5 * time.Second
 	}
 	return &Store{b: b, node: node, epoch: epoch, opts: opts}
 }
@@ -70,15 +76,49 @@ func Transient(err error) bool { return retryable(err) }
 
 func retryable(err error) bool { return errors.Is(err, ErrNotApplied) || errors.Is(err, ErrUnknown) }
 
+// settleCtx is the context for reading back after an unknown outcome: the
+// caller's values, not its cancellation, and a time limit of its own.
+func (s *Store) settleCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), s.opts.Settle)
+}
+
+// unknown is the error for an outcome nobody could learn: ErrUnknown, with the
+// reason (and the caller's context error, if that is why it stopped).
+func unknown(cause error, why string) error {
+	if cause == nil {
+		return fmt.Errorf("%w: %s", ErrUnknown, why)
+	}
+	return fmt.Errorf("%w: %s: %w", ErrUnknown, why, cause)
+}
+
 // write runs a Create or Update with retries. try makes one attempt with the
 // write id. conflict is the outcome that means "somebody got there first".
 // ambiguous says an earlier call with the same id already had an unknown outcome.
+//
+// An unknown outcome is never lost: if the caller's context ends first, the
+// store still reads back (on a context of its own) and returns success if the
+// write landed, and otherwise ErrUnknown together with the context's error.
 func (s *Store) write(ctx context.Context, key string, conflict error, id WriteID, ambiguous bool, try func(id WriteID) (ETag, error)) (ETag, error) {
 	var last error
+	// settle reads the object back on its own context: whether it carries our id.
+	settle := func() (etag ETag, owned bool, err error) {
+		sctx, cancel := s.settleCtx(ctx)
+		defer cancel()
+		return s.ownedBy(sctx, key, id)
+	}
 	for attempt := 0; attempt < s.opts.Attempts; attempt++ {
 		if attempt > 0 {
 			if err := s.wait(ctx, attempt-1); err != nil {
-				return "", err
+				if !ambiguous {
+					if last != nil {
+						return "", fmt.Errorf("%w: %w", last, err)
+					}
+					return "", err
+				}
+				if etag, owned, oerr := settle(); oerr == nil && owned {
+					return etag, nil
+				}
+				return "", unknown(err, "the context ended after an attempt of unknown outcome")
 			}
 		}
 		etag, err := try(id)
@@ -87,10 +127,10 @@ func (s *Store) write(ctx context.Context, key string, conflict error, id WriteI
 			return etag, nil
 		case errors.Is(err, conflict) && ambiguous:
 			// An earlier attempt may have been ours. Its write id says.
-			etag, owned, oerr := s.ownedBy(ctx, key, id)
+			etag, owned, oerr := settle()
 			if oerr != nil {
 				// Couldn't read it back: still unknown, not somebody else's.
-				last = fmt.Errorf("%w: reading back %s: %v", ErrUnknown, key, oerr)
+				last = unknown(oerr, "reading back "+key)
 				continue
 			}
 			if owned {
@@ -108,7 +148,7 @@ func (s *Store) write(ctx context.Context, key string, conflict error, id WriteI
 	}
 	// Out of attempts. If the last word was "unknown", look once more.
 	if ambiguous {
-		if etag, owned, err := s.ownedBy(ctx, key, id); err == nil && owned {
+		if etag, owned, err := settle(); err == nil && owned {
 			return etag, nil
 		}
 	}
@@ -127,40 +167,43 @@ func (s *Store) ownedBy(ctx context.Context, key string, id WriteID) (ETag, bool
 
 // Create writes the object only if the key doesn't exist. ErrExists means
 // somebody else's object is there.
-func (s *Store) Create(ctx context.Context, key string, body io.Reader) (ETag, error) {
-	data, err := io.ReadAll(body)
-	if err != nil {
-		return "", err
-	}
-	return s.write(ctx, key, ErrExists, s.NewWriteID(), false, func(id WriteID) (ETag, error) {
-		return s.b.Create(ctx, key, bytes.NewReader(data), id)
-	})
+//
+// The whole body is sent from its start on every attempt, so a retry never
+// needs the bytes in memory: a file, or a reader over a small slice, are both
+// fine.
+func (s *Store) Create(ctx context.Context, key string, body io.ReadSeeker) (ETag, error) {
+	return s.write(ctx, key, ErrExists, s.NewWriteID(), false, s.attempts(body, func(b io.ReadSeeker, id WriteID) (ETag, error) {
+		return s.b.Create(ctx, key, b, id)
+	}))
 }
 
 // CreateWithID is Create for a caller that keeps retrying one write after
 // Create has given up: every call is a retry of the write named by id (from
 // NewWriteID), so "exists" is checked against that id whatever happened
 // before. The body must be the same each time.
-func (s *Store) CreateWithID(ctx context.Context, key string, body io.Reader, id WriteID) (ETag, error) {
-	data, err := io.ReadAll(body)
-	if err != nil {
-		return "", err
-	}
-	return s.write(ctx, key, ErrExists, id, true, func(id WriteID) (ETag, error) {
-		return s.b.Create(ctx, key, bytes.NewReader(data), id)
-	})
+func (s *Store) CreateWithID(ctx context.Context, key string, body io.ReadSeeker, id WriteID) (ETag, error) {
+	return s.write(ctx, key, ErrExists, id, true, s.attempts(body, func(b io.ReadSeeker, id WriteID) (ETag, error) {
+		return s.b.Create(ctx, key, b, id)
+	}))
 }
 
 // Update replaces the object only if its ETag is expected. ErrConflict means
 // somebody else changed it.
-func (s *Store) Update(ctx context.Context, key string, body io.Reader, expected ETag) (ETag, error) {
-	data, err := io.ReadAll(body)
-	if err != nil {
-		return "", err
+func (s *Store) Update(ctx context.Context, key string, body io.ReadSeeker, expected ETag) (ETag, error) {
+	return s.write(ctx, key, ErrConflict, s.NewWriteID(), false, s.attempts(body, func(b io.ReadSeeker, id WriteID) (ETag, error) {
+		return s.b.Update(ctx, key, b, expected, id)
+	}))
+}
+
+// attempts makes the single attempt a write retries: the body is rewound, so
+// each attempt sends all of it.
+func (s *Store) attempts(body io.ReadSeeker, try func(io.ReadSeeker, WriteID) (ETag, error)) func(WriteID) (ETag, error) {
+	return func(id WriteID) (ETag, error) {
+		if _, err := body.Seek(0, io.SeekStart); err != nil {
+			return "", fmt.Errorf("blob: rewinding the body: %w", err) // nothing was sent, and retrying won't help
+		}
+		return try(body, id)
 	}
-	return s.write(ctx, key, ErrConflict, s.NewWriteID(), false, func(id WriteID) (ETag, error) {
-		return s.b.Update(ctx, key, bytes.NewReader(data), expected, id)
-	})
 }
 
 // Delete removes the object. With expected set it is a conditional delete
@@ -172,10 +215,33 @@ func (s *Store) Update(ctx context.Context, key string, body io.Reader, expected
 func (s *Store) Delete(ctx context.Context, key string, expected ETag) error {
 	var last error
 	ambiguous := false
+	// settle looks at the object on a context of its own after an unknown outcome:
+	// gone means done, and an object that is still the expected one means the
+	// delete did not happen (yet).
+	settle := func(cause error) error {
+		sctx, cancel := s.settleCtx(ctx)
+		defer cancel()
+		info, err := s.Head(sctx, key)
+		switch {
+		case errors.Is(err, ErrNotFound):
+			return nil
+		case err != nil:
+			return unknown(errors.Join(err, cause), "reading back "+key)
+		case expected != "" && info.ETag != expected:
+			return ErrConflict // changed since: the delete can no longer apply
+		}
+		return unknown(cause, "the delete may still land")
+	}
 	for attempt := 0; attempt < s.opts.Attempts; attempt++ {
 		if attempt > 0 {
 			if err := s.wait(ctx, attempt-1); err != nil {
-				return err
+				if !ambiguous {
+					if last != nil {
+						return fmt.Errorf("%w: %w", last, err)
+					}
+					return err
+				}
+				return settle(err)
 			}
 		}
 		err := s.b.Delete(ctx, key, expected)

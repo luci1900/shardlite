@@ -1,4 +1,4 @@
-// Package harness sets up the pieces tests share: a blob directory, a
+// Package harness sets up the pieces tests share: an in-memory blob store, a
 // segment writer, a files layer and test apps.
 package harness
 
@@ -20,9 +20,9 @@ import (
 // Env is one node's worth of storage.
 type Env struct {
 	T     testing.TB
-	Dir   string      // local shard files
-	Meta  string      // Litestream metadata directories, one per shard (tmpfs in production)
-	Local *blob.Local // the backend, for its fault hook
+	Dir   string       // local shard files
+	Meta  string       // Litestream metadata directories, one per shard (tmpfs in production)
+	Blob  *blob.Hooked // the in-memory backend behind its fault hook
 	Store *blob.Store
 	Files *shardfile.Files
 	W     *segment.Writer
@@ -34,19 +34,16 @@ type Env struct {
 // New returns an Env with a segment writer flushing every interval.
 func New(t testing.TB, interval time.Duration) *Env {
 	t.Helper()
-	local, err := blob.NewLocal(filepath.Join(t.TempDir(), "blobs"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	local := blob.WithHook(blob.NewMemory())
 	reg := coord.NewRegistry(local, "n1", coord.RegistryOptions{})
 	lease, err := reg.Acquire(context.Background(), coord.NodeInfo{Name: "n1"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	store := blob.NewStore(local, "n1", lease.Epoch, blob.Options{Backoff: time.Millisecond})
-	e := &Env{T: t, Dir: t.TempDir(), Meta: t.TempDir(), Local: local, Store: store, Node: "n1", Reg: reg, Lease: lease}
-	e.Files = &shardfile.Files{Blob: store, Node: e.Node, Leases: reg}
-	e.W = segment.NewWriter(store, e.Node, segment.Options{Interval: interval})
+	e := &Env{T: t, Dir: t.TempDir(), Meta: t.TempDir(), Blob: local, Store: store, Node: "n1", Reg: reg, Lease: lease}
+	e.Files = &shardfile.Files{Blob: store, Node: e.Node, Leases: reg, TempDir: t.TempDir()}
+	e.W = segment.NewWriter(store, e.Node, segment.Options{Interval: interval, TempDir: e.Files.TempDir})
 	t.Cleanup(e.W.Close)
 	return e
 }
@@ -87,7 +84,7 @@ func (e *Env) NewShard(shard string) (*shardfile.Handle, *capture.Shard) {
 // to the manifest) and starts capturing its file. restored is nil for a new shard.
 func (e *Env) Activate(h *shardfile.Handle, restored *capture.Restored) *capture.Shard {
 	e.T.Helper()
-	sh, err := capture.New(capture.Config{Name: h.Name, Path: e.Path(h.Name), Generation: h.Manifest.Generation, MetaRoot: e.Meta, Writer: e.W, Restored: restored})
+	sh, err := capture.New(capture.Config{Name: h.Name, Path: e.Path(h.Name), Generation: h.Manifest.Generation, MetaRoot: e.Meta, Writer: e.W, Restored: restored, TempDir: e.Files.TempDir, SpoolLimit: e.Files.SpoolLimit})
 	if err != nil {
 		e.T.Fatal(err)
 	}

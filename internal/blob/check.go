@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-// CheckStore runs the startup check of a store (design.md, Coordination) on a
+// CheckStore runs the startup check of a store (docs/internals.md, Coordination) on a
 // scratch key, check/{node}/{random}, and deletes the key afterwards. It
 // refuses a store that misbehaves, naming the step that failed:
 //

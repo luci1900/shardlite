@@ -36,6 +36,7 @@ func newShard(t *testing.T, e *env, path string) *capture.Shard {
 // Before any connection has opened the database, the mapped page is beyond
 // the end of the file: reading it must be an error, not a crash.
 func TestWalIndexBeforeOpenIsAnError(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "users-1.db")
 	w, err := capture.MapWalIndex(path)
 	if err != nil {
@@ -51,6 +52,7 @@ func TestWalIndexBeforeOpenIsAnError(t *testing.T) {
 // file is truncated once, when the first connection (Litestream's) opens it,
 // and never again however often the app connects and disconnects.
 func TestWalIndexSurvivesAppChurn(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, 20*time.Millisecond)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
@@ -112,6 +114,7 @@ func appendInt(b []byte, i int) []byte {
 // connects and disconnects: none may fault once Litestream has opened the
 // shard (SIGBUS would mean SQLite shortened -shm under the mapping).
 func TestWalIndexNeverFaultsWhileCaptured(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, 5*time.Millisecond)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
@@ -170,6 +173,7 @@ func TestWalIndexNeverFaultsWhileCaptured(t *testing.T) {
 // Release closes Litestream's connection. With the app holding the shard the
 // -shm stays and capture reopens; the mapping, made again, is valid.
 func TestWalIndexAcrossHeldRelease(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, 20*time.Millisecond)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
@@ -217,6 +221,7 @@ func TestWalIndexAcrossHeldRelease(t *testing.T) {
 // across WAL restarts (Litestream checkpoints every few pages here, so the log
 // restarts many times and its salts change).
 func TestWalIndexSeesEveryCommit(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, 5*time.Millisecond)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
@@ -279,6 +284,7 @@ func TestWalIndexSeesEveryCommit(t *testing.T) {
 // round) finishes without any flush: the files are queued in the writer and the
 // sync returns. They are in blob storage once the writer has been flushed.
 func TestSyncWithSeveralFilesFinishesWithoutAFlush(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, time.Hour) // flushed by hand, as the node does
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")

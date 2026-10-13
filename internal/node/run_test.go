@@ -16,13 +16,21 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/apptest"
+	"github.com/luci1900/shardlite/internal/blob"
 )
 
 // nodeGoroutines lists the goroutines running code of the node's packages (not
 // the test's own, which are in _test.go files).
 func nodeGoroutines() []string {
 	buf := make([]byte, 1<<22)
-	buf = buf[:runtime.Stack(buf, true)]
+	for { // the dump is cut at the buffer's size: grow it until it all fits
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
 	var out []string
 	for i, g := range strings.Split(string(buf), "\n\n") {
 		if i == 0 || strings.Contains(g, "_test.go") {
@@ -38,10 +46,58 @@ func nodeGoroutines() []string {
 	return out
 }
 
+// goroutineID is the number in a goroutine's stack header.
+func goroutineID(g string) string {
+	f := strings.Fields(g)
+	if len(f) < 2 {
+		return g
+	}
+	return f[1]
+}
+
+// startedSince lists the goroutines of now that were not running in before: other
+// tests' goroutines that end meanwhile do not count, and neither do any that
+// were already running.
+func startedSince(before, now []string) []string {
+	seen := map[string]bool{}
+	for _, g := range before {
+		seen[goroutineID(g)] = true
+	}
+	var out []string
+	for _, g := range now {
+		if !seen[goroutineID(g)] {
+			out = append(out, g)
+		}
+	}
+	return out
+}
+
 // Run returns only after every goroutine it started has ended: the loops, the
 // servers, the health poll, the flush cycle's syncs, the segment writer and
 // the lease keeper.
 func TestRunLeavesNoGoroutines(t *testing.T) {
+	endpoint := os.Getenv("SHARDLITE_TEST_S3_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("Run needs an S3 store and SHARDLITE_TEST_S3_ENDPOINT is not set: start RustFS with docker/compose.s3.yaml")
+	}
+	if os.Getenv("AWS_ACCESS_KEY_ID") == "" {
+		t.Setenv("AWS_ACCESS_KEY_ID", "shardlite")
+		t.Setenv("AWS_SECRET_ACCESS_KEY", "shardlite-secret")
+	}
+	if os.Getenv("AWS_REGION") == "" {
+		t.Setenv("AWS_REGION", "us-east-1")
+	}
+	bucket := os.Getenv("SHARDLITE_TEST_S3_BUCKET")
+	if bucket == "" {
+		bucket = "shardlite-test"
+	}
+	b, err := blob.NewS3(context.Background(), blob.S3Options{Bucket: bucket, Endpoint: endpoint})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.EnsureBucket(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	app := apptest.Start(t)
 	var mu sync.Mutex
 	opened := map[string]bool{}
@@ -67,8 +123,8 @@ func TestRunLeavesNoGoroutines(t *testing.T) {
 		t.Fatal(err)
 	}
 	vars := map[string]string{
-		"SHARDLITE_NODE": "run-test", "SHARDLITE_BLOB": filepath.Join(dir, "blobs"), "SHARDLITE_KINDS": kinds,
-		"SHARDLITE_DATA": filepath.Join(dir, "data"), "SHARDLITE_META": filepath.Join(dir, "meta"),
+		"SHARDLITE_NODE": "run-test", "SHARDLITE_BLOB": "s3://" + bucket, "SHARDLITE_S3_ENDPOINT": endpoint, "SHARDLITE_PREFIX": fmt.Sprintf("run-test-%d/", time.Now().UnixNano()), "SHARDLITE_KINDS": kinds,
+		"SHARDLITE_DATA": filepath.Join(dir, "data"), "SHARDLITE_SCRATCH_DIR": filepath.Join(dir, "meta"),
 		"SHARDLITE_APP": fake.URL, "SHARDLITE_LISTEN": "127.0.0.1:0", "SHARDLITE_CONTROL": "127.0.0.1:0",
 		"SHARDLITE_FLUSH": "50ms", "SHARDLITE_PPROF": "127.0.0.1:0",
 	}
@@ -76,7 +132,7 @@ func TestRunLeavesNoGoroutines(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	before := len(nodeGoroutines())
+	before := nodeGoroutines()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -116,8 +172,8 @@ func TestRunLeavesNoGoroutines(t *testing.T) {
 			}
 		}
 	}
-	if n := len(nodeGoroutines()); n <= before {
-		t.Fatalf("%d node goroutines while running, %d before: the test is not looking at anything", n, before)
+	if n := len(startedSince(before, nodeGoroutines())); n == 0 {
+		t.Fatal("no new node goroutines while running: the test is not looking at anything")
 	}
 
 	cancel()
@@ -130,8 +186,7 @@ func TestRunLeavesNoGoroutines(t *testing.T) {
 		t.Fatal("Run did not return")
 	}
 	// No waiting: Run's return is the join.
-	left := nodeGoroutines()
-	if len(left) > before {
-		t.Fatalf("%d node goroutines left after Run returned (%d before it started):\n%s", len(left), before, strings.Join(left, "\n\n"))
+	if left := startedSince(before, nodeGoroutines()); len(left) > 0 {
+		t.Fatalf("%d node goroutines left after Run returned:\n%s", len(left), strings.Join(left, "\n\n"))
 	}
 }

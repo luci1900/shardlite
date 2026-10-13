@@ -20,16 +20,16 @@ import (
 // neither the kinds file nor the environment says otherwise.
 const DefaultIdleTimeout = 10 * time.Minute
 
-// Kind is a category of shards with shared settings (design.md, Shard kinds).
+// Kind is a category of shards with shared settings (docs/guide.md, Shard kinds).
 type Kind struct {
 	Name        string
 	Sync        bool          // durability gates hold responses until the writes before them are in blob storage ("sync": "on", the default)
 	IdleTimeout time.Duration // how long an unused shard stays active
 	Public      bool          // clients may name it; otherwise only calls from the app reach it
-	// Ephemeral kinds ship nothing: no capture, journal or snapshots, and their output
-	// is never held. The local file is deleted at deactivation and after a crash.
-	// Sync is ignored for them.
-	Ephemeral bool
+	// AutoDelete kinds are ordinary ones whose shards are deleted when they
+	// deactivate (docs/guide.md, Auto-delete kinds), if they were created while the
+	// kind had it and hold no rows in the outbox or inbox.
+	AutoDelete bool
 }
 
 var (
@@ -70,7 +70,7 @@ type kindJSON struct {
 	Sync        string `json:"sync"` // "on" (the default) or "off": a string, like Shardlite-Sync, so more modes can follow
 	IdleTimeout string `json:"idle_timeout"`
 	Public      bool   `json:"public"`
-	Ephemeral   bool   `json:"ephemeral"`
+	AutoDelete  bool   `json:"auto_delete"`
 }
 
 type kindsJSON struct {
@@ -94,9 +94,6 @@ func ParseKinds(data []byte, defaultIdle time.Duration) (map[string]Kind, error)
 		if !kindName.MatchString(name) {
 			return nil, fmt.Errorf("kinds file: %q is not a valid kind name (lowercase letters, digits, - and _, starting with a letter)", name)
 		}
-		if name == ephemeralDir {
-			return nil, fmt.Errorf("kinds file: %q is not a valid kind name (the node keeps the files of ephemeral shards in a directory of that name)", name)
-		}
 		idle := defaultIdle
 		if k.IdleTimeout != "" {
 			d, err := time.ParseDuration(k.IdleTimeout)
@@ -113,7 +110,7 @@ func ParseKinds(data []byte, defaultIdle time.Duration) (map[string]Kind, error)
 		default:
 			return nil, fmt.Errorf(`kinds file: %s: sync is "on" or "off", not %q`, name, k.Sync)
 		}
-		out[name] = Kind{Name: name, Sync: sync, IdleTimeout: idle, Public: k.Public, Ephemeral: k.Ephemeral}
+		out[name] = Kind{Name: name, Sync: sync, IdleTimeout: idle, Public: k.Public, AutoDelete: k.AutoDelete}
 	}
 	return out, nil
 }

@@ -10,6 +10,7 @@ import (
 )
 
 func TestParseTarget(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct{ in, kind, id string }{
 		{"users/42", "users", "42"},
 		{"guild-chat/0192f6a8-7c1e-7b3a-9d2e-5f4c3b2a1d0e", "guild-chat", "0192f6a8-7c1e-7b3a-9d2e-5f4c3b2a1d0e"},
@@ -31,6 +32,7 @@ func TestParseTarget(t *testing.T) {
 }
 
 func TestParseKinds(t *testing.T) {
+	t.Parallel()
 	m, err := ParseKinds([]byte(`{"kinds": {"users": {"public": true, "sync": "off", "idle_timeout": "10m"}, "wallet": {}, "chat": {"sync": "on"}, "audit": {}}}`), 3*time.Minute)
 	if err != nil {
 		t.Fatal(err)
@@ -66,6 +68,7 @@ func TestParseKinds(t *testing.T) {
 }
 
 func TestKindsReload(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "kinds.json")
 	os.WriteFile(path, []byte(`{"kinds": {"users": {}}}`), 0o644)
 	k, err := LoadKinds(path, 0)
@@ -103,8 +106,9 @@ func TestKindsReload(t *testing.T) {
 }
 
 func TestParseEnv(t *testing.T) {
+	t.Parallel()
 	env := map[string]string{
-		"SHARDLITE_NODE": "node-a", "SHARDLITE_BLOB": "/blobs", "SHARDLITE_KINDS": "/k.json", "SHARDLITE_DATA": "/d", "SHARDLITE_META": "/m",
+		"SHARDLITE_NODE": "node-a", "SHARDLITE_BLOB": "s3://blobs", "SHARDLITE_KINDS": "/k.json", "SHARDLITE_DATA": "/d", "SHARDLITE_SCRATCH_DIR": "/m",
 		"SHARDLITE_PREFIX": "staging", "SHARDLITE_FLUSH": "100ms", "SHARDLITE_IDLE_TIMEOUT": "2m", "SHARDLITE_CACHE_LIMIT": "20GB",
 	}
 	e, err := ParseEnv(func(k string) string { return env[k] })
@@ -112,10 +116,16 @@ func TestParseEnv(t *testing.T) {
 		t.Fatal(err)
 	}
 	if e.Name != "node-a" || e.Prefix != "staging/" || e.Flush != 100*time.Millisecond || e.IdleTimeout != 2*time.Minute || e.CacheLimit != 20<<30 ||
-		e.HealthPath != "/health" || e.Listen != ":8080" || e.Control != "127.0.0.1:7000" || e.LeaseTTL != 10*time.Second {
+		e.HealthPath != "/health" || e.Listen != ":8080" || e.Control != "127.0.0.1:7000" || e.LeaseTTL != 10*time.Second ||
+		e.MaxHops != 32 {
 		t.Fatalf("%+v", e)
 	}
-	for k, v := range map[string]string{"SHARDLITE_FLUSH": "fast", "SHARDLITE_CACHE_LIMIT": "lots", "SHARDLITE_BLOB": ""} {
+	env["SHARDLITE_MAX_HOPS"] = "5"
+	if e, err = ParseEnv(func(k string) string { return env[k] }); err != nil || e.MaxHops != 5 {
+		t.Fatalf("%+v %v", e, err)
+	}
+	delete(env, "SHARDLITE_MAX_HOPS")
+	for k, v := range map[string]string{"SHARDLITE_FLUSH": "fast", "SHARDLITE_CACHE_LIMIT": "lots", "SHARDLITE_BLOB": "", "SHARDLITE_MAX_HOPS": "0"} {
 		bad := map[string]string{}
 		for a, b := range env {
 			bad[a] = b
@@ -127,16 +137,13 @@ func TestParseEnv(t *testing.T) {
 	}
 }
 
-func TestParseKindsEphemeral(t *testing.T) {
-	m, err := ParseKinds([]byte(`{"kinds": {"lobby": {"ephemeral": true, "sync": "on"}, "users": {}}}`), time.Minute)
+func TestParseKindsAutoDelete(t *testing.T) {
+	t.Parallel()
+	m, err := ParseKinds([]byte(`{"kinds": {"lobby": {"auto_delete": true, "sync": "on"}, "users": {}}}`), time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !m["lobby"].Ephemeral || m["users"].Ephemeral {
-		t.Fatalf("ephemeral is off by default and on when set: %+v", m)
-	}
-	// The directory of ephemeral shards' files is named like a kind would be.
-	if _, err := ParseKinds([]byte(`{"kinds": {"ephemeral": {}}}`), time.Minute); err == nil {
-		t.Fatal("a kind named like the ephemeral directory was accepted")
+	if !m["lobby"].AutoDelete || m["users"].AutoDelete {
+		t.Fatalf("auto_delete is off by default and on when set: %+v", m)
 	}
 }

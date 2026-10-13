@@ -34,7 +34,7 @@ func entries(t *testing.T, e *harness.Env, name string) (out []segment.Entry) {
 
 type variant struct {
 	deltas      int  // deltas after the base
-	merge       bool // merge everything into one base before letting go
+	rebase      bool // rebase onto one base before letting go
 	journalTail bool // commits after the last file, only in the node journal
 	activations int  // further activations after the first, each restoring and capturing again, without deltas in between
 }
@@ -51,9 +51,9 @@ func letGo(t *testing.T, e *harness.Env, app *apptest.App, sh *capture.Shard) {
 	}
 }
 
-// restoreAndCapture follows the sequence from design.md: restore, register
-// with Litestream starting from scratch, sync once before any app opens the
-// file (a snapshot that is not uploaded), then let the app write more.
+// restoreAndCapture follows the sequence from docs/internals.md: restore, register
+// with Litestream starting from the restored state (capture's seed), sync once
+// before any app opens the file (which writes nothing), then let the app write more.
 func restoreAndCapture(t *testing.T, e *harness.Env, v variant) {
 	t.Helper()
 	ctx := context.Background()
@@ -77,12 +77,12 @@ func restoreAndCapture(t *testing.T, e *harness.Env, v variant) {
 			t.Fatal(err)
 		}
 	}
-	if v.merge {
-		if err := h.Merge(ctx, shardfile.Hooks{}); err != nil {
+	if v.rebase {
+		if _, err := h.Rebase(ctx, sh, shardfile.Hooks{}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if !v.merge && len(h.Manifest.Files) != 1+v.deltas || v.merge && len(h.Manifest.Files) != 1 {
+	if !v.rebase && len(h.Manifest.Files) != 1+v.deltas || v.rebase && len(h.Manifest.Files) != 1 {
 		t.Fatalf("manifest files %v", h.Manifest.Files)
 	}
 	if v.journalTail {
@@ -109,7 +109,7 @@ func restoreAndCapture(t *testing.T, e *harness.Env, v variant) {
 			t.Fatalf("sync of restored shard: %v", err)
 		}
 		if n := len(entries(t, e, shard)); n != before {
-			t.Fatalf("the first sync of a restored shard added %d journal entries: the snapshot was uploaded", n-before)
+			t.Fatalf("the first sync of a restored shard added %d journal entries: a snapshot was taken and uploaded", n-before)
 		}
 
 		app = e.StartApp(shard)
@@ -182,12 +182,13 @@ func restoreAndCapture(t *testing.T, e *harness.Env, v variant) {
 }
 
 func TestRestoreThenCapture(t *testing.T) {
+	t.Parallel()
 	for name, v := range map[string]variant{
 		"base only":                         {},
 		"base and deltas":                   {deltas: 3},
-		"merged base":                       {deltas: 4, merge: true},
+		"rebased base":                      {deltas: 4, rebase: true},
 		"with journal tail":                 {deltas: 1, journalTail: true},
-		"merged, journal tail":              {deltas: 2, merge: true, journalTail: true},
+		"rebased, journal tail":             {deltas: 2, rebase: true, journalTail: true},
 		"tails of several activations":      {deltas: 1, activations: 2},
 		"several activations, journal tail": {journalTail: true, activations: 3},
 	} {
@@ -234,6 +235,7 @@ func pageCount(t *testing.T, b []byte) (pages, commit int) {
 // Segments expire a day after they are written, oldest first, so restore
 // can't start at segment 1: it starts where the node's lease says.
 func TestRestoreFindsTailAfterOldSegmentsExpire(t *testing.T) {
+	t.Parallel()
 	e, ctx := harness.New(t, 10*time.Millisecond), context.Background()
 	app := e.StartApp(shard)
 	h, sh := e.NewShard(shard)

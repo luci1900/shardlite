@@ -3,12 +3,6 @@ package node
 import (
 	"context"
 	"errors"
-	"io/fs"
-	"log/slog"
-	"net/http"
-	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -34,16 +28,17 @@ func (r *mrig) segments() (data, fences int) {
 	return data, fences
 }
 
-// A shard whose tail is not turned into a delta (deltas disabled here) raises
-// the alert once the tail is older than the alert age, while its segments
-// still exist, and they expire after.
+// A shard whose tail is not turned into a delta (its manifest updates fail
+// here) raises the alert once the tail is 3 times the delta age old, while its
+// segments still exist, and they expire after.
 func TestTailOlderThanTheAlertAgeRaisesIt(t *testing.T) {
+	t.Parallel()
 	r := newMRig(t)
 	r.m.cancel()
 	r.m.g.Wait()
 	r.m.idx.close()
-	const alert, expiry = 500 * time.Millisecond, 2 * time.Second
-	r.startManager(func(o *ManagerOptions) { o.DeltaAge = time.Hour; o.TailAlert = alert })
+	const deltaAge, expiry = 170 * time.Millisecond, 2 * time.Second // the alert is at 510 ms
+	r.startManager(func(o *ManagerOptions) { o.DeltaAge = deltaAge })
 	if err := r.n.StartJournalSweeper(expiry); err != nil {
 		t.Fatal(err)
 	}
@@ -55,10 +50,24 @@ func TestTailOlderThanTheAlertAgeRaisesIt(t *testing.T) {
 	if err := r.m.Gate(ctx, ref, true); err != nil {
 		t.Fatal(err)
 	}
+	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
+		if (op == blob.OpUpdate || op == blob.OpCreate) && strings.HasPrefix(key, "manifests/") {
+			return errors.New("storage refuses manifests")
+		}
+		return nil
+	})
+	r.app.Must(t, "insert", "a", "2", "100") // a tail whose delta can never be recorded
+	if err := r.m.Gate(ctx, ref, true); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
 	if r.m.Stats.TailAlerts.Load() != 0 {
 		t.Fatal("alert for a fresh tail")
 	}
 	eventually(t, "the tail alert", func() bool { return r.m.Stats.TailAlerts.Load() > 0 })
+	if age := time.Since(start); age < 3*deltaAge-time.Second { // (the tail is a little older than start)
+		t.Fatalf("alert after %v, want at 3 times the delta age %v", age, 3*deltaAge)
+	}
 	if data, _ := r.segments(); data == 0 {
 		t.Fatal("the segments were gone before the alert")
 	}
@@ -68,11 +77,12 @@ func TestTailOlderThanTheAlertAgeRaisesIt(t *testing.T) {
 // The alert doesn't depend on the delta succeeding: with every manifest update
 // failing, the tail only grows older, and the alert comes all the same.
 func TestTailAlertWhenDeltasFail(t *testing.T) {
+	t.Parallel()
 	r := newMRig(t)
 	r.m.cancel()
 	r.m.g.Wait()
 	r.m.idx.close()
-	r.startManager(func(o *ManagerOptions) { o.DeltaAge = 30 * time.Millisecond; o.TailAlert = 300 * time.Millisecond })
+	r.startManager(func(o *ManagerOptions) { o.DeltaAge = 100 * time.Millisecond }) // the alert is at 300 ms
 	ctx := context.Background()
 	ref := r.acquire("slow/failing")
 	defer ref.Release()
@@ -96,6 +106,7 @@ func TestTailAlertWhenDeltasFail(t *testing.T) {
 // A node restarted after its old segments expired adopts its own journal from the
 // lease's range, keeps its fences, and every shard restores.
 func TestRestartAfterSegmentsExpired(t *testing.T) {
+	t.Parallel()
 	r := newMRig(t)
 	r.m.cancel()
 	r.m.g.Wait()
@@ -125,7 +136,7 @@ func TestRestartAfterSegmentsExpired(t *testing.T) {
 		}
 		return true
 	})
-	time.Sleep(200 * time.Millisecond) // a few more background passes
+	r.afterPasses(2) // a few more background passes
 	dataBefore, _ := r.segments()
 	if dataBefore == 0 {
 		t.Fatal("no segments")
@@ -163,26 +174,28 @@ func TestRestartAfterSegmentsExpired(t *testing.T) {
 }
 
 func envWith(extra map[string]string) (Env, error) {
-	m := map[string]string{"SHARDLITE_NODE": "n", "SHARDLITE_BLOB": "b", "SHARDLITE_KINDS": "k", "SHARDLITE_DATA": "d", "SHARDLITE_META": "m"}
+	m := map[string]string{"SHARDLITE_NODE": "n", "SHARDLITE_BLOB": "s3://b", "SHARDLITE_KINDS": "k", "SHARDLITE_DATA": "d", "SHARDLITE_SCRATCH_DIR": "m"}
 	for k, v := range extra {
 		m[k] = v
 	}
 	return ParseEnv(func(k string) string { return m[k] })
 }
 
-func TestTailAlertAndExpiryEnv(t *testing.T) {
+func TestFlushAndDeltaEnv(t *testing.T) {
+	t.Parallel()
 	e, err := envWith(nil)
-	if err != nil || e.TailAlert != 15*time.Minute || e.JournalExpiry != 24*time.Hour {
-		t.Fatalf("defaults: %v %v %v", e.TailAlert, e.JournalExpiry, err)
+	if err != nil || e.DeltaAge != 15*time.Minute || e.DeltaSize != 1<<20 || e.FlushMin != DefaultFlushMin || len(e.Ignored) != 0 {
+		t.Fatalf("defaults: %+v %v", e, err)
 	}
-	e, err = envWith(map[string]string{"SHARDLITE_TAIL_ALERT": "1m", "SHARDLITE_JOURNAL_EXPIRY": "4m"})
-	if err != nil || e.TailAlert != time.Minute || e.JournalExpiry != 4*time.Minute {
-		t.Fatalf("set: %v %v %v", e.TailAlert, e.JournalExpiry, err)
+	e, err = envWith(map[string]string{"SHARDLITE_DELTA_AGE": "1m", "SHARDLITE_DELTA_SIZE": "64K", "SHARDLITE_FLUSH_MIN": "10ms"})
+	if err != nil || e.DeltaAge != time.Minute || e.DeltaSize != 64<<10 || e.FlushMin != 10*time.Millisecond {
+		t.Fatalf("set: %+v %v", e, err)
 	}
 	for name, vars := range map[string]map[string]string{
-		"expiry under 4x the alert":  {"SHARDLITE_TAIL_ALERT": "1m", "SHARDLITE_JOURNAL_EXPIRY": "3m59s"},
-		"default expiry, long alert": {"SHARDLITE_TAIL_ALERT": "7h"},
-		"bad duration":               {"SHARDLITE_JOURNAL_EXPIRY": "soon"},
+		"bad delta age":   {"SHARDLITE_DELTA_AGE": "soon"},
+		"bad delta size":  {"SHARDLITE_DELTA_SIZE": "lots"},
+		"zero delta size": {"SHARDLITE_DELTA_SIZE": "0"},
+		"bad flush min":   {"SHARDLITE_FLUSH_MIN": "-1s"},
 	} {
 		if _, err := envWith(vars); err == nil {
 			t.Errorf("%s: accepted", name)
@@ -190,10 +203,41 @@ func TestTailAlertAndExpiryEnv(t *testing.T) {
 	}
 }
 
+// The removed settings are not errors, whatever their value: the node logs that
+// it ignores them.
+func TestRemovedSettingsAreIgnoredAndReported(t *testing.T) {
+	t.Parallel()
+	e, err := envWith(map[string]string{"SHARDLITE_TAIL_ALERT": "1m", "SHARDLITE_JOURNAL_EXPIRY": "soon"})
+	if err != nil || len(e.Ignored) != 2 || e.Ignored[0] != "SHARDLITE_TAIL_ALERT" || e.Ignored[1] != "SHARDLITE_JOURNAL_EXPIRY" {
+		t.Fatalf("%+v %v", e.Ignored, err)
+	}
+}
+
+// The tail alert is 3 times the delta age, and segments expire after the
+// larger of 24 hours and 4 times the alert.
+func TestTailAlertAndJournalExpiryFollowTheDeltaAge(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ age, alert, expiry time.Duration }{
+		{15 * time.Minute, 45 * time.Minute, 24 * time.Hour},
+		{time.Minute, 3 * time.Minute, 24 * time.Hour},
+		{2 * time.Hour, 6 * time.Hour, 24 * time.Hour},
+		{3 * time.Hour, 9 * time.Hour, 36 * time.Hour},
+	} {
+		if got := tailAlertAge(tc.age); got != tc.alert {
+			t.Errorf("delta age %v: alert %v, want %v", tc.age, got, tc.alert)
+		}
+		if got := JournalExpiry(tc.age); got != tc.expiry {
+			t.Errorf("delta age %v: expiry %v, want %v", tc.age, got, tc.expiry)
+		}
+	}
+}
+
 // The sweeper starts after adoption: a node that was down for longer than the
 // expiry age still adopts the old segments, then they are deleted.
 func TestSweeperStartsAfterAdoption(t *testing.T) {
+	t.Parallel()
 	r := newMRig(t)
+	r.skew.Store(int64(24 * time.Hour)) // everything written from here on is a day old
 	ctx := context.Background()
 	ref := r.acquire("wallet/1")
 	r.write(ref, "a")
@@ -208,72 +252,18 @@ func TestSweeperStartsAfterAdoption(t *testing.T) {
 		t.Fatal("no segments")
 	}
 	// The node was down for a day: every segment is older than the expiry age.
-	old := time.Now().Add(-24 * time.Hour)
-	err := filepath.WalkDir(filepath.Join(r.blobDir, "journal"), func(p string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return err
-		}
-		return os.Chtimes(p, old, old)
-	})
-	if err != nil {
+	r.skew.Store(0)
+	r.startNode() // the next process adopts the old segments
+	if r.n.Adopted.Deltas != 1 {
+		t.Fatalf("the segments were not adopted: %+v", r.n.Adopted)
+	}
+	if err := r.n.StartJournalSweeper(200 * time.Millisecond); err != nil {
 		t.Fatal(err)
-	}
-
-	health := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	defer health.Close()
-	dir := t.TempDir()
-	vars := map[string]string{
-		"SHARDLITE_NODE": "n1", "SHARDLITE_BLOB": r.blobDir, "SHARDLITE_KINDS": r.kindsPath,
-		"SHARDLITE_DATA": filepath.Join(dir, "data"), "SHARDLITE_META": filepath.Join(dir, "meta"),
-		"SHARDLITE_APP": health.URL, "SHARDLITE_LISTEN": "127.0.0.1:0", "SHARDLITE_CONTROL": "127.0.0.1:0",
-		"SHARDLITE_FLUSH": "50ms", "SHARDLITE_TAIL_ALERT": "50ms", "SHARDLITE_JOURNAL_EXPIRY": "200ms",
-	}
-	env, err := ParseEnv(func(k string) string { return vars[k] })
-	if err != nil {
-		t.Fatal(err)
-	}
-	var logs syncBuffer
-	runCtx, cancel := context.WithCancel(ctx)
-	ran := make(chan error, 1)
-	up := make(chan struct{})
-	go func() {
-		ran <- Run(runCtx, env, slog.New(slog.NewTextHandler(&logs, nil)), func(string, string) { close(up) })
-	}()
-	select {
-	case <-up:
-	case err := <-ran:
-		t.Fatalf("Run ended early: %v", err)
-	case <-time.After(20 * time.Second):
-		t.Fatal("the node did not come up")
-	}
-	if !strings.Contains(logs.String(), "adopted the previous process's journal") || !strings.Contains(logs.String(), "deltas=1") {
-		t.Fatalf("the segments were not adopted:\n%s", logs.String())
 	}
 	eventually(t, "the old segments to expire", func() bool { d, _ := r.segments(); return d == 0 })
-	cancel()
-	if err := <-ran; err != nil {
-		t.Fatal(err)
-	}
 	if got := r.dumpBlob("wallet/1"); got != want {
 		t.Fatal("the shard restores differently")
 	}
-}
-
-type syncBuffer struct {
-	mu sync.Mutex
-	b  strings.Builder
-}
-
-func (s *syncBuffer) Write(p []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.b.Write(p)
-}
-
-func (s *syncBuffer) String() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.b.String()
 }
 
 // putSegment writes a stand-in for a journal segment (a node's journal is only
@@ -299,6 +289,7 @@ func (r *mrig) exists(key string) bool {
 // The sweeper deletes the node's non-empty segments older than the expiry age and
 // nothing else: fences, recent segments and other nodes' journals stay.
 func TestSweepDeletesOldSegmentsKeepsFencesAndRecent(t *testing.T) {
+	t.Parallel()
 	r := newMRig(t)
 	ctx := context.Background()
 	old := r.putSegment("n1", 1001, "old")
@@ -339,6 +330,7 @@ func TestSweepDeletesOldSegmentsKeepsFencesAndRecent(t *testing.T) {
 
 // The sweeper works through List and Delete alone: no Get, Head, Create or Update.
 func TestSweeperUsesOnlyListAndDelete(t *testing.T) {
+	t.Parallel()
 	r := newMRig(t)
 	ctx := context.Background()
 	r.putSegment("n1", 2001, "a")
@@ -368,6 +360,7 @@ func TestSweeperUsesOnlyListAndDelete(t *testing.T) {
 
 // The timer-driven sweeper deletes, can't be started twice, and Close joins it.
 func TestJournalSweeperRunsAndCloseJoins(t *testing.T) {
+	t.Parallel()
 	r := newMRig(t)
 	key := r.putSegment("n1", 3001, "seg")
 	if err := r.n.StartJournalSweeper(300 * time.Millisecond); err != nil {
@@ -382,7 +375,15 @@ func TestJournalSweeperRunsAndCloseJoins(t *testing.T) {
 	}
 	// Joined: a segment written now is not swept, whatever its age.
 	r.local.Create(context.Background(), key, strings.NewReader("seg"), blob.WriteID{})
-	time.Sleep(700 * time.Millisecond)
+	// Close joined the sweeper (a ticker every 30 ms): it has ended, so nothing
+	// can sweep the segment.
+	joined := make(chan struct{})
+	go func() { r.n.sweepGroup.Wait(); close(joined) }()
+	select {
+	case <-joined:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the sweeper still runs after Close")
+	}
 	if !r.exists(key) {
 		t.Fatal("the sweeper ran after Close")
 	}

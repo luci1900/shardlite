@@ -1,5 +1,5 @@
 // Package coord holds a node's lease: the object in blob storage that all of
-// the node's ownerships depend on (design.md, Node leases).
+// the node's ownerships depend on (docs/internals.md, Node leases).
 package coord
 
 import (
@@ -63,7 +63,8 @@ func (l *NodeLease) ValidAt(t time.Time) bool {
 	return !l.Released && l.AdoptedBy == "" && t.Before(l.ExpiresAt())
 }
 
-// NodeRegistry is the single-node subset of design.md's interface. List comes
+// NodeRegistry is the single-node subset of the interface in
+// docs/internals.md. List comes
 // with the cluster in stage 2.
 type NodeRegistry interface {
 	// Acquire takes the node's lease with a new epoch, whether or not the
@@ -210,7 +211,20 @@ func (r *Registry) Release(ctx context.Context, lease NodeLease) error {
 	next.Released = true
 	_, err := r.store.Update(ctx, Key(lease.Name), encodeLease(&next), lease.ETag)
 	if errors.Is(err, blob.ErrConflict) || errors.Is(err, blob.ErrNotFound) {
-		return fmt.Errorf("%w: %s", ErrLeaseLost, lease.Name)
+		// A renewal that was cut short (the keeper stopped) can have landed
+		// without us hearing, which leaves an old ETag. If what is there is
+		// still our epoch and nobody has adopted it, release that.
+		cur, gerr := r.get(ctx, lease.Name)
+		if gerr != nil && !errors.Is(gerr, blob.ErrNotFound) {
+			return gerr
+		}
+		if gerr != nil || cur.Epoch != lease.Epoch || cur.Released || cur.AdoptedBy != "" {
+			return fmt.Errorf("%w: %s", ErrLeaseLost, lease.Name)
+		}
+		_, err = r.store.Update(ctx, Key(lease.Name), encodeLease(&next), cur.ETag)
+		if errors.Is(err, blob.ErrConflict) || errors.Is(err, blob.ErrNotFound) {
+			return fmt.Errorf("%w: %s", ErrLeaseLost, lease.Name)
+		}
 	}
 	return err
 }

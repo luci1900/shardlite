@@ -35,6 +35,7 @@ func logFiles(t *testing.T, e *env, label string) {
 
 // Which files does a new shard produce from activation to its first write?
 func TestFilesFromActivationToFirstWrite(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, 5*time.Millisecond)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
@@ -65,6 +66,7 @@ func TestFilesFromActivationToFirstWrite(t *testing.T) {
 // (db.go, checkpointIfNeeded and bumpLitestreamSeq). Both are uploaded by the
 // same Replica.Sync.
 func TestTimeBasedCheckpointMakesASecondFile(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, 5*time.Millisecond)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
@@ -82,7 +84,7 @@ func TestTimeBasedCheckpointMakesASecondFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	logFiles(t, e, "first sync")
-	time.Sleep(300 * time.Millisecond) // longer than the checkpoint interval since the last write
+	ageDatabase(t, path) // longer than the checkpoint interval since the last write
 	app.Must(t, "insert", "a", "1", "100")
 	before := sh.Position()
 	if err := sh.Sync(ctx); err != nil {

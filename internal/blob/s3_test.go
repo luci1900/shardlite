@@ -43,9 +43,6 @@ func s3Error(status int, code string) *http.Response {
 // fakeS3 is an S3 backend whose every request goes to rt.
 func fakeS3(t *testing.T, rt http.RoundTripper) *S3 {
 	t.Helper()
-	t.Setenv("AWS_ACCESS_KEY_ID", "k")
-	t.Setenv("AWS_SECRET_ACCESS_KEY", "s")
-	t.Setenv("AWS_REGION", "us-east-1")
 	b, err := NewS3(context.Background(), S3Options{Bucket: "b", Endpoint: "http://s3.invalid", HTTPClient: &http.Client{Transport: rt}})
 	if err != nil {
 		t.Fatal(err)
@@ -53,9 +50,10 @@ func fakeS3(t *testing.T, rt http.RoundTripper) *S3 {
 	return b
 }
 
-// The responses S3 and compatible stores give map onto the outcomes (design.md,
+// The responses S3 and compatible stores give map onto the outcomes (docs/internals.md,
 // Coordination), with no store behind them.
 func TestS3StatusMapping(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	type call func(b *S3) error
 	create := func(b *S3) error {
@@ -86,7 +84,9 @@ func TestS3StatusMapping(t *testing.T) {
 		{"update racing another write", update, 409, "ConditionalRequestConflict", ErrNotApplied, false, true},
 		{"create, too many requests", create, 429, "", ErrNotApplied, false, true},
 		{"update, slow down", update, 503, "SlowDown", ErrNotApplied, false, true},
-		{"create, service unavailable", create, 503, "ServiceUnavailable", ErrNotApplied, false, true},
+		{"create, service unavailable", create, 503, "ServiceUnavailable", ErrUnknown, false, true},
+		{"update, 503 with no code", update, 503, "", ErrUnknown, false, true},
+		{"delete, service unavailable", del, 503, "ServiceUnavailable", ErrUnknown, false, true},
 		{"create, internal error", create, 500, "InternalError", ErrUnknown, false, true},
 		{"update, bad gateway", update, 502, "", ErrUnknown, false, true},
 		{"create, request timeout", create, 400, "RequestTimeout", ErrUnknown, false, true},
@@ -130,6 +130,7 @@ func TestS3StatusMapping(t *testing.T) {
 // A request that never got to the store is not applied; one that was sent and
 // got no answer may have been.
 func TestS3TransportFailures(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	refused := &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}
 	var attempts atomic.Int32
@@ -185,6 +186,7 @@ func (*timeoutError) Timeout() bool   { return true }
 func (*timeoutError) Temporary() bool { return true }
 
 func TestS3WriteIDEncoding(t *testing.T) {
+	t.Parallel()
 	for _, id := range []WriteID{{Node: "n1", Epoch: 1, N: 1}, {Node: "a:b c/é.d%", Epoch: 3, N: 9}, {Node: "a.b.c", Epoch: 2, N: 7}, {Node: "", Epoch: 0, N: 5}} {
 		v := encodeWriteID(id)
 		for _, c := range []byte(v) {
@@ -247,6 +249,7 @@ func (f *faults) RoundTrip(r *http.Request) (*http.Response, error) {
 // the PUT reached the store is ErrUnknown, and Store recognises its own write by
 // its write id; a refused connection is ErrNotApplied.
 func TestS3LostResponsesAgainstTheEmulator(t *testing.T) {
+	t.Parallel()
 	endpoint := os.Getenv("SHARDLITE_TEST_S3_ENDPOINT")
 	if endpoint == "" {
 		t.Skip("SHARDLITE_TEST_S3_ENDPOINT is not set (docker/compose.s3.yaml runs an emulator)")

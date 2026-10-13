@@ -3,6 +3,8 @@ package blob
 import (
 	"context"
 	"errors"
+	"io"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -10,7 +12,7 @@ import (
 
 // loseResponse makes the first call of op that has reached the backend and
 // succeeded report a failure instead.
-func loseResponse(l *Local, op Op) *atomic.Int32 {
+func loseResponse(l *Hooked, op Op) *atomic.Int32 {
 	var fired atomic.Int32
 	l.SetHook(func(ctx context.Context, o Op, key string, after bool) error {
 		if o == op && after && fired.Add(1) == 1 {
@@ -22,6 +24,7 @@ func loseResponse(l *Local, op Op) *atomic.Int32 {
 }
 
 func TestCreateLostResponse(t *testing.T) {
+	t.Parallel()
 	s, l := newStore(t)
 	ctx := context.Background()
 	fired := loseResponse(l, OpCreate)
@@ -40,6 +43,7 @@ func TestCreateLostResponse(t *testing.T) {
 }
 
 func TestUpdateLostResponse(t *testing.T) {
+	t.Parallel()
 	s, l := newStore(t)
 	ctx := context.Background()
 	e1, _ := s.Create(ctx, "k", strings.NewReader("v1"))
@@ -54,7 +58,8 @@ func TestUpdateLostResponse(t *testing.T) {
 }
 
 func TestDeleteLostResponse(t *testing.T) {
-	s, l := newStore(t)
+	t.Parallel()
+	s, l := newStrictStore(t)
 	ctx := context.Background()
 	s.Create(ctx, "k", strings.NewReader("v"))
 	fired := loseResponse(l, OpDelete)
@@ -73,6 +78,7 @@ func TestDeleteLostResponse(t *testing.T) {
 // A conditional delete whose response was lost is recognised as done when the retry
 // finds nothing, and a stale ETag is still a conflict.
 func TestConditionalDeleteLostResponse(t *testing.T) {
+	t.Parallel()
 	s, l := newStore(t)
 	ctx := context.Background()
 	e1, _ := s.Create(ctx, "k", strings.NewReader("v1"))
@@ -91,7 +97,8 @@ func TestConditionalDeleteLostResponse(t *testing.T) {
 // A failed request that certainly changed nothing is no reason to call a
 // missing object deleted: only an earlier unknown outcome is.
 func TestDeleteNotFoundAfterNotApplied(t *testing.T) {
-	s, l := newStore(t)
+	t.Parallel()
+	s, l := newStrictStore(t)
 	ctx := context.Background()
 	var calls atomic.Int32
 	l.SetHook(func(ctx context.Context, o Op, key string, after bool) error {
@@ -110,6 +117,7 @@ func TestDeleteNotFoundAfterNotApplied(t *testing.T) {
 
 // Somebody else's object is a real conflict even after an ambiguous failure.
 func TestLostResponseThenSomeoneElsesObject(t *testing.T) {
+	t.Parallel()
 	s, l := newStore(t)
 	other := NewStore(l, "n2", 1, Options{})
 	ctx := context.Background()
@@ -146,6 +154,7 @@ func TestLostResponseThenSomeoneElsesObject(t *testing.T) {
 }
 
 func TestNotAppliedIsRetried(t *testing.T) {
+	t.Parallel()
 	s, l := newStore(t)
 	ctx := context.Background()
 	var calls atomic.Int32
@@ -164,6 +173,7 @@ func TestNotAppliedIsRetried(t *testing.T) {
 }
 
 func TestPersistentFailureIsReturned(t *testing.T) {
+	t.Parallel()
 	s, l := newStore(t)
 	ctx := context.Background()
 	l.SetHook(func(ctx context.Context, o Op, key string, after bool) error {
@@ -187,5 +197,63 @@ func TestPersistentFailureIsReturned(t *testing.T) {
 	_ = l2
 	if _, err := s.Head(ctx, "j"); err != nil || calls.Load() != 2 {
 		t.Fatalf("head: err=%v calls=%d", err, calls.Load())
+	}
+}
+
+// On a store that answers success to a delete of a missing key (S3), a delete
+// whose response was lost, and a second delete, are both done.
+func TestDeleteOfAMissingKeyOnS3Semantics(t *testing.T) {
+	t.Parallel()
+	s, l := newStore(t)
+	ctx := context.Background()
+	s.Create(ctx, "k", strings.NewReader("v"))
+	loseResponse(l, OpDelete)
+	if err := s.Delete(ctx, "k", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Delete(ctx, "k", ""); err != nil {
+		t.Fatalf("second delete: %v", err)
+	}
+}
+
+// A body that is a file is sent from its start on every attempt, whatever an
+// earlier attempt read of it, and the store never holds it in memory.
+func TestRetryResendsTheWholeBody(t *testing.T) {
+	t.Parallel()
+	s, l := newStore(t)
+	ctx := context.Background()
+	f, err := os.CreateTemp(t.TempDir(), "body")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	want := strings.Repeat("0123456789", 1000)
+	f.WriteString(want)
+
+	var attempts atomic.Int32
+	l.SetHook(func(ctx context.Context, o Op, key string, after bool) error {
+		if o == OpCreate && !after && attempts.Add(1) == 1 {
+			return errors.New("refused") // nothing written
+		}
+		if o == OpCreate && after && attempts.Load() == 2 && attempts.Add(1) == 3 {
+			return errors.New("response lost") // written, but the caller isn't told
+		}
+		return nil
+	})
+	f.Seek(0, io.SeekEnd) // wherever it was left
+	if _, err := s.Create(ctx, "big", f); err != nil {
+		t.Fatal(err)
+	}
+	rc, _, err := s.Get(ctx, "big")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(rc)
+	rc.Close()
+	if string(got) != want {
+		t.Fatalf("stored %d bytes, want %d", len(got), len(want))
+	}
+	if attempts.Load() < 3 {
+		t.Fatalf("only %d attempts", attempts.Load())
 	}
 }

@@ -13,7 +13,7 @@ import (
 // maxSweepEvery is the longest wait between two sweeps.
 const maxSweepEvery = 10 * time.Minute
 
-// StartJournalSweeper starts the node's own journal sweeper (design.md, Cleaning
+// StartJournalSweeper starts the node's own journal sweeper (docs/internals.md, Cleaning
 // the journal): every tenth of age (at most every ten minutes) it lists
 // journal/{node}/ and deletes the non-empty segments last modified more than age
 // ago. Empty segments (fences) are never deleted, since a zombie paused for

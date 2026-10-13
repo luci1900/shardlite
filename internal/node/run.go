@@ -10,6 +10,7 @@ import (
 	_ "net/http/pprof" // served only on SHARDLITE_PPROF's own listener
 	"net/url"
 	"os"
+	"path/filepath"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -31,33 +32,25 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 	if err != nil {
 		return err
 	}
-
-	if err := env.checkExpiry(); err != nil {
-		return err
+	for _, name := range env.Ignored {
+		log.Warn(name+" is set but no longer a setting, so it is ignored (the tail alert and journal expiry follow SHARDLITE_DELTA_AGE)", "variable", name)
 	}
-	bucket, dir, err := env.blobTarget()
+
+	bucket, err := env.blobBucket()
 	if err != nil {
 		return err
 	}
 	// Directories first: the checks look at the filesystems they are on.
-	for _, d := range []string{env.Data, env.Meta, dir} {
-		if d == "" {
-			continue // no directory with the S3 backend
-		}
+	for _, d := range []string{env.Data, env.Scratch} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return err
 		}
 	}
 	checks := defaultStartupChecks(log)
-	if err := checks.refuse(env.Data, dir); err != nil {
+	if err := checks.refuse(env.Data); err != nil {
 		return err
 	}
-	var raw blob.Backend
-	if bucket != "" {
-		raw, err = blob.NewS3(ctx, blob.S3Options{Bucket: bucket, Endpoint: env.S3Endpoint})
-	} else {
-		raw, err = blob.NewLocal(dir)
-	}
+	raw, err := blob.NewS3(ctx, blob.S3Options{Bucket: bucket, Endpoint: env.S3Endpoint})
 	if err != nil {
 		return err
 	}
@@ -67,21 +60,30 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 	if err := blob.CheckStore(ctx, backend, env.Name); err != nil {
 		return err
 	}
-	checks.warn(env.Meta)
+	checks.warn(env.Scratch)
+	// Whatever a crash left of deltas, snapshots and downloads.
+	tempDir := filepath.Join(env.Data, tempDirName)
+	if err := os.RemoveAll(tempDir); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(tempDir, 0o755); err != nil {
+		return err
+	}
 
 	n, err := Start(ctx, Config{
 		Name: env.Name, Address: env.Address, Backend: backend,
 		Flush: env.Flush, ManualFlush: true,
-		Lease:  coord.RegistryOptions{TTL: env.LeaseTTL},
-		Keeper: coord.KeeperOptions{Interval: env.LeaseTTL / 3, Margin: env.LeaseTTL / 5},
-		Logger: log,
+		Lease:   coord.RegistryOptions{TTL: env.LeaseTTL},
+		Keeper:  coord.KeeperOptions{Interval: env.LeaseTTL / 3, Margin: env.LeaseTTL / 5},
+		Logger:  log,
+		TempDir: tempDir,
 	})
 	if err != nil {
 		return err
 	}
 	// Expiry starts only now: a node that was down longer than the expiry age
 	// has adopted its old segments before any of them can be deleted.
-	if err := n.StartJournalSweeper(env.JournalExpiry); err != nil {
+	if err := n.StartJournalSweeper(JournalExpiry(env.DeltaAge)); err != nil {
 		n.Close(context.Background(), false)
 		return err
 	}
@@ -89,12 +91,12 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 		log.Info("adopted the previous process's journal", "deltas", n.Adopted.Deltas, "lost", n.Adopted.Lost, "fence", n.Adopted.Fence)
 	}
 	m, err := NewManager(n, ManagerOptions{
-		Kinds: kinds, Data: env.Data, Meta: env.Meta, CacheLimit: env.CacheLimit, Flush: env.Flush, DeltaAge: env.DeltaAge, TailAlert: env.TailAlert, Logger: log,
+		Kinds: kinds, Data: env.Data, Scratch: env.Scratch, CacheLimit: env.CacheLimit, Flush: env.Flush, FlushMin: env.FlushMin, DeltaAge: env.DeltaAge, DeltaSize: env.DeltaSize, Logger: log,
 	})
 	if err != nil {
 		return err
 	}
-	srv := NewServer(m, ServerOptions{App: app, HealthPath: env.HealthPath, MaxCallDepth: env.MaxCallDepth, Logger: log})
+	srv := NewServer(m, ServerOptions{App: app, HealthPath: env.HealthPath, MaxHops: env.MaxHops, Logger: log})
 	abort := func(err error) error { // a failure before serving: stop what is running
 		srv.Close()
 		m.Close(context.Background())
@@ -153,13 +155,41 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 			return nil
 		}
 	})
-	g.Go(func() error { return srv.Serve(gctx, public, control, socket) })
+	g.Go(func() error { return srv.Serve(gctx, public, nil, nil) })
+	// The control API outlives the public listener: while the node drains, the
+	// app's handlers still make calls through it.
+	ctlCtx, stopControl := context.WithCancel(context.Background())
+	defer stopControl()
+	var cg errgroup.Group
+	ctlDone := make(chan struct{})
+	var ctlErr error
+	cg.Go(func() error {
+		defer close(ctlDone)
+		ctlErr = srv.Serve(ctlCtx, nil, control, socket)
+		return nil
+	})
+	g.Go(func() error { // a control listener that fails ends the node
+		select {
+		case <-ctlDone:
+			return ctlErr
+		case <-gctx.Done():
+			return nil
+		}
+	})
 	serveErr := g.Wait()
 
 	// Shutdown: stop taking requests (done), let go of the shards, give up the lease.
 	log.Info("shutting down")
 	sctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	// Messages that are still live get a few seconds to go out before the shards
+	// are let go of (the rest get a wake hint as each shard is).
+	m.Drain(sctx)
+	stopControl()
+	cg.Wait()
+	if ctlErr != nil && serveErr == nil {
+		serveErr = ctlErr
+	}
 	srv.Close()
 	closeErr := m.Close(sctx)
 	if closeErr != nil {

@@ -30,10 +30,7 @@ type env struct {
 
 func newEnv(t *testing.T, interval time.Duration) *env {
 	t.Helper()
-	local, err := blob.NewLocal(filepath.Join(t.TempDir(), "blobs"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	local := blob.WithHook(blob.NewMemory())
 	store := blob.NewStore(local, "n1", 1, blob.Options{Backoff: time.Millisecond})
 	w := segment.NewWriter(store, "n1", segment.Options{Interval: interval})
 	t.Cleanup(w.Close)
@@ -80,6 +77,7 @@ func (e *env) replay(t *testing.T, shard, path string) shardfile.State {
 }
 
 func TestCommitsAppearAsEntries(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, 20*time.Millisecond)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
@@ -113,6 +111,7 @@ func TestCommitsAppearAsEntries(t *testing.T) {
 }
 
 func TestReplayEqualsApp(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, 20*time.Millisecond)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
@@ -150,6 +149,7 @@ func TestReplayEqualsApp(t *testing.T) {
 }
 
 func TestManyShardsOneSegmentPerFlush(t *testing.T) {
+	t.Parallel()
 	const shards, rounds = 100, 5
 	e := newEnv(t, time.Hour) // flushed by hand, as the node's flush cycle does
 	ctx := context.Background()
@@ -275,11 +275,9 @@ func pageCount(t *testing.T, b []byte) (pages, commit int) {
 // runs to the end on its own, so the commit reaches the journal once and a later
 // Sync finds nothing left to do.
 func TestSyncOutlivesItsCaller(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, 5*time.Millisecond)
-	local, err := blob.NewLocal(filepath.Join(t.TempDir(), "blobs"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	local := blob.WithHook(blob.NewMemory())
 	e.store = blob.NewStore(local, "n1", 1, blob.Options{Backoff: time.Millisecond})
 	e.w = segment.NewWriter(e.store, "n1", segment.Options{Interval: 5 * time.Millisecond, Retry: time.Millisecond})
 	t.Cleanup(e.w.Close)
@@ -324,16 +322,10 @@ func TestSyncOutlivesItsCaller(t *testing.T) {
 	close(up)
 
 	// Nothing asks again, yet the commit arrives: the writer never drops a queued file.
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if entries, _ := e.entriesFor(t, "users/1"); len(entries) == len(sh.Tail()) {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the commit never reached the journal after the caller left")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	apptest.Eventually(t, 5*time.Second, "the commit to reach the journal after the caller left", func() bool {
+		entries, _ := e.entriesFor(t, "users/1")
+		return len(entries) == len(sh.Tail())
+	})
 	if err := sh.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -354,6 +346,7 @@ func TestSyncOutlivesItsCaller(t *testing.T) {
 // The tail's segment bound is what the lease records as the oldest segment a
 // restart must read.
 func TestTailFromFollowsTheTail(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, 5*time.Millisecond)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
@@ -372,7 +365,10 @@ func TestTailFromFollowsTheTail(t *testing.T) {
 		if err := sh.Sync(ctx); err != nil {
 			t.Fatal(err)
 		}
-		time.Sleep(10 * time.Millisecond)
+		apptest.Eventually(t, 5*time.Second, "the commit to reach the journal", func() bool {
+			entries, _ := e.entriesFor(t, "users/1")
+			return len(entries) == len(sh.Tail())
+		})
 		if i == 0 {
 			_, seqs := e.entriesFor(t, "users/1")
 			first = seqs[0]
@@ -391,4 +387,60 @@ func TestTailFromFollowsTheTail(t *testing.T) {
 		t.Fatalf("TailFrom = %d after the tail was dropped", sh.TailFrom())
 	}
 	sh.Close(ctx)
+}
+
+// Many commits between two syncs make one LTX file that keeps only the latest
+// version of each page: rewriting the same pages 300 times costs the pages once,
+// not 300 times (merging commits per flush window is a possible later step).
+func TestCommitsInOneWindowKeepOnlyTheLatestPages(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, 20*time.Millisecond)
+	app := apptest.Start(t)
+	path := filepath.Join(e.dir, "users-1.db")
+	app.Must(t, "open", "a", path)
+	app.Must(t, "exec", "a", "CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)")
+	for i := range 40 {
+		app.Must(t, "exec", "a", fmt.Sprintf("INSERT INTO t (id, v) VALUES (%d, randomblob(1000))", i))
+	}
+	sh, err := capture.New(capture.Config{Name: "users/1", Path: path, Generation: "g1", MetaRoot: e.meta, Writer: e.w})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	defer sh.Close(ctx)
+	if err := sh.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := e.entriesFor(t, "users/1")
+
+	const commits = 300
+	for range commits {
+		app.Must(t, "exec", "a", "UPDATE t SET v = randomblob(1000)") // every page of the table, each time
+	}
+	if err := sh.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	entries, seqs := e.entriesFor(t, "users/1")
+	// Litestream may cut the window into more than one file (a checkpoint, say),
+	// but never one per commit.
+	var totalPages, totalBytes, dbPages int
+	for i := len(before); i < len(entries); i++ {
+		b, err := segment.ReadEntry(ctx, e.store, "n1", seqs[i], entries[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		pages, commit := pageCount(t, b)
+		t.Logf("file %d: commits %d-%d, %d pages, %d bytes, database of %d pages", i-len(before)+1, entries[i].Position, entries[i].Last(), pages, len(b), commit)
+		totalPages += pages
+		totalBytes += len(b)
+		dbPages = commit
+		if pages > commit {
+			t.Fatalf("%d pages in a file for a database of %d: older versions are kept", pages, commit)
+		}
+	}
+	files := len(entries) - len(before)
+	t.Logf("%d commits in one window: %d LTX files, %d pages and %d bytes in all, for a database of %d pages", commits, files, totalPages, totalBytes, dbPages)
+	if files > 5 || totalPages > files*dbPages {
+		t.Fatalf("%d files and %d pages for %d commits of the same %d pages", files, totalPages, commits, dbPages)
+	}
 }

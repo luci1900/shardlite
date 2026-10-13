@@ -23,8 +23,9 @@ func slowFlush(o *ManagerOptions) { o.Flush = 300 * time.Millisecond }
 
 // manualFlush stops the flush loop from ever ticking, so the test decides when
 // a cycle runs (r.cycle) and what a request waited for is read off the cycle
-// counter, not the clock.
-func manualFlush(o *ManagerOptions) { o.Flush = time.Hour }
+// counter, not the clock. The janitor is off too: a deactivation waits for a
+// cycle, which only the test would run.
+func manualFlush(o *ManagerOptions) { o.Flush, o.Janitor, o.NoEarlyFlush = time.Hour, time.Hour, true }
 
 func (r *srig) cycle() { r.m.flush.cycle(context.Background()) }
 
@@ -65,6 +66,7 @@ func (r *srig) withCycles(do func()) {
 }
 
 func TestGateOnResponses(t *testing.T) {
+	t.Parallel()
 	r := newSRigWith(t, manualFlush)
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		r.commit(q.Header.Get("Shardlite-Path"))
@@ -118,6 +120,7 @@ func TestGateOnResponses(t *testing.T) {
 }
 
 func TestGateOnStreams(t *testing.T) {
+	t.Parallel()
 	r := newSRigWith(t, slowFlush)
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -149,6 +152,7 @@ func TestGateOnStreams(t *testing.T) {
 }
 
 func TestGateOnUpgradedConnections(t *testing.T) {
+	t.Parallel()
 	r := newSRigWith(t, slowFlush)
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		path := q.Header.Get("Shardlite-Path")
@@ -191,6 +195,7 @@ func TestGateOnUpgradedConnections(t *testing.T) {
 // A call to another shard is bytes leaving the caller: the caller's node holds it
 // until what the caller committed is durable, if the caller's kind has sync on.
 func TestGateOnCalls(t *testing.T) {
+	t.Parallel()
 	r := newSRigWith(t, manualFlush)
 	var seen atomic.Int64 // rows of the caller in blob storage when the callee got the call
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
@@ -240,6 +245,7 @@ func TestGateOnCalls(t *testing.T) {
 }
 
 func TestSyncEndpointAndLeaseLoss(t *testing.T) {
+	t.Parallel()
 	r := newSRigWith(t, slowFlush)
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		r.commit(q.Header.Get("Shardlite-Path"))
@@ -272,6 +278,7 @@ func TestSyncEndpointAndLeaseLoss(t *testing.T) {
 }
 
 func TestCreationOverHTTP(t *testing.T) {
+	t.Parallel()
 	r := newSRig(t)
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		path := q.Header.Get("Shardlite-Path")

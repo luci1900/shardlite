@@ -22,10 +22,10 @@ type prefixed struct {
 	p string
 }
 
-func (x prefixed) Create(ctx context.Context, key string, body io.Reader, id WriteID) (ETag, error) {
+func (x prefixed) Create(ctx context.Context, key string, body io.ReadSeeker, id WriteID) (ETag, error) {
 	return x.b.Create(ctx, x.p+key, body, id)
 }
-func (x prefixed) Update(ctx context.Context, key string, body io.Reader, expected ETag, id WriteID) (ETag, error) {
+func (x prefixed) Update(ctx context.Context, key string, body io.ReadSeeker, expected ETag, id WriteID) (ETag, error) {
 	return x.b.Update(ctx, x.p+key, body, expected, id)
 }
 func (x prefixed) Get(ctx context.Context, key string) (io.ReadCloser, ETag, error) {

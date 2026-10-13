@@ -10,7 +10,7 @@ import (
 
 // Row states of the cache index.
 const (
-	stateActive = "active" // in use by this process; a row left from an earlier process means a crash
+	stateActive = "active" // in use by this process
 	stateCached = "cached" // deactivated, files at rest, still owned
 )
 
@@ -20,7 +20,6 @@ type indexRow struct {
 	Path       string
 	Generation string
 	Position   uint64 // the shard's position in the file, once the shard was deactivated
-	Epoch      uint64 // the node epoch the row was written in
 	State      string
 	LastUsed   time.Time
 	Bytes      int64 // disk used by the file at rest
@@ -44,7 +43,7 @@ func openIndex(path string) (*index, error) {
 	db.SetMaxOpenConns(4)
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS shards (
 		name TEXT PRIMARY KEY, path TEXT NOT NULL, generation TEXT NOT NULL, position INTEGER NOT NULL,
-		epoch INTEGER NOT NULL, state TEXT NOT NULL, last_used INTEGER NOT NULL, bytes INTEGER NOT NULL,
+		state TEXT NOT NULL, last_used INTEGER NOT NULL, bytes INTEGER NOT NULL,
 		size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, wal_size INTEGER NOT NULL, wal_mtime_ns INTEGER NOT NULL, manifest TEXT NOT NULL, etag TEXT NOT NULL);
 		CREATE INDEX IF NOT EXISTS shards_lru ON shards (state, last_used)`)
 	if err != nil {
@@ -58,20 +57,20 @@ func (x *index) close() error { return x.db.Close() }
 
 func (x *index) put(r indexRow) error {
 	_, err := x.db.Exec(`INSERT OR REPLACE INTO shards (`+cols+`)
-		VALUES (:name, :path, :generation, :position, :epoch, :state, :last_used, :bytes, :size, :mtime_ns, :wal_size, :wal_mtime_ns, :manifest, :etag)`,
+		VALUES (:name, :path, :generation, :position, :state, :last_used, :bytes, :size, :mtime_ns, :wal_size, :wal_mtime_ns, :manifest, :etag)`,
 		sql.Named("name", r.Name), sql.Named("path", r.Path), sql.Named("generation", r.Generation), sql.Named("position", r.Position),
-		sql.Named("epoch", r.Epoch), sql.Named("state", r.State), sql.Named("last_used", r.LastUsed.UnixNano()), sql.Named("bytes", r.Bytes),
+		sql.Named("state", r.State), sql.Named("last_used", r.LastUsed.UnixNano()), sql.Named("bytes", r.Bytes),
 		sql.Named("size", r.Size), sql.Named("mtime_ns", r.MTimeNs), sql.Named("wal_size", r.WalSize), sql.Named("wal_mtime_ns", r.WalMTimeNs),
 		sql.Named("manifest", r.Manifest), sql.Named("etag", r.ETag))
 	return err
 }
 
-const cols = `name, path, generation, position, epoch, state, last_used, bytes, size, mtime_ns, wal_size, wal_mtime_ns, manifest, etag`
+const cols = `name, path, generation, position, state, last_used, bytes, size, mtime_ns, wal_size, wal_mtime_ns, manifest, etag`
 
 func scan(s interface{ Scan(...any) error }) (indexRow, error) {
 	var r indexRow
 	var used int64
-	err := s.Scan(&r.Name, &r.Path, &r.Generation, &r.Position, &r.Epoch, &r.State, &used, &r.Bytes, &r.Size, &r.MTimeNs, &r.WalSize, &r.WalMTimeNs, &r.Manifest, &r.ETag)
+	err := s.Scan(&r.Name, &r.Path, &r.Generation, &r.Position, &r.State, &used, &r.Bytes, &r.Size, &r.MTimeNs, &r.WalSize, &r.WalMTimeNs, &r.Manifest, &r.ETag)
 	r.LastUsed = time.Unix(0, used)
 	return r, err
 }

@@ -1,0 +1,350 @@
+package node
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"golang.org/x/sync/errgroup"
+
+	"github.com/luci1900/shardlite/internal/blob"
+)
+
+// longInterval makes the flush interval so long that a cycle in a test can only
+// be one that output asked for, and sets the early-cycle timing.
+func longInterval(coalesce, min time.Duration) func(*ManagerOptions) {
+	return func(o *ManagerOptions) {
+		o.Flush, o.FlushCoalesce, o.FlushMin = time.Hour, coalesce, min
+	}
+}
+
+// journalPuts records when each journal segment is created in blob storage.
+func (r *mrig) journalPuts() (times func() []time.Time) {
+	var mu sync.Mutex
+	var at []time.Time
+	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
+		if op == blob.OpCreate && after && strings.HasPrefix(key, "journal/") {
+			mu.Lock()
+			at = append(at, time.Now())
+			mu.Unlock()
+		}
+		return nil
+	})
+	return func() []time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]time.Time(nil), at...)
+	}
+}
+
+// With sync on, a response after a write waits for one cycle that starts at
+// once (after the coalescing delay), not for the interval to come round.
+func TestGatedResponseDoesNotWaitForTheInterval(t *testing.T) {
+	t.Parallel()
+	r := newMRigWith(t, longInterval(2*time.Millisecond, 0))
+	ref := r.acquire("wallet/f1")
+	defer ref.Release()
+	r.write(ref, "a")
+	before := r.m.Flusher().Completed()
+	start := time.Now()
+	if err := r.m.Gate(context.Background(), ref, true); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("the gate took %v with a one hour flush interval", d)
+	}
+	if got := r.m.Flusher().Completed() - before; got != 1 {
+		t.Fatalf("%d cycles ran for the gate, want 1", got)
+	}
+	if got := strings.Count(r.dumpBlob("wallet/f1"), "kv: "); got != 2 {
+		t.Fatalf("%d rows durable when the gate opened", got)
+	}
+	r.app.Must(t, "close", "a")
+}
+
+// Gated responses that wait at the same time share cycles.
+func TestConcurrentGatedResponsesShareCycles(t *testing.T) {
+	t.Parallel()
+	const n = 200
+	r := newMRigWith(t, longInterval(20*time.Millisecond, 0))
+	var refs []*Ref
+	for i := range 20 {
+		ref := r.acquire(fmt.Sprintf("wallet/c%d", i))
+		defer ref.Release()
+		r.write(ref, fmt.Sprint(i))
+		refs = append(refs, ref)
+	}
+	before := r.m.Flusher().Completed()
+	var g errgroup.Group
+	for i := range n {
+		g.Go(func() error { return r.m.Gate(context.Background(), refs[i%len(refs)], true) })
+	}
+	if err := g.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.m.Flusher().Completed() - before; got < 1 || got > 4 {
+		t.Fatalf("%d cycles for %d gated responses", got, n)
+	}
+	for i := range refs {
+		r.app.Must(t, "close", fmt.Sprint(i))
+	}
+}
+
+// However gated writes keep arriving, cycles start no closer than FlushMin.
+func TestCyclesAreSpacedByFlushMin(t *testing.T) {
+	t.Parallel()
+	const min = 150 * time.Millisecond
+	r := newMRigWith(t, longInterval(0, min))
+	times := r.journalPuts()
+	ref := r.acquire("wallet/f2")
+	defer ref.Release()
+	r.write(ref, "a")
+	for range 6 {
+		r.app.Must(t, "insert", "a", "2", "100")
+		if err := r.m.Gate(context.Background(), ref, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	at := times()
+	if len(at) < 6 {
+		t.Fatalf("%d segments for 6 gated writes", len(at))
+	}
+	for i := 1; i < len(at); i++ {
+		// (a segment is put at the end of its cycle, so the gap between puts is the
+		// gap between starts give or take the time the cycle's work takes)
+		if gap := at[i].Sub(at[i-1]); gap < min-50*time.Millisecond {
+			t.Fatalf("segments %d and %d are %v apart, want about %v or more", i-1, i, gap, min)
+		}
+	}
+	r.app.Must(t, "close", "a")
+}
+
+// Writes nobody waits for are flushed by the tick, and a node with nothing
+// waiting runs cycles on the interval alone.
+func TestNothingWaitingRunsCyclesOnTheTick(t *testing.T) {
+	t.Parallel()
+	const interval = 300 * time.Millisecond
+	r := newMRigWith(t, func(o *ManagerOptions) { o.Flush = interval })
+	times := r.journalPuts()
+	ref := r.acquire("wallet/f3")
+	defer ref.Release()
+	r.write(ref, "a") // nobody waits for it
+	cycles := r.m.Flusher().Completed()
+	start := time.Now()
+	eventually(t, "the tick to flush the write", func() bool { return len(times()) > 0 })
+	if time.Since(start) > 3*interval {
+		t.Fatalf("flushed after %v with an interval of %v", time.Since(start), interval)
+	}
+	// And idle: only ticks, no segments.
+	puts := len(times())
+	time.Sleep(4 * interval)
+	if got := len(times()); got != puts {
+		t.Fatalf("an idle node wrote %d segments", got-puts)
+	}
+	if got := r.m.Flusher().Completed() - cycles; got > 8 {
+		t.Fatalf("%d cycles in %v with an interval of %v", got, 5*interval, interval)
+	}
+	r.app.Must(t, "close", "a")
+}
+
+// Output that passes straight through (a shard with no new frames) never waits
+// for a cycle and never asks for one.
+func TestOutputWithNoNewFramesTriggersNoCycle(t *testing.T) {
+	t.Parallel()
+	r := newMRigWith(t, longInterval(time.Millisecond, 0))
+	ref := r.acquire("wallet/f4")
+	defer ref.Release()
+	r.write(ref, "a")
+	if err := r.m.Gate(context.Background(), ref, true); err != nil {
+		t.Fatal(err)
+	}
+	before := r.m.Flusher().Completed()
+	for range 20 {
+		if err := r.m.Gate(context.Background(), ref, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(100 * time.Millisecond) // a cycle asked for would have run by now
+	if got := r.m.Flusher().Completed() - before; got != 0 {
+		t.Fatalf("%d cycles for output that had nothing to wait for", got)
+	}
+	r.app.Must(t, "close", "a")
+}
+
+// A waiter whose context ends while its cycle is held back leaves nothing
+// asking for it: no cycle runs for nobody.
+func TestCancelledWaiterTriggersNoCycle(t *testing.T) {
+	t.Parallel()
+	r := newMRigWith(t, longInterval(400*time.Millisecond, 0))
+	ref := r.acquire("wallet/f5")
+	defer ref.Release()
+	r.write(ref, "a")
+	before := r.m.Flusher().Completed()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := r.m.Gate(ctx, ref, true); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("gate: %v, want the context's end", err)
+	}
+	time.Sleep(900 * time.Millisecond) // past the coalescing delay
+	if got := r.m.Flusher().Completed() - before; got != 0 {
+		t.Fatalf("%d cycles ran for a waiter that had gone", got)
+	}
+	// A waiter that comes later is served.
+	if err := r.m.Gate(context.Background(), ref, true); err != nil {
+		t.Fatal(err)
+	}
+	r.app.Must(t, "close", "a")
+}
+
+// A waiter that is already in a cycle doesn't cancel it by giving up.
+func TestWaiterGivingUpInACycleDoesNotCancelIt(t *testing.T) {
+	t.Parallel()
+	r := newMRigWith(t, longInterval(time.Millisecond, 0))
+	var stall atomic.Bool
+	release := make(chan struct{})
+	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
+		if op == blob.OpCreate && !after && strings.HasPrefix(key, "journal/") && stall.Load() {
+			<-release
+		}
+		return nil
+	})
+	ref := r.acquire("wallet/f6")
+	defer ref.Release()
+	r.write(ref, "a")
+	stall.Store(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.m.Gate(ctx, ref, true) }()
+	eventually(t, "the cycle to start", func() bool { return r.m.Flusher().started.Load() > 0 })
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("gate: %v", err)
+	}
+	stall.Store(false)
+	close(release)
+	eventually(t, "the cycle to complete anyway", func() bool { return r.m.Flusher().Completed() > 0 })
+	if got := strings.Count(r.dumpBlob("wallet/f6"), "kv: "); got != 2 {
+		t.Fatalf("%d rows durable after the cycle", got)
+	}
+	r.app.Must(t, "close", "a")
+}
+
+// The sync barrier is released by an early cycle too.
+func TestBarrierIsReleasedByAnEarlyCycle(t *testing.T) {
+	t.Parallel()
+	r := newMRigWith(t, longInterval(time.Millisecond, 0))
+	ref := r.acquire("wallet/f7")
+	defer ref.Release()
+	r.write(ref, "a")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := r.m.Barrier(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(r.dumpBlob("wallet/f7"), "kv: "); got != 2 {
+		t.Fatalf("%d rows durable after the barrier", got)
+	}
+	r.app.Must(t, "close", "a")
+}
+
+// An intake waiting for its row to be durable is released by an early cycle: the
+// receiver acknowledges within a cycle, not up to an interval later. (The
+// sender's row is a write nobody waits for, so the tick reads it.)
+func TestIntakeIsReleasedByAnEarlyCycle(t *testing.T) {
+	t.Parallel()
+	r := newSRigWith(t, both(quick, func(o *ManagerOptions) { o.Flush, o.FlushCoalesce = 2*time.Second, time.Millisecond }))
+	rec := &recorder{}
+	r.record(rec, "")
+	var took atomic.Int64
+	r.hookIntake(func(_ int, _ *ActiveShard, _ string, _ *outRow, call func() (int, error)) (int, error) {
+		start := time.Now()
+		status, err := call()
+		took.Store(int64(time.Since(start)))
+		return status, err
+	})
+	r.addMessage("users/i1", "users/i2", "/hi", "x")
+	eventually(t, "the delivery", func() bool { return rec.count() == 1 })
+	if d := time.Duration(took.Load()); d == 0 || d > time.Second {
+		t.Fatalf("the intake took %v to be acknowledged with an interval of 2s, want about one cycle", d)
+	}
+}
+
+// A shard let go of at idle timeout doesn't wait for the tick either.
+func TestDeactivationDoesNotWaitForTheInterval(t *testing.T) {
+	t.Parallel()
+	r := newMRigWith(t, longInterval(time.Millisecond, 0))
+	ref := r.acquire("users/f8")
+	r.write(ref, "a")
+	r.app.Must(t, "close", "a")
+	ref.Release()
+	eventually(t, "deactivation", func() bool { return r.cached("users/f8") })
+}
+
+// A tail that passes DeltaSize gets a delta long before it is DeltaAge old.
+func TestTailPassingTheSizeGetsADeltaBeforeTheAge(t *testing.T) {
+	t.Parallel()
+	r := newMRig(t)
+	r.m.cancel()
+	r.m.g.Wait()
+	r.m.idx.close()
+	r.startManager(func(o *ManagerOptions) { o.DeltaAge, o.DeltaSize = time.Hour, 8<<10 })
+	ctx := context.Background()
+	ref := r.acquire("wallet/d1")
+	defer ref.Release()
+	r.write(ref, "a")
+	if err := r.m.Gate(ctx, ref, true); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond) // several passes of the background loop
+	if m, _ := r.manifest("wallet/d1"); len(m.Files) != 0 {
+		t.Fatalf("a delta for a small tail: %v", m.Files)
+	}
+	r.app.Must(t, "insert", "a", "20", "1000") // about 20 KB in one commit
+	if err := r.m.Gate(ctx, ref, true); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "a delta for the large tail", func() bool {
+		m, err := r.manifest("wallet/d1")
+		return err == nil && len(m.Files) == 1
+	})
+	if r.m.Stats.TailBytesMax.Load() < 8<<10 {
+		t.Fatalf("the highest tail held was %d bytes, want at least the size that made the delta", r.m.Stats.TailBytesMax.Load())
+	}
+	eventually(t, "the tail to be dropped", func() bool { return r.m.Stats.TailBytes.Load() < 8<<10 })
+	r.app.Must(t, "close", "a")
+}
+
+// A shard that writes a little gets a delta only once its tail is DeltaAge old.
+func TestSmallTailGetsADeltaAtTheAge(t *testing.T) {
+	t.Parallel()
+	r := newMRig(t)
+	r.m.cancel()
+	r.m.g.Wait()
+	r.m.idx.close()
+	const age = 600 * time.Millisecond
+	r.startManager(func(o *ManagerOptions) { o.DeltaAge = age })
+	ctx := context.Background()
+	start := time.Now() // the tail starts with the shard's first commit
+	ref := r.acquire("wallet/d2")
+	defer ref.Release()
+	r.write(ref, "a")
+	if err := r.m.Gate(ctx, ref, true); err != nil {
+		t.Fatal(err)
+	}
+	for time.Since(start) < age-100*time.Millisecond {
+		if m, _ := r.manifest("wallet/d2"); len(m.Files) != 0 {
+			t.Fatalf("a delta after %v, before the age %v: %v", time.Since(start), age, m.Files)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	eventually(t, "the delta at the age", func() bool {
+		m, err := r.manifest("wallet/d2")
+		return err == nil && len(m.Files) == 1
+	})
+	r.app.Must(t, "close", "a")
+}

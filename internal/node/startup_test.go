@@ -10,6 +10,7 @@ import (
 )
 
 func TestFilesystemNames(t *testing.T) {
+	t.Parallel()
 	for magic, want := range map[int64]string{
 		0x6969: "nfs", 0x517B: "smb", 0xFF534D42: "smb", 0xFE534D42: "smb", 0x65735546: "fuse",
 		0x01021994: "tmpfs", 0x858458F6: "ramfs", 0xEF53: "", 0x58465342: "",
@@ -35,6 +36,7 @@ func TestFilesystemNames(t *testing.T) {
 }
 
 func TestRefusesNetworkFilesystems(t *testing.T) {
+	t.Parallel()
 	on := func(m map[string]string) fsTypeFunc {
 		return func(p string) (string, error) {
 			if v, ok := m[p]; ok {
@@ -44,21 +46,18 @@ func TestRefusesNetworkFilesystems(t *testing.T) {
 		}
 	}
 	for name, tc := range map[string]struct {
-		fs      map[string]string
-		blobDir string
-		want    string // "" for success
+		fs   map[string]string
+		want string // "" for success
 	}{
-		"local disks":        {map[string]string{"/data": "ext4", "/blob": "ext4"}, "/blob", ""},
-		"data on NFS":        {map[string]string{"/data": "nfs", "/blob": "ext4"}, "/blob", "SHARDLITE_DATA (/data) is on a nfs filesystem"},
-		"data on FUSE":       {map[string]string{"/data": "fuse"}, "", "SHARDLITE_DATA (/data) is on a fuse filesystem"},
-		"data on SMB":        {map[string]string{"/data": "smb"}, "", "smb filesystem"},
-		"local blobs on NFS": {map[string]string{"/data": "ext4", "/blob": "nfs"}, "/blob", "SHARDLITE_BLOB (/blob) is on a nfs filesystem"},
-		"S3: no directory":   {map[string]string{"/data": "xfs"}, "", ""},
-		"unreadable":         {map[string]string{}, "", "checking the filesystem"},
+		"local disk":   {map[string]string{"/data": "ext4"}, ""},
+		"data on NFS":  {map[string]string{"/data": "nfs"}, "SHARDLITE_DATA (/data) is on a nfs filesystem"},
+		"data on FUSE": {map[string]string{"/data": "fuse"}, "SHARDLITE_DATA (/data) is on a fuse filesystem"},
+		"data on SMB":  {map[string]string{"/data": "smb"}, "smb filesystem"},
+		"unreadable":   {map[string]string{}, "checking the filesystem"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			c := startupChecks{fsType: on(tc.fs), limits: func() limits { return limits{} }, log: slog.New(slog.DiscardHandler)}
-			err := c.refuse("/data", tc.blobDir)
+			err := c.refuse("/data")
 			switch {
 			case tc.want == "" && err != nil:
 				t.Fatal(err)
@@ -70,6 +69,7 @@ func TestRefusesNetworkFilesystems(t *testing.T) {
 }
 
 func TestStartupWarnings(t *testing.T) {
+	t.Parallel()
 	run := func(fs string, l limits) string {
 		var buf bytes.Buffer
 		c := startupChecks{
@@ -127,20 +127,21 @@ func TestStartupWarnings(t *testing.T) {
 	}
 }
 
-func TestBlobTarget(t *testing.T) {
+func TestBlobBucket(t *testing.T) {
+	t.Parallel()
 	for name, tc := range map[string]struct {
 		vars          map[string]string
-		bucket, dir   string
+		bucket        string
 		wantErr       bool
 		errorContains string
 	}{
-		"directory":        {map[string]string{"SHARDLITE_BLOB": "/var/blobs"}, "", "/var/blobs", false, ""},
-		"bucket":           {map[string]string{"SHARDLITE_BLOB": "s3://my-bucket"}, "my-bucket", "", false, ""},
-		"bucket and prefx": {map[string]string{"SHARDLITE_BLOB": "s3://my-bucket", "SHARDLITE_PREFIX": "staging"}, "my-bucket", "", false, ""},
-		"endpoint":         {map[string]string{"SHARDLITE_BLOB": "s3://b", "SHARDLITE_S3_ENDPOINT": "http://127.0.0.1:9000"}, "b", "", false, ""},
-		"path in bucket":   {map[string]string{"SHARDLITE_BLOB": "s3://b/x"}, "", "", true, "SHARDLITE_PREFIX"},
-		"no bucket":        {map[string]string{"SHARDLITE_BLOB": "s3://"}, "", "", true, "s3://bucket"},
-		"endpoint, no s3":  {map[string]string{"SHARDLITE_BLOB": "/var/blobs", "SHARDLITE_S3_ENDPOINT": "http://x"}, "", "", true, "SHARDLITE_S3_ENDPOINT"},
+		"directory":           {map[string]string{"SHARDLITE_BLOB": "/var/blobs"}, "", true, "file backend was removed"},
+		"directory, endpoint": {map[string]string{"SHARDLITE_BLOB": "/var/blobs", "SHARDLITE_S3_ENDPOINT": "http://x"}, "", true, "docker/compose.s3.yaml"},
+		"bucket":              {map[string]string{"SHARDLITE_BLOB": "s3://my-bucket"}, "my-bucket", false, ""},
+		"bucket and prefx":    {map[string]string{"SHARDLITE_BLOB": "s3://my-bucket", "SHARDLITE_PREFIX": "staging"}, "my-bucket", false, ""},
+		"endpoint":            {map[string]string{"SHARDLITE_BLOB": "s3://b", "SHARDLITE_S3_ENDPOINT": "http://127.0.0.1:9000"}, "b", false, ""},
+		"path in bucket":      {map[string]string{"SHARDLITE_BLOB": "s3://b/x"}, "", true, "SHARDLITE_PREFIX"},
+		"no bucket":           {map[string]string{"SHARDLITE_BLOB": "s3://"}, "", true, "s3://bucket"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			e, err := envWith(tc.vars)
@@ -153,9 +154,9 @@ func TestBlobTarget(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			bucket, dir, err := e.blobTarget()
-			if err != nil || bucket != tc.bucket || dir != tc.dir {
-				t.Fatalf("bucket %q dir %q: %v", bucket, dir, err)
+			bucket, err := e.blobBucket()
+			if err != nil || bucket != tc.bucket {
+				t.Fatalf("bucket %q: %v", bucket, err)
 			}
 			if e.Prefix != "" && !strings.HasSuffix(e.Prefix, "/") {
 				t.Fatalf("prefix %q", e.Prefix)
@@ -172,6 +173,7 @@ func TestBlobTarget(t *testing.T) {
 // SHARDLITE_TEST_FS_WANT is the name the node should give the filesystem ("" for
 // one it doesn't care about), and the check must refuse exactly the network ones.
 func TestRealFilesystem(t *testing.T) {
+	t.Parallel()
 	path, ok := os.LookupEnv("SHARDLITE_TEST_FS_PATH")
 	if !ok {
 		t.Skip("SHARDLITE_TEST_FS_PATH is not set")
@@ -189,4 +191,24 @@ func TestRealFilesystem(t *testing.T) {
 		t.Fatalf("refusal of a %q filesystem: %v", want, err)
 	}
 	t.Logf("%s: %q, refused: %v", path, got, err)
+}
+
+// SHARDLITE_SCRATCH_DIR defaults to /dev/shm/shardlite/ on Linux and is required elsewhere.
+func TestScratchDirDefault(t *testing.T) {
+	defer func(g string) { goos = g }(goos)
+	for _, tc := range []struct {
+		goos, set, want string
+		ok              bool
+	}{
+		{"linux", "", defaultScratch, true},
+		{"linux", "/tmp/s", "/tmp/s", true},
+		{"darwin", "/tmp/s", "/tmp/s", true},
+		{"darwin", "", "", false},
+	} {
+		goos = tc.goos
+		e, err := envWith(map[string]string{"SHARDLITE_SCRATCH_DIR": tc.set})
+		if (err == nil) != tc.ok || e.Scratch != tc.want {
+			t.Fatalf("%s with %q: %q %v", tc.goos, tc.set, e.Scratch, err)
+		}
+	}
 }

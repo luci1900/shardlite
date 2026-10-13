@@ -5,11 +5,12 @@ package faulttest
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"testing"
 )
 
-var killPoints = []string{"segment-before", "segment-after", "delta-before-manifest", "merge-before-manifest", "merge-after-swap"}
+var killPoints = append([]string{"segment-before", "segment-after", "delta-before-manifest", "rebase-before-manifest", "rebase-after-swap"}, seedPoints...)
 
 // TestRandomCrashes does random work and kills the node at random points,
 // recovering and carrying on each time. Set SHARDLITE_SEED to repeat a run.
@@ -25,7 +26,7 @@ func TestRandomCrashes(t *testing.T) {
 	crashes := 0
 	for round := range rounds {
 		// One operation, maybe with a kill armed for it.
-		op := rng.IntN(10)
+		op := rng.IntN(11)
 		arm := ""
 		if rng.IntN(4) == 0 {
 			arm = killPoints[rng.IntN(len(killPoints))]
@@ -53,14 +54,46 @@ func TestRandomCrashes(t *testing.T) {
 				arm = ""
 			}
 			_, err = r.node.Do("delta", shardName)
+		case op == 10:
+			// Let go of the shard and activate it again, possibly killed on the way.
+			desc = "reactivation"
+			if !slices.Contains(seedPoints, arm) {
+				arm = ""
+			}
+			cached := rng.IntN(2) == 0
+			if cached {
+				desc = "cached reactivation"
+			}
+			r.app.Must(t, "close", "a")
+			rel := []string{"release", shardName}
+			if cached {
+				rel = append(rel, "delta") // a cached shard has no tail
+			}
+			if v, e := r.node.Do(rel...); e != nil || v != "released" {
+				t.Fatalf("round %d: release: %q %v", round, v, e)
+			}
+			r.ackPending()
+			if arm != "" {
+				r.node.Must(t, "arm", arm)
+			}
+			// From the files the release left, or restored from blob storage as after a
+			// restart (which discards them).
+			if cached {
+				_, err = r.node.Do("cached", shardName, r.path)
+			} else {
+				_, err = r.node.Do("open", shardName, r.path)
+			}
+			if err == nil {
+				r.app.Must(t, "open", "a", r.path)
+			}
 		default:
-			desc = "merge"
-			if arm == "merge-before-manifest" || arm == "merge-after-swap" {
+			desc = "rebase"
+			if arm == "rebase-before-manifest" || arm == "rebase-after-swap" {
 				r.node.Must(t, "arm", arm)
 			} else {
 				arm = ""
 			}
-			_, err = r.node.Do("merge", shardName)
+			_, err = r.node.Do("rebase", shardName)
 		}
 		switch {
 		case err != nil && arm == "":

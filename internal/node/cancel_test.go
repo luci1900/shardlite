@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -25,13 +26,15 @@ func (r *srig) refs(target string) int {
 // A client that goes away while its response is held at the gate: the node
 // stops waiting, cancels the request to the app and lets go of the shard.
 func TestClientDisconnectWhileHeldAtTheGate(t *testing.T) {
+	t.Parallel()
 	r := newSRig(t)
 	r.slowJournal(5 * time.Second) // every flush takes 5 s
-	var appCancelled atomic.Bool
+	var appCancelled, appAnswered atomic.Bool
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		r.commit(q.Header.Get("Shardlite-Path"))
 		w.WriteHeader(200)
 		w.(http.Flusher).Flush() // the response starts, and now waits at the gate
+		appAnswered.Store(true)
 		<-q.Context().Done()
 		appCancelled.Store(true)
 	})
@@ -46,8 +49,9 @@ func TestClientDisconnectWhileHeldAtTheGate(t *testing.T) {
 		}
 		done <- err
 	}()
-	eventually(t, "the request to be held at the gate", func() bool { return r.refs("wallet/cx1") == 1 && r.m.flush.Mark() > r.m.flush.Completed() })
-	time.Sleep(100 * time.Millisecond)
+	eventually(t, "the request to be held at the gate", func() bool {
+		return r.refs("wallet/cx1") == 1 && r.m.flush.Mark() > r.m.flush.Completed() && appAnswered.Load()
+	})
 	start := time.Now()
 	cancel()
 	<-done
@@ -61,13 +65,15 @@ func TestClientDisconnectWhileHeldAtTheGate(t *testing.T) {
 // A caller that gives up on a call held at the callee's gate: the callee's
 // request is cancelled too and nothing stays held.
 func TestCallerCancelsAtTheCalleesGate(t *testing.T) {
+	t.Parallel()
 	r := newSRig(t)
 	r.slowJournal(5 * time.Second)
-	var calleeCancelled atomic.Bool
+	var calleeCancelled, calleeEntered atomic.Bool
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		if q.Header.Get("Shardlite-Caller") == "" {
 			return
 		}
+		calleeEntered.Store(true)
 		r.commit(q.Header.Get("Shardlite-Path")) // the callee is a wallet: its response is gated
 		w.WriteHeader(200)
 		w.(http.Flusher).Flush()
@@ -87,6 +93,9 @@ func TestCallerCancelsAtTheCalleesGate(t *testing.T) {
 		done <- err
 	}()
 	eventually(t, "the call to be held at the callee's gate", func() bool { return r.refs("wallet/cx2") == 1 && r.m.flush.Mark() > r.m.flush.Completed() })
+	// Cancel only once the request has reached the app: a cancel before that
+	// means the app never sees it, and there is nothing for the node to cancel.
+	eventually(t, "the callee's request to reach the app", calleeEntered.Load)
 	cancel()
 	<-done
 	eventually(t, "the callee's request to be cancelled", calleeCancelled.Load)
@@ -95,6 +104,7 @@ func TestCallerCancelsAtTheCalleesGate(t *testing.T) {
 
 // ...and held at the caller's gate, before the callee is activated or even asked.
 func TestCallerCancelsAtItsOwnGate(t *testing.T) {
+	t.Parallel()
 	r := newSRigWith(t, manualFlush)
 	var reached atomic.Int32
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
@@ -127,6 +137,7 @@ func TestCallerCancelsAtItsOwnGate(t *testing.T) {
 // ...and while the callee is being activated: the call stops waiting, the
 // activation finishes for whoever asks next, and the shard is not held.
 func TestCallerCancelsDuringActivation(t *testing.T) {
+	t.Parallel()
 	r := newSRig(t)
 	var reached atomic.Int32
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
@@ -134,9 +145,12 @@ func TestCallerCancelsDuringActivation(t *testing.T) {
 			reached.Add(1)
 		}
 	})
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
 	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
 		if !after && op == blob.OpCreate && strings.HasPrefix(key, "manifests/") {
-			time.Sleep(time.Second) // a slow activation
+			once.Do(func() { close(entered) })
+			<-release // a slow activation
 		}
 		return nil
 	})
@@ -145,7 +159,6 @@ func TestCallerCancelsDuringActivation(t *testing.T) {
 	req.Header.Set("Shardlite-Target", "slow/cx4")
 	req.Header.Set("Shardlite-Caller", "app")
 	done := make(chan error, 1)
-	start := time.Now()
 	go func() {
 		resp, err := r.client.Do(req)
 		if err == nil {
@@ -154,9 +167,13 @@ func TestCallerCancelsDuringActivation(t *testing.T) {
 		}
 		done <- err
 	}()
-	time.Sleep(150 * time.Millisecond)
+	<-entered
 	cancel()
 	<-done
+	if r.m.IsActive("slow/cx4") {
+		t.Fatal("the activation did not take as long as the hook made it")
+	}
+	close(release)
 	// The activation is not the caller's to cancel (others may be waiting for it): it ends.
 	eventually(t, "the activation to finish", func() bool { return r.m.IsActive("slow/cx4") })
 	if r.refs("slow/cx4") != 0 {
@@ -164,9 +181,6 @@ func TestCallerCancelsDuringActivation(t *testing.T) {
 	}
 	if reached.Load() != 0 {
 		t.Fatal("the app was called by a cancelled call")
-	}
-	if time.Since(start) < 900*time.Millisecond {
-		t.Fatal("the activation did not take as long as the hook made it")
 	}
 }
 
@@ -179,6 +193,7 @@ func TestCallerCancelsDuringActivation(t *testing.T) {
 // holds a chunk at the gate: it finds out when the gate opens (the next flush
 // cycle, 250 ms by default) and the next read fails.
 func TestCancelledStreamingCall(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		h2    bool

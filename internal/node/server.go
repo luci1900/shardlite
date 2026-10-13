@@ -20,7 +20,7 @@ import (
 	"github.com/luci1900/shardlite/internal/coord"
 )
 
-// The headers the node and the app exchange (design.md, Interface inventory).
+// The headers the node and the app exchange (docs/guide.md, Reference).
 const (
 	hdrPrefix   = "Shardlite-"
 	hdrTarget   = "Shardlite-Target"
@@ -28,8 +28,9 @@ const (
 	hdrCaller   = "Shardlite-Caller"
 	hdrSync     = "Shardlite-Sync"
 	hdrIfActive = "Shardlite-If-Active"
-	hdrDepth    = "Shardlite-Depth"
+	hdrHops     = "Shardlite-Hops"
 	hdrDeadline = "Shardlite-Deadline"
+	hdrInboxID  = "Shardlite-Inbox-Id"
 	queryTarget = "shardlite-target"
 	apiPrefix   = "/_shardlite/"
 	readyPath   = "/_shardlite/ready"
@@ -41,13 +42,15 @@ type ServerOptions struct {
 	App         *url.URL      // the app's base URL
 	HealthPath  string        // the app's health endpoint, /health if empty
 	HealthEvery time.Duration // 1 s if zero
-	// MaxCallDepth is the deepest chain of calls allowed, DefaultMaxCallDepth if zero.
-	MaxCallDepth int
-	Logger       *slog.Logger
+	// MaxHops is the longest chain of hops allowed, DefaultMaxHops if zero.
+	MaxHops int
+	// MessageTimeout is how long one intake or one call to a handler for an inbox row may take, 30 s if zero.
+	MessageTimeout time.Duration
+	Logger         *slog.Logger
 }
 
-// DefaultMaxCallDepth is how deep calls between shards may nest (Dapr's limit).
-const DefaultMaxCallDepth = 32
+// DefaultMaxHops is how many hops a chain of calls and messages may have (Dapr limits calls the same way).
+const DefaultMaxHops = 32
 
 // Server is the node's HTTP side: a public handler for clients (behind the
 // deployment's load balancer) and a control handler for the app on the same
@@ -76,10 +79,14 @@ func NewServer(m *Manager, opts ServerOptions) *Server {
 	if opts.HealthEvery <= 0 {
 		opts.HealthEvery = time.Second
 	}
-	if opts.MaxCallDepth <= 0 {
-		opts.MaxCallDepth = DefaultMaxCallDepth
+	if opts.MaxHops <= 0 {
+		opts.MaxHops = DefaultMaxHops
+	}
+	if opts.MessageTimeout <= 0 {
+		opts.MessageTimeout = 30 * time.Second
 	}
 	s := &Server{m: m, opts: opts, log: opts.Logger}
+	m.msgs.setTransport(&transport{intake: s.sendIntake, inbox: s.sendInbox, maxHops: opts.MaxHops})
 
 	h1 := http.DefaultTransport.(*http.Transport).Clone()
 	h1.MaxIdleConnsPerHost = 256
@@ -248,8 +255,13 @@ type reqInfo struct {
 	public bool
 	log    *slog.Logger
 
-	depth    int       // sent to the app as Shardlite-Depth
+	hops     int       // sent to the app as Shardlite-Hops
 	deadline time.Time // zero if the request has none
+	// internal is set for a request the node makes to itself (an intake, or the
+	// delivery of an inbox row): it isn't gated on the caller, since its row is
+	// durable already.
+	internal bool
+	inboxID  int64 // the inbox row a handler is called for, 0 if none
 	// callerGate gates what the calling shard sends for the whole call (the
 	// request body and, after an upgrade, what it writes), nil if the call isn't gated.
 	callerGate *gate
@@ -269,6 +281,13 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, control bool) {
 		}
 	}
 	info := &reqInfo{target: target, public: !control, log: s.log}
+	info.internal = r.Context().Value(internalCtxKey{}) != nil
+	// The one place that decides a request is an intake. Between nodes it will be
+	// the header, which only a node may set: whatever an app or a client sent is
+	// removed here, so nothing else can ask for it.
+	r.Header.Del(hdrInbox)
+	intake := info.internal && r.Context().Value(intakeCtxKey{}) != nil
+	d, _ := r.Context().Value(deliveryCtxKey{}).(*deliveryInfo)
 	if control {
 		if target == "" {
 			writeError(w, r, http.StatusBadRequest, "a call needs a Shardlite-Target")
@@ -281,19 +300,19 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, control bool) {
 			writeError(w, r, http.StatusBadRequest, "bad Shardlite-Caller")
 			return
 		}
-		// Depth: the call is one deeper than the one the app says it is serving
+		// Hops: the call is one more than the one the app says it is serving
 		// (an app that doesn't pass the header on starts again at 0). It is refused
 		// before anything is gated or activated.
-		if v := r.Header.Get(hdrDepth); v != "" {
+		if v := r.Header.Get(hdrHops); v != "" {
 			d, err := strconv.Atoi(v)
 			if err != nil || d < 0 {
-				writeError(w, r, http.StatusBadRequest, "bad Shardlite-Depth")
+				writeError(w, r, http.StatusBadRequest, "bad Shardlite-Hops")
 				return
 			}
-			info.depth = d + 1
-			if info.depth > s.opts.MaxCallDepth {
-				s.log.Warn("call refused: calls are nested too deep", "caller", info.caller, "target", target, "depth", info.depth, "max", s.opts.MaxCallDepth)
-				writeError(w, r, http.StatusLoopDetected, fmt.Sprintf("calls are nested more than %d deep", s.opts.MaxCallDepth))
+			info.hops = d + 1
+			if info.hops > s.opts.MaxHops {
+				s.log.Warn("call refused: calls are chained too far", "caller", info.caller, "target", target, "hops", info.hops, "max", s.opts.MaxHops)
+				writeError(w, r, http.StatusLoopDetected, fmt.Sprintf("calls are chained more than %d hops", s.opts.MaxHops))
 				return
 			}
 		}
@@ -357,9 +376,9 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, control bool) {
 			return
 		}
 		// A call is bytes leaving the calling shard: everything it sends, for as long
-		// as the call lasts, waits for what that shard committed (design.md,
+		// as the call lasts, waits for what that shard committed (docs/internals.md,
 		// Durability gates). The caller stays active until the call ends.
-		if control && info.caller != callerApp {
+		if control && info.caller != callerApp && !info.internal {
 			cg, err := s.gateCaller(r, info.caller)
 			if err != nil {
 				s.fail(w, r, err)
@@ -380,6 +399,14 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, control bool) {
 		}
 		defer ref.Release() // held for the whole request: a stream or an upgraded connection keeps the shard active
 		info.ref, info.path = ref, ref.Path()
+	}
+	if d != nil {
+		// The handler sees the row's own hops, not one more.
+		info.hops, info.inboxID = d.hops, d.id
+	}
+	if intake {
+		s.serveIntake(w, r, info) // answered by the node, not the app
+		return
 	}
 	s.proxy.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, info)))
 }
@@ -457,7 +484,10 @@ func (s *Server) rewrite(pr *httputil.ProxyRequest) {
 	if info == nil {
 		return
 	}
-	pr.Out.Header.Set(hdrDepth, strconv.Itoa(info.depth))
+	pr.Out.Header.Set(hdrHops, strconv.Itoa(info.hops))
+	if info.inboxID != 0 {
+		pr.Out.Header.Set(hdrInboxID, strconv.FormatInt(info.inboxID, 10))
+	}
 	if !info.deadline.IsZero() {
 		// The time still left, so the app (and its own calls) stop when the node would.
 		left := max(time.Until(info.deadline), time.Millisecond)
@@ -483,6 +513,15 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 	info, _ := resp.Request.Context().Value(ctxKey{}).(*reqInfo)
 	override := resp.Header.Get(hdrSync)
 	stripShardliteHeaders(resp.Header)
+	if info != nil && !info.deadline.IsZero() && isGRPC(resp.Request) {
+		// The app is told the time left, so it usually answers at about the moment
+		// the node's own deadline passes. If that cuts the body short after the headers
+		// went out, the client gets a gRPC status, not a reset stream.
+		if resp.Trailer == nil {
+			resp.Trailer = http.Header{}
+		}
+		defer func() { resp.Body = deadlineBody{resp.Body, resp, resp.Request.Context()} }()
+	}
 	if info == nil || info.ref == nil {
 		return nil // shardless: a plain reverse proxy
 	}
@@ -499,6 +538,24 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 		resp.Body = gatedBody{resp.Body, g}
 	}
 	return nil
+}
+
+// deadlineBody ends a gRPC response whose read failed because the node's deadline
+// passed with DEADLINE_EXCEEDED in its trailers.
+type deadlineBody struct {
+	io.ReadCloser
+	resp *http.Response
+	ctx  context.Context
+}
+
+func (b deadlineBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil && err != io.EOF && errors.Is(b.ctx.Err(), context.DeadlineExceeded) {
+		b.resp.Trailer.Set("Grpc-Status", strconv.Itoa(grpcCodes[http.StatusGatewayTimeout]))
+		b.resp.Trailer.Set("Grpc-Message", grpcMessage(context.DeadlineExceeded.Error()))
+		return n, io.EOF
+	}
+	return n, err
 }
 
 func stripShardliteHeaders(h http.Header) {
@@ -599,7 +656,7 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, ErrUnknownKind), errors.Is(err, ErrBadTarget):
 		status = http.StatusBadRequest
-	case errors.Is(err, ErrBusy), errors.Is(err, ErrKindChanged):
+	case errors.Is(err, ErrBusy):
 		status = http.StatusConflict
 	case errors.Is(err, ErrAppHolds),
 		errors.Is(err, coord.ErrLeaseLost), errors.Is(err, coord.ErrLeaseExpired):
@@ -633,7 +690,8 @@ var grpcCodes = map[int]int{
 // response: HTTP 200 with grpc-status and grpc-message), which is what a
 // gRPC client understands.
 func writeError(w http.ResponseWriter, r *http.Request, status int, msg string) {
-	if isGRPC(r) {
+	// The node's own requests read the status themselves, whatever it carries.
+	if isGRPC(r) && r.Context().Value(internalCtxKey{}) == nil {
 		code, ok := grpcCodes[status]
 		if !ok {
 			code = 13 // INTERNAL

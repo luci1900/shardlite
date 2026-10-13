@@ -35,6 +35,14 @@ type Config struct {
 	Lease       coord.RegistryOptions // lease TTL
 	Keeper      coord.KeeperOptions   // renewal interval and safety margin (Info is the node's own)
 	Logger      *slog.Logger
+	// TempDir is where deltas, snapshots and downloads too large for memory are
+	// built (in the data directory, never the scratch directory, which is tmpfs).
+	// The caller clears what a crash left in it before Start.
+	TempDir string
+	// SpoolLimit is how large a commit file, segment or delta gets before it is
+	// held in a temporary file in TempDir instead of memory (spool.DefaultLimit if
+	// zero).
+	SpoolLimit int
 }
 
 // Node is a started node.
@@ -57,7 +65,7 @@ type Node struct {
 }
 
 // Start takes the node's lease with a new epoch and recovers from whatever the
-// previous process left (design.md, Restarting): it fences its own journal from
+// previous process left (docs/internals.md, Restarting): it fences its own journal from
 // the range recorded in the lease, writes a delta for every shard with a tail
 // there and records the new range. A restart is treated as a crash, so this is
 // the one recovery path.
@@ -79,7 +87,7 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		Config:   cfg,
 		Registry: reg,
 		Store:    store,
-		Files:    &shardfile.Files{Blob: store, Node: cfg.Name, Leases: reg},
+		Files:    &shardfile.Files{Blob: store, Node: cfg.Name, Leases: reg, TempDir: cfg.TempDir, SpoolLimit: cfg.SpoolLimit},
 		tracked:  map[*capture.Shard]struct{}{},
 	}
 
@@ -110,6 +118,7 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		Retry:    cfg.Retry,
 		Check:    func() error { return n.Keeper.Check() },
 		Logger:   cfg.Logger,
+		TempDir:  cfg.TempDir, SpoolLimit: cfg.SpoolLimit,
 	})
 	kopts := cfg.Keeper
 	kopts.Info = n.Info

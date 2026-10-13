@@ -1,7 +1,7 @@
 package shardfile
 
 import (
-	"bytes"
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -14,6 +14,7 @@ import (
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/segment"
+	"github.com/luci1900/shardlite/internal/spool"
 )
 
 type journalRef struct {
@@ -86,13 +87,21 @@ func (f *Files) Restore(ctx context.Context, shard, dst string, opt RestoreOptio
 		return nil, err
 	}
 
-	// Download the manifest's files in parallel.
-	data := make([][]byte, len(files))
+	// Download the manifest's files in parallel, each to a temporary file: a
+	// shard's files can add up to far more than the node has memory for.
+	spools := make([]*spool.File, len(files))
+	defer func() {
+		for _, sp := range spools {
+			if sp != nil {
+				sp.Close()
+			}
+		}
+	}()
 	errs := make([]error, len(files))
 	var g errgroup.Group
 	for i, mf := range files {
 		g.Go(func() error {
-			data[i], errs[i] = h.getFile(ctx, mf)
+			spools[i], errs[i] = h.getFile(ctx, mf)
 			return nil // each file keeps its own error, reported in order below
 		})
 	}
@@ -108,15 +117,19 @@ func (f *Files) Restore(ctx context.Context, shard, dst string, opt RestoreOptio
 	if err != nil {
 		return nil, err
 	}
+	var tail []capture.TailFile
 	fail := func(err error) (*Restored, error) {
 		ap.Abort()
 		os.Remove(tmp)
+		capture.CloseTail(tail)
 		return nil, fmt.Errorf("restore %s: %w", shard, err)
 	}
-	for i, b := range data {
-		if err := ap.Apply(bytes.NewReader(b), files[i].Range); err != nil {
+	for i, sp := range spools {
+		if err := ap.Apply(bufio.NewReaderSize(sp.Reader(), 1<<20), files[i].Range); err != nil {
 			return fail(err)
 		}
+		sp.Close() // applied: its disk is free again
+		spools[i] = nil
 	}
 
 	// Then the commits that only reached the node journal.
@@ -144,20 +157,22 @@ func (f *Files) Restore(ctx context.Context, shard, dst string, opt RestoreOptio
 		}
 	}
 	sort.SliceStable(refs, func(i, j int) bool { return refs[i].entry.Position < refs[j].entry.Position })
-	var tail []capture.TailFile
 	for _, ref := range refs {
 		e := ref.entry
 		if e.Last() <= ap.State().Position {
 			continue // a copy of an entry already applied (a retried segment write)
 		}
-		b, err := segment.ReadEntry(ctx, f.Blob, journal.node, ref.seq, e)
+		// An entry can be as large as the database, so it is read into a temporary
+		// file when it is large.
+		body, err := segment.ReadEntryFile(ctx, f.Blob, journal.node, ref.seq, e, f.TempDir, f.spoolLimit())
 		if err != nil {
 			return fail(err)
 		}
-		if err := ap.Apply(bytes.NewReader(b), Range{e.Position, e.Last()}); err != nil {
+		if err := ap.Apply(bufio.NewReaderSize(body.Reader(), 1<<20), Range{e.Position, e.Last()}); err != nil {
+			body.Close()
 			return fail(err)
 		}
-		tail = append(tail, capture.TailFile{Position: e.Position, Count: e.Count, Data: b, At: at, Seg: ref.seq})
+		tail = append(tail, capture.TailFile{Position: e.Position, Count: e.Count, Body: body, At: at, Seg: ref.seq})
 	}
 
 	st, err := ap.Finish()

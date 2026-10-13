@@ -7,7 +7,9 @@ import (
 	"golang.org/x/sync/errgroup"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/capture"
@@ -36,7 +38,7 @@ type AdoptReport struct {
 const adoptWorkers = 64
 
 // AdoptJournal is what a node does with a journal that may hold commits no file has:
-// its own, left by the process it replaces (design.md, Restarting), or a dead
+// its own, left by the process it replaces (docs/internals.md, Restarting), or a dead
 // node's.
 //
 //  1. It fences the journal: an empty segment at the first free number from next,
@@ -46,6 +48,9 @@ const adoptWorkers = 64
 //     is still needed.
 //  3. For every shard with entries the manifest's files don't cover, it writes
 //     one delta and adds it to the manifest, clearing the manifest's journal.
+//     A wake hint for the current minute is written before the delta: the shard
+//     may hold messages that were never delivered, and the scan for hints is what
+//     wakes it.
 //
 // A tail with a hole in it is reported in Lost, not as a failure, only if the
 // journal's first segments had expired: refusing to start would not bring those
@@ -161,24 +166,48 @@ func (f *Files) adoptShard(ctx context.Context, node, name string, idx *JournalI
 				continue // covered by the manifest's files, or a copy of an entry already taken
 			}
 			if e.Position != pos+1 {
+				capture.CloseTail(tail)
 				return false, &gapError{from: pos + 1, to: e.Position - 1}
 			}
-			b, err := segment.ReadEntry(ctx, f.Blob, node, ref.seq, e)
+			body, err := segment.ReadEntryFile(ctx, f.Blob, node, ref.seq, e, f.TempDir, f.spoolLimit())
 			if err != nil {
+				capture.CloseTail(tail)
 				return false, err
 			}
-			tail = append(tail, capture.TailFile{Position: e.Position, Count: e.Count, Data: b, Seg: ref.seq})
+			tail = append(tail, capture.TailFile{Position: e.Position, Count: e.Count, Body: body, Seg: ref.seq})
 			pos = e.Last()
 		}
 		if len(tail) == 0 {
 			return false, nil
 		}
+		// The hint comes first: if this node dies before the delta, a repeated
+		// adoption finds the tail in the journal and writes the hint again (an
+		// existing one counts as success). A hint that is found before the delta only
+		// means "look": a wake that fails while the shard isn't released leaves it, and
+		// the next scan gets it.
+		if _, err := f.Blob.Create(ctx, WakeKey(time.Now(), name), strings.NewReader("")); err != nil && !errors.Is(err, blob.ErrExists) {
+			capture.CloseTail(tail)
+			return false, fmt.Errorf("writing the wake hint: %w", err)
+		}
 		h := &Handle{F: f, Name: name, Manifest: m, ETag: etag}
 		err = h.putTail(ctx, tail, Hooks{}, func(n *Manifest) { n.Journal = "" })
+		capture.CloseTail(tail)
 		if errors.Is(err, blob.ErrConflict) {
 			continue // somebody changed the manifest: look again
 		}
 		return err == nil, err
 	}
 	return false, errors.New("the manifest keeps changing")
+}
+
+// Wake hints are empty objects wakes/{minute}/{shard}, keyed by the time they
+// are due in UTC at minute resolution (docs/internals.md, Message delivery).
+const (
+	WakePrefix = "wakes/"
+	WakeLayout = "2006-01-02T15:04Z" // fixed width, so keys sort by time
+)
+
+// WakeKey is the key of the hint that wakes shard at t.
+func WakeKey(t time.Time, shard string) string {
+	return WakePrefix + t.UTC().Truncate(time.Minute).Format(WakeLayout) + "/" + shard
 }

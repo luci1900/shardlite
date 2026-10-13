@@ -6,7 +6,6 @@ import (
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 )
 
 func countEntries(dir string) int {
@@ -52,7 +51,9 @@ func TestMeasurePerShardCost(t *testing.T) {
 			ref.Release()
 		}
 	}()
-	time.Sleep(300 * time.Millisecond) // a few flush cycles: the shards are all synced and settled
+	r.afterCycle() // a few flush cycles: the shards are all synced and settled
+	r.afterCycle()
+	r.afterCycle()
 	fds1, maps1 := processCosts()
 	perFD := float64(fds1-fds0) / n
 	perMap := float64(maps1-maps0) / n

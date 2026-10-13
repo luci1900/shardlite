@@ -1,11 +1,11 @@
 // Package blob is the storage layer shardlite uses for leases, manifests,
 // node journal segments and LTX files.
 //
-// A Backend (the local directory here, S3 later) does single attempts and
+// A Backend (S3, or an in-memory one for tests) does single attempts and
 // reports one of a fixed set of outcomes. Callers never use a backend
 // directly: they use a Store, which wraps any backend, tags every write with
 // a write id and retries ambiguous failures, so that a write whose response
-// was lost is recognised as the writer's own afterwards (design.md, Lost
+// was lost is recognised as the writer's own afterwards (docs/internals.md, Lost
 // responses).
 package blob
 
@@ -16,6 +16,26 @@ import (
 	"iter"
 	"time"
 )
+
+// The outcome table. Every Backend follows it for creates, updates and
+// conditional deletes, so a caller can trust what an error says:
+//
+//	Case                                                              Outcome
+//	----                                                              -------
+//	The store answered that it did nothing                            ErrNotApplied
+//	  (409 ConditionalRequestConflict, 429, 503 SlowDown)
+//	The request was never fully written (connection refused, DNS,     ErrNotApplied
+//	  TLS, the context ended before the body was sent)
+//	The request was written and then the response was lost or cut     ErrUnknown
+//	  off, 500, 408, a timeout, or the context ended
+//	A failed precondition                                             ErrExists (create),
+//	                                                                  ErrConflict (update, delete)
+//	The setup is wrong (no bucket, no permission, bad credentials)    a plain error, not retried
+//
+// ErrNotApplied and ErrUnknown wrapping a context error keep it findable with
+// errors.Is. A Store settles an unknown outcome itself, with a context that
+// outlives its caller's, so what reaches a caller as ErrUnknown is an outcome
+// nobody could learn.
 
 // The outcomes a Backend maps its responses onto.
 var (
@@ -58,9 +78,9 @@ type ObjectInfo struct {
 // Backend does single attempts and nothing else.
 type Backend interface {
 	// Create writes the object only if the key doesn't exist (ErrExists otherwise).
-	Create(ctx context.Context, key string, body io.Reader, id WriteID) (ETag, error)
+	Create(ctx context.Context, key string, body io.ReadSeeker, id WriteID) (ETag, error)
 	// Update replaces the object only if its ETag is expected (ErrConflict otherwise, ErrNotFound if missing).
-	Update(ctx context.Context, key string, body io.Reader, expected ETag, id WriteID) (ETag, error)
+	Update(ctx context.Context, key string, body io.ReadSeeker, expected ETag, id WriteID) (ETag, error)
 	Get(ctx context.Context, key string) (io.ReadCloser, ETag, error)
 	GetRange(ctx context.Context, key string, offset, length int64) (io.ReadCloser, error)
 	// Head returns size, ETag, last modified time and write id. A size of 0 is a fence.
@@ -72,7 +92,7 @@ type Backend interface {
 	// ErrNotFound depends on the store: S3 answers success, so callers accept both.
 	Delete(ctx context.Context, key string, expected ETag) error
 	// List returns objects whose key starts with prefix, in key order. It may lag.
-	// A listing carries no metadata on S3, so the objects it returns may have a
-	// zero WriteID (the local backend fills it in). Nothing relies on listed write ids.
+	// A listing carries no metadata on S3, so the objects it returns have a
+	// zero WriteID (the memory backend does the same). Nothing relies on listed write ids.
 	List(ctx context.Context, prefix string) iter.Seq2[ObjectInfo, error]
 }

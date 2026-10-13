@@ -10,19 +10,16 @@ import (
 	"io"
 	"os"
 	"strings"
-	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 )
 
 // backendFactory returns a Backend whose keys are private to the test.
 type backendFactory func(t *testing.T) Backend
 
-func localFactory(t *testing.T) Backend {
-	l := newLocal(t)
-	l.NoSync = true
-	return l
-}
+func memoryFactory(t *testing.T) Backend { return NewMemory() }
 
 // s3Factory returns the S3 backend on the emulator, with the test's keys under
 // a prefix of their own. The tests that use it are skipped unless
@@ -31,21 +28,14 @@ func s3Factory(t *testing.T) Backend {
 	t.Helper()
 	endpoint := os.Getenv("SHARDLITE_TEST_S3_ENDPOINT")
 	if endpoint == "" {
-		t.Skip("SHARDLITE_TEST_S3_ENDPOINT is not set (docker/compose.s3.yaml runs an emulator)")
+		t.Skip("SHARDLITE_TEST_S3_ENDPOINT is not set: start RustFS with docker/compose.s3.yaml")
 	}
 	return s3At(t, endpoint, nil)
 }
 
 func s3At(t *testing.T, endpoint string, mutate func(*S3Options)) Backend {
 	t.Helper()
-	// The emulator script's credentials, unless the environment has its own.
-	if os.Getenv("AWS_ACCESS_KEY_ID") == "" {
-		t.Setenv("AWS_ACCESS_KEY_ID", "shardlite")
-		t.Setenv("AWS_SECRET_ACCESS_KEY", "shardlite-secret")
-	}
-	if os.Getenv("AWS_REGION") == "" {
-		t.Setenv("AWS_REGION", "us-east-1")
-	}
+	// The emulator script's credentials, unless the environment has its own (TestMain).
 	bucket := os.Getenv("SHARDLITE_TEST_S3_BUCKET")
 	if bucket == "" {
 		bucket = "shardlite-test"
@@ -74,7 +64,7 @@ func s3At(t *testing.T, endpoint string, mutate func(*S3Options)) Backend {
 	return WithPrefix(b, "conformance/"+hex.EncodeToString(id[:])+"/")
 }
 
-func TestConformanceLocal(t *testing.T) { conformance(t, localFactory) }
+func TestConformanceMemory(t *testing.T) { conformance(t, memoryFactory) }
 
 func TestConformanceS3(t *testing.T) { conformance(t, s3Factory) }
 
@@ -280,23 +270,15 @@ func conformance(t *testing.T, mk backendFactory) {
 
 	run("ListPaginates", func(t *testing.T, b Backend, s *Store) {
 		const n = 1105 // a listing page is at most 1000 keys
-		var wg sync.WaitGroup
-		sem := make(chan struct{}, 32)
-		errs := make(chan error, n)
+		var wg errgroup.Group
+		wg.SetLimit(32)
 		for i := range n {
-			wg.Add(1)
-			sem <- struct{}{}
-			go func() {
-				defer wg.Done()
-				defer func() { <-sem }()
-				if _, err := s.Create(ctx, fmt.Sprintf("many/%05d", i), strings.NewReader("x")); err != nil {
-					errs <- err
-				}
-			}()
+			wg.Go(func() error {
+				_, err := s.Create(ctx, fmt.Sprintf("many/%05d", i), strings.NewReader("x"))
+				return err
+			})
 		}
-		wg.Wait()
-		close(errs)
-		for err := range errs {
+		if err := wg.Wait(); err != nil {
 			t.Fatal(err)
 		}
 		prev, count := "", 0
@@ -393,14 +375,13 @@ func conformance(t *testing.T, mk backendFactory) {
 		for round := range 15 {
 			key := fmt.Sprintf("race/c%d", round)
 			results := make([]error, 4)
-			var wg sync.WaitGroup
+			var wg errgroup.Group
 			for i := range results {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
+				wg.Go(func() error {
 					st := NewStore(b, fmt.Sprintf("n%d", i), 1, Options{Backoff: time.Millisecond, Attempts: 12})
 					_, results[i] = st.Create(ctx, key, strings.NewReader(fmt.Sprint(i)))
-				}()
+					return nil
+				})
 			}
 			wg.Wait()
 			assertOneWinner(t, round, results, ErrExists)
@@ -426,14 +407,13 @@ func conformance(t *testing.T, mk backendFactory) {
 				t.Fatal(err)
 			}
 			results := make([]error, 4)
-			var wg sync.WaitGroup
+			var wg errgroup.Group
 			for i := range results {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
+				wg.Go(func() error {
 					st := NewStore(b, fmt.Sprintf("n%d", i), 1, Options{Backoff: time.Millisecond, Attempts: 12})
 					_, results[i] = st.Update(ctx, key, strings.NewReader(fmt.Sprint("by ", i)), etag)
-				}()
+					return nil
+				})
 			}
 			wg.Wait()
 			assertOneWinner(t, round, results, ErrConflict)

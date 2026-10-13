@@ -1,7 +1,7 @@
 // Command testnode is the capture side of shardlite in its own process, so
 // tests can kill it with SIGKILL at chosen points.
 //
-//	testnode -blobs <dir> -meta <dir> [-node n1] [-flush 20ms]
+//	testnode -s3-bucket <bucket> -s3-endpoint <url> -prefix <prefix> -meta <dir> [-node n1] [-flush 20ms]
 //
 // Starting is the node's real start (node.Start): it takes the lease with a
 // new epoch, adopts the journal the previous process left and starts the writer
@@ -13,13 +13,14 @@
 //	open  <name> <path>   a new shard (the app has created the file), or, if the shard has a manifest, restore it to <path> first
 //	sync  <name>          capture; replies once the segment holding the commits is in blob storage
 //	delta <name>          write a delta and update the manifest
-//	merge <name>          merge all manifest files into one base
+//	rebase <name>         replace all manifest files with a snapshot of the shard
 //	close <name>          final sync, then stop capturing
 //	arm   <point>         die with SIGKILL when execution reaches the point: segment-before, segment-after,
-//	                      delta-before-manifest, merge-before-manifest, merge-after-swap, restore-before-rename
+//	                      delta-before-manifest, rebase-before-manifest, rebase-after-swap, restore-before-rename
 //	fault <mode> <permille> <delay-ms>   storage faults on segment PUTs: mode "fail" (error before the write),
 //	                      "lost" (write happens, caller sees an error) or "none"; plus a delay on every PUT
 //	release <name>        final sync, close Litestream and everything else on the shard, then check -shm; replies "released" or "held" (capture is reopened)
+//	maxrss -              the process's peak resident memory in bytes
 //	exit
 package main
 
@@ -31,6 +32,8 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"os"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -101,24 +104,35 @@ func (n *testNode) hook(ctx context.Context, op blob.Op, key string, after bool)
 }
 
 func main() {
-	blobs := flag.String("blobs", "", "blob directory")
+	bucket := flag.String("s3-bucket", "", "S3 bucket (RustFS, see docker/compose.s3.yaml)")
+	endpoint := flag.String("s3-endpoint", "", "S3 endpoint URL")
+	prefix := flag.String("prefix", "", "key prefix inside the bucket")
 	meta := flag.String("meta", "", "root of the Litestream metadata directories (tmpfs in production)")
 	name := flag.String("node", "n1", "node name")
 	flush := flag.Duration("flush", 20*time.Millisecond, "segment flush interval")
+	tmp := flag.String("tmp", "", "directory for temporary files (a new one under the system's if empty)")
 	flag.Parse()
+	if *tmp == "" {
+		d, err := os.MkdirTemp("", "testnode-tmp-")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		defer os.RemoveAll(d)
+		*tmp = d
+	}
 
-	local, err := blob.NewLocal(*blobs)
+	s3, err := blob.NewS3(context.Background(), blob.S3Options{Bucket: *bucket, Endpoint: *endpoint})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	// This process is killed, never the machine: the page cache is enough.
-	// (SHARDLITE_FSYNC=1 turns fsync back on, to measure what skipping it saves.)
-	local.NoSync = os.Getenv("SHARDLITE_FSYNC") == ""
+	local := blob.WithHook(blob.WithPrefix(s3, *prefix))
 	nd, err := node.Start(context.Background(), node.Config{
 		Name:    *name,
 		Backend: local,
 		Flush:   *flush,
+		TempDir: *tmp,
 		Blob:    blob.Options{Backoff: 2 * time.Millisecond},
 		Keeper:  coord.KeeperOptions{Interval: time.Second, Margin: 5 * time.Second},
 		Lease:   coord.RegistryOptions{TTL: time.Minute, Blob: blob.Options{Backoff: 2 * time.Millisecond}},
@@ -156,10 +170,10 @@ func removeLocal(path string) {
 }
 
 // activate starts a new activation of a shard. A restored shard is registered
-// with Litestream and synced before any app opens the file: that first sync is
-// the snapshot of the restored state, which is not uploaded.
+// with Litestream (seeded, so it continues from the restored state) and synced
+// before any app opens the file.
 func (n *testNode) activate(ctx context.Context, name, path string, h *shardfile.Handle, restored *capture.Restored) error {
-	sh, err := capture.New(capture.Config{Name: name, Path: path, Generation: h.Manifest.Generation, MetaRoot: n.meta, Writer: n.w, Restored: restored})
+	sh, err := capture.New(capture.Config{Name: name, Path: path, Generation: h.Manifest.Generation, MetaRoot: n.meta, Writer: n.w, Restored: restored, TempDir: n.nd.TempDir, SpoolLimit: n.nd.SpoolLimit, At: n.at})
 	if err != nil {
 		return err
 	}
@@ -167,6 +181,7 @@ func (n *testNode) activate(ctx context.Context, name, path string, h *shardfile
 		if err := sh.Sync(ctx); err != nil {
 			return err
 		}
+		n.at("first-sync-done")
 	}
 	n.mu.Lock()
 	n.shards[name] = &shard{h: h, sh: sh}
@@ -195,6 +210,16 @@ func (n *testNode) do(f []string) (string, error) {
 	case "arm":
 		n.armed.Store(&name)
 		return "", nil
+	case "maxrss":
+		// The process's peak resident memory in bytes, for the memory measurements.
+		var ru syscall.Rusage
+		if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
+			return "", err
+		}
+		if runtime.GOOS != "darwin" {
+			ru.Maxrss *= 1024 // kilobytes elsewhere
+		}
+		return strconv.FormatInt(int64(ru.Maxrss), 10), nil
 	case "fault":
 		var p, ms int64
 		fmt.Sscan(f[2], &p)
@@ -211,6 +236,7 @@ func (n *testNode) do(f []string) (string, error) {
 			return "", err
 		}
 		var restored *capture.Restored
+		var restoreTook time.Duration
 		how := "created"
 		if !created {
 			if err := h.Claim(ctx); err != nil {
@@ -219,6 +245,7 @@ func (n *testNode) do(f []string) (string, error) {
 			// A restart is a crash: whatever is on local disk may hold commits that never
 			// reached the journal, so discard it and restore from what is durable.
 			removeLocal(path)
+			t0 := time.Now()
 			res, err := n.files.Restore(ctx, name, path, shardfile.RestoreOptions{BeforeRename: func() error { n.at("restore-before-rename"); return nil }})
 			switch {
 			case errors.Is(err, shardfile.ErrNothingToRestore):
@@ -228,11 +255,30 @@ func (n *testNode) do(f []string) (string, error) {
 			}
 			h, restored = res.Handle, res.Capture
 			how = fmt.Sprintf("restored %d", res.State.Position)
+			n.at("restored")
+			restoreTook = time.Since(t0)
 		}
+		t1 := time.Now()
 		if err := n.activate(ctx, name, path, h, restored); err != nil {
 			return "", err
 		}
+		if restored != nil {
+			// For the measurements: the restore, then what it takes to start capturing
+			// the restored file and take the first sync.
+			how += fmt.Sprintf(" restore=%dms activate=%dms", restoreTook.Milliseconds(), time.Since(t1).Milliseconds())
+		}
 		return how, nil
+	case "cached":
+		// Activate the shard from the file and WAL a release left, as the node does
+		// for a cached shard: nothing is downloaded. The shard must have been
+		// released after a delta, so that the manifest covers the file.
+		h, created, err := n.files.Open(ctx, name)
+		if err != nil {
+			return "", err
+		} else if created {
+			return "", fmt.Errorf("%s has no manifest", name)
+		}
+		return "", n.activate(ctx, name, f[2], h, &capture.Restored{Position: h.Manifest.LastPosition()})
 	case "openempty":
 		// A shard with a manifest but nothing durable: capture the file the app created again.
 		h, _, err := n.files.Open(ctx, name)
@@ -253,15 +299,23 @@ func (n *testNode) do(f []string) (string, error) {
 		return "", s.sh.Sync(ctx)
 	case "delta":
 		return "", s.h.WriteDelta(ctx, s.sh, shardfile.Hooks{AfterFileWrite: func() error { n.at("delta-before-manifest"); return nil }})
-	case "merge":
-		return "", s.h.Merge(ctx, shardfile.Hooks{
-			AfterFileWrite: func() error { n.at("merge-before-manifest"); return nil },
-			AfterMergeSwap: func() error { n.at("merge-after-swap"); return nil },
+	case "rebase":
+		_, err := s.h.Rebase(ctx, s.sh, shardfile.Hooks{
+			AfterFileWrite:  func() error { n.at("rebase-before-manifest"); return nil },
+			AfterRebaseSwap: func() error { n.at("rebase-after-swap"); return nil },
 		})
+		return "", err
 	case "release":
 		released, err := s.sh.Release(ctx)
 		if err != nil {
 			return "", err
+		}
+		if released && len(f) > 2 && f[2] == "delta" {
+			// As the node does when it deactivates a shard: the final sync is in the
+			// journal, and the delta covers it, so the cached shard has no tail.
+			if err := s.h.WriteDelta(ctx, s.sh, shardfile.Hooks{}); err != nil {
+				return "", err
+			}
 		}
 		if released {
 			n.nd.Untrack(s.sh)

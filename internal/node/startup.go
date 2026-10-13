@@ -17,12 +17,14 @@ import (
 // each, a few hundred threads under load). The app's own descriptors are in the
 // app's process.
 //
-// Measured on Linux with 300 shards: 5.0 descriptors and 6.4 mappings each.
-// Earlier benchmarks (stages 0b and 1f) saw 6 to 7 descriptors and 6.3 to 6.8
-// mappings per shard at up to 10,000 shards.
+// Measured on Linux with 300 shards: 6.0 descriptors and 7.05 mappings each
+// (5.0 and 6.4 before stage 1o: the reserved messages table is created, read
+// and written through a second connection in Litestream's pool, which stays
+// open). Earlier benchmarks (stages 0b and 1f) saw 6 to 7 descriptors and 6.3
+// to 6.8 mappings per shard at up to 10,000 shards.
 const (
 	descriptorsPerShard = 7
-	mappingsPerShard    = 7
+	mappingsPerShard    = 8
 	baseDescriptors     = 64
 	baseMappings        = 1000
 )
@@ -75,25 +77,16 @@ func defaultStartupChecks(log *slog.Logger) startupChecks {
 	return startupChecks{fsType: filesystemOf, limits: readLimits, log: log}
 }
 
-// refuse returns an error if the data directory, or the local backend's
-// directory (blobDir, empty for S3), is on a network filesystem.
-func (c startupChecks) refuse(dataDir, blobDir string) error {
-	if err := refuseNetworkFS(c.fsType, dataDir, "SHARDLITE_DATA"); err != nil {
-		return err
-	}
-	if blobDir != "" {
-		if err := refuseNetworkFS(c.fsType, blobDir, "SHARDLITE_BLOB"); err != nil {
-			return err
-		}
-	}
-	return nil
+// refuse returns an error if the data directory is on a network filesystem.
+func (c startupChecks) refuse(dataDir string) error {
+	return refuseNetworkFS(c.fsType, dataDir, "SHARDLITE_DATA")
 }
 
 // warn logs what is likely to go wrong without refusing to start.
-func (c startupChecks) warn(metaDir string) {
+func (c startupChecks) warn(scratchDir string) {
 	if hasTmpfs {
-		if name, err := c.fsType(metaDir); err == nil && name != "tmpfs" && name != "ramfs" {
-			c.log.Warn("Litestream's metadata directory is not on tmpfs: every sync of every shard does an fsync there, which costs real disk writes (put SHARDLITE_META on tmpfs, such as under /dev/shm)", "dir", metaDir, "filesystem", orOther(name))
+		if name, err := c.fsType(scratchDir); err == nil && name != "tmpfs" && name != "ramfs" {
+			c.log.Warn("the scratch directory is not on tmpfs: every sync of every shard does an fsync there, which costs real disk writes (put SHARDLITE_SCRATCH_DIR on tmpfs, such as under /dev/shm)", "dir", scratchDir, "filesystem", orOther(name))
 		}
 	}
 	l := c.limits()

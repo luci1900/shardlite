@@ -1,15 +1,20 @@
-# The S3 emulator the S3 tests run against: RustFS, pinned to an exact release.
-# It honours If-None-Match and If-Match on PUT with the right status codes, and
-# user metadata.
+# RustFS, pinned to an exact release. It is the S3 store for every run of a node
+# outside a cluster: tests that run nodes as separate processes, and a node on a
+# development machine (point SHARDLITE_BLOB at s3://shardlite-test, with
+# SHARDLITE_S3_ENDPOINT and the credentials below). It honours If-None-Match and
+# If-Match on PUT with the right status codes, and user metadata.
 #
 #   docker compose -f docker/compose.s3.yaml up -d
 #   export SHARDLITE_TEST_S3_ENDPOINT=http://127.0.0.1:19000 SHARDLITE_TEST_S3_BUCKET=shardlite-test \
 #          AWS_ACCESS_KEY_ID=shardlite AWS_SECRET_ACCESS_KEY=shardlite-secret AWS_REGION=us-east-1
-#   go test -tags fault ./...                 # E2E_BACKEND=s3 also runs the node tests on it
+#   go test -tags fault ./...                 # without the endpoint the multi-process tests skip
 #   docker compose -f docker/compose.s3.yaml down
 #
-# The tests create the bucket themselves (S3.EnsureBucket). Data lives inside the
-# container and goes with it on `down`.
+# The tests create the bucket themselves (S3.EnsureBucket); a node never does.
+# Data lives inside the container and goes with it on `down`. For a single
+# machine, copy this file and give /data a durable volume: the strict durability
+# mode below is the safe setting, since a store that acknowledges a write before
+# it is on disk breaks the durability gates' promise.
 services:
   rustfs:
     image: rustfs/rustfs:1.0.1
@@ -18,3 +23,4 @@ services:
     environment:
       RUSTFS_ACCESS_KEY: shardlite
       RUSTFS_SECRET_KEY: shardlite-secret
+      RUSTFS_NEW_BUCKET_DURABILITY_MODE: strict

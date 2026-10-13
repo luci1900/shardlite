@@ -8,7 +8,7 @@
 //	8 bytes: footer length, big-endian
 //	8 bytes: magic "SHLSEG01"
 //
-// An empty object is a fence (see design.md, Fencing).
+// An empty object is a fence (see docs/internals.md, Fencing).
 package segment
 
 import (
@@ -28,6 +28,7 @@ import (
 	"github.com/superfly/ltx"
 
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/spool"
 )
 
 const (
@@ -84,11 +85,17 @@ type Options struct {
 	// returns an error here, and nothing more is acknowledged.
 	Check  func() error
 	Logger *slog.Logger // slog.Default() if nil
+	// A segment is built in memory up to SpoolLimit bytes (spool.DefaultLimit if
+	// zero) and in a temporary file in TempDir beyond it, and so are the files
+	// appended to it. A segment is never held in the scratch directory, which is
+	// memory. Without a TempDir a segment cannot be larger than SpoolLimit.
+	TempDir    string
+	SpoolLimit int
 }
 
 type pendingEntry struct {
 	Entry
-	body []byte
+	body *spool.File // a reference of its own, closed once the segment holds it
 }
 
 // Writer batches appended LTX files into one segment per flush interval.
@@ -117,7 +124,7 @@ type Writer struct {
 // somebody else's object.
 type upload struct {
 	seq     uint64
-	body    []byte
+	body    *spool.File // closed once the segment is written, or the writer is
 	id      blob.WriteID
 	waiters []chan error
 }
@@ -132,6 +139,9 @@ func NewWriter(store *blob.Store, node string, opts Options) *Writer {
 	}
 	if opts.StartSeq == 0 {
 		opts.StartSeq = 1
+	}
+	if opts.SpoolLimit <= 0 {
+		opts.SpoolLimit = spool.DefaultLimit
 	}
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
@@ -155,8 +165,16 @@ func (w *Writer) NextSeq() uint64 {
 // Append queues one LTX file. The returned channel receives nil once the
 // segment holding it has been written, or the error that stopped it.
 func (w *Writer) Append(shard, generation string, position uint64, ltxBytes []byte) <-chan error {
+	f := spool.Bytes(ltxBytes)
+	defer f.Close()
+	return w.AppendFile(shard, generation, position, f)
+}
+
+// AppendFile is Append for a file that may be in a temporary file. The writer
+// takes a reference of its own, so the caller still closes its own.
+func (w *Writer) AppendFile(shard, generation string, position uint64, ltxFile *spool.File) <-chan error {
 	ch := make(chan error, 1)
-	hdr, _, err := ltx.PeekHeader(bytes.NewReader(ltxBytes))
+	hdr, _, err := ltx.PeekHeader(ltxFile.Reader())
 	if err != nil {
 		ch <- fmt.Errorf("segment: bad ltx file for %s: %w", shard, err)
 		return ch
@@ -174,8 +192,8 @@ func (w *Writer) Append(shard, generation string, position uint64, ltxBytes []by
 		}
 	}
 	w.pending = append(w.pending, pendingEntry{
-		Entry: Entry{Shard: shard, Generation: generation, Position: position, Count: uint64(hdr.MaxTXID-hdr.MinTXID) + 1, Length: int64(len(ltxBytes))},
-		body:  ltxBytes,
+		Entry: Entry{Shard: shard, Generation: generation, Position: position, Count: uint64(hdr.MaxTXID-hdr.MinTXID) + 1, Length: ltxFile.Size()},
+		body:  ltxFile.Retain(),
 	})
 	w.waiters = append(w.waiters, ch)
 	return ch
@@ -226,13 +244,35 @@ func (w *Writer) Flush(ctx context.Context) error {
 				w.mu.Unlock()
 				return nil
 			}
-			body, err := encode(w.pending)
+			// The segment is built without the lock: it can be a lot of copying, and
+			// other shards keep appending meanwhile. Only this flush builds segments
+			// (it holds uploadMu), so nothing else touches the inflight upload.
+			pending, waiters := w.pending, w.waiters
+			w.pending, w.waiters = nil, nil
+			w.mu.Unlock()
+			body, err := w.encode(pending)
+			w.mu.Lock()
 			if err != nil {
+				// Nothing is lost: the entries go back, ahead of what came in meanwhile.
+				w.pending = append(pending, w.pending...)
+				w.waiters = append(waiters, w.waiters...)
 				w.mu.Unlock()
 				return err
 			}
-			w.inflight = &upload{seq: w.seq, body: body, id: w.store.NewWriteID(), waiters: w.waiters}
-			w.pending, w.waiters = nil, nil
+			for _, p := range pending {
+				p.body.Close() // the segment has its own copy
+			}
+			if w.stopErr != nil {
+				// Closed or fenced while it was being built.
+				err := w.stopErr
+				w.mu.Unlock()
+				body.Close()
+				for _, ch := range waiters {
+					ch <- err
+				}
+				return err
+			}
+			w.inflight = &upload{seq: w.seq, body: body, id: w.store.NewWriteID(), waiters: waiters}
 		}
 		up := w.inflight
 		w.mu.Unlock()
@@ -245,6 +285,7 @@ func (w *Writer) Flush(ctx context.Context) error {
 			w.inflight = nil
 			w.seq++
 			w.flushes.Add(1)
+			up.body.Close()
 		case errors.Is(err, blob.ErrExists):
 			// Someone else's object holds our number (blob.Store has already ruled out
 			// our own earlier attempts), so a newer writer owns this journal. Fail
@@ -252,6 +293,8 @@ func (w *Writer) Flush(ctx context.Context) error {
 			err = ErrFenced
 			w.stopErr = ErrFenced
 			waiters := append(up.waiters, w.waiters...)
+			up.body.Close()
+			w.closePending()
 			w.inflight, w.pending, w.waiters = nil, nil, nil
 			w.mu.Unlock()
 			for _, ch := range waiters {
@@ -288,7 +331,7 @@ func (w *Writer) Flush(ctx context.Context) error {
 func (w *Writer) send(ctx context.Context, up *upload) error {
 	backoff := w.opts.Retry
 	for {
-		_, err := w.store.CreateWithID(ctx, Key(w.node, up.seq), bytes.NewReader(up.body), up.id)
+		_, err := w.store.CreateWithID(ctx, Key(w.node, up.seq), up.body.Reader(), up.id)
 		if err == nil || errors.Is(err, blob.ErrExists) {
 			return err
 		}
@@ -312,25 +355,42 @@ func (w *Writer) send(ctx context.Context, up *upload) error {
 	}
 }
 
-// encode lays out a segment: the LTX files back to back, then the footer.
-func encode(pending []pendingEntry) ([]byte, error) {
-	var body bytes.Buffer
+// encode lays out a segment: the LTX files back to back, then the footer. It
+// is built in memory if it is small, in a temporary file if it is not. It does
+// not close the entries' files.
+func (w *Writer) encode(pending []pendingEntry) (*spool.File, error) {
+	sw := spool.NewWriter(w.opts.TempDir, w.opts.SpoolLimit)
 	footer := make([]Entry, len(pending))
 	for i, p := range pending {
-		p.Offset = int64(body.Len())
-		body.Write(p.body)
+		p.Offset = sw.Written()
+		if _, err := io.Copy(sw, p.body.Reader()); err != nil {
+			sw.Abort()
+			return nil, err
+		}
 		footer[i] = p.Entry
 	}
 	fb, err := json.Marshal(footer)
 	if err != nil {
+		sw.Abort()
 		return nil, err
 	}
-	body.Write(fb)
 	var n [8]byte
 	binary.BigEndian.PutUint64(n[:], uint64(len(fb)))
-	body.Write(n[:])
-	body.WriteString(magic)
-	return body.Bytes(), nil
+	for _, b := range [][]byte{fb, n[:], []byte(magic)} {
+		if _, err := sw.Write(b); err != nil {
+			sw.Abort()
+			return nil, err
+		}
+	}
+	return sw.Finish()
+}
+
+// closePending closes the files of entries that were never written. The caller
+// holds w.mu.
+func (w *Writer) closePending() {
+	for _, p := range w.pending {
+		p.body.Close()
+	}
 }
 
 // Close stops the flush loop and fails whatever is still pending with ErrClosed.
@@ -348,11 +408,13 @@ func (w *Writer) Close() {
 		for _, ch := range w.inflight.waiters {
 			ch <- ErrClosed
 		}
+		w.inflight.body.Close()
 		w.inflight = nil
 	}
 	for _, ch := range w.waiters {
 		ch <- ErrClosed
 	}
+	w.closePending()
 	w.pending, w.waiters = nil, nil
 }
 
@@ -395,6 +457,27 @@ func ReadFooter(ctx context.Context, store *blob.Store, node string, seq uint64)
 // ReadEntry returns the LTX file bytes of one entry.
 func ReadEntry(ctx context.Context, store *blob.Store, node string, seq uint64, e Entry) ([]byte, error) {
 	return readRange(ctx, store, Key(node, seq), e.Offset, e.Length)
+}
+
+// ReadEntryFile is ReadEntry for an entry of any size: it is read into memory
+// up to limit bytes, and into a temporary file in dir beyond that. The caller
+// closes the file.
+func ReadEntryFile(ctx context.Context, store *blob.Store, node string, seq uint64, e Entry, dir string, limit int) (*spool.File, error) {
+	rc, err := store.GetRange(ctx, Key(node, seq), e.Offset, e.Length)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	f, err := spool.Collect(dir, limit, rc)
+	if err != nil {
+		return nil, err
+	}
+	if f.Size() != e.Length {
+		n := f.Size()
+		f.Close()
+		return nil, fmt.Errorf("%w: %s short range read (%d of %d bytes)", ErrCorrupt, Key(node, seq), n, e.Length)
+	}
+	return f, nil
 }
 
 func readRange(ctx context.Context, store *blob.Store, key string, off, n int64) ([]byte, error) {
@@ -464,7 +547,7 @@ func ScanTo(ctx context.Context, store *blob.Store, node string, from, to uint64
 // Bounds lists a node's journal and returns the lowest and highest segment
 // numbers present (fences included), or 0, 0 for an empty journal. The lowest is
 // where a reader starts, since old segments expire (until the lease records
-// the range still needed, see design.md, Node leases).
+// the range still needed, see docs/internals.md, Node leases).
 func Bounds(ctx context.Context, store *blob.Store, node string) (lowest, highest uint64, err error) {
 	prefix := Prefix(node)
 	for info, err := range store.List(ctx, prefix) {

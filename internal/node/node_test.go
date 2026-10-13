@@ -20,7 +20,7 @@ import (
 
 type rig struct {
 	t     *testing.T
-	local *blob.Local
+	local *blob.Hooked
 	dir   string
 	meta  string
 	app   *apptest.App
@@ -28,12 +28,7 @@ type rig struct {
 
 func newRig(t *testing.T) *rig {
 	t.Helper()
-	l, err := blob.NewLocal(filepath.Join(t.TempDir(), "blobs"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	l.NoSync = true
-	return &rig{t: t, local: l, dir: t.TempDir(), meta: t.TempDir(), app: apptest.Start(t)}
+	return &rig{t: t, local: blob.WithHook(blob.NewMemory()), dir: t.TempDir(), meta: t.TempDir(), app: apptest.Start(t)}
 }
 
 // start is a node whose lease is never renewed by itself (the tests decide
@@ -41,6 +36,7 @@ func newRig(t *testing.T) *rig {
 func (r *rig) start() (*node.Node, error) {
 	return node.Start(context.Background(), node.Config{
 		Name:    "n1",
+		TempDir: r.t.TempDir(),
 		Backend: r.local,
 		Flush:   10 * time.Millisecond,
 		Blob:    blob.Options{Backoff: time.Millisecond},
@@ -118,6 +114,7 @@ func (r *rig) restoreDump(n *node.Node, name string) string {
 // The previous process dies with tails in its journal. The next start fences the
 // journal, turns every tail into a delta and moves the lease's range past the fence.
 func TestRestartAdoptsItsOwnJournal(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name         string
 		publishRange bool // the lease holds a fresh range, or only the range from the start
@@ -226,6 +223,7 @@ func TestRestartAdoptsItsOwnJournal(t *testing.T) {
 // A start that can't finish the adoption leaves the old range in the lease, so
 // the next start does it again.
 func TestFailedAdoptionKeepsTheRange(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	r := newRig(t)
 	n1 := r.mustStart()
@@ -269,6 +267,7 @@ func TestFailedAdoptionKeepsTheRange(t *testing.T) {
 // listing says. A shard whose tail has a hole is reported as lost and the node
 // still starts.
 func TestAdoptionWithExpiredSegments(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	r := newRig(t)
 	n1 := r.mustStart()
@@ -306,6 +305,7 @@ func TestAdoptionWithExpiredSegments(t *testing.T) {
 // A segment missing from the middle of the range isn't expiry (that takes the
 // oldest first), it is a bug or a damaged journal, so it stops the start.
 func TestHoleInTheMiddleOfTheRangeFailsTheStart(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	r := newRig(t)
 	n1 := r.mustStart()

@@ -12,13 +12,9 @@ import (
 	"github.com/luci1900/shardlite/internal/coord"
 )
 
-func newLocal(t *testing.T) *blob.Local {
+func newLocal(t *testing.T) *blob.Hooked {
 	t.Helper()
-	l, err := blob.NewLocal(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	return l
+	return blob.WithHook(blob.NewMemory())
 }
 
 func opts() coord.RegistryOptions {
@@ -26,6 +22,7 @@ func opts() coord.RegistryOptions {
 }
 
 func TestEpochsOnlyGoUp(t *testing.T) {
+	t.Parallel()
 	l, ctx := newLocal(t), context.Background()
 	reg := coord.NewRegistry(l, "n1", opts())
 
@@ -78,6 +75,7 @@ func TestEpochsOnlyGoUp(t *testing.T) {
 }
 
 func TestRenewSurvivesALostResponse(t *testing.T) {
+	t.Parallel()
 	l, ctx := newLocal(t), context.Background()
 	reg := coord.NewRegistry(l, "n1", opts())
 	a, err := reg.Acquire(ctx, coord.NodeInfo{Name: "n1"})
@@ -108,6 +106,7 @@ func keeperOpts(info func() coord.NodeInfo) coord.KeeperOptions {
 }
 
 func TestKeeperRenewsWhileStorageWorks(t *testing.T) {
+	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		l, ctx := newLocal(t), context.Background()
 		reg := coord.NewRegistry(l, "n1", opts())
@@ -144,6 +143,7 @@ func TestKeeperRenewsWhileStorageWorks(t *testing.T) {
 // The holder gives up its lease Margin before others would: after the last
 // renewal at T, others see it valid until T+TTL, the holder only until T+TTL-Margin.
 func TestKeeperExpiresEarlyAndForGood(t *testing.T) {
+	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		l, ctx := newLocal(t), context.Background()
 		reg := coord.NewRegistry(l, "n1", opts())
@@ -199,6 +199,7 @@ func TestKeeperExpiresEarlyAndForGood(t *testing.T) {
 }
 
 func TestKeeperSurvivesBriefTroubleAndStopsWhenReplaced(t *testing.T) {
+	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		l, ctx := newLocal(t), context.Background()
 		reg := coord.NewRegistry(l, "n1", opts())
@@ -236,6 +237,7 @@ func TestKeeperSurvivesBriefTroubleAndStopsWhenReplaced(t *testing.T) {
 }
 
 func TestKeeperReleases(t *testing.T) {
+	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		l, ctx := newLocal(t), context.Background()
 		reg := coord.NewRegistry(l, "n1", opts())
@@ -250,4 +252,38 @@ func TestKeeperReleases(t *testing.T) {
 			t.Fatalf("after release: %+v %v", got, err)
 		}
 	})
+}
+
+// A renewal that landed without the keeper hearing about it (it was stopped
+// mid-request) leaves the keeper with an old ETag. Release still releases its
+// own lease, and still refuses once another process has taken the node over.
+func TestReleaseAfterARenewalItNeverSaw(t *testing.T) {
+	t.Parallel()
+	l, ctx := newLocal(t), context.Background()
+	reg := coord.NewRegistry(l, "n1", opts())
+	old, err := reg.Acquire(ctx, coord.NodeInfo{Name: "n1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.Renew(ctx, old, old.NodeInfo); err != nil { // lands; the caller's `old` is now stale
+		t.Fatal(err)
+	}
+	if err := reg.Release(ctx, old); err != nil {
+		t.Fatalf("release with a stale ETag of its own lease: %v", err)
+	}
+	if got, err := reg.Get(ctx, "n1"); err != nil || !got.Released {
+		t.Fatalf("lease: %+v %v", got, err)
+	}
+
+	// A newer epoch is somebody else's.
+	a, err := reg.Acquire(ctx, coord.NodeInfo{Name: "n1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coord.NewRegistry(l, "n1", opts()).Acquire(ctx, coord.NodeInfo{Name: "n1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Release(ctx, a); !errors.Is(err, coord.ErrLeaseLost) {
+		t.Fatalf("release of a lease that was taken over: %v, want ErrLeaseLost", err)
+	}
 }

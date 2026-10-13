@@ -51,6 +51,7 @@ func l0Files(t *testing.T, sh *capture.Shard) []string {
 
 // 6.1: without the Store, does Litestream delete its local level 0 files?
 func TestL0RetentionWithoutStore(t *testing.T) {
+	t.Parallel()
 	e := harness.New(t, 10*time.Millisecond)
 	ctx := context.Background()
 	app := e.StartApp(name)
@@ -66,8 +67,7 @@ func TestL0RetentionWithoutStore(t *testing.T) {
 	if n < 30 {
 		t.Fatalf("only %d local level 0 files after 30 commits", n)
 	}
-	time.Sleep(time.Second)
-	sh.Sync(ctx)
+	sh.Sync(ctx) // nothing but a Store's compaction deletes level 0 files, and there is none
 	if m := len(l0Files(t, sh)); m < n {
 		t.Fatalf("Litestream deleted local level 0 files by itself (%d -> %d)", n, m)
 	}
@@ -86,20 +86,32 @@ func TestL0RetentionWithoutStore(t *testing.T) {
 	sh.Close(ctx)
 }
 
-// 6.2: how many commits does Litestream make by itself on an idle shard?
+// ageDatabase sets the last write time of the shard's database file (which
+// Litestream measures its checkpoint interval from, and which commits to a
+// WAL-mode database do not touch) to long ago: the interval has passed.
+func ageDatabase(t *testing.T, path string) {
+	t.Helper()
+	old := time.Now().Add(-10 * time.Hour)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// 6.2: how many commits does Litestream make by itself on an idle shard? Each
+// sync here comes after the checkpoint interval has passed since the database
+// file was last written (the worst case for an idle shard: whatever the interval
+// allows is allowed every time), and the shard has to settle.
 func TestIdleShardCommits(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name     string
 		interval time.Duration
-		run      time.Duration
+		syncs    int
 	}{
-		{"checkpoint interval 300ms", 300 * time.Millisecond, 8 * time.Second},
-		{"default checkpoint interval (1m)", 0, 150 * time.Second},
+		{"checkpoint interval 300ms", 300 * time.Millisecond, 40},
+		{"default checkpoint interval (1m)", 0, 40},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.interval == 0 && os.Getenv("SHARDLITE_LONG") == "" {
-				t.Skip("takes 2.5 minutes: set SHARDLITE_LONG=1 to run it")
-			}
 			e := harness.New(t, 10*time.Millisecond)
 			ctx := context.Background()
 			app := e.StartApp(name)
@@ -122,22 +134,21 @@ func TestIdleShardCommits(t *testing.T) {
 				}
 			}
 			lastApp := len(entriesOf(t, e, name))
-			start := time.Now()
-			var lastChange time.Duration
+			var lastChange int
 			prev := lastApp
-			for time.Since(start) < tc.run {
-				time.Sleep(50 * time.Millisecond)
+			for i := 1; i <= tc.syncs; i++ {
+				ageDatabase(t, e.Path(name))
 				if err := sh.Sync(ctx); err != nil {
 					t.Fatal(err)
 				}
 				if n := len(entriesOf(t, e, name)); n != prev {
-					prev, lastChange = n, time.Since(start)
+					prev, lastChange = n, i
 				}
 			}
 			extra := prev - lastApp
-			t.Logf("idle for %v: %d commits by Litestream after the last app write (last one at %v)", tc.run, extra, lastChange.Round(time.Millisecond))
-			if extra > 0 && tc.interval > 0 && lastChange > tc.run/2 {
-				t.Fatalf("still committing at %v of %v: does not settle", lastChange, tc.run)
+			t.Logf("idle for %d syncs: %d commits by Litestream after the last app write (last one at sync %d)", tc.syncs, extra, lastChange)
+			if extra > 0 && tc.interval > 0 && lastChange > tc.syncs/2 {
+				t.Fatalf("still committing at sync %d of %d: does not settle", lastChange, tc.syncs)
 			}
 			sh.Close(ctx)
 		})
@@ -149,6 +160,7 @@ func TestIdleShardCommits(t *testing.T) {
 // (default thresholds) and by time (short interval). Replaying what was
 // captured must give the app's database.
 func TestCheckpointsNeverLoseFrames(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		tune func(*litestream.DB)
@@ -174,7 +186,7 @@ func TestCheckpointsNeverLoseFrames(t *testing.T) {
 				for range 3 {
 					app.Must(t, "insert", "a", fmt.Sprint(tc.rows/3), "1000")
 					if burst%2 == 0 {
-						time.Sleep(120 * time.Millisecond)
+						ageDatabase(t, e.Path(name)) // 120 ms pass between these writes
 					}
 				}
 				if burst%3 != 2 { // sometimes let several bursts pile up unsynced
@@ -216,10 +228,11 @@ func TestCheckpointsNeverLoseFrames(t *testing.T) {
 	}
 }
 
-// The -shm check, in the order design.md gives: the node closes everything it
+// The -shm check, in the order docs/internals.md gives: the node closes everything it
 // has on the shard, then asks, then reopens capture if the app still has the
 // shard open.
 func TestReleaseChecksShm(t *testing.T) {
+	t.Parallel()
 	e := harness.New(t, 10*time.Millisecond)
 	ctx := context.Background()
 	app := e.StartApp(name)
@@ -275,6 +288,7 @@ func TestReleaseChecksShm(t *testing.T) {
 // Once the node has closed everything on a shard, checking it never drops the
 // app's locks: the check's descriptor has none of the node's own to drop.
 func TestCheckAfterClosingKeepsAppLocks(t *testing.T) {
+	t.Parallel()
 	e := harness.New(t, 10*time.Millisecond)
 	ctx := context.Background()
 	app := e.StartApp(name)
@@ -308,6 +322,7 @@ func TestCheckAfterClosingKeepsAppLocks(t *testing.T) {
 // (fcntl locks belong to the process), so another process would no longer
 // see the node's connection.
 func TestThrowawayProbeDropsLocks(t *testing.T) {
+	t.Parallel()
 	e := harness.New(t, 10*time.Millisecond)
 	ctx := context.Background()
 	app := e.StartApp(name)
@@ -334,6 +349,7 @@ func TestThrowawayProbeDropsLocks(t *testing.T) {
 
 // 6.5: what Litestream creates or writes in the app's directory and database.
 func TestLitestreamFootprint(t *testing.T) {
+	t.Parallel()
 	e := harness.New(t, 10*time.Millisecond)
 	ctx := context.Background()
 	app := e.StartApp(name)
@@ -377,6 +393,7 @@ func TestLitestreamFootprint(t *testing.T) {
 // the -shm check, is seen from the wal-index header: the node doesn't let go,
 // and capture picks the commit up.
 func TestReleaseSeesACommitAfterTheFinalSync(t *testing.T) {
+	t.Parallel()
 	e := harness.New(t, 10*time.Millisecond)
 	ctx := context.Background()
 	app := e.StartApp(name)

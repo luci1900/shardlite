@@ -1,7 +1,8 @@
 package shardfile
 
 import (
-	"bytes"
+	"bufio"
+	"container/heap"
 	"context"
 	"errors"
 	"fmt"
@@ -13,38 +14,93 @@ import (
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/capture"
+	"github.com/luci1900/shardlite/internal/spool"
 )
 
-// DefaultMaxFiles is how many files a manifest may list before they are merged into one base.
+// DefaultMaxFiles is how many files a manifest may list before the next
+// snapshot rebases the shard instead of adding a delta.
 const DefaultMaxFiles = 8
 
-// DefaultDeltaAge is how old the oldest tail file gets before a delta is written.
-const DefaultDeltaAge = 3 * time.Minute
+// DefaultDeltaAge is how old the oldest tail file gets before a delta is
+// written, if the tail has not passed DefaultDeltaSize before then. The age
+// bounds how long an adopter replays a dead node's journal, and how long
+// segments must be kept.
+const DefaultDeltaAge = 15 * time.Minute
+
+// DefaultDeltaSize is how many bytes of tail a shard may hold before a delta is
+// written, whatever its age: it bounds the memory the tails take.
+const DefaultDeltaSize = 1 << 20
 
 // Hooks let tests stop between steps. A returned error aborts the operation
-// at that point, as a crash would.
+// at that point, as a crash would. The node also uses AfterFileWrite: it writes a wake hint there
+// (docs/internals.md, Message delivery), and a hint that can't be written leaves the snapshot to the next pass.
 type Hooks struct {
-	AfterFileWrite func() error // delta or base written, manifest not yet updated
-	AfterMergeSwap func() error // merge's manifest update done, superseded files not yet deleted
+	AfterFileWrite  func() error // delta or base written, manifest not yet updated
+	AfterRebaseSwap func() error // rebase's manifest update done, superseded files not yet deleted
 }
 
-// compact merges LTX files that already carry the shard's positions (manifest
-// files) into one, keeping the latest version of each page.
-func compact(inputs [][]byte) ([]byte, error) {
-	rs := make([]io.Reader, len(inputs))
-	for i, b := range inputs {
-		rs[i] = bytes.NewReader(b)
+// Policy says when a snapshot is written, and when it is a rebase and not a delta.
+type Policy struct {
+	MaxFiles int   // how many files the manifest may list before a rebase, DefaultMaxFiles if zero
+	MaxBytes int64 // how many bytes of tail make a delta due whatever their age, DefaultDeltaSize if zero
+}
+
+func (p Policy) withDefaults() Policy {
+	if p.MaxFiles <= 0 {
+		p.MaxFiles = DefaultMaxFiles
 	}
-	var out bytes.Buffer
-	c, err := ltx.NewCompactor(&out, rs)
-	if err != nil {
-		return nil, err
+	if p.MaxBytes <= 0 {
+		p.MaxBytes = DefaultDeltaSize
 	}
-	c.HeaderFlags = ltx.HeaderFlagNoChecksum
-	if err := c.Compact(context.Background()); err != nil {
-		return nil, err
+	return p
+}
+
+// RebaseDue reports whether the shard's next snapshot should be a rebase: it
+// has more than MaxFiles files. The limit is what bounds how many files a
+// restore reads, so it is the whole rule.
+func (h *Handle) RebaseDue(p Policy) bool {
+	return len(h.Manifest.Files) > p.withDefaults().MaxFiles
+}
+
+// source is one of the files being merged, positioned at its current page.
+type source struct {
+	dec  *ltx.Decoder
+	buf  []byte
+	pgno uint32
+	idx  int // position in the list of files: the later, the newer
+}
+
+// next reads the file's next page into buf, and reports false at its end,
+// where it verifies the file's checksum.
+func (s *source) next() (bool, error) {
+	var ph ltx.PageHeader
+	if err := s.dec.DecodePage(&ph, s.buf); errors.Is(err, io.EOF) {
+		return false, s.dec.Close()
+	} else if err != nil {
+		return false, err
 	}
-	return out.Bytes(), nil
+	s.pgno = ph.Pgno
+	return true, nil
+}
+
+// pageHeap orders sources by the page they are at, and for the same page the
+// newest file first.
+type pageHeap []*source
+
+func (h pageHeap) Len() int { return len(h) }
+func (h pageHeap) Less(i, j int) bool {
+	if h[i].pgno != h[j].pgno {
+		return h[i].pgno < h[j].pgno
+	}
+	return h[i].idx > h[j].idx
+}
+func (h pageHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *pageHeap) Push(x any)   { *h = append(*h, x.(*source)) }
+func (h *pageHeap) Pop() any {
+	old := *h
+	x := old[len(old)-1]
+	*h = old[:len(old)-1]
+	return x
 }
 
 // reencode merges captured tail files into one LTX file covering the shard's
@@ -52,38 +108,32 @@ func compact(inputs [][]byte) ([]byte, error) {
 // Litestream's commit numbers, which restart in every activation, so the
 // LTX compactor (which wants contiguous numbers) can't be used. The result
 // has the shard's own positions in its header.
-func reencode(files []capture.TailFile, rg Range) ([]byte, error) {
-	pages := map[uint32][]byte{}
+//
+// The pages of each LTX file are in order, so this is a merge of sorted lists:
+// it holds one page of each file and writes the result as it goes, however
+// many pages the files hold (a VACUUM rewrites the whole database).
+func reencode(w io.Writer, files []capture.TailFile, rg Range) error {
+	if len(files) == 0 {
+		return errors.New("no files to encode")
+	}
+	srcs := make([]*source, len(files))
 	var pageSize, commit uint32
 	var ts int64
-	for _, f := range files {
-		dec := ltx.NewDecoder(bytes.NewReader(f.Data))
+	for i, f := range files {
+		dec := ltx.NewDecoder(bufio.NewReaderSize(f.Body.Reader(), 64<<10))
 		if err := dec.DecodeHeader(); err != nil {
-			return nil, err
+			return err
 		}
 		hdr := dec.Header()
 		if pageSize != 0 && hdr.PageSize != pageSize {
-			return nil, fmt.Errorf("page size changed from %d to %d", pageSize, hdr.PageSize)
+			return fmt.Errorf("page size changed from %d to %d", pageSize, hdr.PageSize)
 		}
 		pageSize, commit, ts = hdr.PageSize, hdr.Commit, hdr.Timestamp
-		for {
-			var ph ltx.PageHeader
-			buf := make([]byte, hdr.PageSize)
-			if err := dec.DecodePage(&ph, buf); errors.Is(err, io.EOF) {
-				break
-			} else if err != nil {
-				return nil, err
-			}
-			pages[ph.Pgno] = buf
-		}
-		if err := dec.Close(); err != nil { // verifies the file's checksum
-			return nil, err
-		}
+		srcs[i] = &source{dec: dec, buf: make([]byte, hdr.PageSize), idx: i}
 	}
-	var out bytes.Buffer
-	enc, err := ltx.NewEncoder(&out)
+	enc, err := ltx.NewEncoder(w)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if err := enc.EncodeHeader(ltx.Header{
 		Version:   ltx.Version,
@@ -94,24 +144,39 @@ func reencode(files []capture.TailFile, rg Range) ([]byte, error) {
 		MaxTXID:   ltx.TXID(rg.Max),
 		Timestamp: ts,
 	}); err != nil {
-		return nil, err
+		return err
 	}
-	pgnos := make([]uint32, 0, len(pages))
-	for pgno := range pages {
-		if pgno <= commit { // pages past the end of the final database are gone
-			pgnos = append(pgnos, pgno)
+	var h pageHeap
+	for _, s := range srcs {
+		if ok, err := s.next(); err != nil {
+			return err
+		} else if ok {
+			h = append(h, s)
 		}
 	}
-	slices.Sort(pgnos)
-	for _, pgno := range pgnos {
-		if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, pages[pgno]); err != nil {
-			return nil, err
+	heap.Init(&h)
+	for h.Len() > 0 {
+		top := h[0]
+		pgno := top.pgno
+		// The newest file's page is written, then every file that is at this page moves on.
+		// Pages past the end of the final database are gone.
+		if pgno <= commit {
+			if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, top.buf); err != nil {
+				return err
+			}
+		}
+		for h.Len() > 0 && h[0].pgno == pgno {
+			s := h[0]
+			if ok, err := s.next(); err != nil {
+				return err
+			} else if ok {
+				heap.Fix(&h, 0)
+			} else {
+				heap.Pop(&h)
+			}
 		}
 	}
-	if err := enc.Close(); err != nil {
-		return nil, err
-	}
-	return out.Bytes(), nil
+	return enc.Close()
 }
 
 // putFile writes an LTX file with Create. The name carries the writer's
@@ -122,7 +187,7 @@ func reencode(files []capture.TailFile, rg Range) ([]byte, error) {
 // say) is the same write: the handle keeps the write id until the manifest
 // has adopted the file, so blob.Store can tell the earlier attempt's object
 // from somebody else's without comparing bytes.
-func (h *Handle) putFile(ctx context.Context, f File, data []byte) error {
+func (h *Handle) putFile(ctx context.Context, f File, body io.ReadSeeker) error {
 	key := FileKey(h.Name, h.Manifest.Generation, f)
 	id, ok := h.writes[key]
 	if !ok {
@@ -132,7 +197,7 @@ func (h *Handle) putFile(ctx context.Context, f File, data []byte) error {
 		}
 		h.writes[key] = id
 	}
-	_, err := h.F.Blob.CreateWithID(ctx, key, bytes.NewReader(data), id)
+	_, err := h.F.Blob.CreateWithID(ctx, key, body, id)
 	return err
 }
 
@@ -142,6 +207,7 @@ func (h *Handle) putFile(ctx context.Context, f File, data []byte) error {
 // whatever Litestream's numbers were. It does nothing if the tail is empty.
 func (h *Handle) WriteDelta(ctx context.Context, sh *capture.Shard, hooks Hooks) error {
 	tail := sh.Tail()
+	defer capture.CloseTail(tail)
 	if len(tail) == 0 {
 		return nil
 	}
@@ -156,7 +222,13 @@ func (h *Handle) WriteDelta(ctx context.Context, sh *capture.Shard, hooks Hooks)
 // adds it to the manifest. edit, if set, changes the manifest in the same
 // compare-and-swap.
 func (h *Handle) putTail(ctx context.Context, tail []capture.TailFile, hooks Hooks, edit func(*Manifest)) error {
+	if err := h.settle(ctx); err != nil {
+		return err
+	}
 	r := Range{tail[0].Position, tail[len(tail)-1].Last()}
+	if slices.Contains(h.Manifest.Files, File{r, h.F.Blob.Epoch()}.String()) {
+		return nil // an earlier call's update landed, though its answer was lost
+	}
 	if prev := h.Manifest.LastPosition(); r.Min != prev+1 {
 		return fmt.Errorf("delta %s for %s does not continue from position %d", r, h.Name, prev)
 	}
@@ -165,12 +237,21 @@ func (h *Handle) putTail(ctx context.Context, tail []capture.TailFile, hooks Hoo
 			return fmt.Errorf("tail of %s has a gap before position %d", h.Name, tail[i].Position)
 		}
 	}
-	data, err := reencode(tail, r)
+	w, err := h.F.newSpool(h.F.spoolLimit())
+	if err != nil {
+		return err
+	}
+	if err := reencode(w, tail, r); err != nil {
+		w.Abort()
+		return fmt.Errorf("delta for %s: %w", h.Name, err)
+	}
+	delta, err := w.Finish()
 	if err != nil {
 		return fmt.Errorf("delta for %s: %w", h.Name, err)
 	}
+	defer delta.Close()
 	file := File{r, h.F.Blob.Epoch()}
-	if err := h.putFile(ctx, file, data); err != nil {
+	if err := h.putFile(ctx, file, delta.Reader()); err != nil {
 		return err
 	}
 	if hooks.AfterFileWrite != nil {
@@ -183,78 +264,115 @@ func (h *Handle) putTail(ctx context.Context, tail []capture.TailFile, hooks Hoo
 	if edit != nil {
 		edit(next)
 	}
-	if err := h.update(ctx, next); err != nil {
+	if err := h.update(ctx, "delta", next); err != nil {
 		return err
 	}
 	delete(h.writes, FileKey(h.Name, h.Manifest.Generation, file))
 	return nil
 }
 
-// MaybeWriteDelta writes a delta if the oldest tail file is older than maxAge.
-func (h *Handle) MaybeWriteDelta(ctx context.Context, sh *capture.Shard, maxAge time.Duration, hooks Hooks) (bool, error) {
-	tail := sh.Tail()
-	if len(tail) == 0 || time.Since(tail[0].At) < maxAge {
-		return false, nil
+// Snapshotted says what MaybeSnapshot wrote.
+type Snapshotted int
+
+const (
+	Nothing Snapshotted = iota
+	WroteDelta
+	WroteRebase
+)
+
+// MaybeSnapshot is the snapshot of an active shard (docs/internals.md, Node journals
+// and snapshots): a delta when the oldest tail file is older than maxAge or the
+// tail holds at least p.MaxBytes, whichever comes first, or a rebase instead if
+// one is due (RebaseDue). A shard that is due for a rebase and has no tail is
+// rebased too if that leaves it with fewer files; one that is not due and has
+// a small, young tail is left alone.
+func (h *Handle) MaybeSnapshot(ctx context.Context, sh *capture.Shard, maxAge time.Duration, p Policy, hooks Hooks) (Snapshotted, error) {
+	tailN, oldest := sh.TailInfo()
+	due := h.RebaseDue(p)
+	switch {
+	case tailN == 0:
+		if due && len(h.Manifest.Files) > 1 {
+			return h.rebase(ctx, sh, hooks)
+		}
+	case time.Since(oldest) >= maxAge || sh.TailBytes() >= p.withDefaults().MaxBytes:
+		if due {
+			return h.rebase(ctx, sh, hooks)
+		}
+		return WroteDelta, h.WriteDelta(ctx, sh, hooks)
 	}
-	return true, h.WriteDelta(ctx, sh, hooks)
+	return Nothing, nil
 }
 
-// getFile downloads one of the shard's LTX files.
-func (h *Handle) getFile(ctx context.Context, f File) ([]byte, error) {
-	rc, _, err := h.F.Blob.Get(ctx, FileKey(h.Name, h.Manifest.Generation, f))
-	if err != nil {
-		return nil, err
+func (h *Handle) rebase(ctx context.Context, sh *capture.Shard, hooks Hooks) (Snapshotted, error) {
+	did, err := h.Rebase(ctx, sh, hooks)
+	if did {
+		return WroteRebase, err
 	}
-	defer rc.Close()
-	return io.ReadAll(rc)
+	return Nothing, err
 }
 
-// MergeIfNeeded merges all the manifest's files into a new base when it
-// lists more than maxFiles. It reports whether it merged.
-func (h *Handle) MergeIfNeeded(ctx context.Context, maxFiles int, hooks Hooks) (bool, error) {
-	if len(h.Manifest.Files) <= maxFiles {
-		return false, nil
+// Rebase replaces the manifest's files with one base: a full snapshot of the
+// shard from Litestream, as Litestream makes its own snapshots. The app keeps
+// writing meanwhile.
+//
+// The snapshot covers the shard's positions up to the one capture says it is
+// at (see capture.Shard.Snapshot), so the base is 1-{position}, and the commits
+// after it are the tail, still in the node's memory and journal. The manifest
+// is pointed at the base alone by compare-and-swap before the old files are
+// deleted, as a crash in between leaves the old files in use and the new base
+// unreferenced. It reports whether it wrote a base: there is nothing to do for a
+// shard that has no commits, or whose only file already covers everything.
+func (h *Handle) Rebase(ctx context.Context, sh *capture.Shard, hooks Hooks) (bool, error) {
+	if err := h.settle(ctx); err != nil {
+		return false, err
 	}
-	return true, h.Merge(ctx, hooks)
-}
-
-// Merge replaces the manifest's files with one base covering all of them.
-func (h *Handle) Merge(ctx context.Context, hooks Hooks) error {
 	files, err := h.Manifest.List()
 	if err != nil {
-		return err
+		return false, err
 	}
-	if len(files) < 2 {
-		return nil
-	}
-	inputs := make([][]byte, len(files))
-	for i, f := range files {
-		if inputs[i], err = h.getFile(ctx, f); err != nil {
-			return fmt.Errorf("merge %s: %w", h.Name, err)
-		}
-	}
-	data, err := compact(inputs)
+	// The snapshot goes to a file, whatever its size: it is the whole database.
+	w, err := h.F.newSpool(0)
 	if err != nil {
-		return fmt.Errorf("merge %s: %w", h.Name, err)
+		return false, err
 	}
-	base := File{Range{1, files[len(files)-1].Max}, h.F.Blob.Epoch()}
-	if err := h.putFile(ctx, base, data); err != nil {
-		return err
+	position, err := h.snapshotTo(ctx, sh, w)
+	if err != nil {
+		w.Abort()
+		return false, fmt.Errorf("rebase %s: %w", h.Name, err)
+	}
+	snap, err := w.Finish()
+	if err != nil {
+		return false, fmt.Errorf("rebase %s: %w", h.Name, err)
+	}
+	defer snap.Close()
+	if position == 0 {
+		return false, nil // nothing has been written
+	}
+	if last := h.Manifest.LastPosition(); position < last {
+		return false, fmt.Errorf("rebase %s: snapshot at position %d is behind the manifest's %d", h.Name, position, last)
+	}
+	base := File{Range{1, position}, h.F.Blob.Epoch()}
+	if len(files) == 1 && files[0].Max == position {
+		return false, nil // already one file that covers it
+	}
+	if err := h.putFile(ctx, base, snap.Reader()); err != nil {
+		return false, err
 	}
 	if hooks.AfterFileWrite != nil {
 		if err := hooks.AfterFileWrite(); err != nil {
-			return err
+			return false, err
 		}
 	}
 	next := h.Manifest.clone()
 	next.Files = []string{base.String()}
-	if err := h.update(ctx, next); err != nil {
-		return err
+	if err := h.update(ctx, "rebase", next); err != nil {
+		return false, err
 	}
 	delete(h.writes, FileKey(h.Name, h.Manifest.Generation, base))
-	if hooks.AfterMergeSwap != nil {
-		if err := hooks.AfterMergeSwap(); err != nil {
-			return err
+	sh.DropTail(position)
+	if hooks.AfterRebaseSwap != nil {
+		if err := hooks.AfterRebaseSwap(); err != nil {
+			return true, err
 		}
 	}
 	// Superseded files are garbage now. A failure here only leaves garbage behind,
@@ -269,5 +387,71 @@ func (h *Handle) Merge(ctx context.Context, hooks Hooks) error {
 			firstErr = err
 		}
 	}
-	return firstErr
+	return true, firstErr
+}
+
+// snapshotTo writes a snapshot of the shard to w as an LTX file covering
+// positions 1 to the position it returns. The snapshot reader is closed before
+// this returns, so Litestream's checkpoints are held off no longer than the copy.
+func (h *Handle) snapshotTo(ctx context.Context, sh *capture.Shard, w io.Writer) (position uint64, err error) {
+	position, rc, err := sh.Snapshot(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer rc.Close()
+	if position == 0 {
+		return 0, nil
+	}
+	// Litestream's snapshot carries its own commit numbers. Decoding and encoding
+	// it again gives it the shard's (as deltas have), and reads the snapshot's
+	// checksums before anything is uploaded.
+	dec := ltx.NewDecoder(bufio.NewReaderSize(rc, 1<<20))
+	if err := dec.DecodeHeader(); err != nil {
+		return 0, err
+	}
+	hdr := dec.Header()
+	enc, err := ltx.NewEncoder(w)
+	if err != nil {
+		return 0, err
+	}
+	if err := enc.EncodeHeader(ltx.Header{
+		Version:   ltx.Version,
+		Flags:     ltx.HeaderFlagNoChecksum,
+		PageSize:  hdr.PageSize,
+		Commit:    hdr.Commit,
+		MinTXID:   1,
+		MaxTXID:   ltx.TXID(position),
+		Timestamp: hdr.Timestamp,
+	}); err != nil {
+		return 0, err
+	}
+	buf := make([]byte, hdr.PageSize)
+	for {
+		var ph ltx.PageHeader
+		if err := dec.DecodePage(&ph, buf); errors.Is(err, io.EOF) {
+			break
+		} else if err != nil {
+			return 0, err
+		}
+		if err := enc.EncodePage(ph, buf); err != nil {
+			return 0, err
+		}
+	}
+	if err := dec.Close(); err != nil {
+		return 0, err
+	}
+	if err := rc.Close(); err != nil { // checkpoints may go on
+		return 0, err
+	}
+	return position, enc.Close()
+}
+
+// getFile downloads one of the shard's LTX files to a temporary file.
+func (h *Handle) getFile(ctx context.Context, f File) (*spool.File, error) {
+	rc, _, err := h.F.Blob.Get(ctx, FileKey(h.Name, h.Manifest.Generation, f))
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	return download(h.F, rc)
 }

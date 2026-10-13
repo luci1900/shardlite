@@ -50,6 +50,7 @@ func restoreDump(t *testing.T, e *harness.Env, name string) string {
 }
 
 func TestDeltaEqualsReplayingTail(t *testing.T) {
+	t.Parallel()
 	e := harness.New(t, 10*time.Millisecond)
 	ctx := context.Background()
 	app := e.StartApp(shard)
@@ -106,68 +107,25 @@ func mustFile(t *testing.T, s string) shardfile.File {
 	return r
 }
 
-func TestMaybeWriteDeltaByAge(t *testing.T) {
+func TestMaybeSnapshotByAge(t *testing.T) {
+	t.Parallel()
 	e := harness.New(t, 10*time.Millisecond)
 	ctx := context.Background()
 	app := e.StartApp(shard)
 	h, sh := e.NewShard(shard)
 	write(t, e, app, func() error { return sh.Sync(ctx) }, 0)
-	if ok, err := h.MaybeWriteDelta(ctx, sh, time.Hour, shardfile.Hooks{}); ok || err != nil {
-		t.Fatalf("wrote a delta too early: %v %v", ok, err)
+	if got, err := h.MaybeSnapshot(ctx, sh, time.Hour, shardfile.Policy{}, shardfile.Hooks{}); got != shardfile.Nothing || err != nil {
+		t.Fatalf("wrote a delta too early: %v %v", got, err)
 	}
-	time.Sleep(60 * time.Millisecond)
-	if ok, err := h.MaybeWriteDelta(ctx, sh, 50*time.Millisecond, shardfile.Hooks{}); !ok || err != nil {
-		t.Fatalf("no delta: %v %v", ok, err)
-	}
-	sh.Close(ctx)
-}
-
-func TestMergedBaseEqualsBasePlusDeltas(t *testing.T) {
-	e := harness.New(t, 10*time.Millisecond)
-	ctx := context.Background()
-	app := e.StartApp(shard)
-	h, sh := e.NewShard(shard)
-	for i := range 10 {
-		write(t, e, app, func() error { return sh.Sync(ctx) }, i)
-		if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); err != nil {
-			t.Fatal(err)
-		}
-		if ok, err := h.MergeIfNeeded(ctx, 8, shardfile.Hooks{}); err != nil {
-			t.Fatal(err)
-		} else if ok != (i == 8) { // the ninth file triggers it
-			t.Fatalf("merge=%v at round %d", ok, i)
-		}
-	}
-	// 9 files were merged into 1 base at round 8, then one more delta.
-	if len(h.Manifest.Files) != 2 {
-		t.Fatalf("files %v", h.Manifest.Files)
-	}
-	want := apptest.Dump(t, e.Path(shard))
-	if got := restoreDump(t, e, "a"); got != want {
-		t.Fatal("base plus delta differs")
-	}
-	if err := h.Merge(ctx, shardfile.Hooks{}); err != nil {
-		t.Fatal(err)
-	}
-	if got := restoreDump(t, e, "b"); got != want {
-		t.Fatal("fully merged base differs")
-	}
-	// Superseded files are gone.
-	n := 0
-	for info, err := range e.Store.List(ctx, "shards/"+shard+"/") {
-		if err != nil {
-			t.Fatal(err)
-		}
-		n++
-		t.Log("left:", info.Key)
-	}
-	if n != 1 {
-		t.Fatalf("%d files left, want 1", n)
+	// The tail is older than a nanosecond by now.
+	if got, err := h.MaybeSnapshot(ctx, sh, time.Nanosecond, shardfile.Policy{}, shardfile.Hooks{}); got != shardfile.WroteDelta || err != nil {
+		t.Fatalf("no delta: %v %v", got, err)
 	}
 	sh.Close(ctx)
 }
 
 func TestCrashBetweenFileAndManifest(t *testing.T) {
+	t.Parallel()
 	e := harness.New(t, 10*time.Millisecond)
 	ctx := context.Background()
 	app := e.StartApp(shard)
@@ -217,12 +175,13 @@ func TestCrashBetweenFileAndManifest(t *testing.T) {
 
 // A failed manifest update (storage error) behaves the same as a crash before it.
 func TestManifestUpdateFails(t *testing.T) {
+	t.Parallel()
 	e := harness.New(t, 10*time.Millisecond)
 	ctx := context.Background()
 	app := e.StartApp(shard)
 	h, sh := e.NewShard(shard)
 	write(t, e, app, func() error { return sh.Sync(ctx) }, 0)
-	e.Local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
+	e.Blob.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
 		if op == blob.OpUpdate && !after {
 			return errors.New("storage down")
 		}
@@ -231,7 +190,7 @@ func TestManifestUpdateFails(t *testing.T) {
 	if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); err == nil {
 		t.Fatal("want error")
 	}
-	e.Local.SetHook(nil)
+	e.Blob.SetHook(nil)
 	if len(h.Manifest.Files) != 0 || len(sh.Tail()) == 0 {
 		t.Fatal("state changed by a failed update")
 	}
@@ -248,6 +207,7 @@ type mustDoer interface {
 // After a delta empties the tail, a failed upload must not make Litestream
 // start again from transaction 1 (whose local file the delta removed).
 func TestUploadFailsAfterDelta(t *testing.T) {
+	t.Parallel()
 	e := harness.New(t, 10*time.Millisecond)
 	ctx := context.Background()
 	app := e.StartApp(shard)
@@ -257,7 +217,7 @@ func TestUploadFailsAfterDelta(t *testing.T) {
 	if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); err != nil {
 		t.Fatal(err)
 	}
-	e.Local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
+	e.Blob.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
 		if op == blob.OpCreate && !after {
 			return errors.New("storage down")
 		}
@@ -270,7 +230,7 @@ func TestUploadFailsAfterDelta(t *testing.T) {
 	if err := sh.Sync(short); err == nil {
 		t.Fatal("want error")
 	}
-	e.Local.SetHook(nil)
+	e.Blob.SetHook(nil)
 	if err := sh.Sync(ctx); err != nil {
 		t.Fatalf("retry after a failed upload: %v", err)
 	}
@@ -287,10 +247,11 @@ func TestUploadFailsAfterDelta(t *testing.T) {
 // Any write to blob storage can succeed while its response is lost. Each write
 // the shardfile layer makes must recognise its own earlier attempt afterwards.
 func TestLostResponses(t *testing.T) {
+	t.Parallel()
 	// lose drops the response of the first successful op on a key with the given prefix.
 	lose := func(e *harness.Env, op blob.Op, prefix string) *atomic.Bool {
 		var fired atomic.Bool
-		e.Local.SetHook(func(ctx context.Context, o blob.Op, key string, after bool) error {
+		e.Blob.SetHook(func(ctx context.Context, o blob.Op, key string, after bool) error {
 			if o == op && after && strings.HasPrefix(key, prefix) && fired.CompareAndSwap(false, true) {
 				return errors.New("response lost")
 			}
@@ -307,7 +268,7 @@ func TestLostResponses(t *testing.T) {
 		if err != nil || !created || !fired.Load() {
 			t.Fatalf("created=%v fired=%v err=%v", created, fired.Load(), err)
 		}
-		e.Local.SetHook(nil)
+		e.Blob.SetHook(nil)
 		if err := h.Touch(ctx); err != nil {
 			t.Fatalf("the ETag adopted after the lost response is wrong: %v", err)
 		}
@@ -323,7 +284,7 @@ func TestLostResponses(t *testing.T) {
 		if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); err != nil || !fired.Load() {
 			t.Fatalf("fired=%v err=%v", fired.Load(), err)
 		}
-		e.Local.SetHook(nil)
+		e.Blob.SetHook(nil)
 		if len(h.Manifest.Files) != 1 || len(sh.Tail()) != 0 {
 			t.Fatalf("files %v, tail %d", h.Manifest.Files, len(sh.Tail()))
 		}
@@ -354,7 +315,7 @@ func TestLostResponses(t *testing.T) {
 		if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); err != nil || !fired.Load() {
 			t.Fatalf("fired=%v err=%v", fired.Load(), err)
 		}
-		e.Local.SetHook(nil)
+		e.Blob.SetHook(nil)
 		sh.Close(ctx)
 	})
 
@@ -383,10 +344,10 @@ func TestLostResponses(t *testing.T) {
 			}
 		}
 		fired := lose(e, blob.OpDelete, "shards/")
-		if err := h.Merge(ctx, shardfile.Hooks{}); err != nil || !fired.Load() {
+		if _, err := h.Rebase(ctx, sh, shardfile.Hooks{}); err != nil || !fired.Load() {
 			t.Fatalf("fired=%v err=%v", fired.Load(), err)
 		}
-		e.Local.SetHook(nil)
+		e.Blob.SetHook(nil)
 		n := 0
 		for range e.Store.List(ctx, "shards/"+shard+"/") {
 			n++
@@ -396,4 +357,80 @@ func TestLostResponses(t *testing.T) {
 		}
 		sh.Close(ctx)
 	})
+}
+
+// A manifest update that lands while every answer, and every read-back, is lost
+// leaves the caller not knowing. The handle must not keep the old version: the
+// next delta, rebase or release would fail with a conflict for good (a 412 at
+// shutdown, with the shard kept).
+func TestManifestUpdateWithAnUnknownOutcomeDoesNotLeaveAStaleHandle(t *testing.T) {
+	t.Parallel()
+	e := harness.New(t, 10*time.Millisecond)
+	ctx := context.Background()
+	app := e.StartApp(shard)
+	h, sh := e.NewShard(shard)
+	write(t, e, app, func() error { return sh.Sync(ctx) }, 0)
+	var down atomic.Bool
+	down.Store(true)
+	e.Blob.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
+		if down.Load() && strings.HasPrefix(key, "manifests/") {
+			if op == blob.OpUpdate && after {
+				return errors.New("response lost") // it happened
+			}
+			if op == blob.OpHead || op == blob.OpGet {
+				return errors.New("storage slow") // and nothing can be read back
+			}
+		}
+		return nil
+	})
+	if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); err == nil {
+		t.Fatal("want an error: the outcome was unknown")
+	}
+	down.Store(false)
+	// Storage is back. The delta is in the manifest, whatever the first call said.
+	if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); err != nil {
+		t.Fatalf("the next delta: %v", err)
+	}
+	if err := h.ReleaseOwnership(ctx); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if got := restoreDump(t, e, "unknown"); got == "" {
+		t.Fatal("nothing restored")
+	}
+	sh.Close(ctx)
+}
+
+// The same when the caller's context ends during the update, as at shutdown: the
+// write lands, and the next call (with a live context) must still work.
+func TestManifestUpdateCancelledAfterLandingDoesNotLeaveAStaleHandle(t *testing.T) {
+	t.Parallel()
+	e := harness.New(t, 10*time.Millisecond)
+	app := e.StartApp(shard)
+	h, sh := e.NewShard(shard)
+	write(t, e, app, func() error { return sh.Sync(context.Background()) }, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	e.Blob.SetHook(func(c context.Context, op blob.Op, key string, after bool) error {
+		if op == blob.OpUpdate && after && strings.HasPrefix(key, "manifests/") {
+			cancel() // the update has happened; the caller is told to stop
+			return context.Canceled
+		}
+		if ctx.Err() != nil && (op == blob.OpHead || op == blob.OpGet) {
+			return ctx.Err() // and can't look
+		}
+		return nil
+	})
+	// blob.Store reads back on a context of its own, so the landed write is
+	// reported as the success it is (an error would be fine too: the next call
+	// must work either way).
+	if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	e.Blob.SetHook(nil)
+	if err := h.WriteDelta(context.Background(), sh, shardfile.Hooks{}); err != nil {
+		t.Fatalf("the next delta: %v", err)
+	}
+	if err := h.ReleaseOwnership(context.Background()); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	sh.Close(context.Background())
 }

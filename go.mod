@@ -12,6 +12,7 @@ require (
 	github.com/superfly/ltx v0.5.2
 	golang.org/x/sync v0.22.0
 	golang.org/x/sys v0.47.0
+	pgregory.net/rapid v1.2.0
 )
 
 require (

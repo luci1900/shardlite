@@ -16,17 +16,20 @@ import (
 	"github.com/luci1900/shardlite/internal/coord"
 )
 
-// Manifest is the per-shard record in blob storage (see design.md,
+// Manifest is the per-shard record in blob storage (see docs/internals.md,
 // Manifest). Last owner and pin come with the cluster and pinning.
 type Manifest struct {
 	Generation string   `json:"generation"` // random, set at creation, part of the shard's object paths
 	Owner      string   `json:"owner"`      // the node allowed to write the shard, "" if released
 	NodeEpoch  uint64   `json:"node_epoch"` // the owner's lease epoch when it claimed the shard
 	Files      []string `json:"files"`      // base and deltas, "min-max.epoch" (min-max in the shard's own positions), in order
-	Journal    string   `json:"journal"`    // the node journal holding commits after the last file, "" if there are none
-	// Ephemeral marks a shard of an ephemeral kind: nothing of it is shipped, so
-	// it never has files or a journal.
-	Ephemeral bool `json:"ephemeral,omitempty"`
+	// (Manifests written before stage 1.2 may have a "base_at"; it is ignored.)
+	Journal string `json:"journal"` // the node journal holding commits after the last file, "" if there are none
+	// AutoDelete is set at creation if the shard's kind had auto_delete then, and
+	// never changes. The node deletes the shard at deactivation only if both the
+	// kind and the manifest have it, so marking a kind auto_delete can't delete
+	// shards written before.
+	AutoDelete bool `json:"auto_delete,omitempty"`
 }
 
 // Range is a range of the shard's own positions covered by one LTX file.
@@ -168,8 +171,21 @@ type Files struct {
 	Node      string        // the node whose journal new shards write to
 	Manifests ManifestStore // over Blob if nil
 	Leases    coord.NodeRegistry
+	// TempDir is where files are built and downloaded that are too large to hold
+	// in memory (deltas, snapshots, the files of a restore). It is in the data
+	// directory, never the scratch directory, which is tmpfs and so memory too.
+	TempDir string
+	// SpoolLimit is how large a delta gets before it is built in a temporary file,
+	// DefaultSpoolLimit if zero.
+	SpoolLimit int
+	once       sync.Once
+}
 
-	once sync.Once
+func (f *Files) spoolLimit() int {
+	if f.SpoolLimit > 0 {
+		return f.SpoolLimit
+	}
+	return DefaultSpoolLimit
 }
 
 func (f *Files) manifests() ManifestStore {
@@ -204,6 +220,11 @@ type Handle struct {
 	ETag     blob.ETag
 
 	writes map[string]blob.WriteID // write ids of files put but not yet adopted by the manifest, by key
+
+	// unknown is the manifest of an update whose outcome was not learned (every
+	// answer was lost and it couldn't be read back). The handle's version may be
+	// behind the stored one until settle has looked.
+	unknown *Manifest
 }
 
 // Open loads a shard's manifest, creating it with a new generation if the
@@ -215,7 +236,7 @@ func (f *Files) Open(ctx context.Context, shard string) (h *Handle, created bool
 	} else if !errors.Is(err, blob.ErrNotFound) {
 		return nil, false, err
 	}
-	return f.Create(ctx, shard)
+	return f.Create(ctx, shard, false)
 }
 
 // Attach loads the handle of a shard that must already have a manifest
@@ -234,19 +255,10 @@ func (f *Files) HandleFor(shard string, m *Manifest, etag blob.ETag) *Handle {
 }
 
 // Create creates a shard's manifest, owned by this node, for a caller that has
-// just found none. created is false if somebody else created it first: the
-// handle is then theirs, to claim like any other shard.
-func (f *Files) Create(ctx context.Context, shard string) (h *Handle, created bool, err error) {
-	return f.CreateAs(ctx, shard, false)
-}
-
-// CreateAs is Create for a shard of an ephemeral kind if ephemeral is set: its
-// manifest says so and names no journal.
-func (f *Files) CreateAs(ctx context.Context, shard string, ephemeral bool) (h *Handle, created bool, err error) {
-	m := &Manifest{Generation: NewGeneration(), Owner: f.Node, NodeEpoch: f.Blob.Epoch(), Files: []string{}, Journal: f.Node, Ephemeral: ephemeral}
-	if ephemeral {
-		m.Journal = ""
-	}
+// just found none. autoDelete records that the shard's kind has auto_delete. created is false if somebody
+// else created it first: the handle is then theirs, to claim like any other shard.
+func (f *Files) Create(ctx context.Context, shard string, autoDelete bool) (h *Handle, created bool, err error) {
+	m := &Manifest{Generation: NewGeneration(), Owner: f.Node, NodeEpoch: f.Blob.Epoch(), Files: []string{}, Journal: f.Node, AutoDelete: autoDelete}
 	etag, err := f.manifests().Put(ctx, shard, m, nil)
 	if err == nil {
 		return &Handle{F: f, Name: shard, Manifest: m, ETag: etag}, true, nil
@@ -259,7 +271,7 @@ func (f *Files) CreateAs(ctx context.Context, shard string, ephemeral bool) (h *
 	cur, v, gerr := f.manifests().Get(ctx, shard)
 	if gerr != nil {
 		if errors.Is(gerr, blob.ErrNotFound) {
-			return f.CreateAs(ctx, shard, ephemeral)
+			return f.Create(ctx, shard, autoDelete)
 		}
 		return nil, false, gerr
 	}
@@ -268,13 +280,47 @@ func (f *Files) CreateAs(ctx context.Context, shard string, ephemeral bool) (h *
 
 // update writes next with compare-and-swap and adopts it. A conflict is
 // somebody else's change: blob.Store has already ruled out an earlier attempt
-// of this writer whose response was lost.
-func (h *Handle) update(ctx context.Context, next *Manifest) error {
+// of this writer whose response was lost. op names the operation for errors.
+//
+// If the outcome stays unknown (blob.ErrUnknown: every answer lost and the
+// read-back too), the write may have landed: the handle looks again at once, and if that fails too
+// it looks before its next operation (settle), so it never keeps writing from a
+// version that is gone, which would conflict for good.
+func (h *Handle) update(ctx context.Context, op string, next *Manifest) error {
 	etag, err := h.F.manifests().Put(ctx, h.Name, next, &h.ETag)
+	if err != nil {
+		if errors.Is(err, blob.ErrUnknown) {
+			// blob.Store has already tried to settle this on a context of its own, so
+			// this is an outcome nobody could learn.
+			h.unknown = next
+			if h.settle(ctx) == nil && h.Manifest == next {
+				return nil // it landed
+			}
+		}
+		return fmt.Errorf("%s of %s: %w", op, ManifestKey(h.Name), err)
+	}
+	h.Manifest, h.ETag = next, etag
+	return nil
+}
+
+// settle finds out what became of an update whose outcome was unknown: if the
+// stored manifest is the one that was written, the handle adopts it. If it is
+// anything else the handle keeps its version, and a conflict on the next write
+// is somebody else's change. It reads nothing if there is nothing unknown.
+func (h *Handle) settle(ctx context.Context) error {
+	if h.unknown == nil {
+		return nil
+	}
+	cur, etag, err := h.F.manifests().Get(ctx, h.Name)
 	if err != nil {
 		return err
 	}
-	h.Manifest, h.ETag = next, etag
+	want, _ := json.Marshal(h.unknown)
+	got, _ := json.Marshal(cur)
+	if bytes.Equal(want, got) {
+		h.Manifest, h.ETag = h.unknown, etag
+	}
+	h.unknown = nil
 	return nil
 }
 
@@ -289,12 +335,10 @@ var ErrOwnedElsewhere = errors.New("shardfile: shard is owned by another node")
 // Adopting a journal clears the manifest's journal for every shard it wrote a delta
 // for, so a node that resumes such a shard must claim it before the shard's
 // first new commit reaches the journal: restore finds the tail through the manifest.
-func (h *Handle) Claim(ctx context.Context) error { return h.ClaimAs(ctx, false) }
-
-// ClaimAs is Claim for a shard of a kind that is ephemeral or not as given: the
-// manifest is brought into line with it. An ephemeral shard names no journal.
-// (The caller has checked that an ephemeral shard has no data to stop shipping.)
-func (h *Handle) ClaimAs(ctx context.Context, ephemeral bool) error {
+func (h *Handle) Claim(ctx context.Context) error {
+	if err := h.settle(ctx); err != nil {
+		return err
+	}
 	m := h.Manifest
 	if m.Owner != "" && m.Owner != h.F.Node && h.F.Leases != nil {
 		l, err := h.F.Leases.Get(ctx, m.Owner)
@@ -306,29 +350,32 @@ func (h *Handle) ClaimAs(ctx context.Context, ephemeral bool) error {
 		}
 	}
 	next := m.clone()
-	next.Owner, next.NodeEpoch, next.Journal, next.Ephemeral = h.F.Node, h.F.Blob.Epoch(), h.F.Node, ephemeral
-	if ephemeral {
-		next.Journal = ""
-	}
-	if next.Owner == m.Owner && next.NodeEpoch == m.NodeEpoch && next.Journal == m.Journal && next.Ephemeral == m.Ephemeral {
+	next.Owner, next.NodeEpoch, next.Journal = h.F.Node, h.F.Blob.Epoch(), h.F.Node
+	if next.Owner == m.Owner && next.NodeEpoch == m.NodeEpoch && next.Journal == m.Journal {
 		return nil
 	}
-	return h.update(ctx, next)
+	return h.update(ctx, "claim", next)
 }
 
 // ReleaseOwnership gives the shard up: no owner and no journal. The caller has
 // written a delta for the whole tail first, so nothing is left in any journal, and
 // the next node to activate the shard claims it like any unowned shard.
 func (h *Handle) ReleaseOwnership(ctx context.Context) error {
+	if err := h.settle(ctx); err != nil {
+		return err
+	}
 	next := h.Manifest.clone()
 	next.Owner, next.NodeEpoch, next.Journal = "", 0, ""
-	return h.update(ctx, next)
+	return h.update(ctx, "release", next)
 }
 
 // Delete removes the shard's manifest by conditional delete at the version the
 // handle holds (blob.ErrConflict if somebody else changed it). It is how a shard
-// that was never written, or is ephemeral, is dropped at deactivation.
+// that was never written is dropped at deactivation.
 func (h *Handle) Delete(ctx context.Context) error {
+	if err := h.settle(ctx); err != nil {
+		return err
+	}
 	return h.F.manifests().Delete(ctx, h.Name, h.ETag)
 }
 
@@ -346,10 +393,18 @@ func (f *Files) DeleteShard(ctx context.Context, shard string) error {
 	} else if err != nil {
 		return err
 	}
+	return h.DeleteShard(ctx)
+}
+
+// DeleteShard is Files.DeleteShard for a shard the caller holds a handle on: the
+// manifest is deleted at the handle's version, so a change by anybody else
+// (blob.ErrConflict) leaves everything as it is.
+func (h *Handle) DeleteShard(ctx context.Context) error {
+	f := h.F
 	if err := h.Delete(ctx); err != nil && !errors.Is(err, blob.ErrNotFound) {
 		return err
 	}
-	prefix := fmt.Sprintf("shards/%s/%s/", shard, h.Manifest.Generation)
+	prefix := fmt.Sprintf("shards/%s/%s/", h.Name, h.Manifest.Generation)
 	var keys []string
 	for info, err := range f.Blob.List(ctx, prefix) {
 		if err != nil {

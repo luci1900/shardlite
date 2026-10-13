@@ -89,6 +89,7 @@ func (r *srig) calleeReadingBody(caller string, seen chan<- seenChunk, started c
 }
 
 func TestGateOnStreamingCallBody(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, ctype string
 		h2          bool
@@ -162,6 +163,7 @@ func TestGateOnStreamingCallBody(t *testing.T) {
 // What a calling shard sends over an upgraded connection is gated on the caller
 // for as long as the connection lasts.
 func TestGateOnUpgradedCall(t *testing.T) {
+	t.Parallel()
 	r := newSRigWith(t, manualFlush)
 	seen := make(chan seenChunk, 16)
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
@@ -248,6 +250,7 @@ func TestGateOnUpgradedCall(t *testing.T) {
 // caller that isn't active here and a call from the app are not held, however
 // much they send. The flush counter is what shows it.
 func TestCallsThatAreNotGated(t *testing.T) {
+	t.Parallel()
 	r := newSRigWith(t, manualFlush)
 	var calls atomic.Int64
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
@@ -268,8 +271,7 @@ func TestCallsThatAreNotGated(t *testing.T) {
 		pr, pw := io.Pipe()
 		go func() {
 			for range 3 {
-				pw.Write([]byte("chunk"))
-				time.Sleep(5 * time.Millisecond)
+				pw.Write([]byte("chunk")) // returns once the node has read it
 			}
 			pw.Close()
 		}()
@@ -306,7 +308,9 @@ func TestCallsThatAreNotGated(t *testing.T) {
 // The calling shard stays active for as long as a streaming call lasts, even
 // past its idle timeout, and can deactivate once the call ends.
 func TestCallerStaysActiveForTheCall(t *testing.T) {
-	r := newSRig(t) // wallet's idle timeout is 300 ms
+	t.Parallel()
+	clk := newFakeClock()
+	r := newSRigWith(t, withClock(clk)) // wallet's idle timeout is 300 ms
 	seen := make(chan seenChunk, 16)
 	started := make(chan struct{})
 	r.calleeReadingBody("wallet/ia1", seen, started)
@@ -327,7 +331,11 @@ func TestCallerStaysActiveForTheCall(t *testing.T) {
 		done <- err
 	}()
 	<-started
-	time.Sleep(1200 * time.Millisecond) // four idle timeouts, janitor every 20 ms
+	for range 4 { // four idle timeouts, with a janitor pass in each
+		passes := r.m.Stats.Janitor.Load()
+		clk.Advance(300 * time.Millisecond)
+		eventually(t, "a janitor pass", func() bool { return r.m.Stats.Janitor.Load() > passes })
+	}
 	if !r.m.IsActive("wallet/ia1") {
 		t.Fatal("the caller was deactivated during its streaming call")
 	}
@@ -339,45 +347,46 @@ func TestCallerStaysActiveForTheCall(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, "the caller to deactivate once the call ended", r.inactive("wallet/ia1"))
+	advanceUntil(t, clk, 100*time.Millisecond, "the caller to deactivate once the call ended", r.inactive("wallet/ia1"))
 }
 
-// --- depth and deadlines ---
+// --- hops and deadlines ---
 
-// A client's own Shardlite-Depth and Shardlite-Deadline never reach the app, and
+// A client's own Shardlite-Hops and Shardlite-Deadline never reach the app, and
 // neither header gets out in a response.
-func TestDepthAndDeadlineAreTheNodes(t *testing.T) {
+func TestHopsAndDeadlineAreTheNodes(t *testing.T) {
+	t.Parallel()
 	r := newSRig(t)
 	var last atomic.Pointer[http.Request]
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		last.Store(q.Clone(context.Background()))
-		w.Header().Set("Shardlite-Depth", "9")
+		w.Header().Set("Shardlite-Hops", "9")
 		w.Header().Set("Shardlite-Deadline", "9")
 	})
-	resp, _ := r.req("GET", r.pub, "/x", map[string]string{"Shardlite-Target": "slow/dd1", "Shardlite-Depth": "20", "Shardlite-Deadline": "1"}, "")
+	resp, _ := r.req("GET", r.pub, "/x", map[string]string{"Shardlite-Target": "slow/dd1", "Shardlite-Hops": "20", "Shardlite-Deadline": "1"}, "")
 	q := last.Load()
-	if resp.StatusCode != 200 || q.Header.Get("Shardlite-Depth") != "0" || q.Header.Get("Shardlite-Deadline") != "" {
-		t.Fatalf("a client request reached the app with depth %q and deadline %q", q.Header.Get("Shardlite-Depth"), q.Header.Get("Shardlite-Deadline"))
+	if resp.StatusCode != 200 || q.Header.Get("Shardlite-Hops") != "0" || q.Header.Get("Shardlite-Deadline") != "" {
+		t.Fatalf("a client request reached the app with hops %q and deadline %q", q.Header.Get("Shardlite-Hops"), q.Header.Get("Shardlite-Deadline"))
 	}
-	if resp.Header.Get("Shardlite-Depth") != "" || resp.Header.Get("Shardlite-Deadline") != "" {
+	if resp.Header.Get("Shardlite-Hops") != "" || resp.Header.Get("Shardlite-Deadline") != "" {
 		t.Fatalf("the app's headers got out: %v", resp.Header)
 	}
-	// A shardless request is sent with depth 0 too.
-	r.req("GET", r.pub, "/news", map[string]string{"Shardlite-Depth": "20"}, "")
-	if q := last.Load(); q.Header.Get("Shardlite-Depth") != "0" || q.Header.Get("Shardlite-Deadline") != "" {
+	// A shardless request is sent with hops 0 too.
+	r.req("GET", r.pub, "/news", map[string]string{"Shardlite-Hops": "20"}, "")
+	if q := last.Load(); q.Header.Get("Shardlite-Hops") != "0" || q.Header.Get("Shardlite-Deadline") != "" {
 		t.Fatalf("shardless: %v", q.Header)
 	}
 	// A call is one deeper than the call it says it is serving, and starts at 0 when it says nothing.
-	r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "slow/dd1", "Shardlite-Depth": "4"}, "")
-	if d := last.Load().Header.Get("Shardlite-Depth"); d != "5" {
-		t.Fatalf("depth of a call from depth 4: %q", d)
+	r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "slow/dd1", "Shardlite-Hops": "4"}, "")
+	if d := last.Load().Header.Get("Shardlite-Hops"); d != "5" {
+		t.Fatalf("hops of a call from hops 4: %q", d)
 	}
 	r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "slow/dd1"}, "")
-	if d := last.Load().Header.Get("Shardlite-Depth"); d != "0" {
-		t.Fatalf("depth of a call with none: %q", d)
+	if d := last.Load().Header.Get("Shardlite-Hops"); d != "0" {
+		t.Fatalf("hops of a call with none: %q", d)
 	}
-	if resp, _ := r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "slow/dd1", "Shardlite-Depth": "x"}, ""); resp.StatusCode != 400 {
-		t.Fatalf("bad depth: %d", resp.StatusCode)
+	if resp, _ := r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "slow/dd1", "Shardlite-Hops": "x"}, ""); resp.StatusCode != 400 {
+		t.Fatalf("bad hops: %d", resp.StatusCode)
 	}
 	if resp, _ := r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "slow/dd1", "Shardlite-Deadline": "soon"}, ""); resp.StatusCode != 400 {
 		t.Fatalf("bad deadline: %d", resp.StatusCode)
@@ -390,7 +399,8 @@ func TestDepthAndDeadlineAreTheNodes(t *testing.T) {
 }
 
 // Shards calling each other in a loop stop at the limit with 508, and the node logs it.
-func TestCallLoopStopsAtTheDepthLimit(t *testing.T) {
+func TestCallLoopStopsAtTheHopLimit(t *testing.T) {
+	t.Parallel()
 	r := newSRig(t)
 	var logs bytes.Buffer
 	var lmu sync.Mutex
@@ -404,7 +414,7 @@ func TestCallLoopStopsAtTheDepthLimit(t *testing.T) {
 			return
 		}
 		invocations.Add(1)
-		d, _ := strconv.Atoi(q.Header.Get("Shardlite-Depth"))
+		d, _ := strconv.Atoi(q.Header.Get("Shardlite-Hops"))
 		maxSeen.Store(max(maxSeen.Load(), int64(d)))
 		self := q.Header.Get("Shardlite-Target")
 		other := map[string]string{"slow/la": "slow/lb", "slow/lb": "slow/la"}[self]
@@ -420,7 +430,7 @@ func TestCallLoopStopsAtTheDepthLimit(t *testing.T) {
 		c.Header.Set("Shardlite-Target", other)
 		c.Header.Set("Shardlite-Caller", self)
 		if pass.Load() {
-			c.Header.Set("Shardlite-Depth", q.Header.Get("Shardlite-Depth"))
+			c.Header.Set("Shardlite-Hops", q.Header.Get("Shardlite-Hops"))
 		}
 		resp, err := r.client.Do(c)
 		if err != nil {
@@ -434,18 +444,18 @@ func TestCallLoopStopsAtTheDepthLimit(t *testing.T) {
 	if resp.StatusCode != 508 {
 		t.Fatalf("a call loop ended with %d, want 508", resp.StatusCode)
 	}
-	// Depths 0 (the client's request) to 32 ran; the call at 33 was refused.
-	if invocations.Load() != DefaultMaxCallDepth+1 || maxSeen.Load() != DefaultMaxCallDepth {
+	// Hops 0 (the client's request) to 32 ran; the call at 33 was refused.
+	if invocations.Load() != DefaultMaxHops+1 || maxSeen.Load() != DefaultMaxHops {
 		t.Fatalf("the app ran %d times, deepest %d", invocations.Load(), maxSeen.Load())
 	}
 	lmu.Lock()
 	logged := logs.String()
 	lmu.Unlock()
-	if !strings.Contains(logged, "nested too deep") || !strings.Contains(logged, "target=slow/") || !strings.Contains(logged, "caller=slow/") {
+	if !strings.Contains(logged, "chained too far") || !strings.Contains(logged, "target=slow/") || !strings.Contains(logged, "caller=slow/") {
 		t.Fatalf("the refusal was not logged with the caller and target:\n%s", logged)
 	}
 	// gRPC callers get RESOURCE_EXHAUSTED.
-	g, _ := r.req("POST", r.ctl, "/svc/M", map[string]string{"Shardlite-Target": "slow/la", "Shardlite-Depth": strconv.Itoa(DefaultMaxCallDepth), "Content-Type": "application/grpc"}, "")
+	g, _ := r.req("POST", r.ctl, "/svc/M", map[string]string{"Shardlite-Target": "slow/la", "Shardlite-Hops": strconv.Itoa(DefaultMaxHops), "Content-Type": "application/grpc"}, "")
 	if g.Header.Get("Grpc-Status") != "8" {
 		t.Fatalf("gRPC: %v", g.Header)
 	}
@@ -505,6 +515,7 @@ func (r *srig) slowJournal(d time.Duration) {
 // test doesn't depend on how fast the machine is: the shard is active before the
 // call, so the deadline can't run out during activation.
 func TestDeadlineStopsAHeldGate(t *testing.T) {
+	t.Parallel()
 	r := newSRig(t)
 	ref, err := r.m.Acquire(context.Background(), "wallet/dl1")
 	if err != nil {
@@ -545,6 +556,7 @@ func TestDeadlineStopsAHeldGate(t *testing.T) {
 // grpc-timeout on a gRPC client request becomes Shardlite-Deadline for the app
 // (and the app's grpc-timeout is the time left).
 func TestGRPCTimeoutBecomesTheDeadline(t *testing.T) {
+	t.Parallel()
 	r := newSRig(t)
 	var dl, gt atomic.Value
 	r.app_(func(w http.ResponseWriter, q *http.Request) {

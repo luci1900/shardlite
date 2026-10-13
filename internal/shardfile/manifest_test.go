@@ -5,9 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/coord"
@@ -16,6 +17,7 @@ import (
 )
 
 func TestManifestStoreCompareAndSwap(t *testing.T) {
+	t.Parallel()
 	e, ctx := harness.New(t, time.Hour), context.Background()
 	ms := shardfile.NewManifestStore(e.Store)
 	m := &shardfile.Manifest{Generation: "g", Owner: "n1", NodeEpoch: 1, Files: []string{}, Journal: "n1"}
@@ -56,6 +58,7 @@ func TestManifestStoreCompareAndSwap(t *testing.T) {
 }
 
 func TestClaim(t *testing.T) {
+	t.Parallel()
 	e, ctx := harness.New(t, time.Hour), context.Background()
 	h, created, err := e.Files.Open(ctx, "users/1")
 	if err != nil || !created {
@@ -71,12 +74,12 @@ func TestClaim(t *testing.T) {
 	}
 
 	// Another node's shard, while its lease is valid, isn't claimed.
-	other := coord.NewRegistry(e.Local, "n2", coord.RegistryOptions{})
+	other := coord.NewRegistry(e.Blob, "n2", coord.RegistryOptions{})
 	l2, err := other.Acquire(ctx, coord.NodeInfo{Name: "n2"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	n2files := &shardfile.Files{Blob: blob.NewStore(e.Local, "n2", l2.Epoch, blob.Options{}), Node: "n2", Leases: other}
+	n2files := &shardfile.Files{Blob: blob.NewStore(e.Blob, "n2", l2.Epoch, blob.Options{}), Node: "n2", Leases: other, TempDir: t.TempDir()}
 	h2, _, err := n2files.Open(ctx, "users/2")
 	if err != nil {
 		t.Fatal(err)
@@ -103,13 +106,14 @@ func TestClaim(t *testing.T) {
 // Creators on two nodes racing to create one shard end with exactly one winner:
 // everybody agrees on the winner's generation, and only the winner created it.
 func TestCreatorsRacing(t *testing.T) {
+	t.Parallel()
 	e, ctx := harness.New(t, time.Hour), context.Background()
-	other := coord.NewRegistry(e.Local, "n2", coord.RegistryOptions{})
+	other := coord.NewRegistry(e.Blob, "n2", coord.RegistryOptions{})
 	l2, err := other.Acquire(ctx, coord.NodeInfo{Name: "n2"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	n2 := &shardfile.Files{Blob: blob.NewStore(e.Local, "n2", l2.Epoch, blob.Options{}), Node: "n2", Leases: other}
+	n2 := &shardfile.Files{Blob: blob.NewStore(e.Blob, "n2", l2.Epoch, blob.Options{}), Node: "n2", Leases: other, TempDir: t.TempDir()}
 
 	for round := range 20 {
 		shard := fmt.Sprintf("users/race%d", round)
@@ -118,19 +122,18 @@ func TestCreatorsRacing(t *testing.T) {
 			created bool
 			err     error
 		}
-		var wg sync.WaitGroup
+		var wg errgroup.Group
 		results := make([]result, 6)
 		for i := range results {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() error {
 				f := e.Files
 				if i%2 == 1 {
 					f = n2
 				}
-				h, created, err := f.Create(ctx, shard)
+				h, created, err := f.Create(ctx, shard, false)
 				results[i] = result{h, created, err}
-			}()
+				return nil
+			})
 		}
 		wg.Wait()
 		winners := 0
@@ -163,6 +166,7 @@ func TestCreatorsRacing(t *testing.T) {
 // generation's files. A delete with a stale version is a conflict that changes
 // nothing, and deleting a shard with no manifest is done.
 func TestDeleteShard(t *testing.T) {
+	t.Parallel()
 	e, ctx := harness.New(t, time.Hour), context.Background()
 	h, _, err := e.Files.Open(ctx, "users/e1")
 	if err != nil {
