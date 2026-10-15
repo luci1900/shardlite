@@ -19,13 +19,15 @@ import (
 
 // slowFlush makes the flush interval long enough for a test to tell a request
 // that waited for a flush from one that did not.
-func slowFlush(o *ManagerOptions) { o.Flush = 300 * time.Millisecond }
+func slowFlush(o *ShardsOptions) { o.Flush.Interval = 300 * time.Millisecond }
 
 // manualFlush stops the flush loop from ever ticking, so the test decides when
 // a cycle runs (r.cycle) and what a request waited for is read off the cycle
-// counter, not the clock. The janitor is off too: a deactivation waits for a
+// counter, not the clock. Idle shards stay active too: a deactivation waits for a
 // cycle, which only the test would run.
-func manualFlush(o *ManagerOptions) { o.Flush, o.Janitor, o.NoEarlyFlush = time.Hour, time.Hour, true }
+func manualFlush(o *ShardsOptions) {
+	o.Flush.Interval, o.Cache.Every, o.Flush.NoEarly, o.Lifecycle.NoIdle = time.Hour, time.Hour, true, true
+}
 
 func (r *srig) cycle() { r.m.flush.cycle(context.Background()) }
 

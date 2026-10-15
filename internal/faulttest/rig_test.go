@@ -22,7 +22,7 @@ import (
 	"strconv"
 	"testing"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
@@ -213,7 +213,7 @@ func (r *rig) readFiles() *shardfile.Files {
 
 func acksIn(t *testing.T, path string) map[int]bool {
 	t.Helper()
-	db, err := sql.Open("sqlite3", "file:"+path)
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
 	if err != nil {
 		t.Fatal(err)
 	}

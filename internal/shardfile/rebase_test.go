@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -37,7 +36,7 @@ func itoa(n int) string { return strconv.Itoa(n) }
 
 func acksOf(t *testing.T, path string) []int {
 	t.Helper()
-	db, err := sql.Open("sqlite3", "file:"+path)
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +69,7 @@ func upTo(n int) []int {
 // age for a base, only the file limit), and rebases once the limit is passed.
 func TestOneDeltaPerSnapshotUntilThereAreTooManyFiles(t *testing.T) {
 	t.Parallel()
-	e := harness.New(t, 10*time.Millisecond)
+	e := harness.New(t)
 	ctx := context.Background()
 	app := e.StartApp(shard)
 	h, sh := e.NewShard(shard)
@@ -108,58 +107,11 @@ func TestOneDeltaPerSnapshotUntilThereAreTooManyFiles(t *testing.T) {
 	}
 }
 
-// A manifest written before base_at was dropped still restores and rebases; the
-// field is ignored, and not written again.
-func TestManifestWithBaseAtStillWorks(t *testing.T) {
-	t.Parallel()
-	e := harness.New(t, 10*time.Millisecond)
-	ctx := context.Background()
-	app := e.StartApp(shard)
-	h, sh := e.NewShard(shard)
-	defer sh.Close(ctx)
-	for i := 1; i <= 4; i++ {
-		ack(t, app, sh, i)
-		if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	key := shardfile.ManifestKey(shard)
-	rc, info, err := e.Store.Get(ctx, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	raw, _ := io.ReadAll(rc)
-	rc.Close()
-	old := strings.Replace(string(raw), "{", `{"base_at": 1700000000000,`, 1)
-	if _, err := e.Store.Update(ctx, key, strings.NewReader(old), info); err != nil {
-		t.Fatal(err)
-	}
-	h2, err := e.Files.Attach(ctx, shard)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := acksOf(t, restoreTo(t, e, "r")); !slices.Equal(got, upTo(4)) {
-		t.Fatalf("restored acks %v", got)
-	}
-	if got, err := h2.MaybeSnapshot(ctx, sh, time.Hour, shardfile.Policy{MaxFiles: 3}, shardfile.Hooks{}); err != nil || got != shardfile.WroteRebase {
-		t.Fatalf("wrote %v, err=%v", got, err)
-	}
-	rc, _, err = e.Store.Get(ctx, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	raw, _ = io.ReadAll(rc)
-	rc.Close()
-	if strings.Contains(string(raw), "base_at") {
-		t.Fatalf("the manifest still says base_at: %s", raw)
-	}
-}
-
 // The tail passing the size makes a delta due before it is old; a small, young
 // tail makes none.
 func TestMaybeSnapshotBySize(t *testing.T) {
 	t.Parallel()
-	e := harness.New(t, 10*time.Millisecond)
+	e := harness.New(t)
 	ctx := context.Background()
 	app := e.StartApp(shard)
 	h, sh := e.NewShard(shard)
@@ -184,7 +136,7 @@ func TestMaybeSnapshotBySize(t *testing.T) {
 // than MaxFiles files.
 func TestRebaseWhenThereAreManyFiles(t *testing.T) {
 	t.Parallel()
-	e := harness.New(t, 10*time.Millisecond)
+	e := harness.New(t)
 	ctx := context.Background()
 	app := e.StartApp(shard)
 	h, sh := e.NewShard(shard)
@@ -221,7 +173,7 @@ func TestRebaseWhenThereAreManyFiles(t *testing.T) {
 // rebased to one file, which is what merging did.
 func TestRebaseWithoutATail(t *testing.T) {
 	t.Parallel()
-	e := harness.New(t, 10*time.Millisecond)
+	e := harness.New(t)
 	ctx := context.Background()
 	app := e.StartApp(shard)
 	h, sh := e.NewShard(shard)
@@ -250,7 +202,7 @@ func TestRebaseWithoutATail(t *testing.T) {
 // after. The tail applies on top.
 func TestRebaseOfAnActiveShardWhileTheAppWrites(t *testing.T) {
 	t.Parallel()
-	e := harness.New(t, 10*time.Millisecond)
+	e := harness.New(t)
 	ctx := context.Background()
 	app := e.StartApp(shard)
 	app.Must(t, "insert", "a", "20000", "1000") // about 20 MB, so reading the snapshot takes a while
@@ -371,7 +323,7 @@ func TestRebaseOfAnActiveShardWhileTheAppWrites(t *testing.T) {
 // files in use and the new base unreferenced.
 func TestCrashBetweenBaseAndManifest(t *testing.T) {
 	t.Parallel()
-	e := harness.New(t, 10*time.Millisecond)
+	e := harness.New(t)
 	ctx := context.Background()
 	app := e.StartApp(shard)
 	h, sh := e.NewShard(shard)
@@ -447,7 +399,7 @@ func countFiles(t *testing.T, e *harness.Env) int {
 // does), which are gone once the operation is done.
 func TestLargeFilesGoThroughTemporaryFiles(t *testing.T) {
 	t.Parallel()
-	e := harness.New(t, 10*time.Millisecond)
+	e := harness.New(t)
 	ctx := context.Background()
 	e.Files.SpoolLimit = 1
 	tmp := e.Files.TempDir
@@ -534,14 +486,5 @@ func TestLargeFilesGoThroughTemporaryFiles(t *testing.T) {
 	}
 	if n := leftInTemp(); n != 0 {
 		t.Fatalf("%d files left after a failed restore", n)
-	}
-
-	// What a crash left is cleared.
-	os.WriteFile(filepath.Join(tmp, "spool-leftover"), []byte("x"), 0o644)
-	if err := e.Files.ClearTemp(); err != nil {
-		t.Fatal(err)
-	}
-	if n := inTemp(); n != 0 {
-		t.Fatalf("%d files left after clearing", n)
 	}
 }

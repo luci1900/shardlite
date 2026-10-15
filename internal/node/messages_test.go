@@ -72,7 +72,7 @@ func (r *srig) journalEntries(shard string) (records, commits, segments int) {
 		r.t.Fatal(err)
 	}
 	seen := map[uint64]bool{}
-	err = segment.Scan(ctx, r.n.Store, r.n.Name, max(lowest, 1), func(seq uint64, e segment.Entry) error {
+	err = segment.Scan(ctx, r.n.Store, r.n.Name, max(lowest, 1), 0, func(seq uint64, e segment.Entry) error {
 		if e.Shard == shard {
 			records++
 			commits += int(e.Count)
@@ -110,32 +110,28 @@ func (r *srig) addMessage(sender, target, path, body string) {
 }
 
 // intakeHookFn wraps the intake of a row: call makes the real one.
-type intakeHookFn func(n int, sender *ActiveShard, target string, row *outRow, call func() (int, error)) (int, error)
+type intakeHookFn func(n int, sender *shard, target string, row *outRow, call func() (int, error)) (int, error)
+
+// intakeHook is an intakeHookFn and the number of intakes that reached it.
+type intakeHook struct {
+	fn intakeHookFn
+	n  atomic.Int64
+}
+
+// inboxHookFn wraps the delivery of an inbox row: call makes the real one.
+type inboxHookFn func(ctx context.Context, call func() (int, error)) (int, error)
 
 // hookIntake wraps the node's intake, for this server and the ones started
 // after a restart. It returns the number of intakes that reached the hook.
 func (r *srig) hookIntake(hook intakeHookFn) *atomic.Int64 {
-	r.hook, r.hookN = hook, new(atomic.Int64)
-	r.applyHook()
-	return r.hookN
-}
-
-func (r *srig) applyHook() {
-	if r.hook == nil {
-		return
-	}
-	tr := *r.baseTr
-	inner, hook, n := tr.intake, r.hook, r.hookN
-	tr.intake = func(ctx context.Context, sender *ActiveShard, target string, row *outRow) (int, error) {
-		i := int(n.Add(1))
-		return hook(i, sender, target, row, func() (int, error) { return inner(ctx, sender, target, row) })
-	}
-	r.m.msgs.setTransport(&tr)
+	h := &intakeHook{fn: hook}
+	r.hook.Store(h)
+	return &h.n
 }
 
 // intakeDownUntil has every intake fail with 503 until up is set, and counts them.
 func (r *srig) intakeDownUntil(up *atomic.Bool) *atomic.Int64 {
-	return r.hookIntake(func(_ int, _ *ActiveShard, _ string, _ *outRow, call func() (int, error)) (int, error) {
+	return r.hookIntake(func(_ int, _ *shard, _ string, _ *outRow, call func() (int, error)) (int, error) {
 		if !up.Load() {
 			return http.StatusServiceUnavailable, errors.New("the receiver's node is down")
 		}
@@ -147,19 +143,34 @@ func (r *srig) intakeDownUntil(up *atomic.Bool) *atomic.Int64 {
 // that is not due yet), which happens when the commit with the row is durable.
 func (r *srig) armed(target string) func() bool {
 	return func() bool {
-		r.m.mu.Lock()
-		a := r.m.active[target]
-		r.m.mu.Unlock()
-		if a == nil || a.msgs == nil {
+		e := r.m.tab.load(target)
+		if e == nil || e.sh == nil || !e.is(entryActive) {
 			return false
 		}
-		a.msgs.mu.Lock()
-		defer a.msgs.mu.Unlock()
-		return a.msgs.timer != nil
+		v, ok := ownerSays(e.sh, func(o *msgOwner) bool { return o.timer.armed() })
+		return ok && v
 	}
 }
 
-// lookedAt is true once the janitor has looked at the shard and found live
+// ownerSays asks the shard's messages owner q on its loop. ok is false if it has
+// ended.
+func ownerSays(a *shard, q func(o *msgOwner) bool) (v, ok bool) {
+	o := a.msgs.load()
+	if o == nil {
+		return false, false
+	}
+	v, err := do(context.Background(), o.ev, o.ended, func() bool { return q(o) })
+	return v, err == nil
+}
+
+// hintsSettled is true once the owner has made the reads it was asked for, none
+// of them is waiting for its cycle, and no hint work is running or waiting.
+func hintsSettled(o *msgOwner) bool {
+	h := &o.hints
+	return !h.busy && h.release == nil && !(h.tidy && h.read1) && !o.reads.now && len(o.reads.captured.C()) == 0 && len(o.reads.waits) == 0
+}
+
+// lookedAt is true once the idle timer has looked at the shard and found live
 // messages holding it (that sets the shard's next look).
 func (r *srig) lookedAt(target string) func() bool {
 	return func() bool { return !r.delay(target).IsZero() }
@@ -172,16 +183,13 @@ func (r *srig) settle(target string) {
 	r.t.Helper()
 	r.afterCycle()
 	r.afterCycle()
-	r.m.mu.Lock()
-	a := r.m.active[target]
-	r.m.mu.Unlock()
-	if a == nil || a.msgs == nil {
+	e := r.m.tab.load(target)
+	if e == nil || e.sh == nil || !e.is(entryActive) {
 		return
 	}
 	eventually(r.t, "the hints of "+target+" to be reconciled", func() bool {
-		a.msgs.mu.Lock()
-		defer a.msgs.mu.Unlock()
-		return !a.msgs.recRunning
+		v, ok := ownerSays(e.sh, hintsSettled)
+		return v || !ok
 	})
 }
 
@@ -202,12 +210,12 @@ func (r *srig) cyclesWhile(what string, cond func() bool) int {
 }
 
 // quick makes retries fast.
-func quick(o *ManagerOptions) {
-	o.MessageBackoff, o.MessageMaxBackoff = 20*time.Millisecond, 50*time.Millisecond
+func quick(o *ShardsOptions) {
+	o.Messages.Backoff, o.Messages.MaxBackoff = 20*time.Millisecond, 50*time.Millisecond
 }
 
-func both(fs ...func(*ManagerOptions)) func(*ManagerOptions) {
-	return func(o *ManagerOptions) {
+func both(fs ...func(*ShardsOptions)) func(*ShardsOptions) {
+	return func(o *ShardsOptions) {
 		for _, f := range fs {
 			f(o)
 		}
@@ -231,8 +239,8 @@ func (s *syncBuffer) String() string {
 	return s.b.String()
 }
 
-func logTo(buf *syncBuffer) func(*ManagerOptions) {
-	return func(o *ManagerOptions) { o.Logger = slog.New(slog.NewTextHandler(buf, nil)) }
+func logTo(buf *syncBuffer) func(*ShardsOptions) {
+	return func(o *ShardsOptions) { o.Logger = slog.New(slog.NewTextHandler(buf, nil)) }
 }
 
 // delivery is a request the fake app got for an inbox row.
@@ -453,13 +461,19 @@ func TestActivatingAShardWithTheTablesCommitsNothing(t *testing.T) {
 			r.closeInApp("users/t2")
 			eventually(t, "deactivation", func() bool { return r.cached("users/t2") })
 			if tc.purge {
-				row, ok, err := r.m.idx.get("users/t2")
+				row, ok, err := r.m.cache.idx.get("users/t2")
 				if err != nil || !ok {
 					t.Fatal(err)
 				}
-				if err := r.m.evict(context.Background(), row); err != nil {
-					t.Fatal(err)
-				}
+				// The entry of the shard's loop may still be in the table for a moment,
+				// and eviction leaves a shard with an entry alone.
+				eventually(t, "the eviction", func() bool {
+					evicted, err := r.m.cache.evict(context.Background(), row)
+					if err != nil {
+						t.Fatal(err)
+					}
+					return evicted
+				})
 				if _, err := os.Stat(path); err == nil {
 					t.Fatal("still cached")
 				}
@@ -471,19 +485,15 @@ func TestActivatingAShardWithTheTablesCommitsNothing(t *testing.T) {
 			journal := r.calls("create", "journal")
 			ref = r.acquire("users/t2")
 			defer ref.Release()
-			a := r.m.active["users/t2"]
-			sh := a.cap.Load()
+			sh := r.shard("users/t2").cap.load()
 			if got := sh.Position(); got != man.LastPosition() {
 				t.Fatalf("position %d after activating, the manifest ends at %d: the activation captured a commit", got, man.LastPosition())
 			}
-			before, err := sh.Header()
-			if err != nil {
+			before := header(t, sh)
+			if err := ensureMessages(context.Background(), sh); err != nil {
 				t.Fatal(err)
 			}
-			if err := r.m.ensureMessages(context.Background(), sh); err != nil {
-				t.Fatal(err)
-			}
-			if after, _ := sh.Header(); after != before {
+			if header(t, sh) != before {
 				t.Fatal("creating the tables again committed")
 			}
 			r.cycle()
@@ -560,7 +570,7 @@ func TestMessageGoesThroughTheInboxOnlyAfterEachCommitIsDurable(t *testing.T) {
 	})
 	var senderRowsAtIntake, receiverRowsAtAck, liveAtAck atomic.Int64
 	var seen atomic.Bool
-	intakes := r.hookIntake(func(_ int, sender *ActiveShard, target string, _ *outRow, call func() (int, error)) (int, error) {
+	intakes := r.hookIntake(func(_ int, sender *shard, target string, _ *outRow, call func() (int, error)) (int, error) {
 		senderRowsAtIntake.Store(int64(r.rows(sender.Name)))
 		status, err := call()
 		receiverRowsAtAck.Store(int64(r.durableInbox(target)))
@@ -629,10 +639,10 @@ func TestMessageOfALostCommitIsNeverSent(t *testing.T) {
 	r.sql("wallet/lost", `BEGIN; INSERT INTO kv (payload) VALUES (x'01'); INSERT INTO _shardlite_outbox (target, path) VALUES ('users/r1', '/in'); COMMIT;`)
 	r.closeInApp("wallet/lost")
 	r.crash()
-	r.n.Close(context.Background(), false)
+	r.stopJournal()
 
 	r.startNode()
-	r.startManager(manualFlush)
+	r.startShards(manualFlush)
 	r.startServer()
 	r.record(rec, "")
 	ref := r.acquire("wallet/lost")
@@ -655,7 +665,7 @@ func TestLostAcknowledgementOfTheIntakeDeliversTwice(t *testing.T) {
 	r := newSRigWith(t, quick)
 	rec := &recorder{}
 	r.record(rec, "")
-	r.hookIntake(func(n int, _ *ActiveShard, _ string, _ *outRow, call func() (int, error)) (int, error) {
+	r.hookIntake(func(n int, _ *shard, _ string, _ *outRow, call func() (int, error)) (int, error) {
 		status, err := call()
 		if n == 1 {
 			return 0, errors.New("the connection broke before the answer") // the intake is durable, the answer is lost
@@ -797,7 +807,7 @@ func TestBurstOfMessagesSharesFlushes(t *testing.T) {
 	r := newSRigWith(t, both(manualFlush, logTo(&logs)))
 	rec := &recorder{keep: true}
 	r.record(rec, "")
-	intakes := r.hookIntake(func(_ int, _ *ActiveShard, _ string, _ *outRow, call func() (int, error)) (int, error) {
+	intakes := r.hookIntake(func(_ int, _ *shard, _ string, _ *outRow, call func() (int, error)) (int, error) {
 		return call()
 	})
 	var stmt strings.Builder
@@ -815,7 +825,7 @@ func TestBurstOfMessagesSharesFlushes(t *testing.T) {
 	r.cycle()
 	cycles := 1
 	for acked := 0; acked < 50; {
-		wave := min(50, acked+r.m.opts.MessageReceiverLimit)
+		wave := min(50, acked+r.m.opts.Messages.ReceiverLimit)
 		eventually(t, "the next wave of intakes in the receiver's inbox", func() bool { return r.inboxRows("users/burst") >= wave })
 		cycles += r.cyclesWhile("the wave to be acknowledged", func() bool { return r.m.Stats.MessagesDelivered.Load() >= int64(wave) })
 		acked = wave
@@ -868,7 +878,7 @@ func TestConflictIsRetried(t *testing.T) {
 	r := newSRigWith(t, quick)
 	rec := &recorder{}
 	r.record(rec, "")
-	attempts := r.hookIntake(func(n int, _ *ActiveShard, _ string, _ *outRow, call func() (int, error)) (int, error) {
+	attempts := r.hookIntake(func(n int, _ *shard, _ string, _ *outRow, call func() (int, error)) (int, error) {
 		if n <= 2 {
 			return http.StatusConflict, errors.New("the receiver's node answered 409")
 		}
@@ -889,7 +899,7 @@ func TestBadRequestGivesUpOnlyThatRow(t *testing.T) {
 	r := newSRigWith(t, both(quick, logTo(&logs)))
 	rec := &recorder{}
 	r.record(rec, "")
-	r.hookIntake(func(_ int, _ *ActiveShard, _ string, row *outRow, call func() (int, error)) (int, error) {
+	r.hookIntake(func(_ int, _ *shard, _ string, row *outRow, call func() (int, error)) (int, error) {
 		if row.path == "/bad" {
 			return http.StatusBadRequest, errors.New("the receiver's node answered 400")
 		}
@@ -923,7 +933,7 @@ func TestGivingUpOnOutboxRows(t *testing.T) {
 	var bad atomic.Bool // the receiver's node answers 400 to /400 until this is cleared
 	bad.Store(true)
 	var attempts400 atomic.Int64
-	r.hookIntake(func(_ int, _ *ActiveShard, _ string, row *outRow, call func() (int, error)) (int, error) {
+	r.hookIntake(func(_ int, _ *shard, _ string, row *outRow, call func() (int, error)) (int, error) {
 		if row.path == "/400" && bad.Load() {
 			attempts400.Add(1)
 			return http.StatusBadRequest, &answerError{status: http.StatusBadRequest, body: "unknown reward"}
@@ -1041,9 +1051,9 @@ func TestShardWithLiveOutboxRowsStaysActive(t *testing.T) {
 	attempts := r.intakeDownUntil(&up)
 	r.addMessage("users/k1", "users/k2", "/x", "")
 	r.closeInApp("users/k1") // idle timeout is 300 ms
-	// Past the idle timeout, with the janitor having looked at the shard and the
+	// Past the idle timeout, with the idle timer having looked at the shard and the
 	// delivery retried (its backoff is on the clock too).
-	advanceUntil(t, clk, 100*time.Millisecond, "the janitor to keep the shard", r.lookedAt("users/k1"))
+	advanceUntil(t, clk, 100*time.Millisecond, "the idle timer to keep the shard", r.lookedAt("users/k1"))
 	advanceUntil(t, clk, 50*time.Millisecond, "a second attempt", func() bool { return attempts.Load() >= 2 })
 	if !r.m.IsActive("users/k1") {
 		t.Fatal("a shard with a live outbox row was deactivated")
@@ -1068,7 +1078,7 @@ func TestOutboxResumesAfterACrash(t *testing.T) {
 	eventually(t, "a first attempt (the commit is durable by then)", func() bool { return attempts.Load() >= 1 })
 	r.closeInApp("users/x1")
 	r.crash()
-	r.n.Close(context.Background(), false)
+	r.stopJournal()
 
 	r.startNode()
 	if r.n.Adopted.Deltas == 0 {
@@ -1078,7 +1088,7 @@ func TestOutboxResumesAfterACrash(t *testing.T) {
 	if keys := r.wakes(); len(keys) != 1 || !strings.HasSuffix(keys[0], "/users/x1") {
 		t.Fatalf("hints after adoption: %v", keys)
 	}
-	r.startManager(quick)
+	r.startShards(quick)
 	r.startServer()
 	up.Store(true)
 	eventually(t, "the message to be delivered after the restart, with nothing asking for the sender", func() bool { return rec.count() == 1 && rec.all()[0].body == "payload" })
@@ -1095,7 +1105,7 @@ func TestReplayedShardWithNothingToDeliverIsWokenAndLetGo(t *testing.T) {
 	r.sql("users/y1", `INSERT INTO kv (payload) VALUES (x'02')`) // only in the journal when the node dies
 	r.closeInApp("users/y1")
 	r.crash()
-	r.n.Close(context.Background(), false)
+	r.stopJournal()
 
 	r.startNode()
 	if r.n.Adopted.Deltas != 1 {
@@ -1104,7 +1114,7 @@ func TestReplayedShardWithNothingToDeliverIsWokenAndLetGo(t *testing.T) {
 	if keys := r.wakes(); len(keys) != 1 || !strings.HasSuffix(keys[0], "/users/y1") {
 		t.Fatalf("hints after adoption: %v", keys)
 	}
-	r.startManager(quick)
+	r.startShards(quick)
 	r.startServer()
 	eventually(t, "the hint to be used", func() bool { return len(r.wakes()) == 0 })
 	if r.m.Stats.Activations.Load() == 0 {
@@ -1126,7 +1136,7 @@ func TestFailedHintWriteDuringAdoptionIsRetried(t *testing.T) {
 	eventually(t, "a first attempt (the commit is durable by then)", func() bool { return attempts.Load() >= 1 })
 	r.closeInApp("users/z1")
 	r.crash()
-	r.n.Close(context.Background(), false)
+	r.stopJournal()
 
 	var failing atomic.Bool
 	failing.Store(true)
@@ -1138,8 +1148,7 @@ func TestFailedHintWriteDuringAdoptionIsRetried(t *testing.T) {
 		}
 		return nil
 	})
-	if n, err := r.tryStartNode(); err == nil {
-		n.Close(context.Background(), false)
+	if _, err := r.tryStartNode(); err == nil {
 		t.Fatal("the adoption finished without the hint")
 	}
 	if failures.Load() == 0 {
@@ -1150,7 +1159,7 @@ func TestFailedHintWriteDuringAdoptionIsRetried(t *testing.T) {
 	if keys := r.wakes(); len(keys) != 1 || !strings.HasSuffix(keys[0], "/users/z1") {
 		t.Fatalf("hints after the second adoption: %v", keys)
 	}
-	r.startManager(quick)
+	r.startShards(quick)
 	r.startServer()
 	up.Store(true)
 	eventually(t, "the message to be delivered", func() bool { return rec.count() == 1 && rec.all()[0].body == "payload" })
@@ -1171,7 +1180,7 @@ func TestCrashBetweenTheHintAndTheDeltaIsRepaired(t *testing.T) {
 	eventually(t, "a first attempt (the commit is durable by then)", func() bool { return attempts.Load() >= 1 })
 	r.closeInApp("users/q1")
 	r.crash()
-	r.n.Close(context.Background(), false)
+	r.stopJournal()
 
 	var failing atomic.Bool
 	failing.Store(true)
@@ -1181,8 +1190,7 @@ func TestCrashBetweenTheHintAndTheDeltaIsRepaired(t *testing.T) {
 		}
 		return nil
 	})
-	if n, err := r.tryStartNode(); err == nil {
-		n.Close(context.Background(), false)
+	if _, err := r.tryStartNode(); err == nil {
 		t.Fatal("the adoption finished without the delta")
 	}
 	if keys := r.wakes(); len(keys) != 1 || !strings.HasSuffix(keys[0], "/users/q1") {
@@ -1196,7 +1204,7 @@ func TestCrashBetweenTheHintAndTheDeltaIsRepaired(t *testing.T) {
 	if keys := r.wakes(); len(keys) != 1 {
 		t.Fatalf("hints after the second adoption: %v", keys)
 	}
-	r.startManager(quick)
+	r.startShards(quick)
 	r.startServer()
 	up.Store(true)
 	eventually(t, "the message to be delivered", func() bool { return rec.count() == 1 && rec.all()[0].body == "payload" })
@@ -1245,7 +1253,7 @@ func TestAutoDeleteReceiverAcknowledgesIntakesAfterTheCommit(t *testing.T) {
 	rec := &recorder{keep: true}
 	r.record(rec, "")
 	var acked atomic.Int64
-	r.hookIntake(func(_ int, _ *ActiveShard, _ string, _ *outRow, call func() (int, error)) (int, error) {
+	r.hookIntake(func(_ int, _ *shard, _ string, _ *outRow, call func() (int, error)) (int, error) {
 		status, err := call()
 		if status == http.StatusAccepted {
 			acked.Add(1)
@@ -1268,7 +1276,7 @@ func TestAutoDeleteRowsSurviveACrash(t *testing.T) {
 	var handlerUp, lobbyUp atomic.Bool
 	rec := &recorder{answer: downUntil(&handlerUp)}
 	r.record(rec, "")
-	attempts := r.hookIntake(func(_ int, sender *ActiveShard, _ string, _ *outRow, call func() (int, error)) (int, error) {
+	attempts := r.hookIntake(func(_ int, sender *shard, _ string, _ *outRow, call func() (int, error)) (int, error) {
 		if sender.Name == "lobby/e3" && !lobbyUp.Load() {
 			return http.StatusServiceUnavailable, errors.New("the receiver's node is down")
 		}
@@ -1282,10 +1290,10 @@ func TestAutoDeleteRowsSurviveACrash(t *testing.T) {
 	r.closeInApp("lobby/e3")
 	r.closeInApp("lobby/e6")
 	r.crash()
-	r.n.Close(context.Background(), false)
+	r.stopJournal()
 
 	r.startNode()
-	r.startManager(quick)
+	r.startShards(quick)
 	r.startServer()
 	handlerUp.Store(true)
 	lobbyUp.Store(true)

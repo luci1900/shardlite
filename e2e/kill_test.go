@@ -73,8 +73,8 @@ func TestKillNodeUnderLoad(t *testing.T) {
 		seconds, _ = strconv.Atoi(v)
 	}
 
-	// Small deltas, a small cache and journal segments that expire after 4 s (deltas must keep up), so deltas, merges, deactivation and eviction happen under the load too.
-	s := newStack(t, "SHARDLITE_DELTA_AGE=300ms", "SHARDLITE_CACHE_LIMIT=150K", "SHARDLITE_JOURNAL_EXPIRY=4s", "SHARDLITE_TAIL_ALERT=1s")
+	// A short delta age and a small cache, so deltas, rebases, deactivation and eviction happen under the load too.
+	s := newStack(t, "SHARDLITE_DELTA_AGE=300ms", "SHARDLITE_CACHE_LIMIT=150K")
 	v := newVerifier(t, s)
 	led := &ledger{acked: map[string]map[string]bool{}, counts: map[string]int{}}
 

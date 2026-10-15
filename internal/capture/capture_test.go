@@ -4,14 +4,15 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	_ "github.com/mattn/go-sqlite3"
-	"github.com/superfly/ltx"
-	"golang.org/x/sync/errgroup"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/superfly/ltx"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
@@ -19,6 +20,7 @@ import (
 	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
+	"github.com/luci1900/shardlite/internal/supervisor"
 )
 
 type env struct {
@@ -28,19 +30,26 @@ type env struct {
 	w     *segment.Writer
 }
 
-func newEnv(t *testing.T, interval time.Duration) *env {
+// newEnv is a shard's storage with a segment writer, which writes only when
+// flushed (Sync flushes it, as the node's flush cycle does).
+func newEnv(t *testing.T) *env {
 	t.Helper()
 	local := blob.WithHook(blob.NewMemory())
 	store := blob.NewStore(local, "n1", 1, blob.Options{Backoff: time.Millisecond})
-	w := segment.NewWriter(store, "n1", segment.Options{Interval: interval})
-	t.Cleanup(w.Close)
+	w := segment.NewWriter(store, "n1", segment.Options{})
+	serveWriter(t, w)
 	return &env{dir: t.TempDir(), meta: t.TempDir(), store: store, w: w}
+}
+
+// serveWriter serves w, as the node's tree does, until the test ends.
+func serveWriter(t *testing.T, w *segment.Writer) {
+	t.Cleanup(supervisor.Background(slog.Default(), "writer", w))
 }
 
 // entriesFor returns every segment entry of a shard, in journal order.
 func (e *env) entriesFor(t *testing.T, shard string) (out []segment.Entry, seqs []uint64) {
 	t.Helper()
-	err := segment.Scan(context.Background(), e.store, "n1", 1, func(seq uint64, en segment.Entry) error {
+	err := segment.Scan(context.Background(), e.store, "n1", 1, 0, func(seq uint64, en segment.Entry) error {
 		if en.Shard == shard {
 			out, seqs = append(out, en), append(seqs, seq)
 		}
@@ -78,7 +87,7 @@ func (e *env) replay(t *testing.T, shard, path string) shardfile.State {
 
 func TestCommitsAppearAsEntries(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, 20*time.Millisecond)
+	e := newEnv(t)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
 	app.Must(t, "open", "a", path)
@@ -112,7 +121,7 @@ func TestCommitsAppearAsEntries(t *testing.T) {
 
 func TestReplayEqualsApp(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, 20*time.Millisecond)
+	e := newEnv(t)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
 	app.Must(t, "open", "a", path)
@@ -151,7 +160,7 @@ func TestReplayEqualsApp(t *testing.T) {
 func TestManyShardsOneSegmentPerFlush(t *testing.T) {
 	t.Parallel()
 	const shards, rounds = 100, 5
-	e := newEnv(t, time.Hour) // flushed by hand, as the node's flush cycle does
+	e := newEnv(t)
 	ctx := context.Background()
 
 	apps := make([]*apptest.App, 4)
@@ -197,7 +206,7 @@ func TestManyShardsOneSegmentPerFlush(t *testing.T) {
 		t.Fatalf("%d segments for %d rounds", flushes, rounds)
 	}
 	var entries int
-	segment.Scan(ctx, e.store, "n1", 1, func(uint64, segment.Entry) error { entries++; return nil })
+	segment.Scan(ctx, e.store, "n1", 1, 0, func(uint64, segment.Entry) error { entries++; return nil })
 	if perSeg := float64(entries) / float64(e.w.Flushes()); perSeg < 3 {
 		t.Fatalf("%.1f entries per segment: shards are not sharing segments", perSeg)
 	}
@@ -276,11 +285,11 @@ func pageCount(t *testing.T, b []byte) (pages, commit int) {
 // Sync finds nothing left to do.
 func TestSyncOutlivesItsCaller(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, 5*time.Millisecond)
+	e := newEnv(t)
 	local := blob.WithHook(blob.NewMemory())
 	e.store = blob.NewStore(local, "n1", 1, blob.Options{Backoff: time.Millisecond})
-	e.w = segment.NewWriter(e.store, "n1", segment.Options{Interval: 5 * time.Millisecond, Retry: time.Millisecond})
-	t.Cleanup(e.w.Close)
+	e.w = segment.NewWriter(e.store, "n1", segment.Options{Retry: time.Millisecond})
+	serveWriter(t, e.w)
 
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
@@ -347,7 +356,7 @@ func TestSyncOutlivesItsCaller(t *testing.T) {
 // restart must read.
 func TestTailFromFollowsTheTail(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, 5*time.Millisecond)
+	e := newEnv(t)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
 	app.Must(t, "open", "a", path)
@@ -394,7 +403,7 @@ func TestTailFromFollowsTheTail(t *testing.T) {
 // not 300 times (merging commits per flush window is a possible later step).
 func TestCommitsInOneWindowKeepOnlyTheLatestPages(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, 20*time.Millisecond)
+	e := newEnv(t)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
 	app.Must(t, "open", "a", path)

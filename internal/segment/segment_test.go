@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"os"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -21,7 +20,15 @@ import (
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/spool"
+	"github.com/luci1900/shardlite/internal/supervisor"
 )
+
+// serve serves w until the test ends, or until stop is called.
+func serve(t testing.TB, w *Writer) (stop func()) {
+	stop = supervisor.Background(slog.Default(), "writer", w)
+	t.Cleanup(stop)
+	return stop
+}
 
 // testLTX builds a small valid LTX file for txid.
 func testLTX(t testing.TB, txid ltx.TXID, fill byte) []byte {
@@ -57,40 +64,32 @@ func newStore(t *testing.T) testStore {
 	return testStore{blob.NewStore(l, "n1", 1, blob.Options{Backoff: time.Millisecond}), l}
 }
 
-func wait(t *testing.T, ch <-chan error) error {
+// mustAppend queues one LTX file of shard (generation "g").
+func mustAppend(t testing.TB, w *Writer, shard string, position uint64, ltxBytes []byte) {
 	t.Helper()
-	select {
-	case err := <-ch:
-		return err
-	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for segment")
-		return nil
+	if err := w.Append(shard, "g", position, ltxBytes); err != nil {
+		t.Fatal(err)
 	}
 }
 
 func TestManyGoroutinesOneSegment(t *testing.T) {
 	t.Parallel()
 	store, ctx := newStore(t), context.Background()
-	w := NewWriter(store.Store, "n1", Options{Interval: time.Hour}) // flush by hand
-	defer w.Close()
+	w := NewWriter(store.Store, "n1", Options{})
+	serve(t, w)
 
 	const n = 100
-	var chans [n]<-chan error
 	var wg errgroup.Group
 	for i := range n {
 		wg.Go(func() error {
-			chans[i] = w.Append(fmt.Sprintf("users/%d", i), "g", uint64(i+1), testLTX(t, ltx.TXID(i+1), byte(i)))
-			return nil
+			return w.Append(fmt.Sprintf("users/%d", i), "g", uint64(i+1), testLTX(t, ltx.TXID(i+1), byte(i)))
 		})
 	}
-	wg.Wait()
-	if err := w.Flush(ctx); err != nil {
+	if err := wg.Wait(); err != nil {
 		t.Fatal(err)
 	}
-	for _, ch := range chans {
-		if err := wait(t, ch); err != nil {
-			t.Fatal(err)
-		}
+	if err := w.Flush(ctx); err != nil {
+		t.Fatal(err)
 	}
 	if w.Flushes() != 1 {
 		t.Fatalf("flushes=%d, want 1", w.Flushes())
@@ -124,7 +123,7 @@ func TestManyGoroutinesOneSegment(t *testing.T) {
 	}
 }
 
-func TestWaitersReleasedAfterPut(t *testing.T) {
+func TestFlushReturnsAfterPut(t *testing.T) {
 	t.Parallel()
 	store, ctx := newStore(t), context.Background()
 	release := make(chan struct{})
@@ -136,17 +135,19 @@ func TestWaitersReleasedAfterPut(t *testing.T) {
 		}
 		return nil
 	})
-	w := NewWriter(store.Store, "n1", Options{Interval: 10 * time.Millisecond})
-	defer w.Close()
-	ch := w.Append("users/1", "g", 1, testLTX(t, 1, 1))
+	w := NewWriter(store.Store, "n1", Options{})
+	serve(t, w)
+	mustAppend(t, w, "users/1", 1, testLTX(t, 1, 1))
+	flushed := make(chan error, 1)
+	go func() { flushed <- w.Flush(ctx) }()
 	apptest.Eventually(t, 5*time.Second, "the PUT to start", inPut.Load)
-	select { // the PUT is held in the hook, so the waiter cannot have been released
-	case <-ch:
-		t.Fatal("waiter released before the PUT finished")
+	select { // the PUT is held in the hook, so the flush cannot have returned
+	case err := <-flushed:
+		t.Fatalf("flush returned (%v) before the PUT finished", err)
 	default:
 	}
 	close(release)
-	if err := wait(t, ch); err != nil {
+	if err := <-flushed; err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.Head(ctx, Key("n1", 1)); err != nil {
@@ -176,17 +177,17 @@ func TestSlowPutDelaysNextSegment(t *testing.T) {
 		}
 		return nil
 	})
-	w := NewWriter(store.Store, "n1", Options{Interval: 5 * time.Millisecond})
-	defer w.Close()
-	var chans []<-chan error
+	w := NewWriter(store.Store, "n1", Options{})
+	serve(t, w)
+	// A flush after every append, many of them waiting at once.
+	var g errgroup.Group
 	for i := range 20 {
-		chans = append(chans, w.Append("users/1", "g", uint64(i+1), testLTX(t, ltx.TXID(i+1), 1)))
+		mustAppend(t, w, "users/1", uint64(i+1), testLTX(t, ltx.TXID(i+1), 1))
+		g.Go(func() error { return w.Flush(context.Background()) })
 		time.Sleep(10 * time.Millisecond)
 	}
-	for _, ch := range chans {
-		if err := wait(t, ch); err != nil {
-			t.Fatal(err)
-		}
+	if err := g.Wait(); err != nil {
+		t.Fatal(err)
 	}
 	if max.Load() != 1 {
 		t.Fatalf("saw %d concurrent uploads", max.Load())
@@ -215,13 +216,14 @@ func TestErrExistsFencesWriter(t *testing.T) {
 	store, ctx := newStore(t), context.Background()
 	// A newer writer already took segment 1 (here, as a fence).
 	store.Create(ctx, Key("n1", 1), strings.NewReader(""))
-	w := NewWriter(store.Store, "n1", Options{Interval: 5 * time.Millisecond})
-	defer w.Close()
-	if err := wait(t, w.Append("users/1", "g", 1, testLTX(t, 1, 1))); !errors.Is(err, ErrFenced) {
-		t.Fatalf("got %v, want ErrFenced", err)
+	w := NewWriter(store.Store, "n1", Options{})
+	serve(t, w)
+	mustAppend(t, w, "users/1", 1, testLTX(t, 1, 1))
+	if err := w.Flush(ctx); !errors.Is(err, ErrFenced) {
+		t.Fatalf("flush got %v, want ErrFenced", err)
 	}
 	// Stopped for good: later appends fail at once and nothing is written.
-	if err := wait(t, w.Append("users/1", "g", 1, testLTX(t, 2, 1))); !errors.Is(err, ErrFenced) {
+	if err := w.Append("users/1", "g", 1, testLTX(t, 2, 1)); !errors.Is(err, ErrFenced) {
 		t.Fatalf("got %v, want ErrFenced", err)
 	}
 	if _, err := store.Head(ctx, Key("n1", 2)); !errors.Is(err, blob.ErrNotFound) {
@@ -238,7 +240,7 @@ func TestFenceRecognised(t *testing.T) {
 	}
 }
 
-// A segment that can't be written is not given up: its waiters keep waiting,
+// A segment that can't be written is not given up: Flush keeps waiting,
 // nothing newer is written ahead of it, and it goes out under the same number
 // once storage is back.
 func TestFailedSegmentIsRetriedNotDropped(t *testing.T) {
@@ -252,29 +254,18 @@ func TestFailedSegmentIsRetriedNotDropped(t *testing.T) {
 		}
 		return nil
 	})
-	w := NewWriter(store.Store, "n1", Options{Interval: time.Hour})
-	defer w.Close()
-	first := w.Append("users/1", "g", 1, testLTX(t, 1, 1))
+	w := NewWriter(store.Store, "n1", Options{})
+	serve(t, w)
+	mustAppend(t, w, "users/1", 1, testLTX(t, 1, 1))
 	short, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
 	defer cancel()
 	if err := w.Flush(short); err == nil {
 		t.Fatal("want the caller's timeout")
 	}
-	select {
-	case err := <-first:
-		t.Fatalf("waiter released with %v while the segment is unwritten", err)
-	default:
-	}
 	// A later commit queues behind it.
-	second := w.Append("users/1", "g", 2, testLTX(t, 2, 1))
+	mustAppend(t, w, "users/1", 2, testLTX(t, 2, 1))
 	fail.Store(false)
 	if err := w.Flush(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if err := wait(t, first); err != nil {
-		t.Fatal(err)
-	}
-	if err := wait(t, second); err != nil {
 		t.Fatal(err)
 	}
 	for seq, want := range map[uint64]uint64{1: 1, 2: 2} {
@@ -308,13 +299,10 @@ func TestLongRunOfFaultsWritesSegmentOnce(t *testing.T) {
 		}
 		return nil
 	})
-	w := NewWriter(store.Store, "n1", Options{Interval: time.Hour, Retry: time.Millisecond})
-	defer w.Close()
-	ch := w.Append("users/1", "g", 1, testLTX(t, 1, 7))
+	w := NewWriter(store.Store, "n1", Options{Retry: time.Millisecond})
+	serve(t, w)
+	mustAppend(t, w, "users/1", 1, testLTX(t, 1, 7))
 	if err := w.Flush(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if err := wait(t, ch); err != nil {
 		t.Fatal(err)
 	}
 	if creates.Load() <= 4 {
@@ -334,37 +322,52 @@ func TestLongRunOfFaultsWritesSegmentOnce(t *testing.T) {
 		t.Fatalf("segment 1 written by %+v", info.WriteID)
 	}
 	// Nothing later is fenced either.
-	ch = w.Append("users/1", "g", 2, testLTX(t, 2, 1))
-	w.Flush(ctx)
-	if err := wait(t, ch); err != nil {
+	mustAppend(t, w, "users/1", 2, testLTX(t, 2, 1))
+	if err := w.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
 }
 
-// Close fails the waiters of a segment still being retried.
-func TestCloseFailsWaitersOfUnknownSegment(t *testing.T) {
+// A Flush waiting for a segment that can't be written returns ErrClosed when
+// the writer is closed, and so does every Flush and Append after it.
+func TestCloseEndsAWaitingFlush(t *testing.T) {
 	t.Parallel()
 	store := newStore(t)
+	inPut := make(chan struct{}, 1)
 	store.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
 		if op == blob.OpCreate && !after {
+			select {
+			case inPut <- struct{}{}:
+			default:
+			}
 			return errors.New("storage down")
 		}
 		return nil
 	})
-	w := NewWriter(store.Store, "n1", Options{Interval: 5 * time.Millisecond})
-	ch := w.Append("users/1", "g", 1, testLTX(t, 1, 1))
+	w := NewWriter(store.Store, "n1", Options{})
+	stop := serve(t, w)
+	mustAppend(t, w, "users/1", 1, testLTX(t, 1, 1))
+	flushed := make(chan error, 1)
+	go func() { flushed <- w.Flush(context.Background()) }()
+	<-inPut
+	stop()
 	select {
-	case err := <-ch:
-		t.Fatalf("released early: %v", err)
-	case <-time.After(150 * time.Millisecond):
+	case err := <-flushed:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("flush got %v, want ErrClosed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the flush still waits after Close")
 	}
-	w.Close()
-	if err := wait(t, ch); !errors.Is(err, ErrClosed) {
-		t.Fatalf("got %v, want ErrClosed", err)
+	if err := w.Flush(context.Background()); !errors.Is(err, ErrClosed) {
+		t.Fatalf("flush after Close got %v, want ErrClosed", err)
+	}
+	if err := w.Append("users/1", "g", 2, testLTX(t, 2, 1)); !errors.Is(err, ErrClosed) {
+		t.Fatalf("append after Close got %v, want ErrClosed", err)
 	}
 }
 
-// A fence found while retrying fails the waiters, including those queued behind.
+// A fence found while retrying fails the flush, of what queued behind it too.
 func TestFenceFoundWhileRetrying(t *testing.T) {
 	t.Parallel()
 	store, ctx := newStore(t), context.Background()
@@ -376,24 +379,21 @@ func TestFenceFoundWhileRetrying(t *testing.T) {
 		}
 		return nil
 	})
-	w := NewWriter(store.Store, "n1", Options{Interval: time.Hour})
-	defer w.Close()
-	first := w.Append("users/1", "g", 1, testLTX(t, 1, 1))
+	w := NewWriter(store.Store, "n1", Options{})
+	serve(t, w)
+	mustAppend(t, w, "users/1", 1, testLTX(t, 1, 1))
 	short, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 	defer cancel()
 	w.Flush(short)
-	second := w.Append("users/1", "g", 2, testLTX(t, 2, 1))
+	mustAppend(t, w, "users/1", 2, testLTX(t, 2, 1))
 	// An adopter fences the journal while the writer is stuck.
 	down.Store(false)
 	adopter := blob.NewStore(store.L, "n2", 1, blob.Options{})
 	if _, err := Fence(ctx, adopter, "n1", 1); err != nil {
 		t.Fatal(err)
 	}
-	w.Flush(ctx)
-	for _, ch := range []<-chan error{first, second} {
-		if err := wait(t, ch); !errors.Is(err, ErrFenced) {
-			t.Fatalf("got %v, want ErrFenced", err)
-		}
+	if err := w.Flush(ctx); !errors.Is(err, ErrFenced) {
+		t.Fatalf("got %v, want ErrFenced", err)
 	}
 }
 
@@ -412,22 +412,18 @@ func TestLostResponseIsNotAFence(t *testing.T) {
 		}
 		return nil
 	})
-	w := NewWriter(store.Store, "n1", Options{Interval: time.Hour})
-	defer w.Close()
-	ch := w.Append("users/1", "g", 1, testLTX(t, 1, 1))
+	w := NewWriter(store.Store, "n1", Options{})
+	serve(t, w)
+	mustAppend(t, w, "users/1", 1, testLTX(t, 1, 1))
 	if err := w.Flush(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if err := wait(t, ch); err != nil {
 		t.Fatalf("lost response: %v", err)
 	}
 	if creates.Load() != 2 {
 		t.Fatalf("%d creates, want the lost one and its retry", creates.Load())
 	}
 	// And it carries on with the next number.
-	ch = w.Append("users/1", "g", 2, testLTX(t, 2, 1))
-	w.Flush(ctx)
-	if err := wait(t, ch); err != nil {
+	mustAppend(t, w, "users/1", 2, testLTX(t, 2, 1))
+	if err := w.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := ReadFooter(ctx, store.Store, "n1", 2); err != nil {
@@ -469,12 +465,21 @@ func TestAdopterFence(t *testing.T) {
 	}
 	// The zombie's own writer now finds its next numbers taken and is fenced.
 	store.SetHook(nil)
-	w := NewWriter(zombie, "dead", Options{Interval: time.Hour, StartSeq: 6})
-	defer w.Close()
-	ch := w.Append("users/1", "g", 1, testLTX(t, 1, 1))
-	w.Flush(ctx)
-	if err := wait(t, ch); !errors.Is(err, ErrFenced) {
+	w := NewWriter(zombie, "dead", Options{StartSeq: 6})
+	serve(t, w)
+	mustAppend(t, w, "users/1", 1, testLTX(t, 1, 1))
+	select {
+	case <-w.Fenced():
+		t.Fatal("Fenced is closed before the writer was fenced")
+	default:
+	}
+	if err := w.Flush(ctx); !errors.Is(err, ErrFenced) {
 		t.Fatalf("got %v, want ErrFenced", err)
+	}
+	select {
+	case <-w.Fenced():
+	default:
+		t.Fatal("Fenced is not closed after the writer was fenced")
 	}
 	// A number already taken, by anyone, is skipped.
 	if _, err := store.Create(ctx, Key("dead", 9), strings.NewReader("")); err != nil {
@@ -482,20 +487,6 @@ func TestAdopterFence(t *testing.T) {
 	}
 	if seq, err := Fence(ctx, store.Store, "dead", 9); err != nil || seq != 10 {
 		t.Fatalf("seq=%d err=%v, want 10", seq, err)
-	}
-}
-
-func TestNextSeq(t *testing.T) {
-	t.Parallel()
-	store, ctx := newStore(t), context.Background()
-	if n, err := NextSeq(ctx, store.Store, "n1"); err != nil || n != 1 {
-		t.Fatalf("empty: %d %v", n, err)
-	}
-	store.Create(ctx, Key("n1", 1), strings.NewReader("x"))
-	store.Create(ctx, Key("n1", 7), strings.NewReader(""))
-	store.Create(ctx, Key("n2", 40), strings.NewReader("x"))
-	if n, err := NextSeq(ctx, store.Store, "n1"); err != nil || n != 8 {
-		t.Fatalf("got %d %v, want 8", n, err)
 	}
 }
 
@@ -510,42 +501,6 @@ func TestBounds(t *testing.T) {
 	store.Create(ctx, Key("n2", 2), strings.NewReader("x"))
 	if lo, hi, err := Bounds(ctx, store.Store, "n1"); err != nil || lo != 5 || hi != 7 {
 		t.Fatalf("got %d %d %v, want 5 7", lo, hi, err)
-	}
-}
-
-func TestCheckStopsAcknowledgements(t *testing.T) {
-	t.Parallel()
-	store, ctx := newStore(t), context.Background()
-	var bad atomic.Pointer[error]
-	errLease := errors.New("lease expired")
-	w := NewWriter(store.Store, "n1", Options{Interval: time.Hour, Check: func() error {
-		if e := bad.Load(); e != nil {
-			return *e
-		}
-		return nil
-	}})
-	defer w.Close()
-
-	ch := w.Append("users/1", "g", 1, testLTX(t, 1, 1))
-	if err := w.Flush(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if err := wait(t, ch); err != nil {
-		t.Fatalf("while the lease is good: %v", err)
-	}
-
-	// Queued while the lease was good, written after it ran out: nobody is told it is durable.
-	ch = w.Append("users/1", "g", 2, testLTX(t, 2, 2))
-	bad.Store(&errLease)
-	if err := w.Flush(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if err := wait(t, ch); !errors.Is(err, errLease) {
-		t.Fatalf("waiter of a segment written after expiry got %v", err)
-	}
-	// And nothing new is accepted.
-	if err := wait(t, w.Append("users/1", "g", 3, testLTX(t, 3, 3))); !errors.Is(err, errLease) {
-		t.Fatalf("append after expiry got %v", err)
 	}
 }
 
@@ -564,24 +519,19 @@ func (f *failCreate) Create(ctx context.Context, key string, body io.ReadSeeker,
 }
 
 type recorder struct {
-	mu   sync.Mutex
-	recs []slog.Record
+	recs apptest.Log[slog.Record]
 }
 
 func (r *recorder) Enabled(context.Context, slog.Level) bool { return true }
 func (r *recorder) Handle(_ context.Context, rec slog.Record) error {
-	r.mu.Lock()
-	r.recs = append(r.recs, rec)
-	r.mu.Unlock()
+	r.recs.Add(rec)
 	return nil
 }
 func (r *recorder) WithAttrs([]slog.Attr) slog.Handler { return r }
 func (r *recorder) WithGroup(string) slog.Handler      { return r }
 func (r *recorder) errors() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	n := 0
-	for _, rec := range r.recs {
+	for _, rec := range r.recs.All() {
 		if rec.Level >= slog.LevelError {
 			n++
 		}
@@ -596,19 +546,20 @@ func TestErrorsRetryingCannotFixAreLogged(t *testing.T) {
 	fc.err.Store(&denied)
 	store := blob.NewStore(fc, "n1", 1, blob.Options{Backoff: time.Millisecond})
 	rec := &recorder{}
-	w := NewWriter(store, "n1", Options{Interval: 5 * time.Millisecond, Retry: time.Millisecond, Logger: slog.New(rec)})
-	defer w.Close()
+	w := NewWriter(store, "n1", Options{Retry: time.Millisecond, Logger: slog.New(rec)})
+	serve(t, w)
 
-	ch := w.Append("users/1", "g", 1, testLTX(t, 1, 1))
-	apptest.Eventually(t, 5*time.Second, "three error logs", func() bool { return rec.errors() >= 3 })
-	select {
-	case err := <-ch:
-		t.Fatalf("the segment was given up on: %v", err)
-	default:
+	mustAppend(t, w, "users/1", 1, testLTX(t, 1, 1))
+	// The caller gives up at once: the uploader goes on alone.
+	short, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if err := w.Flush(short); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("flush got %v, want the caller's timeout", err)
 	}
+	apptest.Eventually(t, 5*time.Second, "three error logs", func() bool { return rec.errors() >= 3 })
 	// The permissions are fixed: the same segment goes out.
 	fc.err.Store(nil)
-	if err := wait(t, ch); err != nil {
+	if err := w.Flush(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.Head(context.Background(), Key("n1", 1)); err != nil {
@@ -627,9 +578,10 @@ func TestTransientTroubleIsNotLoggedAsUnfixable(t *testing.T) {
 		return nil
 	})
 	rec := &recorder{}
-	w := NewWriter(store.Store, "n1", Options{Interval: 5 * time.Millisecond, Retry: time.Millisecond, Logger: slog.New(rec)})
-	defer w.Close()
-	if err := wait(t, w.Append("users/1", "g", 1, testLTX(t, 1, 1))); err != nil {
+	w := NewWriter(store.Store, "n1", Options{Retry: time.Millisecond, Logger: slog.New(rec)})
+	serve(t, w)
+	mustAppend(t, w, "users/1", 1, testLTX(t, 1, 1))
+	if err := w.Flush(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if n := rec.errors(); n != 0 {
@@ -651,8 +603,8 @@ func TestLargeSegmentsGoThroughTemporaryFiles(t *testing.T) {
 		}
 		return len(ents)
 	}
-	w := NewWriter(store.Store, "n1", Options{Interval: time.Hour, TempDir: dir, SpoolLimit: 100})
-	defer w.Close()
+	w := NewWriter(store.Store, "n1", Options{TempDir: dir, SpoolLimit: 100})
+	stop := serve(t, w)
 
 	var seen atomic.Int32
 	store.SetHook(func(_ context.Context, op blob.Op, key string, after bool) error {
@@ -673,20 +625,17 @@ func TestLargeSegmentsGoThroughTemporaryFiles(t *testing.T) {
 		}
 		files = append(files, f)
 	}
-	chans := []<-chan error{w.AppendFile("users/1", "g", 1, files[0]), w.AppendFile("users/2", "g", 1, files[1])}
-	for _, f := range files {
-		f.Close() // the writer holds its own references
+	for i, f := range files {
+		if err := w.AppendFile(fmt.Sprintf("users/%d", i+1), "g", 1, f); err != nil {
+			t.Fatal(err)
+		}
+		f.Close() // the writer holds its own reference
 	}
 	if left() != 2 {
 		t.Fatalf("%d temporary files with two queued, want 2", left())
 	}
 	if err := w.Flush(ctx); err != nil {
 		t.Fatal(err)
-	}
-	for _, ch := range chans {
-		if err := wait(t, ch); err != nil {
-			t.Fatal(err)
-		}
 	}
 	// While the upload ran, the segment had a file of its own.
 	if seen.Load() != 1 {
@@ -713,10 +662,12 @@ func TestLargeSegmentsGoThroughTemporaryFiles(t *testing.T) {
 
 	// Closed with a file still queued.
 	f, _ := spool.Collect(dir, 100, bytes.NewReader(testLTX(t, 3, 3)))
-	ch := w.AppendFile("users/3", "g", 1, f)
+	if err := w.AppendFile("users/3", "g", 1, f); err != nil {
+		t.Fatal(err)
+	}
 	f.Close()
-	w.Close()
-	if err := wait(t, ch); !errors.Is(err, ErrClosed) {
+	stop()
+	if err := w.Flush(ctx); !errors.Is(err, ErrClosed) {
 		t.Fatalf("got %v, want ErrClosed", err)
 	}
 	if left() != 0 {

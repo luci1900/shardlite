@@ -105,7 +105,7 @@ func TestMeasureMemory(t *testing.T) {
 	if _, err := reader.Restore(context.Background(), shardName, dst, shardfile.RestoreOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	db, err := sql.Open("sqlite3", "file:"+dst)
+	db, err := sql.Open("sqlite", "file:"+dst+"?_pragma=busy_timeout(5000)")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -324,7 +324,7 @@ func TestMeasureStage1z(t *testing.T) {
 	if _, err := reader.Restore(context.Background(), name2, dst, shardfile.RestoreOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	db, err := sql.Open("sqlite3", "file:"+dst)
+	db, err := sql.Open("sqlite", "file:"+dst+"?_pragma=busy_timeout(5000)")
 	if err != nil {
 		t.Fatal(err)
 	}

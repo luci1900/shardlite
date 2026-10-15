@@ -5,7 +5,6 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/superfly/ltx"
 
@@ -20,7 +19,7 @@ import (
 // entries returns every segment entry of a shard.
 func entries(t *testing.T, e *harness.Env, name string) (out []segment.Entry) {
 	t.Helper()
-	err := segment.Scan(context.Background(), e.Store, e.Node, 1, func(_ uint64, en segment.Entry) error {
+	err := segment.Scan(context.Background(), e.Store, e.Node, 1, 0, func(_ uint64, en segment.Entry) error {
 		if en.Shard == name {
 			out = append(out, en)
 		}
@@ -45,7 +44,7 @@ func letGo(t *testing.T, e *harness.Env, app *apptest.App, sh *capture.Shard) {
 	t.Helper()
 	app.Must(t, "close", "a")
 	app.Exit()
-	released, err := sh.Release(context.Background())
+	released, _, err := sh.Release(context.Background())
 	if err != nil || !released {
 		t.Fatalf("release: released=%v err=%v", released, err)
 	}
@@ -193,7 +192,7 @@ func TestRestoreThenCapture(t *testing.T) {
 		"several activations, journal tail": {journalTail: true, activations: 3},
 	} {
 		t.Run(name, func(t *testing.T) {
-			restoreAndCapture(t, harness.New(t, 10*time.Millisecond), v)
+			restoreAndCapture(t, harness.New(t), v)
 		})
 	}
 }
@@ -202,7 +201,7 @@ func TestRestoreThenCapture(t *testing.T) {
 func entrySeq(t *testing.T, e *harness.Env, want segment.Entry) uint64 {
 	t.Helper()
 	var found uint64
-	err := segment.Scan(context.Background(), e.Store, e.Node, 1, func(seq uint64, en segment.Entry) error {
+	err := segment.Scan(context.Background(), e.Store, e.Node, 1, 0, func(seq uint64, en segment.Entry) error {
 		if en == want {
 			found = seq
 		}
@@ -236,7 +235,7 @@ func pageCount(t *testing.T, b []byte) (pages, commit int) {
 // can't start at segment 1: it starts where the node's lease says.
 func TestRestoreFindsTailAfterOldSegmentsExpire(t *testing.T) {
 	t.Parallel()
-	e, ctx := harness.New(t, 10*time.Millisecond), context.Background()
+	e, ctx := harness.New(t), context.Background()
 	app := e.StartApp(shard)
 	h, sh := e.NewShard(shard)
 	for i := range 4 {
@@ -269,7 +268,7 @@ func TestRestoreFindsTailAfterOldSegmentsExpire(t *testing.T) {
 		t.Fatal("restore after the journal's first segments expired lost the tail")
 	}
 	// And a caller that loaded the journal itself can pass it.
-	idx, err := e.Files.LoadJournal(ctx, e.Node, firstTail)
+	idx, err := e.Files.LoadJournal(ctx, e.Node, firstTail, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

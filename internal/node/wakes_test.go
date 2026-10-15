@@ -76,21 +76,24 @@ func (r *srig) shutdown(appHandles ...string) {
 	for _, s := range appHandles {
 		r.closeInApp(s)
 	}
-	if err := r.m.Close(ctx); err != nil {
+	if err := r.mrig.stop(); err != nil {
 		r.t.Fatal(err)
 	}
-	r.n.Close(ctx, true)
+	r.stopJournal()
+	if err := r.n.Keeper.Release(ctx); err != nil {
+		r.t.Fatal(err)
+	}
 }
 
-func (r *srig) restart(mutate func(*ManagerOptions)) {
+func (r *srig) restart(mutate func(*ShardsOptions)) {
 	r.t.Helper()
 	r.startNode()
-	r.startManager(mutate)
+	r.startShards(mutate)
 	r.startServer()
 }
 
-func drainFor(d time.Duration) func(*ManagerOptions) {
-	return func(o *ManagerOptions) { o.Drain, o.WakeEvery = d, 50*time.Millisecond }
+func drainFor(d time.Duration) func(*ShardsOptions) {
+	return func(o *ShardsOptions) { o.Drain, o.Wakes.Every = d, 50*time.Millisecond }
 }
 
 func TestDrainDeliversBeforeLettingGo(t *testing.T) {
@@ -165,7 +168,7 @@ func TestHintsThatMeanNothingAreDeleted(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	r.m.scanWakes(ctx)
+	r.m.wakes.scan(ctx)
 	if keys := r.wakes(); len(keys) != 1 || keys[0] != future {
 		t.Fatalf("hints left: %v, want only the one in the future", keys)
 	}
@@ -198,7 +201,7 @@ func TestCrashAfterTheWakeKeepsTheHint(t *testing.T) {
 	r.restart(both(quick, drainFor(200*time.Millisecond)))
 	eventually(t, "the wake to start deliveries", func() bool { return attempts.Load() > before })
 	r.crash()
-	r.n.Close(context.Background(), false)
+	r.stopJournal()
 	if len(r.wakes()) != 1 {
 		t.Fatalf("the hint is gone after a crash: %v", r.wakes())
 	}
@@ -237,120 +240,55 @@ func TestDuplicateHintsDeliverOnce(t *testing.T) {
 	}
 }
 
-// --- hints written because a snapshot takes the tail away ---
-
-func (r *srig) files(target string) int {
-	r.t.Helper()
-	m, err := r.manifest(target)
-	if err != nil {
-		r.t.Fatal(err)
-	}
-	return len(m.Files)
-}
-
-// A delta takes a shard's tail away, and with it the sign an adopter looks for. A shard whose outbox row is
-// still live when its delta is written gets a wake hint first, so a crash afterwards doesn't leave it
-// inactive with a row to deliver and nothing to wake it.
-func TestDeltaOfAShardWithALiveOutboxRowLeavesAHintThatSurvivesACrash(t *testing.T) {
+// A look that can't tell whether a shard has live rows counts as live: here the
+// shard is busy and its owner removed, as during a release that won't go
+// through (the app has the file open), and its row is still there. The drain
+// used to count that as nothing live and end with the row undelivered.
+func TestDrainCountsALookThatCannotTellAsLive(t *testing.T) {
 	t.Parallel()
-	r := newSRigWith(t, both(quick, withDeltas, drainFor(200*time.Millisecond)))
+	r := newSRigWith(t, quick)
 	var up atomic.Bool
-	rec := &recorder{}
-	r.record(rec, "")
 	attempts := r.intakeDownUntil(&up)
-	r.addMessage("users/h1", "users/h2", "/stuck", "payload")
+	r.addMessage("users/dl1", "users/dl2", "/x", "")
 	eventually(t, "a first attempt", func() bool { return attempts.Load() >= 1 })
-	// (The shard's schema gets a delta of its own before the row exists, which needs no hint.)
-	eventually(t, "a hint written for a delta", func() bool { return r.m.Stats.SnapshotHints.Load() == 1 })
-	if keys := r.wakes(); len(keys) != 1 || !strings.HasSuffix(keys[0], "Z/users/h1") {
-		t.Fatalf("hints after the delta: %v, want one for users/h1", keys)
+	a := r.shard("users/dl1")
+	inside, proceed := make(chan struct{}), make(chan struct{})
+	held := make(chan bool, 1)
+	go func() {
+		ok, _ := do(context.Background(), a.ops, a.ended, func() bool {
+			if !a.e.close() {
+				return false
+			}
+			defer a.e.reopen()
+			defer a.addOwner()
+			if err := a.removeOwner(); err != nil {
+				return false
+			}
+			close(inside)
+			<-proceed
+			return true
+		})
+		held <- ok
+	}()
+	select {
+	case <-inside:
+	case ok := <-held:
+		t.Fatalf("could not hold the shard busy (%v)", ok)
 	}
-	eventually(t, "the delta behind the hint", func() bool { return r.files("users/h1") >= 2 })
-
-	// More deltas for the same row write no more hints.
-	before := r.files("users/h1")
-	r.sql("users/h1", `CREATE TABLE IF NOT EXISTS t (x)`)
-	r.sql("users/h1", `INSERT INTO t VALUES (1)`)
-	eventually(t, "a later delta", func() bool { return r.files("users/h1") > before })
-	if n := r.m.Stats.SnapshotHints.Load(); n != 1 {
-		t.Fatalf("%d hints written for snapshots, want 1", n)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	live := r.m.anyLiveMessages(ctx)
+	cancel()
+	close(proceed)
+	if !<-held {
+		t.Fatal("the shard was not held busy")
 	}
-	if len(r.wakes()) != 1 {
-		t.Fatalf("hints after the second delta: %v", r.wakes())
-	}
-
-	// The node crashes with no tail for the adopter to replay. Nothing asks for the sender, and the hint wakes it.
-	// (The app lets go of the file, as the node refuses to wake a shard the app still has open.)
-	r.closeInApp("users/h1")
-	r.crash()
-	r.n.Close(context.Background(), false)
-	if len(r.wakes()) != 1 {
-		t.Fatalf("the hint is gone after a crash: %v", r.wakes())
+	if !live {
+		t.Fatal("the drain counted a busy shard with a live row as having nothing live")
 	}
 	up.Store(true)
-	r.restart(both(quick, withDeltas, drainFor(200*time.Millisecond)))
-	eventually(t, "delivery after the restart, with no request for the sender", func() bool {
-		return rec.count() == 1 && rec.all()[0].body == "payload"
+	eventually(t, "nothing live once the row is delivered", func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		return !r.m.anyLiveMessages(ctx)
 	})
-	eventually(t, "the hint to go", func() bool { return len(r.wakes()) == 0 })
-	if r.liveRows("users/h1") != 0 {
-		t.Fatal("the row is still live")
-	}
-}
-
-// A shard with nothing to deliver when its delta is written costs no request for it.
-func TestDeltaOfAShardWithNothingToDeliverWritesNoHint(t *testing.T) {
-	t.Parallel()
-	r := newSRigWith(t, both(quick, func(o *ManagerOptions) { o.DeltaAge = 500 * time.Millisecond }))
-	rec := &recorder{}
-	r.record(rec, "")
-	r.addMessage("users/n1", "users/n2", "/fine", "x")
-	eventually(t, "the delivery", func() bool { return rec.count() == 1 && r.liveRows("users/n1") == 0 })
-	eventually(t, "a delta", func() bool { return r.files("users/n1") >= 1 })
-	// (The receiver has a hint while its row waits, which is not this change's.)
-	for _, k := range r.wakes() {
-		if strings.HasSuffix(k, "/users/n1") {
-			t.Fatalf("a hint for the sender, which had nothing to deliver: %v", r.wakes())
-		}
-	}
-	if n := r.m.Stats.SnapshotHints.Load(); n != 0 {
-		t.Fatalf("%d hints written for snapshots, want 0", n)
-	}
-}
-
-// A hint that can't be written stops the snapshot, so the tail is never gone without a hint. The next pass
-// writes the hint and then the delta.
-func TestHintThatCannotBeWrittenHoldsBackTheDelta(t *testing.T) {
-	t.Parallel()
-	r := newSRigWith(t, both(quick, withDeltas))
-	var failing atomic.Bool
-	failing.Store(true)
-	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if !after {
-			r.cmu.Lock()
-			r.counts[string(op)+" "+strings.SplitN(key, "/", 2)[0]]++
-			r.cmu.Unlock()
-			if failing.Load() && op == blob.OpCreate && strings.HasPrefix(key, wakePrefix) {
-				return errors.New("the store refuses hints")
-			}
-		}
-		return nil
-	})
-	var up atomic.Bool
-	attempts := r.intakeDownUntil(&up)
-	r.addMessage("users/f1", "users/f2", "/stuck", "x")
-	eventually(t, "a first attempt", func() bool { return attempts.Load() >= 1 })
-	eventually(t, "passes of the background loop that could not snapshot", func() bool {
-		return r.calls("create", "wakes") >= 3
-	})
-	before := r.files("users/f1") // (the schema may have had its delta already)
-	time.Sleep(200 * time.Millisecond)
-	if n := r.files("users/f1"); n != before {
-		t.Fatalf("%d delta files while the hint could not be written, was %d", n, before)
-	}
-	failing.Store(false)
-	eventually(t, "the delta once the hint can be written", func() bool { return r.files("users/f1") > before })
-	if keys := r.wakes(); len(keys) != 1 || !strings.HasSuffix(keys[0], "/users/f1") {
-		t.Fatalf("hints after the delta: %v", keys)
-	}
 }

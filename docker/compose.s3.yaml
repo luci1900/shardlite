@@ -7,8 +7,13 @@
 #   docker compose -f docker/compose.s3.yaml up -d
 #   export SHARDLITE_TEST_S3_ENDPOINT=http://127.0.0.1:19000 SHARDLITE_TEST_S3_BUCKET=shardlite-test \
 #          AWS_ACCESS_KEY_ID=shardlite AWS_SECRET_ACCESS_KEY=shardlite-secret AWS_REGION=us-east-1
-#   go test -tags fault ./...                 # without the endpoint the multi-process tests skip
+#   internal/tools/testwatch/long.sh          # the long suite: fault tests, e2e and the Linux-only checks
+#   go test -tags fault ./...                 # or by hand; without the endpoint the multi-process tests skip
 #   docker compose -f docker/compose.s3.yaml down
+#
+# The fast suite (internal/tools/testwatch/fast.sh) needs none of this and runs
+# on every push and pull request. CI (.github/workflows/test.yml) runs the long
+# suite against this file's RustFS on pushes to main.
 #
 # The tests create the bucket themselves (S3.EnsureBucket); a node never does.
 # Data lives inside the container and goes with it on `down`. For a single

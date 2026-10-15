@@ -34,11 +34,15 @@ func processCosts() (fds, maps int) {
 
 // TestMeasurePerShardCost measures what an active shard costs the node process
 // in descriptors and memory mappings, and checks that the constants the startup
-// warning uses (descriptorsPerShard and mappingsPerShard) are not lower. Run it
-// with -v on Linux to see the figures. Mappings are only counted on Linux. The
-// baselines (what the process holds before any shard) are only logged: in a
-// test binary they include whatever earlier tests left open.
+// warning uses (descriptorsPerShard and mappingsPerShard) are not lower. It runs
+// only when SHARDLITE_MEASURE is set: run it with -v on Linux to see the
+// figures. Mappings are only counted on Linux. The baselines (what the process
+// holds before any shard) are only logged: in a test binary they include
+// whatever earlier tests left open.
 func TestMeasurePerShardCost(t *testing.T) {
+	if os.Getenv("SHARDLITE_MEASURE") == "" {
+		t.Skip("SHARDLITE_MEASURE is not set")
+	}
 	const n = 300
 	r := newMRig(t)
 	fds0, maps0 := processCosts()

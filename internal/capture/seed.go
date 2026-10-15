@@ -239,18 +239,7 @@ func writeSeedFile(db *litestream.DB, pageSize, pages uint32, salt1, salt2 uint3
 	if err := os.MkdirAll(filepath.Dir(name), 0o755); err != nil {
 		return err
 	}
-	tmp := name + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp)
-	enc, err := ltx.NewEncoder(f)
-	if err != nil {
-		f.Close()
-		return err
-	}
-	if err := enc.EncodeHeader(ltx.Header{
+	return writeLTXFile(name, ltx.Header{
 		Version:   ltx.Version,
 		Flags:     ltx.HeaderFlagNoChecksum, // as Litestream's own files
 		PageSize:  pageSize,
@@ -262,16 +251,34 @@ func writeSeedFile(db *litestream.DB, pageSize, pages uint32, salt1, salt2 uint3
 		WALSize:   int64(litestream.WALFrameHeaderSize) + int64(pageSize),
 		WALSalt1:  salt1,
 		WALSalt2:  salt2,
-	}); err != nil {
-		f.Close()
+	}, nil)
+}
+
+// writeLTXFile writes an LTX file with header hdr to a temporary name and renames
+// it to name. pages, if not nil, encodes the file's pages.
+func writeLTXFile(name string, hdr ltx.Header, pages func(*ltx.Encoder) error) error {
+	tmp := name + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
 		return err
 	}
-	if err := enc.Close(); err != nil {
+	defer os.Remove(tmp)
+	enc, err := ltx.NewEncoder(f)
+	if err == nil {
+		err = enc.EncodeHeader(hdr)
+	}
+	if err == nil && pages != nil {
+		err = pages(enc)
+	}
+	if err == nil {
+		err = enc.Close()
+	}
+	if err != nil {
 		f.Close()
 		return err
 	}
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, name)
+	return os.Rename(tmp, filepath.Clean(name))
 }

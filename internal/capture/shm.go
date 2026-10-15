@@ -26,24 +26,16 @@ const dmsByte = 128
 // process's. A missing -shm file means no connection has used the database in
 // WAL mode.
 func ProbeOnce(dbPath string) (bool, error) {
-	held, _, err := ProbeOwner(dbPath)
-	return held, err
-}
-
-// ProbeOwner is ProbeOnce that also returns the pid the kernel reports for
-// the lock holder, as seen from this process's pid namespace (0 if the holder
-// isn't visible from it, which is the case across containers).
-func ProbeOwner(dbPath string) (held bool, pid int, err error) {
 	f, err := os.OpenFile(dbPath+"-shm", os.O_RDWR, 0)
 	if errors.Is(err, fs.ErrNotExist) {
-		return false, 0, nil
+		return false, nil
 	} else if err != nil {
-		return false, 0, err
+		return false, err
 	}
 	defer f.Close()
 	lk := syscall.Flock_t{Type: syscall.F_WRLCK, Whence: 0, Start: dmsByte, Len: 1}
 	if err := syscall.FcntlFlock(f.Fd(), syscall.F_GETLK, &lk); err != nil {
-		return false, 0, err
+		return false, err
 	}
-	return lk.Type != syscall.F_UNLCK, int(lk.Pid), nil
+	return lk.Type != syscall.F_UNLCK, nil
 }

@@ -36,7 +36,7 @@ func logFiles(t *testing.T, e *env, label string) {
 // Which files does a new shard produce from activation to its first write?
 func TestFilesFromActivationToFirstWrite(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, 5*time.Millisecond)
+	e := newEnv(t)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
 	app.Must(t, "open", "a", path) // the app's own tables: its migration
@@ -67,7 +67,7 @@ func TestFilesFromActivationToFirstWrite(t *testing.T) {
 // same Replica.Sync.
 func TestTimeBasedCheckpointMakesASecondFile(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, 5*time.Millisecond)
+	e := newEnv(t)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
 	app.Must(t, "open", "a", path)

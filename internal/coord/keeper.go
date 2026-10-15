@@ -3,10 +3,11 @@ package coord
 import (
 	"context"
 	"errors"
-	"golang.org/x/sync/errgroup"
 	"log/slog"
-	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/luci1900/shardlite/internal/supervisor"
 )
 
 // KeeperOptions tune a Keeper.
@@ -17,7 +18,7 @@ type KeeperOptions struct {
 	Logger   *slog.Logger
 }
 
-// Keeper renews a node's lease in the background and answers the one question
+// Keeper renews a node's lease and answers the one question
 // the node asks before acknowledging anything: is the lease still good?
 //
 // The holder judges its own lease expired a safety margin before others do,
@@ -26,22 +27,22 @@ type KeeperOptions struct {
 // can't leave it acting on a lease others consider dead. Expiry is final: a
 // node whose lease has run out may have lost shards to other nodes, so it
 // stops for good and a restart takes a new epoch.
+//
+// A Keeper renews only while it is served (it is a suture service): a lease
+// that is never served runs out like any other.
 type Keeper struct {
-	reg  NodeRegistry
+	reg  *Registry
 	opts KeeperOptions
 
-	mu    sync.Mutex
-	lease NodeLease
-	err   error // set once, final
+	lease atomic.Pointer[NodeLease] // the latest, stored only by the renewal loop
+	err   atomic.Pointer[error]     // set once, final
 
-	lost   chan struct{}
-	stop   context.CancelFunc
-	g      errgroup.Group // owns the renewal loop; Close joins it
-	closed sync.Once
+	lost chan struct{}
 }
 
-// StartKeeper starts renewing lease, which Acquire just returned.
-func StartKeeper(reg NodeRegistry, lease NodeLease, opts KeeperOptions) *Keeper {
+// NewKeeper returns the Keeper of lease, which Acquire just returned. It renews
+// nothing until it is served.
+func NewKeeper(reg *Registry, lease NodeLease, opts KeeperOptions) *Keeper {
 	if opts.Interval <= 0 {
 		opts.Interval = 3 * time.Second
 	}
@@ -55,57 +56,51 @@ func StartKeeper(reg NodeRegistry, lease NodeLease, opts KeeperOptions) *Keeper 
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	k := &Keeper{reg: reg, opts: opts, lease: lease, lost: make(chan struct{}), stop: cancel}
-	k.g.Go(func() error { k.loop(ctx); return nil })
+	k := &Keeper{reg: reg, opts: opts, lost: make(chan struct{})}
+	k.lease.Store(&lease)
 	return k
 }
 
-func (k *Keeper) validUntil() time.Time { return k.lease.Renewed.Add(k.lease.TTL - k.opts.Margin) }
+func (k *Keeper) validUntil(l NodeLease) time.Time { return l.Renewed.Add(l.TTL - k.opts.Margin) }
 
 // Lease returns the latest lease.
-func (k *Keeper) Lease() NodeLease {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	return k.lease
-}
+func (k *Keeper) Lease() NodeLease { return *k.lease.Load() }
 
 // Check returns nil while the lease is good for acknowledging work, and the
 // reason (ErrLeaseLost or ErrLeaseExpired) once it is not.
 func (k *Keeper) Check() error {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	if k.err == nil && !time.Now().Before(k.validUntil()) {
-		k.failLocked(ErrLeaseExpired)
+	if k.err.Load() == nil && !time.Now().Before(k.validUntil(k.Lease())) {
+		k.fail(ErrLeaseExpired)
 	}
-	return k.err
+	if e := k.err.Load(); e != nil {
+		return *e
+	}
+	return nil
 }
 
 // Lost is closed once the lease is lost or has expired.
 func (k *Keeper) Lost() <-chan struct{} { return k.lost }
 
-func (k *Keeper) failLocked(err error) {
-	if k.err == nil {
-		k.err = err
+// fail makes err the final one, if none was set yet.
+func (k *Keeper) fail(err error) {
+	if k.err.CompareAndSwap(nil, &err) {
 		close(k.lost)
-		k.opts.Logger.Error("node lease is no longer valid, the node must stop", "node", k.lease.Name, "epoch", k.lease.Epoch, "err", err)
+		l := k.Lease()
+		k.opts.Logger.Error("node lease is no longer valid, the node must stop", "node", l.Name, "epoch", l.Epoch, "err", err)
 	}
 }
 
-func (k *Keeper) fail(err error) {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	k.failLocked(err)
-}
+func (*Keeper) String() string { return "keeper" }
 
-func (k *Keeper) loop(ctx context.Context) {
-	k.mu.Lock()
-	delay := time.Until(k.lease.Renewed.Add(k.opts.Interval))
-	k.mu.Unlock()
+// Serve is the renewal loop, which owns the lease: cur is the latest one, and
+// each renewal publishes it for the readers. It ends when ctx does or the lease
+// is lost or has expired, and is never restarted. The lease is left as it is:
+// Release gives it up.
+func (k *Keeper) Serve(ctx context.Context) error {
+	cur := k.Lease()
+	delay := time.Until(cur.Renewed.Add(k.opts.Interval))
 	for {
-		k.mu.Lock()
-		until := k.validUntil()
-		k.mu.Unlock()
+		until := k.validUntil(cur)
 
 		// Wake for the next renewal, or for expiry, whichever comes first.
 		wake, expire := time.NewTimer(delay), time.NewTimer(time.Until(until))
@@ -113,33 +108,29 @@ func (k *Keeper) loop(ctx context.Context) {
 		case <-ctx.Done():
 			wake.Stop()
 			expire.Stop()
-			return
+			return supervisor.NoRestart(nil)
 		case <-expire.C:
 			wake.Stop()
 			k.fail(ErrLeaseExpired)
-			return
+			return supervisor.NoRestart(nil)
 		case <-wake.C:
 			expire.Stop()
 		}
 
-		k.mu.Lock()
-		cur := k.lease
-		k.mu.Unlock()
 		// A renewal that is still going when the margin runs out is worth nothing.
 		rctx, cancel := context.WithDeadline(ctx, until)
 		renewed, err := k.reg.Renew(rctx, cur, k.opts.Info())
 		cancel()
 		switch {
 		case err == nil:
-			k.mu.Lock()
-			k.lease = renewed
+			cur = renewed
+			k.lease.Store(&renewed)
 			delay = time.Until(renewed.Renewed.Add(k.opts.Interval))
-			k.mu.Unlock()
 		case ctx.Err() != nil:
-			return
+			return supervisor.NoRestart(nil)
 		case errors.Is(err, ErrLeaseLost):
 			k.fail(err)
-			return
+			return supervisor.NoRestart(nil)
 		default:
 			// Storage trouble. Try again soon, until the margin runs out.
 			k.opts.Logger.Warn("lease renewal failed", "node", cur.Name, "err", err)
@@ -148,23 +139,15 @@ func (k *Keeper) loop(ctx context.Context) {
 	}
 }
 
-// Close stops renewing. With release, the lease is marked released (a
-// graceful shutdown), unless it was already lost.
-func (k *Keeper) Close(ctx context.Context, release bool) error {
-	var err error
-	k.closed.Do(func() {
-		k.stop()
-		k.g.Wait()
-		if release {
-			k.mu.Lock()
-			l, ferr := k.lease, k.err
-			k.mu.Unlock()
-			if ferr == nil {
-				l.NodeInfo = k.opts.Info()
-				l.NodeInfo.Name = k.lease.Name
-				err = k.reg.Release(ctx, l)
-			}
-		}
-	})
-	return err
+// Release marks the lease released (a graceful shutdown), unless it was already
+// lost. The Keeper must have stopped being served first.
+func (k *Keeper) Release(ctx context.Context) error {
+	if k.err.Load() != nil {
+		return nil
+	}
+	l := k.Lease()
+	name := l.Name
+	l.NodeInfo = k.opts.Info()
+	l.NodeInfo.Name = name
+	return k.reg.Release(ctx, l)
 }

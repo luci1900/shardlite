@@ -331,10 +331,11 @@ func TestCallerStaysActiveForTheCall(t *testing.T) {
 		done <- err
 	}()
 	<-started
-	for range 4 { // four idle timeouts, with a janitor pass in each
-		passes := r.m.Stats.Janitor.Load()
+	a := r.shard("wallet/ia1")
+	for range 4 { // four idle timeouts, with a look of the idle timer in each
+		looks := a.looks.idle.Load()
 		clk.Advance(300 * time.Millisecond)
-		eventually(t, "a janitor pass", func() bool { return r.m.Stats.Janitor.Load() > passes })
+		waitCounter(t, "a look of the idle timer", &a.looks.idle, looks+1)
 	}
 	if !r.m.IsActive("wallet/ia1") {
 		t.Fatal("the caller was deactivated during its streaming call")

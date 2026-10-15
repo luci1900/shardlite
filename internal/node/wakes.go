@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"slices"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -13,50 +13,46 @@ import (
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/capture"
+	"github.com/luci1900/shardlite/internal/coord"
 	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/supervisor"
 )
 
 // Wake hints (docs/internals.md, Message delivery): an empty object wakes/{minute}/{shard} for a
 // shard that was let go of with live outbox rows or inbox rows due later, or
-// whose tail an adoption replayed, or that still had a live outbox row when a snapshot took its tail away,
-// so a node finds it and activates it, whichever node it was and whether or not it kept its data directory.
+// whose tail an adoption replayed, so a node finds it and activates it, whichever node it was and whether or not it kept its data directory.
 
 const (
-	wakePrefix = shardfile.WakePrefix
-	wakeLayout = shardfile.WakeLayout
+	wakePrefix = "wakes/"
+	wakeLayout = "2006-01-02T15:04Z" // fixed width, so keys sort by time
 )
 
-func wakeKey(t time.Time, shard string) string { return shardfile.WakeKey(t, shard) }
+// wakeKey is the key of the hint that wakes shard at t.
+func wakeKey(t time.Time, shard string) string {
+	return wakePrefix + t.UTC().Truncate(time.Minute).Format(wakeLayout) + "/" + shard
+}
+
+// hintStore is where the wake hints are: the node's blob storage.
+type hintStore struct{ store *blob.Store }
 
 // writeWake records that shard needs waking at t. An existing hint is success.
-func (m *Manager) writeWake(ctx context.Context, shard string, t time.Time) (string, error) {
+func (h hintStore) writeWake(ctx context.Context, shard string, t time.Time) (string, error) {
 	key := wakeKey(t, shard)
-	_, err := m.n.Store.Create(ctx, key, strings.NewReader(""))
+	_, err := h.store.Create(ctx, key, strings.NewReader(""))
 	if err != nil && !errors.Is(err, blob.ErrExists) {
 		return key, err
 	}
 	return key, nil
 }
 
-func (m *Manager) deleteWakes(ctx context.Context, keys ...string) error {
+func (h hintStore) deleteWakes(ctx context.Context, keys ...string) error {
 	var errs []error
 	for _, k := range keys {
-		if err := m.n.Store.Delete(ctx, k, ""); err != nil && !errors.Is(err, blob.ErrNotFound) {
+		if err := h.store.Delete(ctx, k, ""); err != nil && !errors.Is(err, blob.ErrNotFound) {
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
-}
-
-func (s *shardMsgs) addHints(keys []string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.hints == nil {
-		s.hints = map[string]bool{}
-	}
-	for _, k := range keys {
-		s.hints[k] = true
-	}
 }
 
 // hintMinute is the time a hint is for.
@@ -66,268 +62,363 @@ func hintMinute(key string) (time.Time, bool) {
 	return t, ok && err == nil
 }
 
-// scheduleReconcile asks for the shard's hints to be brought in line with what
-// it holds, in the background (calls that arrive meanwhile share the next run).
-func (s *shardMsgs) scheduleReconcile() {
-	s.mu.Lock()
-	if s.recRunning {
-		s.recAgain = true
-		s.mu.Unlock()
-		return
-	}
-	s.recRunning = true
-	s.mu.Unlock()
-	mg := s.a.m.msgs
-	mg.spawn(func() {
-		for {
-			mg.reconcile(s.ctx, s.a)
-			s.mu.Lock()
-			if !s.recAgain {
-				s.recRunning = false
-				s.mu.Unlock()
-				return
-			}
-			s.recAgain = false
-			s.mu.Unlock()
-		}
-	})
+// wakeHints is the owner's side of the shard's wake hints: what it knows of
+// them (in kept), the earliest inbox row they follow, and the child that writes
+// and deletes them in blob storage, one at a time. Only the owner's loop calls
+// it. The child's result comes back on result, which the loop takes.
+type wakeHints struct {
+	k      *kept // hints and hintDirty
+	store  wakeStore
+	name   string
+	result chan hintResult // buffered: the child never waits for the loop
+	child  errgroup.Group
+
+	read1       bool // a read is durable (earliest is meaningful)
+	earliest    int64
+	hasEarliest bool
+	tidy        bool        // the hints are to be brought in line with what the shard holds
+	busy        bool        // the child is running
+	release     *releaseAsk // the hints for a release, waiting for the child to end
+	released    bool        // the hints for the release are written: nothing changes them any more
 }
 
-// reconcile writes the hint for the shard's earliest inbox row if it has none
-// (one write for any number of rows in that minute), and deletes the hints
-// that have done their job: a hint for a minute the earliest row has moved
-// past, once the shard has no live outbox rows either. A hint that woke the shard
-// is one of these. It does nothing until the shard's first read (before that the
-// node doesn't know what it holds).
-func (mg *messenger) reconcile(ctx context.Context, a *ActiveShard) {
-	s := a.msgs
-	s.hintMu.Lock()
-	defer s.hintMu.Unlock()
-	if ctx.Err() != nil {
-		return
+// hintJob is a change to the shard's hints in blob storage, which the child
+// makes: the writes in order, then the deletes. A write that fails stops it.
+type hintJob struct {
+	write  []time.Time
+	delete []string
+	clean  bool             // nothing is left for later once it succeeds
+	done   func(hintResult) // run on the loop once the child has ended
+}
+
+type hintResult struct {
+	job            *hintJob
+	wrote, deleted []string
+	op             string // what failed: "write" or "delete"
+	err            error
+}
+
+// noteEarliest is for a read that is durable now: the hints follow its earliest
+// inbox row.
+func (h *wakeHints) noteEarliest(snap *snapshot) {
+	changed := !h.read1 || h.hasEarliest != snap.hasEarliest || h.earliest != snap.earliest || h.k.hintDirty
+	h.read1, h.earliest, h.hasEarliest = true, snap.earliest, snap.hasEarliest
+	if changed {
+		h.tidy = true
 	}
-	s.mu.Lock()
-	if !s.read1 {
-		s.mu.Unlock()
-		return
+}
+
+// woken notes the hints that woke the shard: they are the shard's now, and go
+// once they have done their job.
+func (h *wakeHints) woken(keys []string) {
+	for _, k := range keys {
+		h.k.hints[k] = true
 	}
-	earliest, has := s.earliest, s.hasEarliest
-	have := make([]string, 0, len(s.hints))
-	for k := range s.hints {
-		have = append(have, k)
-	}
-	s.mu.Unlock()
-	fail := func(what string, err error) {
-		if ctx.Err() == nil {
-			mg.m.log.Warn("could not "+what+" a wake hint", "shard", a.Name, "err", err)
-		}
-		s.mu.Lock()
-		s.hintDirty = true
-		s.mu.Unlock()
-	}
+	h.tidy = true
+}
+
+// reconcileJob is what bringing the hints in line takes: a write of the hint for
+// the earliest inbox row if there is none (one for any number of rows in that
+// minute), and the deletes of hints that have done their job, for a minute the
+// earliest row has moved past (a hint that woke the shard is one of these). The
+// owner drops the deletes while an outbox row is live.
+func (h *wakeHints) reconcileJob() *hintJob {
+	job := &hintJob{clean: true}
 	want := ""
-	if has {
-		want = wakeKey(time.Unix(earliest, 0), a.Name)
-		if !slices.Contains(have, want) {
-			if _, err := mg.ensureHint(ctx, a, time.Unix(earliest, 0)); err != nil {
-				fail("write", err)
-				return
-			}
+	if h.hasEarliest {
+		t := time.Unix(h.earliest, 0)
+		want = wakeKey(t, h.name)
+		if !h.k.hints[want] {
+			job.write = []time.Time{t}
 		}
 	}
-	var stale []string
-	for _, k := range have {
+	for k := range h.k.hints {
 		if k == want {
 			continue
 		}
 		t, ok := hintMinute(k)
-		if !has || !ok || earliest >= t.Add(time.Minute).Unix() {
-			stale = append(stale, k)
+		if !h.hasEarliest || !ok || h.earliest >= t.Add(time.Minute).Unix() {
+			job.delete = append(job.delete, k)
 		}
 	}
-	if len(stale) == 0 {
-		s.mu.Lock()
-		s.hintDirty = false
-		s.mu.Unlock()
-		return
-	}
-	// A hint also means "look at the outbox": it stays while any row is live.
-	live, err := s.liveOutbox(ctx, a)
-	if err != nil {
-		if !errors.Is(err, capture.ErrClosed) {
-			fail("check for", err)
-		}
-		return
-	}
+	return job
+}
+
+// releaseJob is what the hints before a release take: one for now if the shard
+// has live outbox rows and one for its earliest inbox row not given up on, and
+// the others deleted.
+func (h *wakeHints) releaseJob(now time.Time, live bool, earliest int64, has bool) *hintJob {
+	want := map[string]time.Time{}
 	if live {
-		return
+		want[wakeKey(now, h.name)] = now
 	}
-	if err := mg.m.deleteWakes(ctx, stale...); err != nil {
-		fail("delete", err)
-		return
+	if has {
+		t := time.Unix(earliest, 0)
+		want[wakeKey(t, h.name)] = t
 	}
-	s.mu.Lock()
-	for _, k := range stale {
-		delete(s.hints, k)
+	job := &hintJob{clean: true}
+	for k, t := range want {
+		if !h.k.hints[k] {
+			job.write = append(job.write, t)
+		}
 	}
-	s.hintDirty = false
-	s.mu.Unlock()
+	for k := range h.k.hints {
+		if _, ok := want[k]; !ok {
+			job.delete = append(job.delete, k)
+		}
+	}
+	return job
 }
 
-// liveOutbox reports whether the shard has an outbox row the node has not given up on.
-func (s *shardMsgs) liveOutbox(ctx context.Context, a *ActiveShard) (bool, error) {
-	var live bool
-	given := s.given()
-	err := a.useDB(ctx, func(db *sql.DB) error {
-		var err error
-		live, err = firstOutbox(ctx, db, given)
-		return err
+// run starts the child for a job.
+func (h *wakeHints) run(ctx context.Context, job *hintJob) {
+	h.busy = true
+	h.child.Go(func() error {
+		r := hintResult{job: job}
+		for _, t := range job.write {
+			k, err := h.store.writeWake(ctx, h.name, t)
+			if err != nil {
+				r.op, r.err = "write", err
+				break
+			}
+			r.wrote = append(r.wrote, k)
+		}
+		if r.err == nil && len(job.delete) > 0 {
+			if err := h.store.deleteWakes(ctx, job.delete...); err != nil {
+				r.op, r.err = "delete", err
+			} else {
+				r.deleted = job.delete
+			}
+		}
+		h.result <- r
+		return nil
 	})
-	return live, err
 }
 
-// ensureHint writes the shard's hint for t unless the shard already knows it, and
-// remembers it. wrote says whether it made a request. The caller holds hintMu.
-func (mg *messenger) ensureHint(ctx context.Context, a *ActiveShard, t time.Time) (wrote bool, err error) {
-	s := a.msgs
-	k := wakeKey(t, a.Name)
-	s.mu.Lock()
-	known := s.hints[k]
-	s.mu.Unlock()
-	if known {
-		return false, nil
-	}
-	if _, err := mg.m.writeWake(ctx, a.Name, t); err != nil {
-		return false, err
-	}
-	s.mu.Lock()
-	if s.hints == nil {
-		s.hints = map[string]bool{}
-	}
-	s.hints[k] = true
-	s.mu.Unlock()
-	return true, nil
+// ended takes the child's result.
+func (h *wakeHints) ended(r hintResult) {
+	h.busy = false
+	h.note(r)
+	r.job.done(r)
 }
 
-// hintLiveOutbox is for a snapshot that is about to take the shard's tail away (a delta or a
-// rebase, before the manifest adopts it). After a crash an adopter writes a hint only for a shard whose
-// tail it replays, so a shard that still has a live outbox row (a delivery that is failing or backing off)
-// would otherwise be inactive with work and no way to be woken once the tail is gone. So the hint for now
-// goes first, and if it can't be written the snapshot doesn't happen and the next pass tries again.
-// Healthy shards have no live row minutes after the commit and cost nothing here. The hint is deleted by
-// reconcile once no row is live, like the one written when a shard is let go of.
-func (mg *messenger) hintLiveOutbox(ctx context.Context, a *ActiveShard) error {
-	if !mg.enabled() {
-		return nil
+// note records what the child wrote and deleted.
+func (h *wakeHints) note(r hintResult) {
+	for _, k := range r.wrote {
+		h.k.hints[k] = true
 	}
-	s := a.msgs
-	s.hintMu.Lock()
-	defer s.hintMu.Unlock()
-	live, err := s.liveOutbox(ctx, a)
-	if err != nil {
-		return fmt.Errorf("checking for live outbox rows: %w", err)
+	for _, k := range r.deleted {
+		delete(h.k.hints, k)
 	}
-	if !live {
-		return nil
+}
+
+// stop waits for the child, whose context has ended, and keeps what it did.
+func (h *wakeHints) stop() {
+	h.child.Wait()
+	select {
+	case r := <-h.result:
+		h.busy = false
+		h.note(r)
+	default:
 	}
-	wrote, err := mg.ensureHint(ctx, a, mg.m.now())
-	if err != nil {
-		return fmt.Errorf("writing a wake hint: %w", err)
+}
+
+// woken is the wake scan telling the owner which hints woke the shard.
+func (o *msgOwner) woken(ctx context.Context, keys []string) {
+	o.send(ctx, func() { o.hints.woken(keys) })
+}
+
+// tend starts the hint work that is waiting, once the child is free: the hints
+// for a release first, then bringing the hints in line (after the shard's first
+// durable read: before that the node doesn't know what it holds).
+func (o *msgOwner) tend() {
+	h := &o.hints
+	switch {
+	case h.busy:
+	case h.release != nil:
+		ask := h.release
+		h.release = nil
+		o.releaseHints(ask)
+	case h.tidy && h.read1 && !h.released:
+		h.tidy = false
+		o.reconcile()
 	}
-	if wrote {
-		mg.m.Stats.SnapshotHints.Add(1)
+}
+
+// reconcile brings the hints in line (reconcileJob). A hint also means "look at
+// the outbox", so none is deleted while any outbox row is live.
+func (o *msgOwner) reconcile() {
+	ctx := o.ctx
+	fail := func(what string, err error) {
+		if ctx.Err() == nil {
+			o.mg.log.Warn("could not "+what+" a wake hint", "shard", o.a.Name, "err", err)
+		}
+		o.k.hintDirty = true
 	}
-	return nil
+	job := o.hints.reconcileJob()
+	if len(job.delete) > 0 {
+		var live bool
+		err := o.db(ctx, func(db *sql.DB) error {
+			var err error
+			live, err = firstOutbox(ctx, db, o.k.givenUp)
+			return err
+		})
+		switch {
+		case err != nil && !errors.Is(err, capture.ErrClosed):
+			fail("check for", err)
+			return
+		case err != nil:
+			return
+		case live:
+			job.delete, job.clean = nil, false
+		}
+	}
+	if len(job.write) == 0 && len(job.delete) == 0 {
+		if job.clean {
+			o.k.hintDirty = false
+		}
+		return
+	}
+	job.done = func(r hintResult) {
+		switch {
+		case r.err != nil:
+			fail(r.op, r.err)
+		case job.clean:
+			o.k.hintDirty = false
+		}
+	}
+	o.hints.run(ctx, job)
+}
+
+// releaseAsk is the lifecycle loop asking for the hints before a release.
+type releaseAsk struct {
+	ctx context.Context
+	res chan error // buffered
 }
 
 // hintsBeforeRelease is what a shard does before it is let go of: the hints
 // that will wake it again exist before its final sync (an early one is only a
-// stale one). It needs one for now if it has live outbox rows and one for its
-// earliest inbox row that it has not given up on; the others are deleted. A
-// failure keeps the shard active.
-func (mg *messenger) hintsBeforeRelease(ctx context.Context, a *ActiveShard) error {
-	s := a.msgs
-	s.hintMu.Lock()
-	defer s.hintMu.Unlock()
+// stale one). A failure keeps the shard active. After it, nothing changes the
+// hints until the owner is removed. Only the lifecycle loop calls it.
+func (o *msgOwner) hintsBeforeRelease(ctx context.Context) error {
+	ask := &releaseAsk{ctx: ctx, res: make(chan error, 1)}
+	if !o.send(ctx, func() { o.hints.release = ask }) {
+		return fmt.Errorf("writing the wake hints: %w", errLoopEnded)
+	}
+	select {
+	case err := <-ask.res:
+		return err
+	case <-o.ended:
+		select {
+		case err := <-ask.res:
+			return err
+		default:
+			return fmt.Errorf("writing the wake hints: %w", errLoopEnded)
+		}
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
+}
+
+// releaseHints is hintsBeforeRelease on the loop, once the child is free.
+func (o *msgOwner) releaseHints(ask *releaseAsk) {
+	ctx := ask.ctx
 	var live, has bool
 	var earliest int64
-	given := s.given()
-	err := a.useDB(ctx, func(db *sql.DB) error {
-		var err error
-		if live, err = firstOutbox(ctx, db, given); err != nil {
+	err := o.db(ctx, func(db *sql.DB) error {
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
 			return err
 		}
-		earliest, has, err = firstInbox(ctx, db, given, ``)
+		defer tx.Rollback()
+		if live, err = firstOutbox(ctx, tx, o.k.givenUp); err != nil {
+			return err
+		}
+		earliest, has, err = firstInbox(ctx, tx, o.k.givenUp, ``)
 		return err
 	})
 	if err != nil {
-		return fmt.Errorf("checking for hints to write: %w", err)
+		ask.res <- fmt.Errorf("checking for hints to write: %w", err)
+		return
 	}
-	want := map[string]time.Time{}
-	if live {
-		want[wakeKey(mg.m.now(), a.Name)] = mg.m.now()
+	job := o.hints.releaseJob(o.mg.now(), live, earliest, has)
+	if len(job.write) == 0 && len(job.delete) == 0 {
+		o.hints.released = true
+		ask.res <- nil
+		return
 	}
-	if has {
-		t := time.Unix(earliest, 0)
-		want[wakeKey(t, a.Name)] = t
-	}
-	for _, t := range want {
-		if _, err := mg.ensureHint(ctx, a, t); err != nil {
-			return fmt.Errorf("writing a wake hint: %w", err)
+	// The child stops with the owner or with the release.
+	cctx, cancel := context.WithCancel(o.ctx)
+	stop := context.AfterFunc(ctx, cancel)
+	job.done = func(r hintResult) {
+		stop()
+		cancel()
+		switch {
+		case r.err != nil && r.op == "write":
+			ask.res <- fmt.Errorf("writing a wake hint: %w", r.err)
+			return
+		case r.err != nil:
+			o.mg.log.Warn("could not delete wake hints", "shard", o.a.Name, "err", r.err) // stale ones are harmless
 		}
+		o.hints.released = true
+		ask.res <- nil
 	}
-	var stale []string
-	s.mu.Lock()
-	for k := range s.hints {
-		if _, ok := want[k]; !ok {
-			stale = append(stale, k)
-		}
-	}
-	s.mu.Unlock()
-	if len(stale) > 0 {
-		if err := mg.m.deleteWakes(ctx, stale...); err != nil {
-			mg.m.log.Warn("could not delete wake hints", "shard", a.Name, "err", err)
-			return nil // stale ones are harmless
-		}
-		s.mu.Lock()
-		for _, k := range stale {
-			delete(s.hints, k)
-		}
-		s.mu.Unlock()
-	}
-	return nil
+	o.hints.run(cctx, job)
 }
 
-// wakeLoop scans for hints at startup (after adoption) and then every WakeEvery.
-func (m *Manager) wakeLoop(ctx context.Context) {
-	tick, stop := m.opts.Clock.NewTicker(m.opts.WakeEvery)
+// WakeOptions configure the scan for wake hints.
+type WakeOptions struct {
+	Every           time.Duration // how often wake hints are looked for, 1 min if zero
+	ActivationLimit int           // shards activated at once by the scan, 32 if zero
+}
+
+// wakeScan is the part of Shards that finds the wake hints that are due and
+// activates the shards they name.
+type wakeScan struct {
+	store   *blob.Store // listed for hints
+	hints   hintStore
+	files   *shardfile.Files
+	keeper  *coord.Keeper
+	kinds   *Kinds
+	acquire func(ctx context.Context, target string) (*Ref, error) // activates a shard (Shards.Acquire)
+	clock   Clock
+	opts    WakeOptions
+	log     *slog.Logger
+}
+
+func (w *wakeScan) String() string { return "wake scan" }
+
+// Serve scans for hints at startup (after adoption) and then every
+// WakeOptions.Every. It is the wake scan's loop, as a service.
+func (w *wakeScan) Serve(ctx context.Context) error {
+	tick, stop := w.clock.NewTicker(w.opts.Every)
 	defer stop()
 	for {
-		m.scanWakes(ctx)
+		w.scan(ctx)
 		select {
 		case <-ctx.Done():
-			return
+			return supervisor.NoRestart(nil)
 		case <-tick:
 		}
 	}
 }
 
-// scanWakes lists the hints from the start up to now and wakes each shard
-// they name: activated through the normal path under the activation limit. A
-// hint that can't be used (a name that doesn't parse, a kind that isn't declared
-// a shard with no manifest) is deleted: a hint never creates a shard.
-func (m *Manager) scanWakes(ctx context.Context) {
-	if m.n.Keeper.Check() != nil {
+// scan lists the hints from the start up to now and wakes each shard they
+// name: activated through the normal path under the activation limit. A hint
+// that can't be used (a name that doesn't parse, a kind that isn't declared a
+// shard with no manifest) is deleted: a hint never creates a shard.
+func (w *wakeScan) scan(ctx context.Context) {
+	if w.keeper.Check() != nil {
 		return
 	}
-	now := m.now().UTC().Format(wakeLayout)
+	now := w.clock.Now().UTC().Format(wakeLayout)
 	byShard := map[string][]string{}
 	var order []string
 	var junk []string
-	for info, err := range m.n.Store.List(ctx, wakePrefix) {
+	for info, err := range w.store.List(ctx, wakePrefix) {
 		if err != nil {
 			if ctx.Err() == nil {
-				m.log.Warn("could not list wake hints", "err", err)
+				w.log.Warn("could not list wake hints", "err", err)
 			}
 			return
 		}
@@ -345,26 +436,26 @@ func (m *Manager) scanWakes(ctx context.Context) {
 		byShard[shard] = append(byShard[shard], info.Key)
 	}
 	if len(junk) > 0 {
-		m.log.Error("deleting wake hints that don't parse", "keys", junk)
-		m.deleteWakes(ctx, junk...)
+		w.log.Error("deleting wake hints that don't parse", "keys", junk)
+		w.hints.deleteWakes(ctx, junk...)
 	}
 	var g errgroup.Group
-	g.SetLimit(m.opts.ActivationLimit)
+	g.SetLimit(w.opts.ActivationLimit)
 	for _, shard := range order {
 		keys := byShard[shard]
 		g.Go(func() error {
-			m.wake(ctx, shard, keys)
+			w.wake(ctx, shard, keys)
 			return nil // independent: one shard failing must not stop the others
 		})
 	}
 	g.Wait()
 }
 
-func (m *Manager) wake(ctx context.Context, shard string, keys []string) {
+func (w *wakeScan) wake(ctx context.Context, shard string, keys []string) {
 	drop := func(why string) {
-		m.log.Warn("deleting a wake hint: "+why, "shard", shard)
-		if err := m.deleteWakes(ctx, keys...); err != nil && ctx.Err() == nil {
-			m.log.Warn("could not delete wake hints", "shard", shard, "err", err)
+		w.log.Warn("deleting a wake hint: "+why, "shard", shard)
+		if err := w.hints.deleteWakes(ctx, keys...); err != nil && ctx.Err() == nil {
+			w.log.Warn("could not delete wake hints", "shard", shard, "err", err)
 		}
 	}
 	kind, _, err := ParseTarget(shard)
@@ -372,54 +463,66 @@ func (m *Manager) wake(ctx context.Context, shard string, keys []string) {
 		drop("the shard name doesn't parse")
 		return
 	}
-	if _, err := m.opts.Kinds.Lookup(kind); err != nil {
+	if _, err := w.kinds.Lookup(kind); err != nil {
 		drop("the kind is not declared")
 		return
 	}
-	if _, _, err := m.n.Files.GetManifest(ctx, shard); errors.Is(err, blob.ErrNotFound) {
+	if _, _, err := w.files.GetManifest(ctx, shard); errors.Is(err, blob.ErrNotFound) {
 		drop("the shard has no manifest")
 		return
 	} else if err != nil {
 		if ctx.Err() == nil {
-			m.log.Warn("could not read a woken shard's manifest", "shard", shard, "err", err)
+			w.log.Warn("could not read a woken shard's manifest", "shard", shard, "err", err)
 		}
 		return
 	}
-	ref, err := m.Acquire(ctx, shard)
+	ref, err := w.acquire(ctx, shard)
 	if err != nil {
 		if ctx.Err() == nil {
-			m.log.Warn("could not wake a shard", "shard", shard, "err", err)
+			w.log.Warn("could not wake a shard", "shard", shard, "err", err)
 		}
 		return
 	}
 	defer ref.Release()
-	ref.a.msgs.addHints(keys)
-	ref.a.msgs.scheduleReconcile()
+	ref.a.msgs.load().woken(ctx, keys)
 }
 
-// anyLiveMessages reports whether an active shard has live outbox rows or inbox rows that are due.
-func (m *Manager) anyLiveMessages(ctx context.Context) bool {
-	m.mu.Lock()
-	list := make([]*ActiveShard, 0, len(m.active))
-	for _, a := range m.active {
-		list = append(list, a)
-	}
-	m.mu.Unlock()
-	for _, a := range list {
-		live, err := m.msgs.busy(ctx, a, false)
-		if err == nil && live {
-			return true
+// anyLiveMessages reports whether an active shard has live outbox rows or inbox
+// rows that are due. Each shard is looked at on its own, and a row moving from
+// a sender's outbox to a receiver's inbox is inserted before it is deleted, so
+// a look can only miss it if an intake landed during the look: then it looks
+// again. A look that can't tell counts as live: the shard is being let go of
+// (its owner is removed for the final sync, and comes back if the release
+// doesn't go through) or its database didn't answer, and either way its rows
+// may still be there.
+func (m *Shards) anyLiveMessages(ctx context.Context) bool {
+	for ctx.Err() == nil {
+		intakes := m.msgs.intakes.Load()
+		var list []*shard
+		m.tab.shards(func(a *shard) { list = append(list, a) }, entryActive, entryBusy)
+		for _, a := range list {
+			o := a.msgs.load()
+			if o == nil {
+				continue
+			}
+			if live, err := o.live(ctx, false, false); err != nil || live {
+				return ctx.Err() == nil
+			}
+		}
+		if m.msgs.intakes.Load() == intakes {
+			return false
 		}
 	}
 	return false
 }
 
-// Drain keeps delivering messages for up to the drain time (ManagerOptions.Drain),
+// Drain keeps delivering messages for up to the drain time (ShardsOptions.Drain),
 // or until no active shard has live rows. It is for shutdown, before the shards
 // are let go of: the flush loop and the deliveries keep running, receivers are
 // activated as messages need them, and the messages they send are delivered too.
-func (m *Manager) Drain(ctx context.Context) {
-	if !m.msgs.enabled() || m.n.Keeper.Check() != nil {
+// It does nothing once the node may not write any more.
+func (m *Shards) Drain(ctx context.Context) {
+	if m.n.Err() != nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(ctx, m.opts.Drain)

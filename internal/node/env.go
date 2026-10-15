@@ -1,6 +1,7 @@
 package node
 
 import (
+	"cmp"
 	"fmt"
 	"os"
 	"runtime"
@@ -29,8 +30,7 @@ type Env struct {
 	LeaseTTL    time.Duration // SHARDLITE_LEASE_TTL: 10s
 	FlushMin    time.Duration // SHARDLITE_FLUSH_MIN: the shortest time between two flush cycle starts, DefaultFlushMin
 	DeltaAge    time.Duration // SHARDLITE_DELTA_AGE: how old a shard's tail gets before a delta is written, 15m. A tail 3 times older raises an alert, and journal segments expire after the larger of 24h and 12 times this
-	DeltaSize   int64         // SHARDLITE_DELTA_SIZE: how many bytes of tail make a delta due, 1MB
-	Ignored     []string      // removed settings that are set (SHARDLITE_TAIL_ALERT, SHARDLITE_JOURNAL_EXPIRY): the node logs that it ignores them
+	DeltaSize   int64         // SHARDLITE_DELTA_SIZE: how many bytes of tail make a delta due, 256KB
 	App         string        // SHARDLITE_APP: the app's base URL, for example http://127.0.0.1:9000
 	HealthPath  string        // SHARDLITE_HEALTH_PATH: the app's health endpoint, /health
 	Listen      string        // SHARDLITE_LISTEN: the public listener, :8080
@@ -63,15 +63,9 @@ func ParseEnv(getenv func(string) string) (Env, error) {
 		}
 		e.Name = h
 	}
-	if e.HealthPath == "" {
-		e.HealthPath = "/health"
-	}
-	if e.Listen == "" {
-		e.Listen = ":8080"
-	}
-	if e.Control == "" {
-		e.Control = "127.0.0.1:7000"
-	}
+	e.HealthPath = cmp.Or(e.HealthPath, "/health")
+	e.Listen = cmp.Or(e.Listen, ":8080")
+	e.Control = cmp.Or(e.Control, "127.0.0.1:7000")
 	for _, d := range []struct {
 		name string
 		dst  *time.Duration
@@ -99,11 +93,6 @@ func ParseEnv(getenv func(string) string) (Env, error) {
 		}
 		e.DeltaSize = n
 	}
-	for _, name := range []string{"SHARDLITE_TAIL_ALERT", "SHARDLITE_JOURNAL_EXPIRY"} {
-		if getenv(name) != "" {
-			e.Ignored = append(e.Ignored, name)
-		}
-	}
 	if v := getenv("SHARDLITE_CACHE_LIMIT"); v != "" {
 		n, err := parseBytes(v)
 		if err != nil {
@@ -128,12 +117,11 @@ func ParseEnv(getenv func(string) string) (Env, error) {
 	return e, nil
 }
 
-// blobBucket is the bucket of the s3://bucket setting. The file backend is
-// gone, so a path is refused with a pointer to RustFS.
+// blobBucket is the bucket of the s3://bucket setting.
 func (e Env) blobBucket() (string, error) {
 	rest, ok := strings.CutPrefix(e.Blob, "s3://")
 	if !ok {
-		return "", fmt.Errorf("SHARDLITE_BLOB is %q, want s3://bucket: the file backend was removed, so run RustFS (docker/compose.s3.yaml) and point SHARDLITE_BLOB at its bucket instead", e.Blob)
+		return "", fmt.Errorf("SHARDLITE_BLOB is %q, want s3://bucket", e.Blob)
 	}
 	if rest == "" || strings.Contains(rest, "/") {
 		return "", fmt.Errorf("SHARDLITE_BLOB is %q, want s3://bucket (the bucket's name alone: SHARDLITE_PREFIX sets a prefix inside it)", e.Blob)

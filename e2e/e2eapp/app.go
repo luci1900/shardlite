@@ -23,8 +23,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
 	"google.golang.org/grpc"
+	_ "modernc.org/sqlite"
 )
 
 // Options configure an App.
@@ -439,7 +439,7 @@ func (p *pool) get(path string) (*handle, error) {
 		h.refs++
 		p.mu.Unlock()
 		// WAL mode, the default locking mode, and write transactions that start with BEGIN IMMEDIATE.
-		h.sql, h.err = sql.Open("sqlite3", "file:"+path+"?_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL&_txlock=immediate")
+		h.sql, h.err = sql.Open("sqlite", "file:"+path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_txlock=immediate")
 		if h.err == nil {
 			p.open.Add(1)
 			h.sql.SetMaxOpenConns(8)

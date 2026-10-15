@@ -12,12 +12,16 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
+	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
@@ -25,12 +29,13 @@ import (
 
 // srig is a node serving in front of a fake app. The fake app is in the test
 // process, but it never opens a shard itself: commits go through the separate
-// testapp process (see manager_test.go for why).
+// testapp process (see shards_test.go for why).
 type srig struct {
 	*mrig
 	fake    *httptest.Server
 	handler atomic.Pointer[http.HandlerFunc]
 	srv     *Server
+	stop    func() // stops the public and control servers and the health poll and joins them
 	pub     string // http://host:port
 	ctl     string
 	sock    string
@@ -40,16 +45,15 @@ type srig struct {
 	omu    sync.Mutex
 	opened map[string]bool
 
-	baseTr *transport    // the transport the server installed
-	hook   intakeHookFn  // wraps the intake, kept across restarts
-	hookN  *atomic.Int64 // counts the intakes that reached the hook
+	hook      atomic.Pointer[intakeHook]  // wraps the intake, kept across restarts
+	inboxHook atomic.Pointer[inboxHookFn] // wraps the delivery of an inbox row
 }
 
 func newSRig(t *testing.T) *srig { return newSRigWith(t, nil) }
 
-func newSRigWith(t *testing.T, mutate func(*ManagerOptions)) *srig {
+func newSRigWith(t *testing.T, mutate func(*ShardsOptions)) *srig {
 	t.Helper()
-	r := &srig{mrig: newMRigWith(t, mutate), opened: map[string]bool{}}
+	r := &srig{mrig: newUnstartedMRig(t, nil), opened: map[string]bool{}}
 	r.fake = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
 		if q.URL.Path == "/health" {
 			return
@@ -66,6 +70,9 @@ func newSRigWith(t *testing.T, mutate func(*ManagerOptions)) *srig {
 	r.fake.Config.Protocols = protos
 	r.fake.Start()
 	t.Cleanup(r.fake.Close)
+	r.newTransport = r.serverTransport
+	r.startNode()
+	r.startShards(mutate)
 	r.startServer()
 
 	r.client = &http.Client{Timeout: 20 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}}
@@ -76,13 +83,33 @@ func newSRigWith(t *testing.T, mutate func(*ManagerOptions)) *srig {
 	return r
 }
 
-func (r *srig) startServer() {
+// serverTransport makes the server the shards are built with, and returns its
+// transport behind the hooks.
+func (r *srig) serverTransport(m *Shards) *transport {
 	u, _ := url.Parse(r.fake.URL)
-	srv := NewServer(r.m, ServerOptions{App: u, HealthEvery: 20 * time.Millisecond})
-	r.srv = srv
-	tr := *r.m.msgs.send.Load()
-	r.baseTr = &tr
-	r.applyHook()
+	r.srv = NewServer(m, m.opts.Kinds, m.n.Keeper, ServerOptions{App: u, HealthEvery: 20 * time.Millisecond, Grace: 500 * time.Millisecond})
+	tr := r.srv.transport()
+	intake, inbox := tr.intake, tr.inbox
+	tr.intake = func(ctx context.Context, sender *shard, target string, row *outRow) (int, error) {
+		h := r.hook.Load()
+		if h == nil {
+			return intake(ctx, sender, target, row)
+		}
+		i := int(h.n.Add(1))
+		return h.fn(i, sender, target, row, func() (int, error) { return intake(ctx, sender, target, row) })
+	}
+	tr.inbox = func(ctx context.Context, a *shard, row *inRow) (int, error) {
+		if h := r.inboxHook.Load(); h != nil {
+			return (*h)(ctx, func() (int, error) { return inbox(ctx, a, row) })
+		}
+		return inbox(ctx, a, row)
+	}
+	return tr
+}
+
+// startServer serves the server the shards were built with.
+func (r *srig) startServer() {
+	srv := r.srv
 	pub, _ := net.Listen("tcp", "127.0.0.1:0")
 	ctl, _ := net.Listen("tcp", "127.0.0.1:0")
 	// Unix socket paths are short (104 bytes on macOS): not t.TempDir().
@@ -98,9 +125,13 @@ func (r *srig) startServer() {
 	}
 	r.pub, r.ctl = "http://"+pub.Addr().String(), "http://"+ctl.Addr().String()
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() { srv.Serve(ctx, pub, ctl, sock); close(done) }()
-	r.t.Cleanup(func() { cancel(); <-done; srv.Close() })
+	var g errgroup.Group
+	g.Go(func() error { return srv.publicServer(pub, nil).Serve(ctx) })
+	g.Go(func() error { return srv.controlServer(nil, ctl, sock).Serve(ctx) })
+	g.Go(func() error { return srv.health.Serve(ctx) })
+	var once sync.Once
+	r.stop = func() { once.Do(func() { cancel(); g.Wait() }) }
+	r.t.Cleanup(r.stop)
 	eventually(r.t, "the app to be seen as healthy", func() bool { ok, _ := r.srv.Ready(); return ok })
 }
 
@@ -426,11 +457,109 @@ func TestServerUpgrade(t *testing.T) {
 	}
 	conn.Close()
 	// Once it is closed the shard is free to go.
-	eventually(t, "the hold to be released", func() bool {
-		r.m.mu.Lock()
-		defer r.m.mu.Unlock()
-		a := r.m.active["slow/ws"]
-		return a != nil && a.refs == 0
+	eventually(t, "the hold to be released", func() bool { return r.refs("slow/ws") == 0 })
+}
+
+// Stopping the servers ends what is left of their requests and joins them: a
+// WebSocket, which Shutdown alone would leave open, and a request still running
+// after the grace period. A request that finishes within the grace period gets
+// its answer. Once the servers have stopped, no request holds a shard.
+func TestServerShutdownEndsAndJoinsRequests(t *testing.T) {
+	t.Parallel()
+	r := newSRig(t)
+	var started, ended apptest.Log[string]
+	r.app_(func(w http.ResponseWriter, q *http.Request) {
+		started.Add(q.URL.Path)
+		defer ended.Add(q.URL.Path)
+		switch q.URL.Path {
+		case "/ws":
+			conn, rw, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+			rw.Flush()
+			sc := bufio.NewScanner(rw)
+			for sc.Scan() {
+				rw.WriteString("echo " + sc.Text() + "\n")
+				rw.Flush()
+			}
+		case "/slow":
+			<-q.Context().Done() // until the node gives up on it
+		case "/finish":
+			time.Sleep(100 * time.Millisecond) // within the grace period
+			io.WriteString(w, "done")
+		}
+	})
+	refs := r.refs
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(r.pub, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	fmt.Fprintf(conn, "GET /ws?shardlite-target=slow/ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+	br := bufio.NewReader(conn)
+	if resp, err := http.ReadResponse(br, nil); err != nil || resp.StatusCode != 101 {
+		t.Fatalf("upgrade: %v %v", resp, err)
+	}
+	fmt.Fprintf(conn, "one\n")
+	if line, err := br.ReadString('\n'); err != nil || line != "echo one\n" {
+		t.Fatalf("%q %v", line, err)
+	}
+
+	type answer struct {
+		status int
+		body   string
+		err    error
+	}
+	call := func(base, path, target string) chan answer {
+		ch := make(chan answer, 1)
+		go func() {
+			q, _ := http.NewRequest("GET", base+path, nil)
+			q.Header.Set("Shardlite-Target", target)
+			resp, err := r.client.Do(q)
+			if err != nil {
+				ch <- answer{err: err}
+				return
+			}
+			defer resp.Body.Close()
+			b, err := io.ReadAll(resp.Body)
+			ch <- answer{resp.StatusCode, string(b), err}
+		}()
+		return ch
+	}
+	slow := call(r.ctl, "/slow", "slow/call") // through the control server
+	finish := call(r.pub, "/finish", "slow/finish")
+	started.WaitFor(t, 10*time.Second, "the requests to reach the app", func(p []string) bool {
+		return slices.Contains(p, "/ws") && slices.Contains(p, "/slow") && slices.Contains(p, "/finish")
+	})
+	for _, target := range []string{"slow/ws", "slow/call", "slow/finish"} {
+		if n := refs(target); n < 1 {
+			t.Fatalf("%s: %d references before the servers stop", target, n)
+		}
+	}
+
+	r.stop()
+	// Joined: nothing is left holding a shard the moment the servers have stopped.
+	for _, target := range []string{"slow/ws", "slow/call", "slow/finish"} {
+		if n := refs(target); n != 0 {
+			t.Fatalf("%s: %d references after the servers stopped", target, n)
+		}
+	}
+	if a := <-finish; a.err != nil || a.status != 200 || a.body != "done" {
+		t.Fatalf("a request that finished within the grace period: %+v", a)
+	}
+	if a := <-slow; a.err == nil && a.status == 200 {
+		t.Fatalf("a request still running after the grace period was not ended: %+v", a)
+	}
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := br.ReadString('\n'); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("the WebSocket is still open: %v", err)
+	}
+	ended.WaitFor(t, 10*time.Second, "the app's handlers to end", func(p []string) bool {
+		return slices.Contains(p, "/ws") && slices.Contains(p, "/slow")
 	})
 }
 
@@ -532,8 +661,7 @@ func TestServerReadiness(t *testing.T) {
 	var unhealthy atomic.Bool
 	h := http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {})
 	_ = h
-	// The fake app's /health is always 200; swap the whole server for one we can break.
-	r.srv.Close()
+	// The fake app's /health is always 200; use a second server, polling one we can break.
 	broken := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
 		if unhealthy.Load() {
 			w.WriteHeader(500)
@@ -541,8 +669,11 @@ func TestServerReadiness(t *testing.T) {
 	}))
 	defer broken.Close()
 	u, _ := url.Parse(broken.URL)
-	srv := NewServer(r.m, ServerOptions{App: u, HealthEvery: 20 * time.Millisecond})
-	defer srv.Close()
+	srv := NewServer(r.m, r.kinds, r.m.n.Keeper, ServerOptions{App: u, HealthEvery: 20 * time.Millisecond})
+	hctx, stopHealth := context.WithCancel(context.Background())
+	var hg errgroup.Group
+	hg.Go(func() error { return srv.health.Serve(hctx) })
+	defer func() { stopHealth(); hg.Wait() }()
 	ready := func() bool { ok, _ := srv.Ready(); return ok }
 	eventually(t, "ready", ready)
 

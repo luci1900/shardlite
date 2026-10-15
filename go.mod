@@ -8,10 +8,11 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.3
 	github.com/aws/smithy-go v1.28.5
 	github.com/benbjohnson/litestream v0.5.18-0.20261009180205-fd72802bc885
-	github.com/mattn/go-sqlite3 v1.14.19
 	github.com/superfly/ltx v0.5.2
+	github.com/thejerf/suture/v4 v4.0.6
 	golang.org/x/sync v0.22.0
 	golang.org/x/sys v0.47.0
+	modernc.org/sqlite v1.49.1
 	pgregory.net/rapid v1.2.0
 )
 
@@ -58,5 +59,4 @@ require (
 	modernc.org/libc v1.72.0 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
-	modernc.org/sqlite v1.49.1 // indirect
 )

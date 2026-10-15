@@ -9,11 +9,11 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/coord"
+	"github.com/luci1900/shardlite/internal/spool"
 )
 
 // Manifest is the per-shard record in blob storage (see docs/internals.md,
@@ -23,8 +23,7 @@ type Manifest struct {
 	Owner      string   `json:"owner"`      // the node allowed to write the shard, "" if released
 	NodeEpoch  uint64   `json:"node_epoch"` // the owner's lease epoch when it claimed the shard
 	Files      []string `json:"files"`      // base and deltas, "min-max.epoch" (min-max in the shard's own positions), in order
-	// (Manifests written before stage 1.2 may have a "base_at"; it is ignored.)
-	Journal string `json:"journal"` // the node journal holding commits after the last file, "" if there are none
+	Journal    string   `json:"journal"`    // the node journal holding commits after the last file, "" if there are none
 	// AutoDelete is set at creation if the shard's kind had auto_delete then, and
 	// never changes. The node deletes the shard at deactivation only if both the
 	// kind and the manifest have it, so marking a kind auto_delete can't delete
@@ -119,27 +118,15 @@ func NewGeneration() string {
 // Version identifies one version of a manifest (its ETag).
 type Version = blob.ETag
 
-// ManifestStore reads and changes shards' manifests. Every change is a
-// compare-and-swap.
-type ManifestStore interface {
-	// Get returns a shard's manifest (blob.ErrNotFound if there is none).
-	Get(ctx context.Context, shard string) (*Manifest, Version, error)
-	// Put creates the manifest when expected is nil (blob.ErrExists if somebody
-	// else has) and otherwise replaces the version expected (blob.ErrConflict if
-	// somebody else changed it).
-	Put(ctx context.Context, shard string, m *Manifest, expected *Version) (Version, error)
-	// Delete removes the manifest if it is still at expected (blob.ErrConflict if
-	// somebody else changed it, blob.ErrNotFound if it is gone). It is a
-	// conditional delete, which the startup check requires of the store.
-	Delete(ctx context.Context, shard string, expected Version) error
-}
-
-type blobManifests struct{ store *blob.Store }
+// ManifestStore reads and changes shards' manifests in blob storage. Every
+// change is a compare-and-swap.
+type ManifestStore struct{ store *blob.Store }
 
 // NewManifestStore returns a ManifestStore over blob storage.
-func NewManifestStore(store *blob.Store) ManifestStore { return blobManifests{store} }
+func NewManifestStore(store *blob.Store) ManifestStore { return ManifestStore{store} }
 
-func (b blobManifests) Get(ctx context.Context, shard string) (*Manifest, Version, error) {
+// Get returns a shard's manifest (blob.ErrNotFound if there is none).
+func (b ManifestStore) Get(ctx context.Context, shard string) (*Manifest, Version, error) {
 	rc, etag, err := b.store.Get(ctx, ManifestKey(shard))
 	if err != nil {
 		return nil, "", err
@@ -152,14 +139,20 @@ func (b blobManifests) Get(ctx context.Context, shard string) (*Manifest, Versio
 	return &m, etag, nil
 }
 
-func (b blobManifests) Put(ctx context.Context, shard string, m *Manifest, expected *Version) (Version, error) {
+// Put creates the manifest when expected is nil (blob.ErrExists if somebody
+// else has) and otherwise replaces the version expected (blob.ErrConflict if
+// somebody else changed it).
+func (b ManifestStore) Put(ctx context.Context, shard string, m *Manifest, expected *Version) (Version, error) {
 	if expected == nil {
 		return b.store.Create(ctx, ManifestKey(shard), encode(m))
 	}
 	return b.store.Update(ctx, ManifestKey(shard), encode(m), *expected)
 }
 
-func (b blobManifests) Delete(ctx context.Context, shard string, expected Version) error {
+// Delete removes the manifest if it is still at expected (blob.ErrConflict if
+// somebody else changed it, blob.ErrNotFound if it is gone). It is a
+// conditional delete, which the startup check requires of the store.
+func (b ManifestStore) Delete(ctx context.Context, shard string, expected Version) error {
 	return b.store.Delete(ctx, ManifestKey(shard), expected)
 }
 
@@ -167,35 +160,26 @@ func (b blobManifests) Delete(ctx context.Context, shard string, expected Versio
 // Lost responses are handled by blob.Store, which tags every write with a
 // write id and recognises its own earlier attempts.
 type Files struct {
-	Blob      *blob.Store
-	Node      string        // the node whose journal new shards write to
-	Manifests ManifestStore // over Blob if nil
-	Leases    coord.NodeRegistry
+	Blob   *blob.Store
+	Node   string // the node whose journal new shards write to
+	Leases *coord.Registry
 	// TempDir is where files are built and downloaded that are too large to hold
 	// in memory (deltas, snapshots, the files of a restore). It is in the data
 	// directory, never the scratch directory, which is tmpfs and so memory too.
 	TempDir string
 	// SpoolLimit is how large a delta gets before it is built in a temporary file,
-	// DefaultSpoolLimit if zero.
+	// spool.DefaultLimit if zero.
 	SpoolLimit int
-	once       sync.Once
 }
 
 func (f *Files) spoolLimit() int {
 	if f.SpoolLimit > 0 {
 		return f.SpoolLimit
 	}
-	return DefaultSpoolLimit
+	return spool.DefaultLimit
 }
 
-func (f *Files) manifests() ManifestStore {
-	f.once.Do(func() {
-		if f.Manifests == nil {
-			f.Manifests = NewManifestStore(f.Blob)
-		}
-	})
-	return f.Manifests
-}
+func (f *Files) manifests() ManifestStore { return ManifestStore{f.Blob} }
 
 // GetManifest returns a shard's manifest and its version (blob.ErrNotFound if
 // there is none).
@@ -229,14 +213,12 @@ type Handle struct {
 
 // Open loads a shard's manifest, creating it with a new generation if the
 // shard doesn't exist yet. Created reports which happened.
-func (f *Files) Open(ctx context.Context, shard string) (h *Handle, created bool, err error) {
-	m, etag, err := f.GetManifest(ctx, shard)
-	if err == nil {
-		return &Handle{F: f, Name: shard, Manifest: m, ETag: etag}, false, nil
-	} else if !errors.Is(err, blob.ErrNotFound) {
-		return nil, false, err
+func (f *Files) Open(ctx context.Context, shard string, autoDelete bool) (h *Handle, created bool, err error) {
+	h, err = f.Attach(ctx, shard)
+	if errors.Is(err, blob.ErrNotFound) {
+		return f.Create(ctx, shard, autoDelete)
 	}
-	return f.Create(ctx, shard, false)
+	return h, false, err
 }
 
 // Attach loads the handle of a shard that must already have a manifest
@@ -247,11 +229,6 @@ func (f *Files) Attach(ctx context.Context, shard string) (*Handle, error) {
 		return nil, err
 	}
 	return &Handle{F: f, Name: shard, Manifest: m, ETag: etag}, nil
-}
-
-// Restore-time helper for callers that keep a manifest between activations.
-func (f *Files) HandleFor(shard string, m *Manifest, etag blob.ETag) *Handle {
-	return &Handle{F: f, Name: shard, Manifest: m, ETag: etag}
 }
 
 // Create creates a shard's manifest, owned by this node, for a caller that has
@@ -268,14 +245,11 @@ func (f *Files) Create(ctx context.Context, shard string, autoDelete bool) (h *H
 	}
 	// Somebody got there first: the shard is theirs, unless they have deleted
 	// the manifest again since.
-	cur, v, gerr := f.manifests().Get(ctx, shard)
-	if gerr != nil {
-		if errors.Is(gerr, blob.ErrNotFound) {
-			return f.Create(ctx, shard, autoDelete)
-		}
-		return nil, false, gerr
+	h, err = f.Attach(ctx, shard)
+	if errors.Is(err, blob.ErrNotFound) {
+		return f.Create(ctx, shard, autoDelete)
 	}
-	return &Handle{F: f, Name: shard, Manifest: cur, ETag: v}, false, nil
+	return h, false, err
 }
 
 // update writes next with compare-and-swap and adopts it. A conflict is

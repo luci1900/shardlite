@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"os"
-	"path/filepath"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/superfly/ltx"
@@ -93,33 +92,10 @@ func shrinkNewest(db *litestream.DB, txid uint64) error {
 		return err
 	}
 
-	tmp := name + ".tmp"
-	out, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp)
-	enc, err := ltx.NewEncoder(out)
-	if err != nil {
-		out.Close()
-		return err
-	}
-	if err := enc.EncodeHeader(hdr); err != nil {
-		out.Close()
-		return err
-	}
-	if page != nil {
-		if err := enc.EncodePage(ltx.PageHeader{Pgno: want}, page); err != nil {
-			out.Close()
-			return err
+	return writeLTXFile(name, hdr, func(enc *ltx.Encoder) error {
+		if page == nil {
+			return nil
 		}
-	}
-	if err := enc.Close(); err != nil {
-		out.Close()
-		return err
-	}
-	if err := out.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp, filepath.Clean(name))
+		return enc.EncodePage(ltx.PageHeader{Pgno: want}, page)
+	})
 }

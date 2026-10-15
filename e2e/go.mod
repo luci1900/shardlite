@@ -5,9 +5,9 @@ go 1.26.0
 require (
 	github.com/coder/websocket v1.8.15
 	github.com/luci1900/shardlite v0.0.0
-	github.com/mattn/go-sqlite3 v1.14.19
 	google.golang.org/grpc v1.84.0
 	google.golang.org/protobuf v1.36.11
+	modernc.org/sqlite v1.49.1
 )
 
 require (
@@ -53,6 +53,7 @@ require (
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/superfly/ltx v0.5.2 // indirect
 	github.com/tetratelabs/wazero v1.2.1 // indirect
+	github.com/thejerf/suture/v4 v4.0.6 // indirect
 	github.com/wasilibs/go-re2 v1.3.0 // indirect
 	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
@@ -62,7 +63,6 @@ require (
 	modernc.org/libc v1.72.0 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
-	modernc.org/sqlite v1.49.1 // indirect
 )
 
 replace github.com/luci1900/shardlite => ../

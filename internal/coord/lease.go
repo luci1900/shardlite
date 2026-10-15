@@ -32,7 +32,6 @@ type NodeInfo struct {
 	Name    string `json:"name"`
 	Address string `json:"address"`
 	Shards  int    `json:"shards"` // active shards
-	Conns   int    `json:"conns"`  // open connections
 	// JournalFrom is the oldest segment of the node's journal that may still hold a tail
 	// no delta covers, and JournalNext the next segment number the node would write
 	// when it published this. An adopter reads from JournalFrom, and fences by probing
@@ -63,24 +62,6 @@ func (l *NodeLease) ValidAt(t time.Time) bool {
 	return !l.Released && l.AdoptedBy == "" && t.Before(l.ExpiresAt())
 }
 
-// NodeRegistry is the single-node subset of the interface in
-// docs/internals.md. List comes
-// with the cluster in stage 2.
-type NodeRegistry interface {
-	// Acquire takes the node's lease with a new epoch, whether or not the
-	// previous one is still valid: the caller knows its previous process is gone.
-	// The lease keeps the previous life's journal range until the first Renew, so a
-	// crash before the journal is adopted leaves the range in place.
-	Acquire(ctx context.Context, info NodeInfo) (NodeLease, error)
-	// Renew rewrites the lease. info can change (counts and the journal range). ErrLeaseLost if somebody else changed it.
-	Renew(ctx context.Context, lease NodeLease, info NodeInfo) (NodeLease, error)
-	// Release marks the lease released, keeping its epoch so epochs never repeat.
-	Release(ctx context.Context, lease NodeLease) error
-	// Get returns a node's lease whether or not it is valid (check ValidAt).
-	// blob.ErrNotFound if the node never had one.
-	Get(ctx context.Context, node string) (*NodeLease, error)
-}
-
 // Key is the object key of a node's lease.
 func Key(node string) string { return "nodes/" + node }
 
@@ -91,7 +72,7 @@ type RegistryOptions struct {
 	Now  func() time.Time // time.Now if nil, for tests
 }
 
-// Registry implements NodeRegistry over blob storage.
+// Registry keeps nodes' leases in blob storage.
 type Registry struct {
 	store *blob.Store
 	opts  RegistryOptions
@@ -120,7 +101,9 @@ func encodeLease(l *NodeLease) *bytes.Reader {
 	return bytes.NewReader(b)
 }
 
-func (r *Registry) get(ctx context.Context, node string) (*NodeLease, error) {
+// Get returns a node's lease whether or not it is valid (check ValidAt).
+// blob.ErrNotFound if the node never had one.
+func (r *Registry) Get(ctx context.Context, node string) (*NodeLease, error) {
 	rc, etag, err := r.store.Get(ctx, Key(node))
 	if err != nil {
 		return nil, err
@@ -134,15 +117,13 @@ func (r *Registry) get(ctx context.Context, node string) (*NodeLease, error) {
 	return &l, nil
 }
 
-// Get returns a node's lease.
-func (r *Registry) Get(ctx context.Context, node string) (*NodeLease, error) {
-	return r.get(ctx, node)
-}
-
-// Acquire takes the lease with the next epoch.
+// Acquire takes the node's lease with a new epoch, whether or not the
+// previous one is still valid: the caller knows its previous process is gone.
+// The lease keeps the previous life's journal range until the first Renew, so a
+// crash before the journal is adopted leaves the range in place.
 func (r *Registry) Acquire(ctx context.Context, info NodeInfo) (NodeLease, error) {
 	for {
-		prev, err := r.get(ctx, info.Name)
+		prev, err := r.Get(ctx, info.Name)
 		next := NodeLease{NodeInfo: info, Epoch: 1, TTL: r.opts.TTL}
 		next.JournalFrom, next.JournalNext = 1, 1
 		if err == nil {
@@ -173,30 +154,15 @@ func (r *Registry) Acquire(ctx context.Context, info NodeInfo) (NodeLease, error
 	}
 }
 
-// Renew rewrites the lease at the same epoch.
+// Renew rewrites the lease at the same epoch. info can change (counts and the
+// journal range). ErrLeaseLost if somebody else changed it.
 func (r *Registry) Renew(ctx context.Context, lease NodeLease, info NodeInfo) (NodeLease, error) {
 	next := lease
 	next.Previous = nil
 	next.NodeInfo = info
 	next.NodeInfo.Name = lease.Name
 	next.Renewed = r.opts.Now()
-	etag, err := r.store.Update(ctx, Key(lease.Name), encodeLease(&next), lease.ETag)
-	if errors.Is(err, blob.ErrConflict) || errors.Is(err, blob.ErrNotFound) {
-		// A write of ours whose outcome stayed unknown leaves us holding an old
-		// ETag. If what is there is still our epoch and nobody has adopted it, it
-		// is our own earlier write: carry on from it.
-		cur, gerr := r.get(ctx, lease.Name)
-		if gerr != nil || cur.Epoch != lease.Epoch || cur.Released || cur.AdoptedBy != "" {
-			if gerr != nil && !errors.Is(gerr, blob.ErrNotFound) {
-				return lease, gerr
-			}
-			return lease, fmt.Errorf("%w: %s", ErrLeaseLost, lease.Name)
-		}
-		etag, err = r.store.Update(ctx, Key(lease.Name), encodeLease(&next), cur.ETag)
-		if errors.Is(err, blob.ErrConflict) {
-			return lease, fmt.Errorf("%w: %s", ErrLeaseLost, lease.Name)
-		}
-	}
+	etag, err := r.write(ctx, lease, &next)
 	if err != nil {
 		return lease, err
 	}
@@ -204,29 +170,38 @@ func (r *Registry) Renew(ctx context.Context, lease NodeLease, info NodeInfo) (N
 	return next, nil
 }
 
-// Release marks the lease released.
+// Release marks the lease released, keeping its epoch so epochs never repeat.
 func (r *Registry) Release(ctx context.Context, lease NodeLease) error {
 	next := lease
 	next.Previous = nil
 	next.Released = true
-	_, err := r.store.Update(ctx, Key(lease.Name), encodeLease(&next), lease.ETag)
-	if errors.Is(err, blob.ErrConflict) || errors.Is(err, blob.ErrNotFound) {
-		// A renewal that was cut short (the keeper stopped) can have landed
-		// without us hearing, which leaves an old ETag. If what is there is
-		// still our epoch and nobody has adopted it, release that.
-		cur, gerr := r.get(ctx, lease.Name)
-		if gerr != nil && !errors.Is(gerr, blob.ErrNotFound) {
-			return gerr
-		}
-		if gerr != nil || cur.Epoch != lease.Epoch || cur.Released || cur.AdoptedBy != "" {
-			return fmt.Errorf("%w: %s", ErrLeaseLost, lease.Name)
-		}
-		_, err = r.store.Update(ctx, Key(lease.Name), encodeLease(&next), cur.ETag)
-		if errors.Is(err, blob.ErrConflict) || errors.Is(err, blob.ErrNotFound) {
-			return fmt.Errorf("%w: %s", ErrLeaseLost, lease.Name)
-		}
-	}
+	_, err := r.write(ctx, lease, &next)
 	return err
 }
 
-var _ NodeRegistry = (*Registry)(nil)
+// write replaces lease with next. A write of ours whose outcome stayed unknown
+// (a renewal cut short by the keeper stopping, say) can have landed without us
+// hearing, which leaves us holding an old ETag. So on a conflict, if what is
+// there is still our epoch and nobody has released or adopted it, it is our own
+// earlier write, and next replaces that. Anything else is ErrLeaseLost.
+func (r *Registry) write(ctx context.Context, lease NodeLease, next *NodeLease) (blob.ETag, error) {
+	lost := fmt.Errorf("%w: %s", ErrLeaseLost, lease.Name)
+	etag, err := r.store.Update(ctx, Key(lease.Name), encodeLease(next), lease.ETag)
+	if !errors.Is(err, blob.ErrConflict) && !errors.Is(err, blob.ErrNotFound) {
+		return etag, err
+	}
+	cur, err := r.Get(ctx, lease.Name)
+	switch {
+	case errors.Is(err, blob.ErrNotFound):
+		return "", lost
+	case err != nil:
+		return "", err
+	case cur.Epoch != lease.Epoch || cur.Released || cur.AdoptedBy != "":
+		return "", lost
+	}
+	etag, err = r.store.Update(ctx, Key(lease.Name), encodeLease(next), cur.ETag)
+	if errors.Is(err, blob.ErrConflict) || errors.Is(err, blob.ErrNotFound) {
+		return "", lost
+	}
+	return etag, err
+}

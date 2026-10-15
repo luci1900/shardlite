@@ -13,16 +13,6 @@ import (
 	"github.com/luci1900/shardlite/internal/blob"
 )
 
-// refs is how many holds a shard has (-1 if it is not active).
-func (r *srig) refs(target string) int {
-	r.m.mu.Lock()
-	defer r.m.mu.Unlock()
-	if a := r.m.active[target]; a != nil {
-		return a.refs
-	}
-	return -1
-}
-
 // A client that goes away while its response is held at the gate: the node
 // stops waiting, cancels the request to the app and lets go of the shard.
 func TestClientDisconnectWhileHeldAtTheGate(t *testing.T) {

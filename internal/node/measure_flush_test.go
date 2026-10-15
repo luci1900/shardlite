@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/s3test"
 )
@@ -71,9 +72,9 @@ type flushResult struct {
 func loadFlush(t *testing.T, cfg flushCfg, n int, d time.Duration) flushResult {
 	t.Helper()
 	s := s3test.Setup(t)
-	r := newMRigOn(t, func(o *ManagerOptions) {
-		o.Flush, o.FlushMin, o.FlushCoalesce, o.NoEarlyFlush = cfg.interval, cfg.min, cfg.coales, cfg.noEarly
-		o.Janitor = time.Hour
+	r := newMRigOn(t, func(o *ShardsOptions) {
+		o.Flush.Interval, o.Flush.Min, o.Flush.Coalesce, o.Flush.NoEarly = cfg.interval, cfg.min, cfg.coales, cfg.noEarly
+		o.Cache.Every = time.Hour
 	}, s.Backend(t))
 	var puts counter
 	const shards = 20
@@ -86,8 +87,7 @@ func loadFlush(t *testing.T, cfg flushCfg, n int, d time.Duration) flushResult {
 		t.Fatal(err)
 	}
 	s3Latency(r, &puts)
-	var mu sync.Mutex
-	var lats []time.Duration
+	var log apptest.Log[time.Duration]
 	var wg sync.WaitGroup
 	c0, start := r.m.Flusher().Completed(), time.Now()
 	end := start.Add(d)
@@ -108,15 +108,14 @@ func loadFlush(t *testing.T, cfg flushCfg, n int, d time.Duration) flushResult {
 					t.Error(err)
 					return
 				}
-				mu.Lock()
-				lats = append(lats, time.Since(t0))
-				mu.Unlock()
+				log.Add(time.Since(t0))
 				time.Sleep(100*time.Millisecond + time.Duration(rng.Int64N(int64(200*time.Millisecond))))
 			}
 		}()
 	}
 	wg.Wait()
 	el := time.Since(start)
+	lats := log.All()
 	sort.Slice(lats, func(i, j int) bool { return lats[i] < lats[j] })
 	pick := func(q float64) time.Duration {
 		if len(lats) == 0 {
@@ -183,8 +182,8 @@ func TestMeasureDeltas(t *testing.T) {
 	)
 	one := func(name string, age time.Duration, size int64) {
 		s := s3test.Setup(t)
-		r := newMRigOn(t, func(o *ManagerOptions) {
-			o.DeltaAge, o.DeltaSize, o.Background, o.Janitor = age, size, 200*time.Millisecond, time.Hour
+		r := newMRigOn(t, func(o *ShardsOptions) {
+			o.Lifecycle.DeltaAge, o.Lifecycle.DeltaSize, o.Lifecycle.SnapshotEvery, o.Cache.Every = age, size, 200*time.Millisecond, time.Hour
 		}, s.Backend(t))
 		var puts counter
 		refs := make([]*Ref, shards)
@@ -233,7 +232,7 @@ func TestMeasureReplay(t *testing.T) {
 	measuring(t, "replay")
 	for _, d := range []time.Duration{10 * time.Second, 30 * time.Second} {
 		s := s3test.Setup(t)
-		r := newMRigOn(t, func(o *ManagerOptions) { o.Janitor = time.Hour; o.DeltaAge = time.Hour }, s.Backend(t))
+		r := newMRigOn(t, func(o *ShardsOptions) { o.Cache.Every = time.Hour; o.Lifecycle.DeltaAge = time.Hour }, s.Backend(t))
 		var puts counter
 		const shards = 20
 		refs := make([]*Ref, shards)
@@ -263,7 +262,7 @@ func TestMeasureReplay(t *testing.T) {
 			r.app.Must(t, "close", fmt.Sprint(i))
 		}
 		r.crash()
-		r.n.Close(context.Background(), false)
+		r.stopJournal()
 		r.local.SetHook(nil)
 		start := time.Now()
 		r.startNode()

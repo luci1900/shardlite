@@ -32,8 +32,7 @@ func (a *App) ws(w http.ResponseWriter, r *http.Request, s *shardReq) {
 	defer func() {
 		code := websocket.CloseStatus(endErr)
 		reason := ""
-		var ce websocket.CloseError
-		if errors.As(endErr, &ce) {
+		if ce, ok := errors.AsType[websocket.CloseError](endErr); ok {
 			reason = ce.Reason
 		}
 		a.debug.mu.Lock()

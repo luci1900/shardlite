@@ -135,8 +135,8 @@ func TestBlobBucket(t *testing.T) {
 		wantErr       bool
 		errorContains string
 	}{
-		"directory":           {map[string]string{"SHARDLITE_BLOB": "/var/blobs"}, "", true, "file backend was removed"},
-		"directory, endpoint": {map[string]string{"SHARDLITE_BLOB": "/var/blobs", "SHARDLITE_S3_ENDPOINT": "http://x"}, "", true, "docker/compose.s3.yaml"},
+		"directory":           {map[string]string{"SHARDLITE_BLOB": "/var/blobs"}, "", true, "want s3://bucket"},
+		"directory, endpoint": {map[string]string{"SHARDLITE_BLOB": "/var/blobs", "SHARDLITE_S3_ENDPOINT": "http://x"}, "", true, "want s3://bucket"},
 		"bucket":              {map[string]string{"SHARDLITE_BLOB": "s3://my-bucket"}, "my-bucket", false, ""},
 		"bucket and prefx":    {map[string]string{"SHARDLITE_BLOB": "s3://my-bucket", "SHARDLITE_PREFIX": "staging"}, "my-bucket", false, ""},
 		"endpoint":            {map[string]string{"SHARDLITE_BLOB": "s3://b", "SHARDLITE_S3_ENDPOINT": "http://127.0.0.1:9000"}, "b", false, ""},

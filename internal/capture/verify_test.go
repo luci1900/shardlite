@@ -2,6 +2,7 @@ package capture_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,7 +25,7 @@ const name = "users/7"
 
 func entriesOf(t *testing.T, e *harness.Env, shard string) (out []segment.Entry) {
 	t.Helper()
-	err := segment.Scan(context.Background(), e.Store, e.Node, 1, func(_ uint64, en segment.Entry) error {
+	err := segment.Scan(context.Background(), e.Store, e.Node, 1, 0, func(_ uint64, en segment.Entry) error {
 		if en.Shard == shard {
 			out = append(out, en)
 		}
@@ -52,7 +53,7 @@ func l0Files(t *testing.T, sh *capture.Shard) []string {
 // 6.1: without the Store, does Litestream delete its local level 0 files?
 func TestL0RetentionWithoutStore(t *testing.T) {
 	t.Parallel()
-	e := harness.New(t, 10*time.Millisecond)
+	e := harness.New(t)
 	ctx := context.Background()
 	app := e.StartApp(name)
 	h, sh := e.NewShard(name)
@@ -112,10 +113,10 @@ func TestIdleShardCommits(t *testing.T) {
 		{"default checkpoint interval (1m)", 0, 40},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			e := harness.New(t, 10*time.Millisecond)
+			e := harness.New(t)
 			ctx := context.Background()
 			app := e.StartApp(name)
-			h, created, _ := e.Files.Open(ctx, name)
+			h, created, _ := e.Files.Open(ctx, name, false)
 			_ = h
 			_ = created
 			sh, err := capture.New(capture.Config{Name: name, Path: e.Path(name), Generation: h.Manifest.Generation, MetaRoot: e.Meta, Writer: e.W,
@@ -171,10 +172,10 @@ func TestCheckpointsNeverLoseFrames(t *testing.T) {
 		{"tiny thresholds", func(db *litestream.DB) { db.MinCheckpointPageN = 10; db.TruncatePageN = 40 }, 30},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			e := harness.New(t, 10*time.Millisecond)
+			e := harness.New(t)
 			ctx := context.Background()
 			app := e.StartApp(name)
-			h, _, err := e.Files.Open(ctx, name)
+			h, _, err := e.Files.Open(ctx, name, false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -202,7 +203,7 @@ func TestCheckpointsNeverLoseFrames(t *testing.T) {
 			replayed := filepath.Join(t.TempDir(), "replayed.db")
 			ap, _ := shardfile.NewApplier(replayed)
 			var full int
-			err = segment.Scan(ctx, e.Store, e.Node, 1, func(seq uint64, en segment.Entry) error {
+			err = segment.Scan(ctx, e.Store, e.Node, 1, 0, func(seq uint64, en segment.Entry) error {
 				if en.Shard != name {
 					return nil
 				}
@@ -233,10 +234,10 @@ func TestCheckpointsNeverLoseFrames(t *testing.T) {
 // shard open.
 func TestReleaseChecksShm(t *testing.T) {
 	t.Parallel()
-	e := harness.New(t, 10*time.Millisecond)
+	e := harness.New(t)
 	ctx := context.Background()
 	app := e.StartApp(name)
-	h, _, _ := e.Files.Open(ctx, name)
+	h, _, _ := e.Files.Open(ctx, name, false)
 	sh, err := capture.New(capture.Config{Name: name, Path: e.Path(name), Generation: h.Manifest.Generation, MetaRoot: e.Meta, Writer: e.W})
 	if err != nil {
 		t.Fatal(err)
@@ -248,7 +249,7 @@ func TestReleaseChecksShm(t *testing.T) {
 	obs := apptest.Start(t) // a third process, to see who holds the shard
 
 	// The app has the shard open: the node doesn't let go, and capture carries on where it was.
-	if released, err := sh.Release(ctx); err != nil || released {
+	if released, _, err := sh.Release(ctx); err != nil || released {
 		t.Fatalf("app open: released=%v err=%v", released, err)
 	}
 	pos := sh.Position()
@@ -261,7 +262,7 @@ func TestReleaseChecksShm(t *testing.T) {
 	}
 	// Doing it again and again changes nothing.
 	for range 5 {
-		if released, err := sh.Release(ctx); err != nil || released {
+		if released, _, err := sh.Release(ctx); err != nil || released {
 			t.Fatalf("app open: released=%v err=%v", released, err)
 		}
 	}
@@ -271,7 +272,7 @@ func TestReleaseChecksShm(t *testing.T) {
 
 	// The app closes its connection: now the node can let go.
 	app.Must(t, "close", "a")
-	if released, err := sh.Release(ctx); err != nil || !released {
+	if released, _, err := sh.Release(ctx); err != nil || !released {
 		t.Fatalf("app closed: released=%v err=%v", released, err)
 	}
 	if _, err := os.Stat(capture.MetaDir(e.Meta, name, h.Manifest.Generation)); !os.IsNotExist(err) {
@@ -289,10 +290,10 @@ func TestReleaseChecksShm(t *testing.T) {
 // app's locks: the check's descriptor has none of the node's own to drop.
 func TestCheckAfterClosingKeepsAppLocks(t *testing.T) {
 	t.Parallel()
-	e := harness.New(t, 10*time.Millisecond)
+	e := harness.New(t)
 	ctx := context.Background()
 	app := e.StartApp(name)
-	h, _, _ := e.Files.Open(ctx, name)
+	h, _, _ := e.Files.Open(ctx, name, false)
 	sh, err := capture.New(capture.Config{Name: name, Path: e.Path(name), Generation: h.Manifest.Generation, MetaRoot: e.Meta, Writer: e.W})
 	if err != nil {
 		t.Fatal(err)
@@ -323,10 +324,10 @@ func TestCheckAfterClosingKeepsAppLocks(t *testing.T) {
 // see the node's connection.
 func TestThrowawayProbeDropsLocks(t *testing.T) {
 	t.Parallel()
-	e := harness.New(t, 10*time.Millisecond)
+	e := harness.New(t)
 	ctx := context.Background()
 	app := e.StartApp(name)
-	h, _, _ := e.Files.Open(ctx, name)
+	h, _, _ := e.Files.Open(ctx, name, false)
 	sh, err := capture.New(capture.Config{Name: name, Path: e.Path(name), Generation: h.Manifest.Generation, MetaRoot: e.Meta, Writer: e.W})
 	if err != nil {
 		t.Fatal(err)
@@ -350,12 +351,12 @@ func TestThrowawayProbeDropsLocks(t *testing.T) {
 // 6.5: what Litestream creates or writes in the app's directory and database.
 func TestLitestreamFootprint(t *testing.T) {
 	t.Parallel()
-	e := harness.New(t, 10*time.Millisecond)
+	e := harness.New(t)
 	ctx := context.Background()
 	app := e.StartApp(name)
 	app.Must(t, "insert", "a", "5", "100")
 	before := tables(t, e.Path(name))
-	h, _, _ := e.Files.Open(ctx, name)
+	h, _, _ := e.Files.Open(ctx, name, false)
 	sh, err := capture.New(capture.Config{Name: name, Path: e.Path(name), Generation: h.Manifest.Generation, MetaRoot: e.Meta, Writer: e.W})
 	if err != nil {
 		t.Fatal(err)
@@ -394,10 +395,10 @@ func TestLitestreamFootprint(t *testing.T) {
 // and capture picks the commit up.
 func TestReleaseSeesACommitAfterTheFinalSync(t *testing.T) {
 	t.Parallel()
-	e := harness.New(t, 10*time.Millisecond)
+	e := harness.New(t)
 	ctx := context.Background()
 	app := e.StartApp(name)
-	h, _, _ := e.Files.Open(ctx, name)
+	h, _, _ := e.Files.Open(ctx, name, false)
 	late := false
 	sh, err := capture.New(capture.Config{Name: name, Path: e.Path(name), Generation: h.Manifest.Generation, MetaRoot: e.Meta, Writer: e.W,
 		Durable: func(ctx context.Context) error {
@@ -421,7 +422,7 @@ func TestReleaseSeesACommitAfterTheFinalSync(t *testing.T) {
 	pos := sh.Position()
 
 	late = true
-	if released, err := sh.Release(ctx); err != nil || released {
+	if released, _, err := sh.Release(ctx); err != nil || released {
 		t.Fatalf("commit after the final sync: released=%v err=%v", released, err)
 	}
 	if err := sh.Sync(ctx); err != nil {
@@ -431,7 +432,58 @@ func TestReleaseSeesACommitAfterTheFinalSync(t *testing.T) {
 		t.Fatal("the late commit was not captured after capture resumed")
 	}
 	// With nothing new, the node lets go.
-	if released, err := sh.Release(ctx); err != nil || !released {
+	if released, _, err := sh.Release(ctx); err != nil || !released {
 		t.Fatalf("nothing new: released=%v err=%v", released, err)
+	}
+}
+
+// A release whose wait for durability fails reopens capture itself and says
+// so (Open), so the node carries on with it rather than starting a second
+// capture of the same file.
+func TestReleaseWhoseWaitFailsReopensCapture(t *testing.T) {
+	t.Parallel()
+	e := harness.New(t)
+	ctx := context.Background()
+	app := e.StartApp(name)
+	h, _, _ := e.Files.Open(ctx, name, false)
+	errStorage := errors.New("storage down")
+	fail := true
+	sh, err := capture.New(capture.Config{Name: name, Path: e.Path(name), Generation: h.Manifest.Generation, MetaRoot: e.Meta, Writer: e.W,
+		Durable: func(ctx context.Context) error {
+			if fail {
+				fail = false
+				return errStorage
+			}
+			return e.W.Flush(ctx)
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.Must(t, "insert", "a", "5", "100")
+	if err := sh.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	app.Must(t, "close", "a")
+	if released, _, err := sh.Release(ctx); !errors.Is(err, errStorage) || released {
+		t.Fatalf("release whose wait failed: released=%v err=%v", released, err)
+	}
+	if !sh.Open() {
+		t.Fatal("capture was not reopened")
+	}
+	pos := sh.Position()
+	app.Must(t, "open", "a", e.Path(name))
+	app.Must(t, "insert", "a", "5", "100")
+	app.Must(t, "close", "a")
+	if err := sh.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if sh.Position() <= pos {
+		t.Fatal("a commit after the failed release was not captured")
+	}
+	if released, _, err := sh.Release(ctx); err != nil || !released {
+		t.Fatalf("second release: released=%v err=%v", released, err)
+	}
+	if sh.Open() {
+		t.Fatal("open after it was released")
 	}
 }

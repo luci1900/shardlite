@@ -27,7 +27,7 @@ func replayDump(t *testing.T, e *harness.Env, name string) (dump string, entries
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = segment.Scan(ctx, e.Store, e.Node, 1, func(seq uint64, en segment.Entry) error {
+	err = segment.Scan(ctx, e.Store, e.Node, 1, 0, func(seq uint64, en segment.Entry) error {
 		if en.Shard != name {
 			return nil
 		}
@@ -77,7 +77,7 @@ func TestAppCheckpointsItself(t *testing.T) {
 	for _, mode := range []string{"PASSIVE", "FULL", "RESTART", "TRUNCATE"} {
 		t.Run(mode, func(t *testing.T) {
 			t.Parallel()
-			e := harness.New(t, 10*time.Millisecond)
+			e := harness.New(t)
 			// A short busy timeout: Litestream's read transaction makes the app's
 			// FULL, RESTART and TRUNCATE checkpoints wait for it on every call.
 			app := apptest.Start(t)
@@ -110,7 +110,7 @@ func TestAppCheckpointsItself(t *testing.T) {
 // An app that closes and reopens its connection all the time.
 func TestAppReconnectsConstantly(t *testing.T) {
 	t.Parallel()
-	e := harness.New(t, 10*time.Millisecond)
+	e := harness.New(t)
 	app := e.StartApp("users/1")
 	app.Must(t, "insert", "a", "50", "1000")
 	_, sh := e.NewShard("users/1")

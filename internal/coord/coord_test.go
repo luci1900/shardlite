@@ -8,6 +8,8 @@ import (
 	"testing/synctest"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/coord"
 )
@@ -15,6 +17,15 @@ import (
 func newLocal(t *testing.T) *blob.Hooked {
 	t.Helper()
 	return blob.WithHook(blob.NewMemory())
+}
+
+// serve serves k, as the node's tree does, and returns the func that stops it
+// and waits for it to end.
+func serve(k *coord.Keeper) (stop func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var g errgroup.Group
+	g.Go(func() error { return k.Serve(ctx) })
+	return func() { cancel(); g.Wait() }
 }
 
 func opts() coord.RegistryOptions {
@@ -115,10 +126,10 @@ func TestKeeperRenewsWhileStorageWorks(t *testing.T) {
 			t.Fatal(err)
 		}
 		var shards atomic.Int64
-		k := coord.StartKeeper(reg, lease, keeperOpts(func() coord.NodeInfo {
+		k := coord.NewKeeper(reg, lease, keeperOpts(func() coord.NodeInfo {
 			return coord.NodeInfo{Name: "n1", Shards: int(shards.Load())}
 		}))
-		defer k.Close(ctx, false)
+		defer serve(k)()
 
 		for range 20 {
 			time.Sleep(3 * time.Second)
@@ -151,8 +162,8 @@ func TestKeeperExpiresEarlyAndForGood(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		k := coord.StartKeeper(reg, lease, keeperOpts(nil))
-		defer k.Close(ctx, false)
+		k := coord.NewKeeper(reg, lease, keeperOpts(nil))
+		defer serve(k)()
 
 		time.Sleep(4 * time.Second) // renewed at 3 s
 		last := k.Lease().Renewed
@@ -204,8 +215,8 @@ func TestKeeperSurvivesBriefTroubleAndStopsWhenReplaced(t *testing.T) {
 		l, ctx := newLocal(t), context.Background()
 		reg := coord.NewRegistry(l, "n1", opts())
 		lease, _ := reg.Acquire(ctx, coord.NodeInfo{Name: "n1"})
-		k := coord.StartKeeper(reg, lease, keeperOpts(nil))
-		defer k.Close(ctx, false)
+		k := coord.NewKeeper(reg, lease, keeperOpts(nil))
+		defer serve(k)()
 
 		// Four seconds of failures are within the margin; renewals resume after.
 		var down atomic.Bool
@@ -242,14 +253,46 @@ func TestKeeperReleases(t *testing.T) {
 		l, ctx := newLocal(t), context.Background()
 		reg := coord.NewRegistry(l, "n1", opts())
 		lease, _ := reg.Acquire(ctx, coord.NodeInfo{Name: "n1"})
-		k := coord.StartKeeper(reg, lease, keeperOpts(nil))
+		k := coord.NewKeeper(reg, lease, keeperOpts(nil))
+		stop := serve(k)
 		time.Sleep(5 * time.Second)
-		if err := k.Close(ctx, true); err != nil {
+		stop()
+		if err := k.Release(ctx); err != nil {
 			t.Fatal(err)
 		}
 		got, err := reg.Get(ctx, "n1")
 		if err != nil || !got.Released {
 			t.Fatalf("after release: %+v %v", got, err)
+		}
+	})
+}
+
+// Ending Serve ends the renewals and leaves the lease as it is. Release, later,
+// gives it up: the node stops renewing with the rest of its services and decides
+// about the lease once its shards are let go.
+func TestKeeperStopsThenReleases(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		l, ctx := newLocal(t), context.Background()
+		reg := coord.NewRegistry(l, "n1", opts())
+		lease, _ := reg.Acquire(ctx, coord.NodeInfo{Name: "n1"})
+		k := coord.NewKeeper(reg, lease, keeperOpts(nil))
+		stop := serve(k)
+		time.Sleep(5 * time.Second)
+		stop()
+		before, err := reg.Get(ctx, "n1")
+		if err != nil || before.Released {
+			t.Fatalf("after stop: %+v %v", before, err)
+		}
+		time.Sleep(5 * time.Second)
+		if after, _ := reg.Get(ctx, "n1"); !after.Renewed.Equal(before.Renewed) {
+			t.Fatalf("renewed after stop: %v, then %v", before.Renewed, after.Renewed)
+		}
+		if err := k.Release(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := reg.Get(ctx, "n1"); err != nil || !got.Released {
+			t.Fatalf("after Release: %+v %v", got, err)
 		}
 	})
 }

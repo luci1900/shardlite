@@ -14,6 +14,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/luci1900/shardlite/internal/supervisor"
 )
 
 // DefaultIdleTimeout is how long a shard stays active without requests when
@@ -182,31 +184,29 @@ func (k *Kinds) CheckPublic(target string) error {
 	return nil
 }
 
-// Names returns the declared kinds.
-func (k *Kinds) Names() []string {
-	var out []string
-	for n := range *k.cur.Load() {
-		out = append(out, n)
-	}
-	return out
+// kindsReload reloads the kinds file whenever the process gets SIGHUP.
+type kindsReload struct {
+	kinds *Kinds
+	log   *slog.Logger
 }
 
-// RunReloadOnSIGHUP reloads the file whenever the process gets SIGHUP, until
-// ctx ends. It is meant to run as a child of whoever owns the node.
-func (k *Kinds) RunReloadOnSIGHUP(ctx context.Context, logger *slog.Logger) {
+func (*kindsReload) String() string { return "kinds reload" }
+
+func (k *kindsReload) Serve(ctx context.Context) error {
+	defer serving(k.log, k.String())()
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGHUP)
 	defer signal.Stop(ch)
 	for {
 		select {
 		case <-ch:
-			if err := k.Reload(); err != nil {
-				logger.Error("kinds file not reloaded, keeping the kinds already loaded and reporting not ready", "path", k.path, "err", err)
+			if err := k.kinds.Reload(); err != nil {
+				k.log.Error("kinds file not reloaded, keeping the kinds already loaded and reporting not ready", "path", k.kinds.path, "err", err)
 			} else {
-				logger.Info("kinds file reloaded", "path", k.path)
+				k.log.Info("kinds file reloaded", "path", k.kinds.path)
 			}
 		case <-ctx.Done():
-			return
+			return supervisor.NoRestart(nil)
 		}
 	}
 }

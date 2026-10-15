@@ -3,14 +3,18 @@ package node
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"runtime"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
 
 	"github.com/luci1900/shardlite/internal/capture"
+	"github.com/luci1900/shardlite/internal/coord"
+	"github.com/luci1900/shardlite/internal/notify"
+	"github.com/luci1900/shardlite/internal/segment"
+	"github.com/luci1900/shardlite/internal/supervisor"
 )
 
 // Defaults of the flush timing, chosen from the measurements in plans/stage-1.2-report.md.
@@ -30,17 +34,21 @@ const (
 // than the minimum spacing after the previous start. Each cycle does:
 //
 //  1. every active shard whose wal-index header differs from the one at its last
-//     completed capture is synced (Shard.Capture), each in a goroutine of the
-//     cycle's own, a bounded number at a time;
+//     completed capture, or whose header can't be read, is synced
+//     (Shard.Capture), each in a goroutine of the cycle's own, a bounded number
+//     at a time;
 //  2. once all of those have queued their commits in the segment writer, the
 //     writer is flushed: one segment for the whole node;
 //  3. the cycle completes: shards whose sync and flush succeeded are marked
-//     captured, and the counter advances.
+//     captured if the lease is still good, and the counter advances.
 //
 // The counters are what the durability gates use: a chunk of output read from
 // the app is held until a cycle that began after it was read has completed.
 type Flusher struct {
-	m        *Manager
+	tab      *table          // the shards it syncs
+	writer   *segment.Writer // the node's journal, flushed once per cycle
+	keeper   *coord.Keeper   // the lease, which an acknowledgement needs
+	log      *slog.Logger
 	interval time.Duration
 	min      time.Duration // shortest time between two cycle starts
 	coalesce time.Duration // delay of a cycle that was asked for, so output arriving together shares it
@@ -51,18 +59,27 @@ type Flusher struct {
 	wantAfter atomic.Uint64 // the highest mark a waiter has asked for a cycle after
 
 	started atomic.Uint64
-	done    atomic.Uint64
+	done    notify.Counter // cycles completed
 
-	exited chan struct{} // closed when the loop has ended (the manager is closing)
-
-	mu      sync.Mutex
-	changed chan struct{} // closed and replaced whenever done changes or the loop fails
-	fatal   error         // the journal's writer was fenced or closed: nothing will ever be flushed again
+	exited chan struct{} // closed when the loop has ended (the shards are stopping)
 }
 
-func newFlusher(m *Manager, interval, min, coalesce time.Duration, noEarly bool) *Flusher {
-	return &Flusher{m: m, interval: interval, min: min, coalesce: coalesce, noEarly: noEarly,
-		kick: make(chan struct{}, 1), changed: make(chan struct{}), exited: make(chan struct{})}
+// FlushOptions configure the flush loop.
+type FlushOptions struct {
+	Interval time.Duration // flush interval, 250 ms if zero
+	// Min is the shortest time between the starts of two flush cycles, DefaultFlushMin if zero.
+	Min time.Duration
+	// Coalesce is how long a cycle that output is waiting for is held back so
+	// that output arriving together shares it, DefaultFlushCoalesce if zero.
+	Coalesce time.Duration
+	// NoEarly makes cycles run on the interval alone, for tests that decide when one runs.
+	NoEarly bool
+}
+
+func newFlusher(tab *table, writer *segment.Writer, keeper *coord.Keeper, log *slog.Logger, opts FlushOptions) *Flusher {
+	return &Flusher{tab: tab, writer: writer, keeper: keeper, log: log,
+		interval: opts.Interval, min: opts.Min, coalesce: opts.Coalesce, noEarly: opts.NoEarly,
+		kick: make(chan struct{}, 1), exited: make(chan struct{})}
 }
 
 // request asks for a cycle that begins after mark.
@@ -100,14 +117,10 @@ func sleep(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-func (f *Flusher) broadcast() {
-	f.mu.Lock()
-	close(f.changed)
-	f.changed = make(chan struct{})
-	f.mu.Unlock()
-}
+func (f *Flusher) String() string { return "flusher" }
 
-func (f *Flusher) loop(ctx context.Context) {
+// Serve is the flusher's loop, as a service.
+func (f *Flusher) Serve(ctx context.Context) error {
 	defer close(f.exited)
 	tick := time.NewTimer(f.interval)
 	defer tick.Stop()
@@ -118,7 +131,7 @@ func (f *Flusher) loop(ctx context.Context) {
 		if !early {
 			select {
 			case <-ctx.Done():
-				return
+				return supervisor.NoRestart(nil)
 			case <-tick.C:
 			case <-f.kick:
 				if f.noEarly || !f.pending() {
@@ -126,13 +139,13 @@ func (f *Flusher) loop(ctx context.Context) {
 				}
 				early = true
 				if !sleep(ctx, f.coalesce) { // so that output arriving together shares the cycle
-					return
+					return supervisor.NoRestart(nil)
 				}
 			}
 		}
 		// Never closer to the last start than the minimum, whatever starts this one.
 		if !last.IsZero() && !sleep(ctx, f.min-time.Since(last)) {
-			return
+			return supervisor.NoRestart(nil)
 		}
 		if early && !f.pending() {
 			kicked = false // everybody who waited has gone: nobody is flushed for
@@ -157,26 +170,18 @@ func (f *Flusher) loop(ctx context.Context) {
 func syncLimit() int { return runtime.GOMAXPROCS(0) }
 
 type pendingSync struct {
-	a   *ActiveShard
+	a   *shard
 	h   capture.Header
 	ok  bool
 	err error // the sync's result
-
-	snap *snapshot // what was read just before the capture, delivered once it is durable
 }
 
 func (f *Flusher) cycle(ctx context.Context) {
-	m := f.m
 	f.started.Add(1)
 
-	m.mu.Lock()
-	var durable []*ActiveShard
-	for _, a := range m.active {
-		if !a.closing {
-			durable = append(durable, a)
-		}
-	}
-	m.mu.Unlock()
+	// Shards being let go of are left to their final sync.
+	var durable []*shard
+	f.tab.shards(func(a *shard) { durable = append(durable, a) }, entryActive)
 
 	// 1. Sync what changed, and 2. when every sync has queued what it captured
 	// (however many files that is), write them all as one segment. The writer is
@@ -185,30 +190,18 @@ func (f *Flusher) cycle(ctx context.Context) {
 	var ops []*pendingSync
 	var sg errgroup.Group
 	sg.SetLimit(syncLimit())
-	msgs := m.msgs.enabled()
 	for _, a := range durable {
-		sh := a.cap.Load()
+		sh := a.cap.load()
 		if sh == nil {
 			continue
 		}
-		h, ok, changed := a.changed()
-		// A shard that did not change is still read when rows were left unread
-		// (activation, or more than fit): it has nothing new to capture, so what
-		// it holds is durable once this cycle completes.
-		read := msgs && (changed || a.msgs.wantsRead())
-		if !changed && !read {
+		h, ok, changed := a.cap.changed()
+		if !changed {
 			continue
 		}
 		p := &pendingSync{a: a, h: h, ok: ok}
 		ops = append(ops, p)
 		sg.Go(func() error {
-			if read {
-				// Before the capture starts, so that everything the read shows is in it.
-				var err error
-				if p.snap, err = a.msgs.read(ctx); err != nil && ctx.Err() == nil && !errors.Is(err, capture.ErrClosed) {
-					m.log.Warn("could not read a shard's outbox and inbox", "shard", a.Name, "err", err)
-				}
-			}
 			p.err = sh.Capture(ctx) // each shard's own result: one failing must not cancel the rest
 			return nil
 		})
@@ -217,10 +210,15 @@ func (f *Flusher) cycle(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
-	flushErr := m.n.Writer.Flush(ctx)
+	flushErr := f.writer.Flush(ctx)
 	if flushErr != nil && ctx.Err() == nil {
-		m.log.Error("flushing the node journal failed", "err", flushErr)
+		f.log.Error("flushing the node journal failed", "err", flushErr)
 		// A fenced or closed writer never recovers.
+	}
+	if flushErr == nil {
+		// Acknowledging is the moment the lease has to be good: nothing written
+		// after it ran out counts as durable (the keeper logs the loss).
+		flushErr = f.keeper.Check()
 	}
 
 	// 3. Completion.
@@ -229,38 +227,29 @@ func (f *Flusher) cycle(ctx context.Context) {
 		if err == nil {
 			err = flushErr // queued, but never written
 		}
-		m.mu.Lock()
-		closing := p.a.closing
-		m.mu.Unlock()
+		closing := !p.a.e.is(entryActive)
 		if err != nil {
-			p.a.syncErr.Store(&err)
+			p.a.cap.synced(err)
 			if ctx.Err() == nil && !closing {
-				m.log.Error("capturing a shard failed", "shard", p.a.Name, "err", err)
+				f.log.Error("capturing a shard failed", "shard", p.a.Name, "err", err)
 			}
 			continue
 		}
-		p.a.syncErr.Store(nil)
-		p.a.captured(p.h, p.ok)
-		p.a.msgs.afterRead(p.snap)
-		m.msgs.start(p.a.msgs, p.snap) // durable now
+		p.a.cap.synced(nil)
+		p.a.cap.captured(p.h, p.ok)
+		if o := p.a.msgs.load(); o != nil {
+			o.reads.captured.Kick() // its new rows can be read, and are durable
+		}
 	}
-	f.done.Add(1)
-	f.broadcast()
+	f.done.Inc()
 }
 
 // WaitCycle waits for a cycle that begins after the call to complete: every
 // file queued before it is then in blob storage. Shards use it as their
-// Config.Durable, so deactivations share segments with everything else.
-//
-// Once the loop has ended (the manager is closing and deactivating its shards)
-// there are no more cycles, and it flushes the writer itself.
-func (f *Flusher) WaitCycle(ctx context.Context) error {
-	err := f.Wait(ctx, f.Mark())
-	if errors.Is(err, errFlusherStopped) {
-		return f.m.n.Writer.Flush(ctx)
-	}
-	return err
-}
+// Config.Durable, so deactivations share segments with everything else. The
+// flush loop stops only once every shard has been let go of, so there is always
+// a cycle to wait for.
+func (f *Flusher) WaitCycle(ctx context.Context) error { return f.Wait(ctx, f.Mark()) }
 
 var errFlusherStopped = errors.New("node: the flush loop has stopped")
 
@@ -274,7 +263,7 @@ func (f *Flusher) Completed() uint64 { return f.done.Load() }
 // Wait blocks until a cycle that began after mark has completed, and fails if
 // the node's lease is no longer good by then (or ctx ends first).
 func (f *Flusher) Wait(ctx context.Context, mark uint64) error {
-	keeper := f.m.n.Keeper
+	keeper := f.keeper
 	f.waiting.Add(1)
 	defer f.waiting.Add(-1)
 	if f.done.Load() <= mark && f.started.Load() <= mark {
@@ -282,62 +271,50 @@ func (f *Flusher) Wait(ctx context.Context, mark uint64) error {
 		// this waits for, and the loop starts the next if more output waits.)
 		f.request(mark)
 	}
-	for {
-		f.mu.Lock()
-		ch := f.changed
-		f.mu.Unlock()
-		if f.done.Load() > mark {
-			// Acknowledging is the moment the lease has to be good.
-			return keeper.Check()
-		}
-		if err := keeper.Check(); err != nil {
-			return err
-		}
-		select {
-		case <-ch:
-		case <-f.exited:
-			return errFlusherStopped
-		case <-ctx.Done():
-			return context.Cause(ctx)
-		case <-keeper.Lost():
-			return keeper.Check()
-		}
+	if f.done.Load() > mark {
+		// Acknowledging is the moment the lease has to be good.
+		return keeper.Check()
+	}
+	if err := keeper.Check(); err != nil {
+		return err
+	}
+	select {
+	case <-f.done.Reached(mark + 1):
+		return keeper.Check()
+	case <-f.exited:
+		return errFlusherStopped
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	case <-keeper.Lost():
+		return keeper.Check()
 	}
 }
 
 // Barrier is what POST /_shardlite/sync does: it returns once everything
 // committed before the call is in blob storage (the next completed cycle), and
 // fails once the node's lease is lost.
-func (m *Manager) Barrier(ctx context.Context) error { return m.BarrierFor(ctx, "") }
-
-// BarrierFor is Barrier for a call made by the shard named caller (""
-// if it came from the app).
-func (m *Manager) BarrierFor(ctx context.Context, caller string) error {
-	return m.flush.Wait(ctx, m.flush.Mark())
-}
+func (m *Shards) Barrier(ctx context.Context) error { return m.flush.Wait(ctx, m.flush.Mark()) }
 
 // Gate holds a chunk of a shard's output until what the shard committed before
 // it is durable (docs/internals.md, Durability gates):
 //
 //   - with sync off the chunk goes straight out;
 //   - with sync on it waits for a flush cycle that began after the chunk was
-//     read, unless the shard has had no new frames since its last capture.
+//     read, unless the shard has had no new frames since its last capture (a
+//     shard whose header can't be read counts as having them).
 //
 // Call it once the chunk has been read from the app. sync is the kind's
 // setting or a Shardlite-Sync override.
-func (m *Manager) Gate(ctx context.Context, r *Ref, sync bool) error {
+func (m *Shards) Gate(ctx context.Context, r *Ref, sync bool) error {
 	if !sync {
 		return nil
 	}
 	mark := m.flush.Mark()
-	if !r.a.hasNewFrames() {
+	if !r.a.cap.hasNewFrames() {
 		return nil
 	}
 	if err := m.flush.Wait(ctx, mark); err != nil {
 		return err
 	}
-	if e := r.a.syncErr.Load(); e != nil && *e != nil {
-		return *e
-	}
-	return nil
+	return r.a.cap.err()
 }

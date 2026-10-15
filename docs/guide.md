@@ -223,7 +223,7 @@ Shards talk reliably through two reserved tables in each shard, written in the s
 - **The outbox,** `_shardlite_outbox`, holds calls to other shards. The node moves each row into the target's inbox once the commit is durable.
 - **The inbox,** `_shardlite_inbox`, holds calls to the shard itself, now or later: delivered messages, and rows the app sets for itself ("this upgrade finishes at 14:05"). The node calls the shard's handler when a row is due, and the handler consumes the row in the same transaction as its work.
 
-Nothing is sent for a write that is later lost, and nothing is lost once the write is durable. What a handler commits for a row happens once, but a message can arrive in the inbox twice. The node creates both tables at activation, before the app gets the shard (their schemas are in [Reserved tables](#reserved-tables)).
+Nothing is sent for a write that is later lost, and nothing is lost once the write is durable. What a handler commits for a row happens once, but a message can arrive in the inbox twice. That leaves two ideas to hold: a message arrives at least once, so handlers deduplicate, and anything a shard must do later, or must not forget, is a row in its own inbox. The node creates both tables at activation, before the app gets the shard (their schemas are in [Reserved tables](#reserved-tables)).
 
 Sending:
 
@@ -243,7 +243,7 @@ Failures:
 - **Retries.** `429`, `5xx` and connection failures are retried with backoff, for both delivery and handlers.
 - **Giving up.** The node gives up on a row whose target isn't a valid shard or whose kind isn't declared, whose hops are past the limit, that gets another `4xx`, whose handler answers `2xx` without consuming it (a bug in the handler) or that has failed for more than a day. It logs an error and stops trying for as long as the shard stays active. The row is tried once more on the next activation, so a broken row costs one attempt and one error per activation.
 - **Finding stuck messages.** On an outbox row the node gives up on, it sets `error` to the reason (`400 from players/42: unknown reward`, `undeclared kind`), so the sending app can find them with `WHERE error IS NOT NULL`. It is only information: the next attempt deletes the row or overwrites it, and the app may clear it or delete the row. Inbox rows are left as they are, since their failures are the app's own handler's answers, which it can record itself.
-- **Liveness.** A shard with messages to send, or inbox rows due now, stays active until they are handled, even with no request arriving. Inbox rows due later don't keep it active: the node wakes the shard when they come due, on whichever node then claims it.
+- **Liveness.** An active shard sends and handles what it has without a request, and stays active until nothing is left to send or due now. Inbox rows due later don't keep it active: the node wakes the shard when they come due, on whichever node then claims it. A shard whose sending had been failing for minutes when its node crashed waits for its next request, call or timer, so a recurring row in its own inbox covers anything that mustn't wait.
 
 Uses: fan-out in one transaction (rewards for 100 players at the end of a match), transfers and trades by custody (the item moves into a trade shard and out again), work deferred past a response, timers that must fire while nobody is connected (an upgrade finishing, an auction closing) and recurring jobs.
 
@@ -354,7 +354,7 @@ Nodes must be on a trusted private network: traffic between them is not encrypte
 Rough estimates on S3 Standard, to be checked by the prototype:
 
 - **Journal segments:** 4 PUTs a second per busy node at the default 250 ms flush interval, about 50 USD a month per busy node, whatever the number of active shards. Idle nodes write nothing. A shorter interval makes sync faster and the loss window smaller at a higher cost (about 130 USD a month at 100 ms).
-- **Snapshots:** one PUT (the changed pages only) and one manifest write each time a shard deactivates or its unsnapshotted commits age out (about once per session), about 10 USD per million sessions. A rebase uploads the whole shard, at most once a day for a shard in use or after 8 snapshots. Infrequent-access storage classes bill small objects as at least 128 KB, so small files stay in the standard class.
+- **Snapshots:** one PUT (the changed pages only) and one manifest write each time a shard deactivates or its unsnapshotted commits age out (about once per session), about 10 USD per million sessions. A rebase uploads the whole shard once it has more than 8 files, so about every 8 snapshots. Infrequent-access storage classes bill small objects as at least 128 KB, so small files stay in the standard class.
 - **Restores:** a few GETs in parallel, for the base and deltas.
 - **Storage:** a 100 KB player shard is 100 GB for a million players, a few dollars a month, plus old files during their retention.
 - **Manifests and leases:** one conditional write per new shard (plus a delete, which is free on S3, for one that is never written), per move and per snapshot, and lease renewals every few seconds per node (well under a dollar a day per node). Noticing dead nodes costs about 7 USD a month for the whole cluster.
@@ -381,7 +381,7 @@ Estimated, not measured:
 ### Observability
 
 - **Tracing.** The node passes W3C trace context (`traceparent`) through every hop, including forwarding between nodes and calls between shards, and adds its own spans (routing, activation, restore, gate waits). Apps that also propagate it get end-to-end traces across shards. The node also counts shardless requests that lead to calls to a shard, and logs a sample of their paths, so routes where clients don't name the shard they need show up.
-- **Alerts.** The node logs an alert if a shard's commits have gone longer than `SHARDLITE_TAIL_ALERT` without a snapshot, which means its snapshots are failing.
+- **Alerts.** The node logs an alert if a shard's commits have gone longer than 3× `SHARDLITE_DELTA_AGE` without a snapshot, which means its snapshots are failing.
 - **Diagnosis.** `SHARDLITE_PPROF` serves Go's pprof handlers.
 
 ## Reference
@@ -464,9 +464,8 @@ Errors the node generates itself (sent as gRPC status for gRPC requests):
 | `SHARDLITE_FLUSH` | `250ms` | flush interval |
 | `SHARDLITE_IDLE_TIMEOUT` | built in | idle timeout for kinds that don't set one |
 | `SHARDLITE_LEASE_TTL` | `10s` | node lease TTL |
-| `SHARDLITE_DELTA_AGE` | `3m` | how old a shard's unsnapshotted commits get before a snapshot is written |
-| `SHARDLITE_TAIL_ALERT` | `15m` | alert when a shard's unsnapshotted commits are older than this |
-| `SHARDLITE_JOURNAL_EXPIRY` | `24h` | how long journal segments are kept. At least 4× `SHARDLITE_TAIL_ALERT` |
+| `SHARDLITE_DELTA_AGE` | `15m` | how old a shard's unsnapshotted commits get before a snapshot is written. The tail alert (3×) and journal expiry (a day, or 4× the alert if longer) follow from it |
+| `SHARDLITE_DELTA_SIZE` | `256KB` | how many bytes of unsnapshotted commits make a snapshot due, whatever their age |
 | `SHARDLITE_MAX_HOPS` | `32` | the hop limit for calls and messages |
 | `SHARDLITE_PPROF` | off | address for Go's pprof handlers |
 

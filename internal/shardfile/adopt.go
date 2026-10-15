@@ -4,12 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"golang.org/x/sync/errgroup"
 	"log/slog"
 	"sort"
-	"strings"
-	"sync"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/capture"
@@ -48,7 +47,8 @@ const adoptWorkers = 64
 //     is still needed.
 //  3. For every shard with entries the manifest's files don't cover, it writes
 //     one delta and adds it to the manifest, clearing the manifest's journal.
-//     A wake hint for the current minute is written before the delta: the shard
+//     A wake hint for the current minute is written (by wake, which writes the
+//     hint and counts an existing one as success) before the delta: the shard
 //     may hold messages that were never delivered, and the scan for hints is what
 //     wakes it.
 //
@@ -60,7 +60,7 @@ const adoptWorkers = 64
 // Every shard is tried, so one bad shard doesn't leave the others' tails in
 // the journal. If any failed the error says so (and Problems lists them): the
 // journal's range must not be moved on, since the tails are still there.
-func (f *Files) AdoptJournal(ctx context.Context, node string, from, next uint64, logger *slog.Logger) (AdoptReport, error) {
+func (f *Files) AdoptJournal(ctx context.Context, node string, from, next uint64, wake func(ctx context.Context, shard string) error, logger *slog.Logger) (AdoptReport, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -90,41 +90,47 @@ func (f *Files) AdoptJournal(ctx context.Context, node string, from, next uint64
 	// Every number from the start of the range to the fence must be there. A
 	// missing one in the middle would hide the segments after it from a plain
 	// scan, and with them commits an acknowledgement was given for.
-	idx := &JournalIndex{node: node, byShard: map[string][]journalRef{}}
-	err = segment.ScanTo(ctx, f.Blob, node, from, fence, func(seq uint64, e segment.Entry) error {
-		idx.byShard[e.Shard] = append(idx.byShard[e.Shard], journalRef{seq, e})
-		return nil
-	})
+	idx, err := f.LoadJournal(ctx, node, from, fence)
 	if err != nil {
 		return rep, fmt.Errorf("adopt %s: reading the journal: %w", node, err)
 	}
 	rep.Shards = len(idx.byShard)
 
-	var mu sync.Mutex
+	// Each worker fills its own slot, and they are folded after Wait.
+	names := make([]string, 0, len(idx.byShard))
+	for name := range idx.byShard {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	type result struct {
+		wrote bool
+		err   error
+	}
+	results := make([]result, len(names))
 	var g errgroup.Group
 	g.SetLimit(adoptWorkers)
-	for name := range idx.byShard {
+	for i, name := range names {
 		g.Go(func() error {
-			wrote, err := f.adoptShard(ctx, node, name, idx)
-			mu.Lock()
-			defer mu.Unlock()
-			var gap *gapError
-			if errors.As(err, &gap) && rep.Expired {
-				logger.Error("a shard's tail has a hole, commits after it are lost", "node", node, "shard", name, "err", err)
-				rep.Lost = append(rep.Lost, name)
-			} else if err != nil {
-				if gap != nil {
-					err = fmt.Errorf("%w (the journal's range was not expired, so this is a bug)", err)
-				}
-				rep.Problems = append(rep.Problems, fmt.Errorf("%s: %w", name, err))
-			} else if wrote {
-				rep.Deltas++
-			}
-			return nil // each shard's problem is collected in rep, the others carry on
+			results[i].wrote, results[i].err = f.adoptShard(ctx, node, name, idx, wake)
+			return nil // each shard's problem is collected below, the others carry on
 		})
 	}
 	g.Wait()
-	sort.Strings(rep.Lost)
+	for i, name := range names {
+		r := results[i]
+		if _, gap := errors.AsType[*gapError](r.err); gap && rep.Expired {
+			logger.Error("a shard's tail has a hole, commits after it are lost", "node", node, "shard", name, "err", r.err)
+			rep.Lost = append(rep.Lost, name)
+		} else if r.err != nil {
+			err := r.err
+			if gap {
+				err = fmt.Errorf("%w (the journal's range was not expired, so this is a bug)", err)
+			}
+			rep.Problems = append(rep.Problems, fmt.Errorf("%s: %w", name, err))
+		} else if r.wrote {
+			rep.Deltas++
+		}
+	}
 	sort.Slice(rep.Problems, func(i, j int) bool { return rep.Problems[i].Error() < rep.Problems[j].Error() })
 	if len(rep.Problems) > 0 {
 		return rep, fmt.Errorf("adopt %s: %d of %d shards failed: %w", node, len(rep.Problems), rep.Shards, errors.Join(rep.Problems...))
@@ -139,43 +145,21 @@ func (g *gapError) Error() string {
 }
 
 // adoptShard writes the delta for one shard's uncovered entries, if it has any.
-func (f *Files) adoptShard(ctx context.Context, node, name string, idx *JournalIndex) (bool, error) {
+func (f *Files) adoptShard(ctx context.Context, node, name string, idx *JournalIndex, wake func(ctx context.Context, shard string) error) (bool, error) {
 	for range 5 {
-		m, etag, err := f.GetManifest(ctx, name)
+		h, err := f.Attach(ctx, name)
 		if errors.Is(err, blob.ErrNotFound) {
 			return false, nil // deleted since: its tail is never read again
 		} else if err != nil {
 			return false, err
 		}
+		m := h.Manifest
 		if m.Journal != node {
 			return false, nil // its commits go to another journal now
 		}
-		var refs []journalRef
-		for _, ref := range idx.byShard[name] {
-			if ref.entry.Generation == m.Generation {
-				refs = append(refs, ref)
-			}
-		}
-		sort.SliceStable(refs, func(i, j int) bool { return refs[i].entry.Position < refs[j].entry.Position })
-
-		pos := m.LastPosition()
-		var tail []capture.TailFile
-		for _, ref := range refs {
-			e := ref.entry
-			if e.Last() <= pos {
-				continue // covered by the manifest's files, or a copy of an entry already taken
-			}
-			if e.Position != pos+1 {
-				capture.CloseTail(tail)
-				return false, &gapError{from: pos + 1, to: e.Position - 1}
-			}
-			body, err := segment.ReadEntryFile(ctx, f.Blob, node, ref.seq, e, f.TempDir, f.spoolLimit())
-			if err != nil {
-				capture.CloseTail(tail)
-				return false, err
-			}
-			tail = append(tail, capture.TailFile{Position: e.Position, Count: e.Count, Body: body, Seg: ref.seq})
-			pos = e.Last()
+		tail, err := idx.tail(ctx, f, name, m.Generation, m.LastPosition(), time.Time{})
+		if err != nil {
+			return false, err
 		}
 		if len(tail) == 0 {
 			return false, nil
@@ -185,11 +169,10 @@ func (f *Files) adoptShard(ctx context.Context, node, name string, idx *JournalI
 		// existing one counts as success). A hint that is found before the delta only
 		// means "look": a wake that fails while the shard isn't released leaves it, and
 		// the next scan gets it.
-		if _, err := f.Blob.Create(ctx, WakeKey(time.Now(), name), strings.NewReader("")); err != nil && !errors.Is(err, blob.ErrExists) {
+		if err := wake(ctx, name); err != nil {
 			capture.CloseTail(tail)
 			return false, fmt.Errorf("writing the wake hint: %w", err)
 		}
-		h := &Handle{F: f, Name: name, Manifest: m, ETag: etag}
 		err = h.putTail(ctx, tail, Hooks{}, func(n *Manifest) { n.Journal = "" })
 		capture.CloseTail(tail)
 		if errors.Is(err, blob.ErrConflict) {
@@ -198,16 +181,4 @@ func (f *Files) adoptShard(ctx context.Context, node, name string, idx *JournalI
 		return err == nil, err
 	}
 	return false, errors.New("the manifest keeps changing")
-}
-
-// Wake hints are empty objects wakes/{minute}/{shard}, keyed by the time they
-// are due in UTC at minute resolution (docs/internals.md, Message delivery).
-const (
-	WakePrefix = "wakes/"
-	WakeLayout = "2006-01-02T15:04Z" // fixed width, so keys sort by time
-)
-
-// WakeKey is the key of the hint that wakes shard at t.
-func WakeKey(t time.Time, shard string) string {
-	return WakePrefix + t.UTC().Truncate(time.Minute).Format(WakeLayout) + "/" + shard
 }

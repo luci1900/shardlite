@@ -15,7 +15,6 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
 	"github.com/superfly/ltx"
 
 	"github.com/luci1900/shardlite/internal/apptest"
@@ -93,7 +92,7 @@ func metaDir(e *harness.Env, res *shardfile.Restored) string {
 func TestRestoredShardMetadataStaysSmall(t *testing.T) {
 	t.Parallel()
 	const mb = 20
-	e := harness.New(t, 5*time.Millisecond)
+	e := harness.New(t)
 	res := stored(t, e, mb)
 	fi, err := os.Stat(e.Path(name))
 	if err != nil {
@@ -161,7 +160,7 @@ func TestActivatingARestoredShardReadsNoPages(t *testing.T) {
 	if testing.Short() {
 		mb = 8
 	}
-	e := harness.New(t, 5*time.Millisecond)
+	e := harness.New(t)
 	res := stored(t, e, mb)
 	ctx := context.Background()
 
@@ -205,7 +204,7 @@ func replayInto(t *testing.T, e *harness.Env, path string) {
 	}
 	ctx := context.Background()
 	var last uint64
-	err = segment.Scan(ctx, e.Store, e.Node, 1, func(seq uint64, en segment.Entry) error {
+	err = segment.Scan(ctx, e.Store, e.Node, 1, 0, func(seq uint64, en segment.Entry) error {
 		if en.Shard != name || en.Last() <= last {
 			return nil
 		}
@@ -285,7 +284,7 @@ func TestRestoredShardCapturePaths(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			e := harness.New(t, 5*time.Millisecond)
+			e := harness.New(t)
 			res := stored(t, e, 3)
 			ctx := context.Background()
 			sh := e.Activate(res.Handle, res.Capture)
@@ -315,14 +314,14 @@ func TestRestoredShardCapturePaths(t *testing.T) {
 // anything behind: no files in the tail, the same position.
 func TestRestoredShardNeverWritten(t *testing.T) {
 	t.Parallel()
-	e := harness.New(t, 5*time.Millisecond)
+	e := harness.New(t)
 	res := stored(t, e, 2)
 	ctx := context.Background()
 	sh := e.Activate(res.Handle, res.Capture)
 	if err := sh.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
-	released, err := sh.Release(ctx)
+	released, empty, err := sh.Release(ctx)
 	if err != nil || !released {
 		t.Fatalf("release: %v, %v", released, err)
 	}
@@ -332,7 +331,7 @@ func TestRestoredShardNeverWritten(t *testing.T) {
 	if got := sh.Position(); got != res.State.Position {
 		t.Fatalf("position moved from %d to %d", res.State.Position, got)
 	}
-	if sh.Empty() {
+	if empty {
 		t.Fatal("a shard with data in it counts as empty")
 	}
 }
@@ -342,7 +341,7 @@ func TestRestoredShardNeverWritten(t *testing.T) {
 // across activations.
 func TestReactivationFoldsTheWALItLeft(t *testing.T) {
 	t.Parallel()
-	e := harness.New(t, 5*time.Millisecond)
+	e := harness.New(t)
 	res := stored(t, e, 2)
 	ctx := context.Background()
 	sh := e.Activate(res.Handle, res.Capture)
@@ -354,7 +353,7 @@ func TestReactivationFoldsTheWALItLeft(t *testing.T) {
 		}
 	}
 	app.Must(t, "close", "a")
-	released, err := sh.Release(ctx)
+	released, _, err := sh.Release(ctx)
 	if err != nil || !released {
 		t.Fatalf("release: %v, %v", released, err)
 	}
@@ -385,7 +384,7 @@ func TestReactivationFoldsTheWALItLeft(t *testing.T) {
 // stage 1z report).
 func TestSeedRelianceOnLitestream(t *testing.T) {
 	t.Parallel()
-	e := harness.New(t, 5*time.Millisecond)
+	e := harness.New(t)
 	res := stored(t, e, 2)
 	ctx := context.Background()
 	var logs bytes.Buffer
@@ -488,7 +487,7 @@ func TestLargeCommitSpillsAndLeavesNothingBehind(t *testing.T) {
 		mb   int
 	}{{"3 MB, below Litestream's checkpoint threshold", 3}, {"6 MB", 6}} {
 		t.Run(tc.name, func(t *testing.T) {
-			e := harness.New(t, 5*time.Millisecond)
+			e := harness.New(t)
 			res := stored(t, e, 1)
 			ctx := context.Background()
 			e.Files.SpoolLimit = 64 << 10
@@ -598,7 +597,7 @@ func TestLargeCommitSpillsAndLeavesNothingBehind(t *testing.T) {
 // the ones that were deleted.
 func TestRefusedReleaseAfterTheTailWasDropped(t *testing.T) {
 	t.Parallel()
-	e := harness.New(t, 5*time.Millisecond)
+	e := harness.New(t)
 	res := stored(t, e, 2)
 	ctx := context.Background()
 	sh := e.Activate(res.Handle, res.Capture)
@@ -614,7 +613,7 @@ func TestRefusedReleaseAfterTheTailWasDropped(t *testing.T) {
 		if n, _ := sh.TailInfo(); n != 0 {
 			t.Fatalf("%d files in the tail after a delta", n)
 		}
-		released, err := sh.Release(ctx)
+		released, _, err := sh.Release(ctx)
 		if err != nil || released {
 			t.Fatalf("release with the app holding the shard: %v, %v", released, err)
 		}
@@ -641,10 +640,10 @@ func TestSeedAnyPageSize(t *testing.T) {
 	t.Parallel()
 	for _, size := range []int{1024, 8192, 65536} {
 		t.Run(strconv.Itoa(size), func(t *testing.T) {
-			e := harness.New(t, 5*time.Millisecond)
+			e := harness.New(t)
 			ctx := context.Background()
 			// The database is made with the page size before the app's own tables.
-			db, err := sql.Open("sqlite3", "file:"+e.Path(name))
+			db, err := sql.Open("sqlite", "file:"+e.Path(name)+"?_pragma=busy_timeout(5000)")
 			if err != nil {
 				t.Fatal(err)
 			}

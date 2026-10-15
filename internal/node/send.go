@@ -2,6 +2,7 @@ package node
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -11,39 +12,49 @@ import (
 	"strconv"
 )
 
-// internalCtxKey marks the context of a request the node makes to itself: an
-// intake or the delivery of an inbox row. Such a request comes from a row that
-// is durable already, so it isn't gated on the caller, and a gRPC failure is
-// read from its status rather than turned into a gRPC response.
-type internalCtxKey struct{}
+// origin says who asked for a request: the public handler (a client) and the
+// control handler (a call by the app) set it from the request. The node's own
+// requests, an intake or the delivery of an inbox row, say what they are. Such a
+// request comes from a row that is durable already, so it isn't gated on the
+// caller, and a gRPC failure is read from its status rather than turned into a
+// gRPC response.
+type origin struct {
+	kind    originKind
+	inboxID int64 // the row a delivery is for
+	hops    int   // the row's own hops, which the handler sees
+}
 
-// deliveryCtxKey carries what the node tells a handler about the inbox row it is
-// called for.
-type deliveryCtxKey struct{}
+type originKind int
 
-type deliveryInfo struct {
-	id   int64
-	hops int
+const (
+	fromClient   originKind = iota // the public handler
+	fromCall                       // the control handler
+	fromIntake                     // the node, delivering an outbox row to the target's inbox
+	fromDelivery                   // the node, calling the handler for an inbox row
+)
+
+func (o origin) control() bool  { return o.kind != fromClient }
+func (o origin) internal() bool { return o.kind >= fromIntake }
+
+// transport is the node's way of reaching its shards in process, for the
+// messenger: the server's routing, with the message timeout and the hop limit.
+func (s *Server) transport() *transport {
+	return &transport{intake: s.sendIntake, inbox: s.sendInbox, maxHops: s.opts.MaxHops}
 }
 
 // sendIntake sends an outbox row to the node of target as the call it will
 // become, from its sender, through the same routing as a call over the control
 // API (activation, forwarding, deadlines and the target checks): the node's own
 // handler is called in process, with no socket. Between nodes the marker will be
-// the header Shardlite-Inbox: true; here it is a context value.
-func (s *Server) sendIntake(ctx context.Context, sender *ActiveShard, target string, row *outRow) (int, error) {
-	ctx, cancel := context.WithTimeout(context.WithValue(context.WithValue(ctx, internalCtxKey{}, true), intakeCtxKey{}, true), s.opts.MessageTimeout)
+// the header Shardlite-Inbox: true; here it is the origin.
+func (s *Server) sendIntake(ctx context.Context, sender *shard, target string, row *outRow) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, s.opts.MessageTimeout)
 	defer cancel()
-	req := s.internalRequest(ctx, row.path, row.body)
+	req := s.internalRequest(ctx, row.path, row.contentType, row.body)
 	req.Header.Set(hdrTarget, target)
 	req.Header.Set(hdrCaller, sender.Name)
 	req.Header.Set(hdrHops, strconv.Itoa(row.hops))
-	ct := row.contentType
-	if ct == "" {
-		ct = "application/octet-stream"
-	}
-	req.Header.Set("Content-Type", ct)
-	w, status, err := s.serveInternal(req)
+	w, status, err := s.serveInternal(req, origin{kind: fromIntake})
 	if err != nil || status/100 == 2 {
 		return status, err
 	}
@@ -63,34 +74,28 @@ func (e *answerError) Error() string {
 
 // sendInbox calls a shard's handler for one of its inbox rows: a POST to the
 // row's path on the shard itself.
-func (s *Server) sendInbox(ctx context.Context, a *ActiveShard, row *inRow) (int, error) {
+func (s *Server) sendInbox(ctx context.Context, a *shard, row *inRow) (int, error) {
 	if _, err := url.ParseRequestURI(row.path); err != nil {
 		return http.StatusBadRequest, fmt.Errorf("bad path %q: %w", row.path, err)
 	}
-	ctx, cancel := context.WithTimeout(context.WithValue(context.WithValue(ctx, internalCtxKey{}, true), deliveryCtxKey{}, &deliveryInfo{id: row.id, hops: row.hops}), s.opts.MessageTimeout)
+	ctx, cancel := context.WithTimeout(ctx, s.opts.MessageTimeout)
 	defer cancel()
-	req := s.internalRequest(ctx, row.path, row.body)
+	req := s.internalRequest(ctx, row.path, row.contentType, row.body)
 	req.Header.Set(hdrTarget, a.Name)
-	caller := row.sender
-	if caller == "" {
-		caller = a.Name
-	}
-	req.Header.Set(hdrCaller, caller)
-	ct := row.contentType
-	if ct == "" {
-		ct = "application/octet-stream"
-	}
-	req.Header.Set("Content-Type", ct)
-	w, status, err := s.serveInternal(req)
+	req.Header.Set(hdrCaller, cmp.Or(row.sender, a.Name))
+	w, status, err := s.serveInternal(req, origin{kind: fromDelivery, inboxID: row.id, hops: row.hops})
 	if err != nil || status/100 == 2 {
 		return status, err
 	}
 	return status, fmt.Errorf("the handler answered %d: %s", status, bytes.TrimSpace(w.head))
 }
 
+// defaultContentType is what a message without a content type of its own is sent as.
+const defaultContentType = "application/octet-stream"
+
 // internalRequest builds a POST for the node's own routing, with the message
-// timeout as the deadline the app is told.
-func (s *Server) internalRequest(ctx context.Context, path string, body []byte) *http.Request {
+// timeout as the deadline the app is told, and contentType (or the default).
+func (s *Server) internalRequest(ctx context.Context, path, contentType string, body []byte) *http.Request {
 	u, _ := url.ParseRequestURI(path)
 	if u == nil {
 		u = &url.URL{Path: path}
@@ -102,12 +107,13 @@ func (s *Server) internalRequest(ctx context.Context, path string, body []byte) 
 		req.Body = http.NoBody
 	}
 	req.Header.Set(hdrDeadline, strconv.FormatInt(s.opts.MessageTimeout.Milliseconds(), 10))
+	req.Header.Set("Content-Type", cmp.Or(contentType, defaultContentType))
 	return req
 }
 
 // serveInternal runs a request through the node's routing in process and returns
 // the answer. status is 0 if there was none, and err says why not.
-func (s *Server) serveInternal(req *http.Request) (w *discardWriter, status int, err error) {
+func (s *Server) serveInternal(req *http.Request, o origin) (w *discardWriter, status int, err error) {
 	ctx := req.Context()
 	w = &discardWriter{header: http.Header{}}
 	defer func() {
@@ -120,7 +126,7 @@ func (s *Server) serveInternal(req *http.Request) (w *discardWriter, status int,
 			panic(r)
 		}
 	}()
-	s.route(w, req, true)
+	s.route(w, req, o)
 	if w.status == 0 {
 		if ctx.Err() != nil {
 			return w, 0, context.Cause(ctx)

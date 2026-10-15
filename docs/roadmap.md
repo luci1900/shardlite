@@ -29,12 +29,16 @@ Useful on its own: SQLite per actor with continuous backup.
 - The localhost control API: `Shardlite-Target` calls (with `Shardlite-If-Active`), `sync` and delete.
 - Hop limit and deadline propagation.
 - Messages: an outbox and an inbox in each shard, with delayed calls to the shard itself.
-- A node lease and manifests through the `NodeRegistry` and `ManifestStore` interfaces, so restarts are fenced.
+- A node lease and manifests (the `coord.Registry` and `shardfile.ManifestStore` types), so restarts are fenced.
 - S3-compatible blob storage, tested against a local emulator. Manifests of deleted and never-written shards are deleted by conditional delete.
 - Startup checks that refuse to start: the store's conditional writes misbehave, or the data directory is on a network filesystem.
 - Startup checks that warn: the scratch directory not on tmpfs, and `vm.max_map_count` or the open file limit too low for the expected active shards.
 - Cancellation propagation (mostly there through request contexts: a test that a cancelled call stops its held and gated requests).
 - Ephemeral kinds, replaced by auto-delete kinds (stage 1.1): normal shards that are deleted when they deactivate.
+- The node as a supervision tree: every goroutine has an owner that joins it, a shard is an actor with a lifecycle loop and a messages owner, the servers join their requests, the tree's dependencies wired in one place, and the locks that stood in for ownership are gone. One SQLite driver (modernc) is linked, so the node builds without cgo. The tests are rebuilt around a fast suite (about 40 seconds, under a minute with `-race`) that runs under a watcher which dumps and kills a stuck test binary.
+- Fewer parts (stage 1.4): no lock nests, is held across I/O or a wait on another goroutine, or stands in for ownership. Each captured shard has a capture loop that owns Litestream's database, the wal-index mapping and the client's tail, so the capture hold, its nested locks and a header read that waits are gone (a busy loop counts as changed). The first fatal error, the lease, the flusher's finished cycles and the last header became atomics or a counter. Restore and adoption build a shard's tail in one place, the node's requests to itself carry an explicit origin instead of context keys, the messages transport is passed when the shards are built, and leases and manifests are concrete types.
+- The long suite in CI (stage 1.5): `internal/tools/testwatch/long.sh` runs the main module with `-tags fault` against RustFS (with and without `-race`), the `e2e` module (with `-race`) and, on Linux, the per-shard cost and filesystem checks, all under the stuck-test watcher. GitHub Actions on Linux runs the fast suite (with and without `-race`, after build, vet and `gofmt`) and, if asked, the long suite. Both run only when started by hand.
+- Services and the journal, tidied (stage 1.7): one question about the journal (`Node.Err`), Run's tree as four stages stopped in order with the drain as a step of Run, health, the journal sweeper and the kinds reload as types, every listener bound before the shards are built, and a journal writer that knows nothing of leases (acknowledgements come only through the flusher, which checks the lease after each flush).
 
 ### 2. A cluster
 
@@ -67,16 +71,20 @@ The lease, fencing and adoption protocol is specified in [Quint](https://quint-l
 - Virtual-hosted-style S3 addressing where a store prefers it (stage 1 always uses path style, which AWS, R2, emulators and self-hosted stores accept).
 - LTX files over S3's 5 GB limit for a single PUT, with multipart uploads (LTX files have unique names, so a plain multipart upload can replace the conditional create they use now).
 - Distributed tracing with W3C trace context, and counting shardless requests that lead to calls to a shard.
+- Metrics for everything the node does: requests, activations, flushes and gate waits, deltas and rebases, storage calls, leases and the egress proxy when it exists.
 - Hash prefixes on per-shard keys (`manifests/7f/users/42`, and the same for LTX files), so a launch spike spreads over many S3 prefixes instead of hitting the limit per prefix (about 3,500 writes a second, raised only gradually) on `manifests/users/`. Changing the key layout later means moving objects, so it should be settled before production data exists.
 - Format versions for everything shardlite stores, with a marker per deployment that a node from an older release refuses.
 - The `shardlite` command for operators: `ls`, `export`, `import` and `verify`, through the running node, or directly on blob storage when no lease is live.
+- A crashed shard costs only that shard. A panic in a shard's own goroutines quarantines it (its requests get `503` and an alert is logged) while the rest of the node carries on, instead of crashing the process. Once no process has the file open, the node lets the shard go from its local file: a new base written from the file and swapped into the manifest by compare-and-swap, which holds every commit (including ones never captured) and supersedes the journal. The next request activates it as usual. Its messages can restart on their own instead, since their state is rebuilt from the shard's tables.
+- No uncaptured commits lost to a held file. A shard file that an app still has open across a restart is deleted once the app closes it, with whatever it committed that was never captured. Letting it go from the file, as for a crashed shard, keeps those commits.
+- Saving shards when the segment writer panics: letting them go from their local files (a few rebases at a time) until the shutdown deadline, instead of leaving all of them to adoption.
 - A soak test: the fault rig running for hours against a cluster, with kills, pauses, partitions, slow storage and restarts, checking the same guarantees as the per-scenario tests.
 - A startup check that refuses to start on a non-empty prefix without this deployment's format marker.
 - A sweeper that deletes LTX files no manifest refers to (left by crashes mid-write, deltas never adopted and rebases that failed after their upload), once they are older than any write still in flight could be.
 
 ## Later
 
-- Large shards: a rebase uploads the whole database, so shards of gigabytes may want a longer rebase interval or a middle level of merged deltas.
+- Large shards: a rebase uploads the whole database, so shards of gigabytes may want a higher file limit or a middle level of merged deltas.
 - Holding requests that reach a shard during a handoff until the new owner is ready, instead of answering `503`. Worth it if a launch's error rates show the `503`s from rebalancing hurt (see [Routing and forwarding](internals.md#routing-and-forwarding)).
 - Keeping the local cache across a node restart, for deployments where node redeploys are frequent or a cold cache is costly (large shards, or nodes redeployed with every app deploy as a sidecar). It needs the cache to be trustworthy after an OS crash: the index and shard files made durable at deactivation, or discarded when the boot id changes, or checked against whole-database checksums once LTX files carry them.
 - Cancelling a running rebase when its shard deactivates, if waiting for it (about 9 s for 1 GB) ever matters. The upload can simply be abandoned.
@@ -132,6 +140,8 @@ The node could also offer an egress proxy for HTTP and HTTPS, so calls to extern
 - HTTPS goes through `CONNECT` tunnels. The node gates the tunnel's bytes like any other output. There is no TLS interception or parsing.
 - Egress is gated by waiting for the next flush, so no egress traffic has to be attributed to a shard. It waits only while the node has pending writes from kinds with sync on, up to a flush interval under load. Otherwise it passes straight through. Telemetry and logging can bypass it by destination (`NO_PROXY`, or an allowlist in an environment variable).
 - The app can also skip the gate call by call: `Shardlite-Sync: off` on the request (or on the `CONNECT` request for HTTPS, where the client can set proxy headers), or simply an HTTP client configured without the proxy. Where a datacentre requires all egress to go through its proxy, the header is the way, and the node chains to that proxy.
+- Egress is fenced. While the node doesn't hold its lease (lost, or not yet renewed after a pause) or is draining, the proxy refuses new calls and closes open tunnels, so a zombie node can't send side effects (payments, emails, webhooks) for writes that won't survive. Calls that skipped the gate with the header are fenced too, since fencing is about the node, not one write. An app can't easily do this itself, because it doesn't know when the node loses its lease. The refusals (`503`) and closed tunnels are another way it finds out, alongside failing `sync` calls.
+- Metrics per destination host: calls, bytes, errors, time waiting at the gate and calls refused by fencing. The proxy sees only the host for HTTPS, which is enough.
 - It only covers clients that honour the proxy settings. Most HTTP clients do; some need configuration (Node's `fetch`, Java).
 
 Without the proxy, or for anything it can't see, `sync` gates side effects explicitly.
@@ -155,7 +165,7 @@ Each language has a framework-neutral core and thin adapters for its standard in
 
 - **Flush interval.** It sets the loss window on a node crash (for shard kinds with sync off), the latency of sync and the PUT rate per node. 250 ms for now.
 - **WAL capture correctness.** Capturing frames from files another process writes is the riskiest part. Litestream still has open data-loss issues in exactly this area (external checkpoints, WAL resets), so shardlite depends on their fixes and needs its own fault-injection tests from the start.
-- Tail age limit, rebase interval and file limit: shorter tails mean faster recovery after a crash, at the cost of more deltas, and rarer rebases mean more files per restore.
+- Tail age limit and file limit: shorter tails mean faster recovery after a crash, at the cost of more deltas, and rarer rebases mean more files per restore.
 - Node lease TTL: short enough for fast failover, long enough to survive VM pauses and network blips.
 - **Regions.** v1 is one region. Region-locked games run a separate cluster per region and send players to theirs at login. Global games (a guild with members in EU and NA) would need more. Each shard would have a home region in the manifest, set at creation (where it was first written, or from a hint). Requests from other regions would be forwarded, and moves between regions would be explicit, since blob storage is regional. Data residency would pin a shard's region.
 - How to secure traffic between nodes (see [Securing traffic between nodes](#securing-traffic-between-nodes)).

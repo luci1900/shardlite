@@ -5,11 +5,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"golang.org/x/sync/errgroup"
 	"os"
 	"path/filepath"
 	"sort"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/capture"
@@ -36,22 +37,62 @@ func (f *Files) LoadLeasedJournal(ctx context.Context, node string) (*JournalInd
 	}
 	l, err := f.Leases.Get(ctx, node)
 	if errors.Is(err, blob.ErrNotFound) {
-		return &JournalIndex{node: node, byShard: map[string][]journalRef{}}, nil
+		return &JournalIndex{node: node}, nil
 	} else if err != nil {
 		return nil, err
 	}
-	return f.LoadJournal(ctx, node, max(l.JournalFrom, 1))
+	return f.LoadJournal(ctx, node, max(l.JournalFrom, 1), 0)
 }
 
-// LoadJournal reads the footers of a node's segments from number from on, up to
-// the first number that doesn't exist.
-func (f *Files) LoadJournal(ctx context.Context, node string, from uint64) (*JournalIndex, error) {
+// LoadJournal reads the footers of a node's segments from number from on. With
+// to zero it stops at the first number that doesn't exist, and otherwise it
+// reads through to (the fence of an adoption) and fails on a missing number
+// (segment.Scan).
+func (f *Files) LoadJournal(ctx context.Context, node string, from, to uint64) (*JournalIndex, error) {
 	idx := &JournalIndex{node: node, byShard: map[string][]journalRef{}}
-	err := segment.Scan(ctx, f.Blob, node, from, func(seq uint64, e segment.Entry) error {
+	err := segment.Scan(ctx, f.Blob, node, from, to, func(seq uint64, e segment.Entry) error {
 		idx.byShard[e.Shard] = append(idx.byShard[e.Shard], journalRef{seq, e})
 		return nil
 	})
 	return idx, err
+}
+
+// tail reads the shard's entries of generation that follow position from, in
+// position order, as tail files stamped at. Positions were assigned when the
+// commits were captured, so they say what is covered without anything of
+// Litestream's in the manifest. Copies of an entry already taken (a retried
+// segment write) are skipped. A hole between the entries is a *gapError. The
+// caller closes the files.
+func (idx *JournalIndex) tail(ctx context.Context, f *Files, shard, generation string, from uint64, at time.Time) ([]capture.TailFile, error) {
+	var refs []journalRef
+	for _, ref := range idx.byShard[shard] {
+		if ref.entry.Generation == generation {
+			refs = append(refs, ref)
+		}
+	}
+	sort.SliceStable(refs, func(i, j int) bool { return refs[i].entry.Position < refs[j].entry.Position })
+	var tail []capture.TailFile
+	pos := from
+	for _, ref := range refs {
+		e := ref.entry
+		if e.Last() <= pos {
+			continue // covered by the files, or a copy of an entry already taken
+		}
+		if e.Position != pos+1 {
+			capture.CloseTail(tail)
+			return nil, &gapError{from: pos + 1, to: e.Position - 1}
+		}
+		// An entry can be as large as the database, so it is read into a temporary
+		// file when it is large.
+		body, err := segment.ReadEntryFile(ctx, f.Blob, idx.node, ref.seq, e, f.TempDir, f.spoolLimit())
+		if err != nil {
+			capture.CloseTail(tail)
+			return nil, err
+		}
+		tail = append(tail, capture.TailFile{Position: e.Position, Count: e.Count, Body: body, At: at, Seg: ref.seq})
+		pos = e.Last()
+	}
+	return tail, nil
 }
 
 // ErrNothingToRestore means a shard has a manifest but no commits in its files or journal.
@@ -77,11 +118,11 @@ type Restored struct {
 // for commits after them, from its node journal. Every file's checksums are
 // verified, and the file only appears at dst when complete.
 func (f *Files) Restore(ctx context.Context, shard, dst string, opt RestoreOptions) (*Restored, error) {
-	m, etag, err := f.GetManifest(ctx, shard)
+	h, err := f.Attach(ctx, shard)
 	if err != nil {
 		return nil, err
 	}
-	h := &Handle{F: f, Name: shard, Manifest: m, ETag: etag}
+	m := h.Manifest
 	files, err := m.List()
 	if err != nil {
 		return nil, err
@@ -141,38 +182,19 @@ func (f *Files) Restore(ctx context.Context, shard, dst string, opt RestoreOptio
 		}
 	}
 	if journal == nil {
-		journal = &JournalIndex{byShard: map[string][]journalRef{}}
+		journal = &JournalIndex{}
 	}
 	at := opt.TailAge
 	if at.IsZero() {
 		at = time.Now()
 	}
-	// Entries of this generation that the manifest's files don't cover, in
-	// position order. Positions were assigned when the commits were captured, so
-	// they say what is covered without anything of Litestream's in the manifest.
-	var refs []journalRef
-	for _, ref := range journal.byShard[shard] {
-		if ref.entry.Generation == m.Generation && ref.entry.Last() > ap.State().Position {
-			refs = append(refs, ref)
-		}
+	if tail, err = journal.tail(ctx, f, shard, m.Generation, ap.State().Position, at); err != nil {
+		return fail(err)
 	}
-	sort.SliceStable(refs, func(i, j int) bool { return refs[i].entry.Position < refs[j].entry.Position })
-	for _, ref := range refs {
-		e := ref.entry
-		if e.Last() <= ap.State().Position {
-			continue // a copy of an entry already applied (a retried segment write)
-		}
-		// An entry can be as large as the database, so it is read into a temporary
-		// file when it is large.
-		body, err := segment.ReadEntryFile(ctx, f.Blob, journal.node, ref.seq, e, f.TempDir, f.spoolLimit())
-		if err != nil {
+	for _, tf := range tail {
+		if err := ap.Apply(bufio.NewReaderSize(tf.Body.Reader(), 1<<20), Range{tf.Position, tf.Position + tf.Count - 1}); err != nil {
 			return fail(err)
 		}
-		if err := ap.Apply(bufio.NewReaderSize(body.Reader(), 1<<20), Range{e.Position, e.Last()}); err != nil {
-			body.Close()
-			return fail(err)
-		}
-		tail = append(tail, capture.TailFile{Position: e.Position, Count: e.Count, Body: body, At: at, Seg: ref.seq})
 	}
 
 	st, err := ap.Finish()

@@ -19,7 +19,9 @@
 //	                      delta-before-manifest, rebase-before-manifest, rebase-after-swap, restore-before-rename
 //	fault <mode> <permille> <delay-ms>   storage faults on segment PUTs: mode "fail" (error before the write),
 //	                      "lost" (write happens, caller sees an error) or "none"; plus a delay on every PUT
-//	release <name>        final sync, close Litestream and everything else on the shard, then check -shm; replies "released" or "held" (capture is reopened)
+//	release <name> [delta] final sync, close Litestream and everything else on the shard, then check -shm; replies "released" or "held" (capture is reopened).
+//	                      With delta the tail is written as a delta, as the node does. Without, the tail stays in the journal and the
+//	                      lease's range keeps covering it until the shard is activated again
 //	maxrss -              the process's peak resident memory in bytes
 //	exit
 package main
@@ -30,6 +32,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"os"
 	"runtime"
@@ -46,6 +49,7 @@ import (
 	"github.com/luci1900/shardlite/internal/node"
 	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/supervisor"
 )
 
 type shard struct {
@@ -55,16 +59,35 @@ type shard struct {
 
 type testNode struct {
 	nd     *node.Node
+	tails  node.TailSet // the shards the lease counts
 	files  *shardfile.Files
 	meta   string
 	w      *segment.Writer
 	mu     sync.Mutex
 	shards map[string]*shard
+	// Shards released without a delta: their tail is only in the journal, so they
+	// stay counted until they are activated again (the node itself always writes the delta).
+	released map[string]*capture.Shard
 
 	armed     atomic.Pointer[string]
 	faultMode atomic.Pointer[string]
 	faultPm   atomic.Int64
 	faultMs   atomic.Int64
+}
+
+// leased is the node's writer as its shards see it. This node has no flusher,
+// so its replies say a write is durable once a flush returns: Flush also fails
+// once the lease is no longer good, since acknowledging is the moment it has to be.
+type leased struct {
+	*segment.Writer
+	nd *node.Node
+}
+
+func (w leased) Flush(ctx context.Context) error {
+	if err := w.Writer.Flush(ctx); err != nil {
+		return err
+	}
+	return w.nd.Keeper.Check()
 }
 
 func die() {
@@ -131,7 +154,6 @@ func main() {
 	nd, err := node.Start(context.Background(), node.Config{
 		Name:    *name,
 		Backend: local,
-		Flush:   *flush,
 		TempDir: *tmp,
 		Blob:    blob.Options{Backoff: 2 * time.Millisecond},
 		Keeper:  coord.KeeperOptions{Interval: time.Second, Margin: 5 * time.Second},
@@ -141,7 +163,26 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	n := &testNode{nd: nd, files: nd.Files, meta: *meta, w: nd.Writer, shards: map[string]*shard{}}
+	n := &testNode{nd: nd, files: nd.Files, meta: *meta, w: nd.Writer, shards: map[string]*shard{}, released: map[string]*capture.Shard{}}
+	nd.SetTails(&n.tails)
+	// Run serves the writer and the keeper in the real node; this one serves them
+	// while main runs.
+	defer supervisor.Background(slog.Default(), "journal", nd.Writer, nd.Keeper)()
+	// The writer flushes only when asked: this node does it on a timer.
+	flushCtx, stopFlushing := context.WithCancel(context.Background())
+	defer stopFlushing()
+	go func() {
+		t := time.NewTicker(*flush)
+		defer t.Stop()
+		for {
+			select {
+			case <-flushCtx.Done():
+				return
+			case <-t.C:
+				_ = n.w.Flush(flushCtx)
+			}
+		}
+	}()
 	local.SetHook(n.hook)
 
 	sc := bufio.NewScanner(os.Stdin)
@@ -173,7 +214,7 @@ func removeLocal(path string) {
 // with Litestream (seeded, so it continues from the restored state) and synced
 // before any app opens the file.
 func (n *testNode) activate(ctx context.Context, name, path string, h *shardfile.Handle, restored *capture.Restored) error {
-	sh, err := capture.New(capture.Config{Name: name, Path: path, Generation: h.Manifest.Generation, MetaRoot: n.meta, Writer: n.w, Restored: restored, TempDir: n.nd.TempDir, SpoolLimit: n.nd.SpoolLimit, At: n.at})
+	sh, err := capture.New(capture.Config{Name: name, Path: path, Generation: h.Manifest.Generation, MetaRoot: n.meta, Writer: leased{n.w, n.nd}, Restored: restored, TempDir: n.nd.TempDir, SpoolLimit: n.nd.SpoolLimit, At: n.at})
 	if err != nil {
 		return err
 	}
@@ -183,10 +224,15 @@ func (n *testNode) activate(ctx context.Context, name, path string, h *shardfile
 		}
 		n.at("first-sync-done")
 	}
+	n.tails.Track(sh)
 	n.mu.Lock()
 	n.shards[name] = &shard{h: h, sh: sh}
+	old := n.released[name]
+	delete(n.released, name)
 	n.mu.Unlock()
-	n.nd.Track(sh)
+	if old != nil {
+		n.tails.Untrack(old) // the new capture covers the tail now
+	}
 	return nil
 }
 
@@ -231,7 +277,7 @@ func (n *testNode) do(f []string) (string, error) {
 		return "", nil
 	case "open":
 		path := f[2]
-		h, created, err := n.files.Open(ctx, name)
+		h, created, err := n.files.Open(ctx, name, false)
 		if err != nil {
 			return "", err
 		}
@@ -272,7 +318,7 @@ func (n *testNode) do(f []string) (string, error) {
 		// Activate the shard from the file and WAL a release left, as the node does
 		// for a cached shard: nothing is downloaded. The shard must have been
 		// released after a delta, so that the manifest covers the file.
-		h, created, err := n.files.Open(ctx, name)
+		h, created, err := n.files.Open(ctx, name, false)
 		if err != nil {
 			return "", err
 		} else if created {
@@ -281,7 +327,7 @@ func (n *testNode) do(f []string) (string, error) {
 		return "", n.activate(ctx, name, f[2], h, &capture.Restored{Position: h.Manifest.LastPosition()})
 	case "openempty":
 		// A shard with a manifest but nothing durable: capture the file the app created again.
-		h, _, err := n.files.Open(ctx, name)
+		h, _, err := n.files.Open(ctx, name, false)
 		if err != nil {
 			return "", err
 		}
@@ -306,28 +352,34 @@ func (n *testNode) do(f []string) (string, error) {
 		})
 		return "", err
 	case "release":
-		released, err := s.sh.Release(ctx)
+		released, _, err := s.sh.Release(ctx)
 		if err != nil {
 			return "", err
 		}
-		if released && len(f) > 2 && f[2] == "delta" {
+		if !released {
+			return "held", nil
+		}
+		delta := len(f) > 2 && f[2] == "delta"
+		if delta {
 			// As the node does when it deactivates a shard: the final sync is in the
 			// journal, and the delta covers it, so the cached shard has no tail.
 			if err := s.h.WriteDelta(ctx, s.sh, shardfile.Hooks{}); err != nil {
 				return "", err
 			}
 		}
-		if released {
-			n.nd.Untrack(s.sh)
-			n.mu.Lock()
-			delete(n.shards, name)
-			n.mu.Unlock()
-			return "released", nil
+		n.mu.Lock()
+		delete(n.shards, name)
+		if !delta {
+			n.released[name] = s.sh
 		}
-		return "held", nil
+		n.mu.Unlock()
+		if delta {
+			n.tails.Untrack(s.sh)
+		}
+		return "released", nil
 	case "close":
 		err := s.sh.Close(ctx)
-		n.nd.Untrack(s.sh)
+		n.tails.Untrack(s.sh)
 		n.mu.Lock()
 		delete(n.shards, name)
 		n.mu.Unlock()

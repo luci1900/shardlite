@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -22,7 +21,9 @@ import (
 
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/coord"
+	"github.com/luci1900/shardlite/internal/notify"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
 )
@@ -37,16 +38,22 @@ const testKinds = `{"kinds": {
 }}`
 
 type mrig struct {
-	t         *testing.T
-	local     *blob.Hooked // the bucket, behind its fault hook
-	skew      atomic.Int64 // nanoseconds the bucket's clock runs behind, to age objects
-	data      string
-	meta      string
-	kinds     *Kinds
-	kindsPath string
-	app       *apptest.App
-	n         *Node
-	m         *Manager
+	t           *testing.T
+	stopJournal func()       // stops the writer and the keeper of the current node
+	local       *blob.Hooked // the bucket, behind its fault hook
+	skew        atomic.Int64 // nanoseconds the bucket's clock runs behind, to age objects
+	data        string
+	meta        string
+	kinds       *Kinds
+	kindsPath   string
+	app         *apptest.App
+	n           *Node
+	m           *Shards
+	stopM       func() error // stops the shards' Serve and returns what it returned
+
+	// newTransport makes the shards' transport (the server's, for the rigs that
+	// have one). The default reaches nobody.
+	newTransport func(*Shards) *transport
 
 	cmu    sync.Mutex
 	counts map[string]int
@@ -54,10 +61,19 @@ type mrig struct {
 
 func newMRig(t *testing.T) *mrig { return newMRigWith(t, nil) }
 
-func newMRigWith(t *testing.T, mutate func(*ManagerOptions)) *mrig { return newMRigOn(t, mutate, nil) }
+func newMRigWith(t *testing.T, mutate func(*ShardsOptions)) *mrig { return newMRigOn(t, mutate, nil) }
 
 // newMRigOn is newMRigWith over the given backend (in memory if nil).
-func newMRigOn(t *testing.T, mutate func(*ManagerOptions), backend blob.Backend) *mrig {
+func newMRigOn(t *testing.T, mutate func(*ShardsOptions), backend blob.Backend) *mrig {
+	t.Helper()
+	r := newUnstartedMRig(t, backend)
+	r.startNode()
+	r.startShards(mutate)
+	return r
+}
+
+// newUnstartedMRig is the rig with no node and no shards yet.
+func newUnstartedMRig(t *testing.T, backend blob.Backend) *mrig {
 	t.Helper()
 	r := &mrig{t: t, data: filepath.Join(t.TempDir(), "data"), meta: filepath.Join(t.TempDir(), "meta"), app: apptest.Start(t), counts: map[string]int{}}
 	if backend == nil {
@@ -81,8 +97,6 @@ func newMRigOn(t *testing.T, mutate func(*ManagerOptions), backend blob.Backend)
 		}
 		return nil
 	})
-	r.startNode()
-	r.startManager(mutate)
 	return r
 }
 
@@ -93,40 +107,74 @@ func (r *mrig) startNode() {
 		r.t.Fatal(err)
 	}
 	r.n = n
-	r.t.Cleanup(func() { n.Close(context.Background(), false) })
+	r.stopJournal = serveJournal(r.t, n)
 }
 
 // tryStartNode is startNode that reports a failed start (an adoption that failed).
 func (r *mrig) tryStartNode() (*Node, error) {
 	return Start(context.Background(), Config{
-		Name: "n1", Backend: r.local, Flush: 20 * time.Millisecond, ManualFlush: true, TempDir: filepath.Join(r.data, tempDirName),
+		Name: "n1", Backend: r.local, TempDir: filepath.Join(r.data, tempDirName),
 		Blob:   blob.Options{Backoff: time.Millisecond},
 		Lease:  coord.RegistryOptions{TTL: time.Hour, Blob: blob.Options{Backoff: time.Millisecond}},
 		Keeper: coord.KeeperOptions{Interval: 100 * time.Millisecond, Margin: time.Minute},
 	})
 }
 
-func (r *mrig) startManager(mutate func(*ManagerOptions)) {
+func (r *mrig) startShards(mutate func(*ShardsOptions)) {
 	r.t.Helper()
-	o := ManagerOptions{Kinds: r.kinds, Data: r.data, Scratch: r.meta, Flush: 20 * time.Millisecond, Janitor: 20 * time.Millisecond,
-		Background: 20 * time.Millisecond, HoldOff: 100 * time.Millisecond}
+	o := ShardsOptions{Kinds: r.kinds, Data: r.data, Scratch: r.meta,
+		Flush:     FlushOptions{Interval: 20 * time.Millisecond},
+		Cache:     CacheOptions{Every: 20 * time.Millisecond},
+		Lifecycle: LifecycleOptions{SnapshotEvery: 20 * time.Millisecond, HoldOff: 100 * time.Millisecond, IdleRecheck: 20 * time.Millisecond}}
 	if mutate != nil {
 		mutate(&o)
 	}
-	m, err := NewManager(r.n, o)
+	newTransport := r.newTransport
+	if newTransport == nil {
+		newTransport = func(*Shards) *transport {
+			unserved := errors.New("the node is not serving")
+			return &transport{maxHops: DefaultMaxHops,
+				intake: func(context.Context, *shard, string, *outRow) (int, error) { return 0, unserved },
+				inbox:  func(context.Context, *shard, *inRow) (int, error) { return 0, unserved }}
+		}
+	}
+	m, err := NewShards(r.n, o, newTransport)
 	if err != nil {
 		r.t.Fatal(err)
 	}
 	r.m = m
-	r.t.Cleanup(func() { m.cancel(); m.g.Wait() })
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	var g errgroup.Group
+	g.Go(func() error {
+		served <- m.Serve(ctx)
+		return nil
+	})
+	var once sync.Once
+	var err2 error
+	r.stopM = func() error {
+		once.Do(func() {
+			cancel()
+			g.Wait()
+			err2 = <-served
+		})
+		return err2
+	}
+	// At the end of the test the shards stop as a crash would: letting go of
+	// every shard would only slow the test down.
+	stop := r.stopM
+	r.t.Cleanup(func() { m.abandon.Store(true); stop() })
 }
 
-// crash stops the manager and node loops without letting go of anything, as a
-// SIGKILL would (the old writer still exists, as a zombie).
+// stop stops the shards in order, letting go of every one, and returns what
+// Serve returned.
+func (r *mrig) stop() error { return r.stopM() }
+
+// crash stops the shards without letting go of anything, as a SIGKILL would
+// (the old writer still exists, as a zombie, and so do the captures).
 func (r *mrig) crash() {
-	r.m.cancel()
-	r.m.g.Wait()
-	r.m.idx.close()
+	r.m.abandon.Store(true)
+	r.stopM()
 }
 
 func (r *mrig) calls(op, prefix string) int {
@@ -182,14 +230,71 @@ func eventually(t *testing.T, what string, cond func() bool) {
 	apptest.Eventually(t, 30*time.Second, what, cond) // a deadline for failures only: a slow machine under -race takes a while
 }
 
-// afterPasses returns once n passes of the janitor and of the background loop
-// have completed, which began after the call.
-func (r *mrig) afterPasses(n int64) {
+// header reads a capture's wal-index header, asking again while the capture's
+// loop is busy (the messages owner or the flush cycle may be using it).
+func header(t *testing.T, sh *capture.Shard) capture.Header {
+	t.Helper()
+	h, err := sh.Header()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h
+}
+
+// afterCachePasses returns once n passes of the cache loop have completed,
+// which began after the call.
+func (r *mrig) afterCachePasses(n uint64) {
 	r.t.Helper()
-	jan, bg := r.m.Stats.Janitor.Load(), r.m.Stats.Background.Load()
-	eventually(r.t, "passes of the janitor and the background loop", func() bool {
-		return r.m.Stats.Janitor.Load() >= jan+n+1 && r.m.Stats.Background.Load() >= bg+n+1
-	})
+	waitCounter(r.t, "passes of the cache loop", &r.m.Stats.CachePasses, r.m.Stats.CachePasses.Load()+n+1)
+}
+
+// afterLooks returns once the idle timer of each shard named has looked at it n
+// times since the call (the first may have begun before it).
+func (r *mrig) afterLooks(n uint64, targets ...string) {
+	r.t.Helper()
+	for _, target := range targets {
+		a := r.shard(target)
+		waitCounter(r.t, "looks of the idle timer at "+target, &a.looks.idle, a.looks.idle.Load()+n+1)
+	}
+}
+
+// afterSnapshotLooks returns once the delta timer of each shard named has looked
+// at it n times since the call (the first may have begun before it).
+func (r *mrig) afterSnapshotLooks(n uint64, targets ...string) {
+	r.t.Helper()
+	for _, target := range targets {
+		a := r.shard(target)
+		waitCounter(r.t, "looks of the delta timer at "+target, &a.looks.snap, a.looks.snap.Load()+n+1)
+	}
+}
+
+// refs is how many holds a shard has (-1 if it is not active).
+func (r *mrig) refs(target string) int {
+	e := r.m.tab.load(target)
+	if e == nil || e.sh == nil || !e.is(entryActive, entryBusy) {
+		return -1
+	}
+	n, _ := e.use()
+	return n
+}
+
+// shard is the actor of an active shard.
+func (r *mrig) shard(target string) *shard {
+	r.t.Helper()
+	e := r.m.tab.load(target)
+	if e == nil || e.sh == nil {
+		r.t.Fatalf("%s is not active", target)
+	}
+	return e.sh
+}
+
+func waitCounter(t *testing.T, what string, c *notify.Counter, n uint64) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := c.Wait(ctx, n); err != nil {
+		t.Fatalf("waiting for %s: %v", what, err)
+	}
 }
 
 // afterCycle returns once a flush cycle that began after the call has completed
@@ -213,13 +318,15 @@ func advanceUntil(t *testing.T, clk *fakeClock, step time.Duration, what string,
 	})
 }
 
-// delay is when the janitor next looks at the shard (zero until it has been
+// delay is when the idle timer next looks at the shard (zero until it has been
 // held off, by messages or by the app keeping the file open).
 func (r *mrig) delay(target string) time.Time {
-	r.m.mu.Lock()
-	defer r.m.mu.Unlock()
-	if a := r.m.active[target]; a != nil {
-		return a.delay
+	e := r.m.tab.load(target)
+	if e == nil || e.sh == nil {
+		return time.Time{}
+	}
+	if ns := e.sh.idle.nextLook.Load(); ns != 0 {
+		return time.Unix(0, ns)
 	}
 	return time.Time{}
 }
@@ -360,7 +467,7 @@ func TestGates(t *testing.T) {
 	}
 
 	// A shard with no new frames passes straight through.
-	eventually(t, "the shard to be captured", func() bool { return !ref.a.hasNewFrames() })
+	eventually(t, "the shard to be captured", func() bool { return !ref.a.cap.hasNewFrames() })
 	// No flush can complete while the journal's writes are stalled, so a gate that
 	// returns now did not wait for one.
 	stall := make(chan struct{})
@@ -387,7 +494,7 @@ func TestGates(t *testing.T) {
 	}
 	close(stall)
 	// ...but the commit is captured by the flush loop all the same.
-	eventually(t, "the flush loop to capture the commit", func() bool { return !ref.a.hasNewFrames() })
+	eventually(t, "the flush loop to capture the commit", func() bool { return !ref.a.cap.hasNewFrames() })
 	if r.dumpBlob("wallet/1") != r.liveDump(ref.Path()) {
 		t.Fatal("commit not in blob storage after the flush loop captured it")
 	}
@@ -411,7 +518,7 @@ func TestIdleNodeWritesNoSegments(t *testing.T) {
 	if err := r.m.Gate(context.Background(), ref, true); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, "the shard to be captured", func() bool { return !ref.a.hasNewFrames() })
+	eventually(t, "the shard to be captured", func() bool { return !ref.a.cap.hasNewFrames() })
 	r.afterCycle()
 	next := r.n.Writer.NextSeq()
 	cycles := r.m.Flusher().Completed()
@@ -545,17 +652,17 @@ func TestRestartStartsWithAnEmptyCache(t *testing.T) {
 		eventually(t, "deactivation", func() bool { return r.cached(id) })
 		want[id] = r.dumpBlob(id)
 	}
-	if err := r.m.Close(ctx); err != nil {
+	if err := r.stop(); err != nil {
 		t.Fatal(err)
 	}
-	r.n.Close(ctx, false)
+	r.stopJournal()
 	// A file that is not a shard's, and a temporary one, go too.
 	if err := os.WriteFile(filepath.Join(r.data, tempDirName, "leftover"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	r.startNode()
-	r.startManager(nil)
+	r.startShards(nil)
 	var left []string
 	filepath.WalkDir(r.data, func(p string, d fs.DirEntry, err error) error {
 		if err == nil && !d.IsDir() && !strings.HasPrefix(filepath.Base(p), indexName) {
@@ -600,13 +707,13 @@ func TestRestartWithACorruptIndex(t *testing.T) {
 	eventually(t, "deactivation", func() bool { return r.cached("users/8") })
 	want := r.dumpBlob("users/8")
 	r.crash()
-	r.n.Close(ctx, false)
+	r.stopJournal()
 	for _, suffix := range []string{"", "-wal", "-shm"} {
 		os.WriteFile(filepath.Join(r.data, indexName+suffix), []byte("this is not a database, and the files are not the ones it names"), 0o644)
 	}
 
 	r.startNode()
-	r.startManager(nil)
+	r.startShards(nil)
 	ref = r.acquire("users/8")
 	defer ref.Release()
 	if got := r.liveDump(ref.Path()); got != want {
@@ -619,7 +726,7 @@ func TestRestartWithACorruptIndex(t *testing.T) {
 
 // A shard file that an app still has open across a restart is never deleted
 // (the app could go on committing to it without an error), and activating the
-// shard is refused. The janitor deletes it once the app has closed it.
+// shard is refused. The cache loop deletes it once the app has closed it.
 func TestRestartLeavesAFileTheAppHasOpenUntilItIsClosed(t *testing.T) {
 	t.Parallel()
 	var logs syncBuffer
@@ -632,19 +739,19 @@ func TestRestartLeavesAFileTheAppHasOpenUntilItIsClosed(t *testing.T) {
 	}
 	path := ref.Path()
 	r.crash() // the app still has the file open
-	r.n.Close(ctx, false)
+	r.stopJournal()
 
 	r.startNode()
-	r.startManager(logTo(&logs))
+	r.startShards(logTo(&logs))
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("the file the app has open was deleted: %v", err)
 	}
 	if !strings.Contains(logs.String(), "still open in another process") {
 		t.Fatalf("no log line about the open file:\n%s", logs.String())
 	}
-	r.afterPasses(2)
+	r.afterCachePasses(2)
 	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("the janitor deleted a file the app has open: %v", err)
+		t.Fatalf("the cache loop deleted a file the app has open: %v", err)
 	}
 	if _, err := r.m.Acquire(ctx, "users/9"); !errors.Is(err, ErrAppHolds) {
 		t.Fatalf("acquire: %v, want ErrAppHolds", err)
@@ -653,7 +760,7 @@ func TestRestartLeavesAFileTheAppHasOpenUntilItIsClosed(t *testing.T) {
 		t.Fatalf("a refused activation deleted the file: %v", err)
 	}
 	r.app.Must(t, "close", "a")
-	eventually(t, "the janitor to delete the closed file", func() bool {
+	eventually(t, "the cache loop to delete the closed file", func() bool {
 		_, err := os.Stat(path)
 		return errors.Is(err, os.ErrNotExist)
 	})
@@ -682,7 +789,7 @@ func TestCrashLeavesActiveFilesToBeDiscarded(t *testing.T) {
 	r.crash()
 
 	r.startNode()
-	r.startManager(nil)
+	r.startShards(nil)
 	if r.n.Adopted.Deltas != 1 {
 		t.Fatalf("adoption: %+v", r.n.Adopted)
 	}
@@ -709,11 +816,12 @@ func TestIdleTimeoutAndOpenConnections(t *testing.T) {
 	r.write(ref, "a")
 	r.app.Must(t, "close", "a")
 	// A hold (an open connection) keeps the shard active past its 300 ms timeout:
-	// the clock moves three timeouts, and the janitor passes at each.
+	// the clock moves three timeouts, and the idle timer looks at each.
+	a := r.shard("users/8")
 	for range 3 {
-		passes := r.m.Stats.Janitor.Load()
+		looks := a.looks.idle.Load()
 		clk.Advance(300 * time.Millisecond)
-		eventually(t, "a janitor pass", func() bool { return r.m.Stats.Janitor.Load() > passes })
+		waitCounter(t, "a look of the idle timer", &a.looks.idle, looks+1)
 	}
 	if !r.m.IsActive("users/8") {
 		t.Fatal("deactivated while held")
@@ -771,7 +879,7 @@ func TestEvictsLeastRecentlyUsed(t *testing.T) {
 	}
 	make1("users/a")
 	make1("users/b")
-	used, err := r.m.idx.cachedBytes()
+	used, err := r.m.cache.idx.cachedBytes()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -894,10 +1002,8 @@ func TestDeleteOfACachedShard(t *testing.T) {
 func TestBackgroundDeltasAndRebases(t *testing.T) {
 	t.Parallel()
 	r := newMRig(t)
-	r.m.cancel()
-	r.m.g.Wait()
-	r.m.idx.close()
-	r.startManager(func(o *ManagerOptions) { o.DeltaAge = 30 * time.Millisecond; o.MaxFiles = 3 })
+	r.crash()
+	r.startShards(func(o *ShardsOptions) { o.Lifecycle.DeltaAge = 30 * time.Millisecond; o.Lifecycle.MaxFiles = 3 })
 	ctx := context.Background()
 	ref := r.acquire("slow/bg")
 	defer ref.Release()
@@ -930,9 +1036,18 @@ func TestBackgroundDeltasAndRebases(t *testing.T) {
 	if len(m.Files) == 0 || len(m.Files) > 4 || maxFiles < 3 {
 		t.Fatalf("files %v (max seen %d): deltas and rebases should keep a handful", m.Files, maxFiles)
 	}
-	if r.dumpBlob("slow/bg") != r.liveDump(ref.Path()) {
-		t.Fatal("restore differs")
-	}
+	// A snapshot seen above may be an earlier commit's late rebase, so the last
+	// commit's own snapshot can still be on its way, and a restore can find a file
+	// that a rebase has replaced since it read the manifest.
+	eventually(t, "the blobs to restore to what is live", func() bool {
+		dst := filepath.Join(t.TempDir(), "restored.db")
+		if _, err := r.n.Files.Restore(ctx, "slow/bg", dst, shardfile.RestoreOptions{}); errors.Is(err, blob.ErrNotFound) {
+			return false
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		return sqlitetest.Dump(t, dst) == r.liveDump(ref.Path())
+	})
 }
 
 // Once the lease can't be renewed the node acknowledges nothing: the barrier
@@ -940,12 +1055,10 @@ func TestBackgroundDeltasAndRebases(t *testing.T) {
 func TestLostLeaseFailsTheBarrier(t *testing.T) {
 	t.Parallel()
 	r := newMRig(t)
-	r.m.cancel()
-	r.m.g.Wait()
-	r.m.idx.close()
-	r.n.Close(context.Background(), false)
+	r.crash()
+	r.stopJournal()
 	n, err := Start(context.Background(), Config{
-		Name: "n1", Backend: r.local, Flush: 20 * time.Millisecond, ManualFlush: true, TempDir: filepath.Join(r.data, tempDirName),
+		Name: "n1", Backend: r.local, TempDir: filepath.Join(r.data, tempDirName),
 		Blob:   blob.Options{Backoff: time.Millisecond},
 		Lease:  coord.RegistryOptions{TTL: 400 * time.Millisecond, Blob: blob.Options{Backoff: time.Millisecond}},
 		Keeper: coord.KeeperOptions{Interval: 50 * time.Millisecond, Margin: 100 * time.Millisecond, Logger: nil},
@@ -954,8 +1067,8 @@ func TestLostLeaseFailsTheBarrier(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.n = n
-	t.Cleanup(func() { n.Close(context.Background(), false) })
-	r.startManager(nil)
+	serveJournal(t, n)
+	r.startShards(nil)
 	ctx := context.Background()
 	if err := r.m.Barrier(ctx); err != nil {
 		t.Fatal(err)
@@ -974,6 +1087,39 @@ func TestLostLeaseFailsTheBarrier(t *testing.T) {
 	}
 	if _, err := r.m.Acquire(ctx, "users/x"); !errors.Is(err, coord.ErrLeaseExpired) {
 		t.Fatalf("Acquire = %v", err)
+	}
+}
+
+// A commit written to the journal after the lease was lost is not acknowledged:
+// the cycle that wrote it doesn't count it as captured, so the gate waits for a
+// cycle and fails rather than letting the output through.
+func TestWrittenAfterTheLeaseWasLostIsNotAcknowledged(t *testing.T) {
+	t.Parallel()
+	r := newMRig(t)
+	ctx := context.Background()
+	ref := r.acquire("wallet/1")
+	defer ref.Release()
+	r.write(ref, "a")
+	if err := r.m.Gate(ctx, ref, true); err != nil {
+		t.Fatal(err)
+	}
+	// Another life of the node takes the lease. Nothing fences the journal, so
+	// this node's writer still writes.
+	other := coord.NewRegistry(r.local, "n1", coord.RegistryOptions{TTL: time.Hour})
+	if _, err := other.Acquire(ctx, coord.NodeInfo{Name: "n1"}); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the lease to be lost", func() bool { return r.n.Keeper.Check() != nil })
+	next := r.n.Writer.NextSeq()
+	r.app.Must(t, "insert", "a", "3", "100")
+	eventually(t, "a segment holding the commit", func() bool { return r.n.Writer.NextSeq() > next })
+	cycles := r.m.Flusher().Completed()
+	eventually(t, "the cycle that wrote it to complete", func() bool { return r.m.Flusher().Completed() >= cycles+1 })
+	if !ref.a.cap.hasNewFrames() {
+		t.Fatal("a commit written after the lease was lost counts as captured")
+	}
+	if err := r.m.Gate(ctx, ref, true); err == nil {
+		t.Fatal("the gate let output through after the lease was lost")
 	}
 }
 
@@ -1019,7 +1165,7 @@ func TestCycleFinishesWhenASyncUploadsTwoFiles(t *testing.T) {
 	for range 5 {
 		r.app.Must(t, "insert", "wallet/1", "1", "100")
 		// A local LTX file nobody has uploaded yet, so the next round uploads two.
-		if err := ref.a.cap.Load().DB().Sync(ctx); err != nil {
+		if err := ref.a.cap.load().DB().Sync(ctx); err != nil {
 			t.Fatal(err)
 		}
 		r.app.Must(t, "insert", "wallet/1", "1", "100")
@@ -1067,7 +1213,7 @@ func TestReleasesShareSegments(t *testing.T) {
 		r.app.Must(t, "close", fmt.Sprint(i)) // the app lets go of the file, or the node keeps the shard
 		ref.Release()
 		g.Go(func() error {
-			ok, err := r.m.deactivate(ctx, ref.a)
+			ok, err := ref.a.release(ctx)
 			if err == nil && !ok {
 				err = errors.New("not deactivated")
 			}
@@ -1094,13 +1240,11 @@ func TestReleasesShareSegments(t *testing.T) {
 func TestBackgroundSnapshotsAreNotRebasedByAge(t *testing.T) {
 	t.Parallel()
 	r := newMRig(t)
-	r.m.cancel()
-	r.m.g.Wait()
-	r.m.idx.close()
+	r.crash()
 	clock := newFakeClock()
-	r.startManager(func(o *ManagerOptions) {
-		o.DeltaAge = 20 * time.Millisecond
-		o.MaxFiles = 100
+	r.startShards(func(o *ShardsOptions) {
+		o.Lifecycle.DeltaAge = 20 * time.Millisecond
+		o.Lifecycle.MaxFiles = 100
 		o.Clock = clock
 	})
 	ctx := context.Background()
@@ -1116,7 +1260,8 @@ func TestBackgroundSnapshotsAreNotRebasedByAge(t *testing.T) {
 			t.Fatal(err)
 		}
 		var m *shardfile.Manifest
-		eventually(t, "a snapshot to be taken", func() bool {
+		// The delta timer is on the clock.
+		advanceUntil(t, clock, 20*time.Millisecond, "a snapshot to be taken", func() bool {
 			var err error
 			m, err = r.manifest("slow/age")
 			return err == nil && !slices.Equal(m.Files, before.Files)
@@ -1136,16 +1281,59 @@ func TestBackgroundSnapshotsAreNotRebasedByAge(t *testing.T) {
 	if len(m.Files) != n+1 {
 		t.Fatalf("files %v after a day (it had %d): want one more delta, not a rebase", m.Files, n)
 	}
-	rc, _, err := r.n.Store.Get(ctx, shardfile.ManifestKey("slow/age"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	raw, _ := io.ReadAll(rc)
-	rc.Close()
-	if strings.Contains(string(raw), "base_at") {
-		t.Fatalf("manifest %s has a base time", raw)
-	}
 	if r.dumpBlob("slow/age") != r.liveDump(ref.Path()) {
 		t.Fatal("restore differs")
+	}
+}
+
+// Shards stops in order: once the shards are being let go of, the wake scan no
+// longer activates anything (a hint that comes due during a release wakes
+// nothing), and the flusher still runs (a gate during a release goes through,
+// and so does each release's own final sync, which no longer has a fallback).
+func TestShardsStopInOrder(t *testing.T) {
+	t.Parallel()
+	r := newMRigWith(t, func(o *ShardsOptions) { o.Wakes.Every = 20 * time.Millisecond })
+	ctx := context.Background()
+	// A cached shard, which a hint would wake.
+	ref := r.acquire("users/so1")
+	r.write(ref, "so1")
+	ref.Release()
+	r.app.Must(t, "close", "so1")
+	if ok, err := r.shard("users/so1").release(ctx); err != nil || !ok {
+		t.Fatalf("release: %v %v", ok, err)
+	}
+	// An active shard whose release is held in its delta.
+	ref = r.acquire("wallet/so2")
+	r.write(ref, "so2")
+	if err := r.m.Gate(ctx, ref, true); err != nil {
+		t.Fatal(err)
+	}
+	ref.Release()
+	r.app.Must(t, "close", "so2")
+	entered, _, unblock := r.blockCreates("shards/wallet/so2/")
+	defer unblock()
+	activations := r.m.Stats.Activations.Load()
+	stopped := make(chan error, 1)
+	go func() { stopped <- r.stop() }()
+	<-entered // letting go of wallet/so2, past its final sync
+
+	if _, err := r.n.Store.Create(ctx, wakeKey(r.m.now(), "users/so1"), strings.NewReader("")); err != nil {
+		t.Fatal(err)
+	}
+	quick, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := r.m.Barrier(quick); err != nil {
+		t.Fatalf("a gate during the release: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond) // five periods of the wake scan
+	if n := r.m.Stats.Activations.Load(); n != activations || r.m.IsActive("users/so1") {
+		t.Fatalf("a hint woke a shard while the shards were let go of (%d activations)", n-activations)
+	}
+	unblock()
+	if err := <-stopped; err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if r.m.IsActive("wallet/so2") {
+		t.Fatal("wallet/so2 was not let go of")
 	}
 }

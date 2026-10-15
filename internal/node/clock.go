@@ -2,16 +2,15 @@ package node
 
 import "time"
 
-// Clock is the time the manager uses for reminders (their timers and due
-// times), wake hints (the minute of a key, which keys are due), the age of rows,
-// the retry backoff of messages, and the janitor's and the wake scan's periods
-// with the idle times they compare (a shard's last use and hold-off). Tests move
-// it. Flush cycles, deltas and rebases, the tail alert, the short pauses
-// between a commit's writes, and shutdown use real time.
+// Clock is the time the shards use for reminders (their timers and due times),
+// wake hints (the minute of a key, which keys are due), the age of rows, the
+// retry backoff of messages, each shard's idle and delta timers with the times
+// they compare (a shard's last use and hold-off), and the periods of the cache
+// loop, the watchdog and the wake scan. Tests move it. Flush cycles, the ages of
+// tails (which decide whether a delta is due, and the tail alert), the short
+// pauses between a commit's writes, and shutdown use real time.
 type Clock interface {
 	Now() time.Time
-	// AfterFunc runs f once, d from now, and returns a function that stops it.
-	AfterFunc(d time.Duration, f func()) (stop func() bool)
 	// NewTimer sends the time on the channel once, d from now. The function
 	// stops it and reports whether it had not fired.
 	NewTimer(d time.Duration) (c <-chan time.Time, stop func() bool)
@@ -24,10 +23,6 @@ type realClock struct{}
 
 func (realClock) Now() time.Time { return time.Now() }
 
-func (realClock) AfterFunc(d time.Duration, f func()) func() bool {
-	return time.AfterFunc(d, f).Stop
-}
-
 func (realClock) NewTimer(d time.Duration) (<-chan time.Time, func() bool) {
 	t := time.NewTimer(d)
 	return t.C, t.Stop
@@ -38,4 +33,4 @@ func (realClock) NewTicker(d time.Duration) (<-chan time.Time, func()) {
 	return t.C, t.Stop
 }
 
-func (m *Manager) now() time.Time { return m.opts.Clock.Now() }
+func (m *Shards) now() time.Time { return m.opts.Clock.Now() }

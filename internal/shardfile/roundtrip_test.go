@@ -10,7 +10,6 @@ import (
 	"slices"
 	"strconv"
 	"testing"
-	"time"
 
 	"pgregory.net/rapid"
 
@@ -154,7 +153,7 @@ func (s *shardSim) deactivate() {
 	if err := s.app.Exit(); err != nil {
 		s.rt.Fatal(err)
 	}
-	released, err := s.sh.Release(s.ctx)
+	released, _, err := s.sh.Release(s.ctx)
 	if err != nil || !released {
 		s.rt.Fatalf("release: released=%v err=%v", released, err)
 	}
@@ -410,7 +409,7 @@ func TestShardRoundTripsProperty(t *testing.T) {
 		}
 		c := &caseTB{TB: t, rt: rt, dir: dir}
 		defer c.finish()
-		e := harness.New(c, 5*time.Millisecond)
+		e := harness.New(c)
 		s := &shardSim{rt: rt, e: e, ctx: context.Background(), tables: map[string]bool{}, indexes: map[string]string{}}
 		s.startApp()
 		s.h, s.sh = e.NewShard(shard)

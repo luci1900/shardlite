@@ -1,6 +1,6 @@
 // Package node is the shardlite node: the pieces that make one process the
 // owner of its shards. This file starts it: it takes the node's lease, adopts
-// the journal the previous process left behind and starts the journal's writer.
+// the journal the previous process left behind and makes the journal's writer.
 package node
 
 import (
@@ -8,15 +8,15 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
-
-	"golang.org/x/sync/errgroup"
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/coord"
 	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/supervisor"
 )
 
 // Config describes a node.
@@ -25,19 +25,14 @@ type Config struct {
 	Address string
 	Backend blob.Backend
 
-	Flush time.Duration // segment flush interval, segment.DefaultFlush if zero
-	// ManualFlush leaves flushing the segment writer to the caller (the shard
-	// manager's flush loop flushes it right after capturing, so a segment holds
-	// what the capture just queued) instead of the writer's own timer.
-	ManualFlush bool
-	Retry       time.Duration         // first wait before a segment upload is retried, see segment.Options
-	Blob        blob.Options          // retries of the node's blob.Store
-	Lease       coord.RegistryOptions // lease TTL
-	Keeper      coord.KeeperOptions   // renewal interval and safety margin (Info is the node's own)
-	Logger      *slog.Logger
+	Retry  time.Duration         // first wait before a segment upload is retried, see segment.Options
+	Blob   blob.Options          // retries of the node's blob.Store
+	Lease  coord.RegistryOptions // lease TTL
+	Keeper coord.KeeperOptions   // renewal interval and safety margin (Info is the node's own)
+	Logger *slog.Logger
 	// TempDir is where deltas, snapshots and downloads too large for memory are
 	// built (in the data directory, never the scratch directory, which is tmpfs).
-	// The caller clears what a crash left in it before Start.
+	// It is made when it is first needed. Shards empties it of what a crash left.
 	TempDir string
 	// SpoolLimit is how large a commit file, segment or delta gets before it is
 	// held in a temporary file in TempDir instead of memory (spool.DefaultLimit if
@@ -57,11 +52,21 @@ type Node struct {
 	// had no previous lease).
 	Adopted shardfile.AdoptReport
 
-	mu      sync.Mutex
-	tracked map[*capture.Shard]struct{}
+	tails atomic.Pointer[Tails] // what the lease counts, nil until SetTails
+}
 
-	sweepCancel context.CancelFunc // set once the journal sweeper runs (guarded by mu)
-	sweepGroup  errgroup.Group     // owns the journal sweeper; Close joins it
+// Err returns nil while the node may write: its lease is good and its journal's
+// writer is not fenced. Otherwise it returns the reason, which is fatal.
+func (n *Node) Err() error {
+	select {
+	case <-n.Writer.Fenced():
+		return supervisor.Fatal(fmt.Errorf("the node's journal writer is fenced: %w", segment.ErrFenced))
+	default:
+	}
+	if err := n.Keeper.Check(); err != nil {
+		return supervisor.Fatal(fmt.Errorf("the node's lease is gone: %w", err))
+	}
+	return nil
 }
 
 // Start takes the node's lease with a new epoch and recovers from whatever the
@@ -88,12 +93,14 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		Registry: reg,
 		Store:    store,
 		Files:    &shardfile.Files{Blob: store, Node: cfg.Name, Leases: reg, TempDir: cfg.TempDir, SpoolLimit: cfg.SpoolLimit},
-		tracked:  map[*capture.Shard]struct{}{},
 	}
 
 	start := uint64(1)
 	if lease.Previous != nil {
-		rep, err := n.Files.AdoptJournal(ctx, cfg.Name, lease.JournalFrom, lease.JournalNext, cfg.Logger)
+		rep, err := n.Files.AdoptJournal(ctx, cfg.Name, lease.JournalFrom, lease.JournalNext, func(ctx context.Context, shard string) error {
+			_, err := hintStore{store}.writeWake(ctx, shard, time.Now())
+			return err
+		}, cfg.Logger)
 		n.Adopted = rep
 		if err != nil {
 			return nil, err
@@ -108,72 +115,81 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		return nil, fmt.Errorf("record journal range: %w", err)
 	}
 
-	interval := cfg.Flush
-	if cfg.ManualFlush {
-		interval = 24 * time.Hour
-	}
 	n.Writer = segment.NewWriter(store, cfg.Name, segment.Options{
-		Interval: interval,
 		StartSeq: start,
 		Retry:    cfg.Retry,
-		Check:    func() error { return n.Keeper.Check() },
 		Logger:   cfg.Logger,
 		TempDir:  cfg.TempDir, SpoolLimit: cfg.SpoolLimit,
 	})
 	kopts := cfg.Keeper
 	kopts.Info = n.Info
 	kopts.Logger = cfg.Logger
-	n.Keeper = coord.StartKeeper(reg, lease, kopts)
+	n.Keeper = coord.NewKeeper(reg, lease, kopts)
 	return n, nil
 }
 
-// Track registers an active shard, so the lease counts it and records its
-// tail as part of the journal range still needed.
-func (n *Node) Track(sh *capture.Shard) {
-	n.mu.Lock()
-	n.tracked[sh] = struct{}{}
-	n.mu.Unlock()
+// Tails is where the lease's shard count and journal range come from: whatever
+// runs the node's shards (Shards, or a TailSet for programs that capture shards
+// themselves).
+type Tails interface {
+	// Tails returns how many shards are captured and the lowest segment number
+	// their tails still need (0 if none does). A shard is counted from before its
+	// capture's first sync until it is let go of.
+	Tails() (shards int, from uint64)
 }
 
-// Untrack forgets a shard that is no longer active.
-func (n *Node) Untrack(sh *capture.Shard) {
-	n.mu.Lock()
-	delete(n.tracked, sh)
-	n.mu.Unlock()
-}
+// SetTails makes t what the lease counts.
+func (n *Node) SetTails(t Tails) { n.tails.Store(&t) }
 
 // Info is what the node publishes in its lease.
 func (n *Node) Info() coord.NodeInfo {
 	// The writer's next number comes first: a file queued after it is read has
-	// a segment at or above it, so the scan below can't miss one that sits
-	// below it.
+	// a segment at or above it, so the look at the tails below can't miss one
+	// that sits below it.
 	next := n.Writer.NextSeq()
 	from := next
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	for sh := range n.tracked {
-		if f := sh.TailFrom(); f != 0 && f < from {
+	shards := 0
+	if t := n.tails.Load(); t != nil {
+		var f uint64
+		shards, f = (*t).Tails()
+		if f != 0 && f < from {
 			from = f
 		}
 	}
-	return coord.NodeInfo{Name: n.Name, Address: n.Address, Shards: len(n.tracked), JournalFrom: from, JournalNext: next}
+	return coord.NodeInfo{Name: n.Name, Address: n.Address, Shards: shards, JournalFrom: from, JournalNext: next}
 }
 
-// stopSweeper stops the journal sweeper, if one runs, and waits for it.
-func (n *Node) stopSweeper() {
-	n.mu.Lock()
-	cancel := n.sweepCancel
-	n.mu.Unlock()
-	if cancel != nil {
-		cancel()
+// TailSet is a set of captured shards as Tails, for programs that capture
+// shards without Shards (the test node, and tests of the node's journal).
+type TailSet struct {
+	mu sync.Mutex
+	m  map[*capture.Shard]struct{}
+}
+
+// Track counts a shard, before its capture's first sync.
+func (s *TailSet) Track(sh *capture.Shard) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.m == nil {
+		s.m = map[*capture.Shard]struct{}{}
 	}
-	n.sweepGroup.Wait()
+	s.m[sh] = struct{}{}
 }
 
-// Close stops the node's writer and its lease. With release, the lease is
-// marked released (a graceful shutdown, after the node's shards were let go).
-func (n *Node) Close(ctx context.Context, release bool) error {
-	n.stopSweeper()
-	n.Writer.Close()
-	return n.Keeper.Close(ctx, release)
+// Untrack forgets a shard that is no longer active.
+func (s *TailSet) Untrack(sh *capture.Shard) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.m, sh)
+}
+
+func (s *TailSet) Tails() (shards int, from uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for sh := range s.m {
+		if f := sh.TailFrom(); f != 0 && (from == 0 || f < from) {
+			from = f
+		}
+	}
+	return len(s.m), from
 }

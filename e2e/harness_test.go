@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
@@ -268,7 +268,7 @@ func (v *verifier) tokens(shard string) (toks map[string]bool, ok bool, err erro
 		}
 		return nil, false, fmt.Errorf("restore %s: %w", shard, err)
 	}
-	db, err := sql.Open("sqlite3", "file:"+dst+"?mode=ro")
+	db, err := sql.Open("sqlite", "file:"+dst+"?mode=ro&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, false, err
 	}

@@ -100,8 +100,7 @@ func (s *S3) EnsureBucket(ctx context.Context) error {
 		in.CreateBucketConfiguration = &s3types.CreateBucketConfiguration{LocationConstraint: s3types.BucketLocationConstraint(s.region)}
 	}
 	_, err := s.c.CreateBucket(ctx, in)
-	var ae smithy.APIError
-	if errors.As(err, &ae) && (ae.ErrorCode() == "BucketAlreadyOwnedByYou" || ae.ErrorCode() == "BucketAlreadyExists") {
+	if ae, ok := errors.AsType[smithy.APIError](err); ok && (ae.ErrorCode() == "BucketAlreadyOwnedByYou" || ae.ErrorCode() == "BucketAlreadyExists") {
 		return nil // created meanwhile
 	}
 	if err != nil {
@@ -184,8 +183,7 @@ func classify(err error, k kind, wasSent bool) error {
 	if err == nil {
 		return nil
 	}
-	var se *smithyhttp.RequestSendError
-	if errors.As(err, &se) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+	if _, sent := errors.AsType[*smithyhttp.RequestSendError](err); sent || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		if k == kindRead {
 			// Nothing to have changed: reads simply retry. A cancelled context is the caller's.
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -201,12 +199,10 @@ func classify(err error, k kind, wasSent bool) error {
 		}
 		return fmt.Errorf("%w: %w", ErrNotApplied, err)
 	}
-	var re *awshttp.ResponseError
-	if errors.As(err, &re) {
+	if re, ok := errors.AsType[*awshttp.ResponseError](err); ok {
 		status := re.HTTPStatusCode()
 		code := ""
-		var ae smithy.APIError
-		if errors.As(err, &ae) {
+		if ae, ok := errors.AsType[smithy.APIError](err); ok {
 			code = ae.ErrorCode()
 		}
 		switch {
@@ -229,8 +225,7 @@ func classify(err error, k kind, wasSent bool) error {
 		}
 		return fmt.Errorf("blob: s3: %w", err)
 	}
-	var de *smithy.DeserializationError
-	if errors.As(err, &de) {
+	if _, ok := errors.AsType[*smithy.DeserializationError](err); ok {
 		return fmt.Errorf("%w: %v", ErrUnknown, err) // the response was cut short
 	}
 	return fmt.Errorf("blob: s3: %w", err)

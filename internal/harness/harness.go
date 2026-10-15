@@ -5,6 +5,7 @@ package harness
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/luci1900/shardlite/internal/coord"
 	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/supervisor"
 )
 
 // Env is one node's worth of storage.
@@ -31,8 +33,9 @@ type Env struct {
 	Lease coord.NodeLease
 }
 
-// New returns an Env with a segment writer flushing every interval.
-func New(t testing.TB, interval time.Duration) *Env {
+// New returns an Env with a segment writer, which writes only when flushed
+// (capture.Shard.Sync flushes it).
+func New(t testing.TB) *Env {
 	t.Helper()
 	local := blob.WithHook(blob.NewMemory())
 	reg := coord.NewRegistry(local, "n1", coord.RegistryOptions{})
@@ -43,8 +46,8 @@ func New(t testing.TB, interval time.Duration) *Env {
 	store := blob.NewStore(local, "n1", lease.Epoch, blob.Options{Backoff: time.Millisecond})
 	e := &Env{T: t, Dir: t.TempDir(), Meta: t.TempDir(), Blob: local, Store: store, Node: "n1", Reg: reg, Lease: lease}
 	e.Files = &shardfile.Files{Blob: store, Node: e.Node, Leases: reg, TempDir: t.TempDir()}
-	e.W = segment.NewWriter(store, e.Node, segment.Options{Interval: interval, TempDir: e.Files.TempDir})
-	t.Cleanup(e.W.Close)
+	e.W = segment.NewWriter(store, e.Node, segment.Options{TempDir: e.Files.TempDir})
+	t.Cleanup(supervisor.Background(slog.Default(), "writer", e.W))
 	return e
 }
 
@@ -70,7 +73,7 @@ func (e *Env) Path(shard string) string {
 // created) file.
 func (e *Env) NewShard(shard string) (*shardfile.Handle, *capture.Shard) {
 	e.T.Helper()
-	h, created, err := e.Files.Open(context.Background(), shard)
+	h, created, err := e.Files.Open(context.Background(), shard, false)
 	if err != nil {
 		e.T.Fatal(err)
 	}

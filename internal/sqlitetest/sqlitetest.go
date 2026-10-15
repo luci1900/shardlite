@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 // Dump returns every row of every table except Litestream's own, plus the
@@ -23,7 +23,7 @@ func Dump(tb testing.TB, path string) string {
 
 // TryDump is Dump returning an error instead of failing a test.
 func TryDump(path string) (string, error) {
-	db, err := sql.Open("sqlite3", "file:"+path+"?_busy_timeout=5000")
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
 	if err != nil {
 		return "", err
 	}

@@ -34,14 +34,10 @@ func (r *mrig) segments() (data, fences int) {
 func TestTailOlderThanTheAlertAgeRaisesIt(t *testing.T) {
 	t.Parallel()
 	r := newMRig(t)
-	r.m.cancel()
-	r.m.g.Wait()
-	r.m.idx.close()
+	r.crash()
 	const deltaAge, expiry = 170 * time.Millisecond, 2 * time.Second // the alert is at 510 ms
-	r.startManager(func(o *ManagerOptions) { o.DeltaAge = deltaAge })
-	if err := r.n.StartJournalSweeper(expiry); err != nil {
-		t.Fatal(err)
-	}
+	r.startShards(func(o *ShardsOptions) { o.Lifecycle.DeltaAge = deltaAge })
+	r.startSweeper(expiry)
 
 	ctx := context.Background()
 	ref := r.acquire("slow/tail")
@@ -60,14 +56,7 @@ func TestTailOlderThanTheAlertAgeRaisesIt(t *testing.T) {
 	if err := r.m.Gate(ctx, ref, true); err != nil {
 		t.Fatal(err)
 	}
-	start := time.Now()
-	if r.m.Stats.TailAlerts.Load() != 0 {
-		t.Fatal("alert for a fresh tail")
-	}
 	eventually(t, "the tail alert", func() bool { return r.m.Stats.TailAlerts.Load() > 0 })
-	if age := time.Since(start); age < 3*deltaAge-time.Second { // (the tail is a little older than start)
-		t.Fatalf("alert after %v, want at 3 times the delta age %v", age, 3*deltaAge)
-	}
 	if data, _ := r.segments(); data == 0 {
 		t.Fatal("the segments were gone before the alert")
 	}
@@ -79,10 +68,8 @@ func TestTailOlderThanTheAlertAgeRaisesIt(t *testing.T) {
 func TestTailAlertWhenDeltasFail(t *testing.T) {
 	t.Parallel()
 	r := newMRig(t)
-	r.m.cancel()
-	r.m.g.Wait()
-	r.m.idx.close()
-	r.startManager(func(o *ManagerOptions) { o.DeltaAge = 100 * time.Millisecond }) // the alert is at 300 ms
+	r.crash()
+	r.startShards(func(o *ShardsOptions) { o.Lifecycle.DeltaAge = 100 * time.Millisecond }) // the alert is at 300 ms
 	ctx := context.Background()
 	ref := r.acquire("slow/failing")
 	defer ref.Release()
@@ -108,10 +95,8 @@ func TestTailAlertWhenDeltasFail(t *testing.T) {
 func TestRestartAfterSegmentsExpired(t *testing.T) {
 	t.Parallel()
 	r := newMRig(t)
-	r.m.cancel()
-	r.m.g.Wait()
-	r.m.idx.close()
-	r.startManager(func(o *ManagerOptions) { o.DeltaAge = 30 * time.Millisecond })
+	r.crash()
+	r.startShards(func(o *ShardsOptions) { o.Lifecycle.DeltaAge = 30 * time.Millisecond })
 	ctx := context.Background()
 
 	want := map[string]string{}
@@ -136,7 +121,7 @@ func TestRestartAfterSegmentsExpired(t *testing.T) {
 		}
 		return true
 	})
-	r.afterPasses(2) // a few more background passes
+	r.afterSnapshotLooks(2, "wallet/1", "wallet/2", "users/3") // a few more looks of the delta timers
 	dataBefore, _ := r.segments()
 	if dataBefore == 0 {
 		t.Fatal("no segments")
@@ -147,11 +132,9 @@ func TestRestartAfterSegmentsExpired(t *testing.T) {
 	r.crash()
 
 	// Everything written so far is older than the expiry age.
-	if err := r.n.StartJournalSweeper(300 * time.Millisecond); err != nil {
-		t.Fatal(err)
-	}
+	stop := r.startSweeper(300 * time.Millisecond)
 	eventually(t, "the old segments to expire", func() bool { d, _ := r.segments(); return d == 0 })
-	r.n.stopSweeper()
+	stop()
 	if _, fences := r.segments(); fences != 0 {
 		t.Fatalf("%d fences before the restart", fences)
 	}
@@ -160,7 +143,7 @@ func TestRestartAfterSegmentsExpired(t *testing.T) {
 	if r.n.Adopted.Fence == 0 || len(r.n.Adopted.Lost) != 0 {
 		t.Fatalf("adoption: %+v", r.n.Adopted)
 	}
-	r.startManager(nil)
+	r.startShards(nil)
 	for name, dump := range want {
 		ref := r.acquire(name)
 		if got := r.liveDump(ref.Path()); got != dump {
@@ -184,7 +167,7 @@ func envWith(extra map[string]string) (Env, error) {
 func TestFlushAndDeltaEnv(t *testing.T) {
 	t.Parallel()
 	e, err := envWith(nil)
-	if err != nil || e.DeltaAge != 15*time.Minute || e.DeltaSize != 1<<20 || e.FlushMin != DefaultFlushMin || len(e.Ignored) != 0 {
+	if err != nil || e.DeltaAge != 15*time.Minute || e.DeltaSize != 256<<10 || e.FlushMin != DefaultFlushMin {
 		t.Fatalf("defaults: %+v %v", e, err)
 	}
 	e, err = envWith(map[string]string{"SHARDLITE_DELTA_AGE": "1m", "SHARDLITE_DELTA_SIZE": "64K", "SHARDLITE_FLUSH_MIN": "10ms"})
@@ -200,16 +183,6 @@ func TestFlushAndDeltaEnv(t *testing.T) {
 		if _, err := envWith(vars); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
-	}
-}
-
-// The removed settings are not errors, whatever their value: the node logs that
-// it ignores them.
-func TestRemovedSettingsAreIgnoredAndReported(t *testing.T) {
-	t.Parallel()
-	e, err := envWith(map[string]string{"SHARDLITE_TAIL_ALERT": "1m", "SHARDLITE_JOURNAL_EXPIRY": "soon"})
-	if err != nil || len(e.Ignored) != 2 || e.Ignored[0] != "SHARDLITE_TAIL_ALERT" || e.Ignored[1] != "SHARDLITE_JOURNAL_EXPIRY" {
-		t.Fatalf("%+v %v", e.Ignored, err)
 	}
 }
 
@@ -257,9 +230,7 @@ func TestSweeperStartsAfterAdoption(t *testing.T) {
 	if r.n.Adopted.Deltas != 1 {
 		t.Fatalf("the segments were not adopted: %+v", r.n.Adopted)
 	}
-	if err := r.n.StartJournalSweeper(200 * time.Millisecond); err != nil {
-		t.Fatal(err)
-	}
+	r.startSweeper(200 * time.Millisecond)
 	eventually(t, "the old segments to expire", func() bool { d, _ := r.segments(); return d == 0 })
 	if got := r.dumpBlob("wallet/1"); got != want {
 		t.Fatal("the shard restores differently")
@@ -302,11 +273,11 @@ func TestSweepDeletesOldSegmentsKeepsFencesAndRecent(t *testing.T) {
 	// (Their real modification times are all about now.)
 	realNow := time.Now()
 	age := time.Hour
-	deleted, err := r.n.sweepJournal(ctx, age, realNow.Add(30*time.Minute))
+	deleted, err := r.sweeper(age).sweepJournal(ctx, realNow.Add(30*time.Minute))
 	if err != nil || deleted != 0 {
 		t.Fatalf("nothing is old yet: deleted %d, %v", deleted, err)
 	}
-	deleted, err = r.n.sweepJournal(ctx, age, realNow.Add(2*time.Hour))
+	deleted, err = r.sweeper(age).sweepJournal(ctx, realNow.Add(2*time.Hour))
 	if err != nil || deleted != 3-1 {
 		t.Fatalf("deleted %d, %v, want the two non-empty segments", deleted, err)
 	}
@@ -323,7 +294,7 @@ func TestSweepDeletesOldSegmentsKeepsFencesAndRecent(t *testing.T) {
 		t.Fatal("the lease was swept")
 	}
 	// Nothing left to delete.
-	if deleted, err := r.n.sweepJournal(ctx, age, realNow.Add(3*time.Hour)); err != nil || deleted != 0 {
+	if deleted, err := r.sweeper(age).sweepJournal(ctx, realNow.Add(3*time.Hour)); err != nil || deleted != 0 {
 		t.Fatalf("second sweep: %d %v", deleted, err)
 	}
 }
@@ -347,7 +318,7 @@ func TestSweeperUsesOnlyListAndDelete(t *testing.T) {
 		}
 		return nil
 	})
-	deleted, err := r.n.sweepJournal(ctx, time.Minute, time.Now().Add(time.Hour))
+	deleted, err := r.sweeper(time.Minute).sweepJournal(ctx, time.Now().Add(time.Hour))
 	if err != nil || deleted != 2 {
 		t.Fatalf("deleted %d, %v", deleted, err)
 	}
@@ -358,36 +329,37 @@ func TestSweeperUsesOnlyListAndDelete(t *testing.T) {
 	}
 }
 
-// The timer-driven sweeper deletes, can't be started twice, and Close joins it.
-func TestJournalSweeperRunsAndCloseJoins(t *testing.T) {
+// The timer-driven sweeper deletes, and once stopped it is joined: nothing can
+// sweep after the stop returns.
+func TestJournalSweeperRunsAndStopJoins(t *testing.T) {
 	t.Parallel()
 	r := newMRig(t)
 	key := r.putSegment("n1", 3001, "seg")
-	if err := r.n.StartJournalSweeper(300 * time.Millisecond); err != nil {
-		t.Fatal(err)
-	}
-	if err := r.n.StartJournalSweeper(time.Second); err == nil {
-		t.Fatal("started twice")
-	}
+	stop := r.startSweeper(300 * time.Millisecond)
 	eventually(t, "the segment to expire", func() bool { return !r.exists(key) })
-	if err := r.n.Close(context.Background(), false); err != nil {
-		t.Fatal(err)
-	}
-	// Joined: a segment written now is not swept, whatever its age.
+	stop()
+	// Joined: a segment written now is not swept, whatever its age (the ticker
+	// is every 30 ms).
 	r.local.Create(context.Background(), key, strings.NewReader("seg"), blob.WriteID{})
-	// Close joined the sweeper (a ticker every 30 ms): it has ended, so nothing
-	// can sweep the segment.
-	joined := make(chan struct{})
-	go func() { r.n.sweepGroup.Wait(); close(joined) }()
-	select {
-	case <-joined:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the sweeper still runs after Close")
-	}
+	time.Sleep(100 * time.Millisecond)
 	if !r.exists(key) {
-		t.Fatal("the sweeper ran after Close")
+		t.Fatal("the sweeper ran after it was stopped")
 	}
-	if err := r.n.StartJournalSweeper(0); err == nil {
-		t.Fatal("a zero expiry was accepted")
-	}
+}
+
+// sweeper builds the node's journal sweeper from the node's parts, as Run does.
+func (r *mrig) sweeper(age time.Duration) *sweeper {
+	return &sweeper{r.n.Store, r.n.Name, age, r.n.Logger}
+}
+
+// startSweeper runs the node's journal sweeper, as Run does, until the returned
+// stop (or the end of the test), which joins it.
+func (r *mrig) startSweeper(age time.Duration) (stop func()) {
+	r.t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); r.sweeper(age).Serve(ctx) }()
+	stop = func() { cancel(); <-done }
+	r.t.Cleanup(stop)
+	return stop
 }

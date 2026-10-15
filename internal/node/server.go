@@ -1,11 +1,11 @@
 package node
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"golang.org/x/sync/errgroup"
 	"io"
 	"log/slog"
 	"net"
@@ -14,10 +14,14 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/luci1900/shardlite/internal/coord"
+	"github.com/luci1900/shardlite/internal/supervisor"
 )
 
 // The headers the node and the app exchange (docs/guide.md, Reference).
@@ -46,7 +50,10 @@ type ServerOptions struct {
 	MaxHops int
 	// MessageTimeout is how long one intake or one call to a handler for an inbox row may take, 30 s if zero.
 	MessageTimeout time.Duration
-	Logger         *slog.Logger
+	// Grace is how long stopping a server waits for requests in flight before it
+	// ends them, 10 s if zero.
+	Grace  time.Duration
+	Logger *slog.Logger
 }
 
 // DefaultMaxHops is how many hops a chain of calls and messages may have (Dapr limits calls the same way).
@@ -58,35 +65,30 @@ const DefaultMaxHops = 32
 // shard, proxy to the app with Shardlite-Target and Shardlite-Path, and hold
 // the app's output at the shard's durability gate.
 type Server struct {
-	m     *Manager
-	opts  ServerOptions
-	log   *slog.Logger
-	proxy *httputil.ReverseProxy
-
-	healthy atomic.Bool
-	cancel  context.CancelFunc
-	g       errgroup.Group // owns the health poll; Close joins it
+	m      *Shards
+	kinds  *Kinds
+	keeper *coord.Keeper
+	opts   ServerOptions
+	log    *slog.Logger
+	proxy  *httputil.ReverseProxy
+	health *health // a service of Run's
 }
 
-// NewServer starts polling the app's health endpoint.
-func NewServer(m *Manager, opts ServerOptions) *Server {
+// NewServer makes the node's servers. The app counts as unhealthy until its
+// health endpoint has answered (once Run serves s.health).
+func NewServer(m *Shards, kinds *Kinds, keeper *coord.Keeper, opts ServerOptions) *Server {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
-	if opts.HealthPath == "" {
-		opts.HealthPath = "/health"
-	}
-	if opts.HealthEvery <= 0 {
-		opts.HealthEvery = time.Second
-	}
-	if opts.MaxHops <= 0 {
-		opts.MaxHops = DefaultMaxHops
-	}
-	if opts.MessageTimeout <= 0 {
-		opts.MessageTimeout = 30 * time.Second
-	}
-	s := &Server{m: m, opts: opts, log: opts.Logger}
-	m.msgs.setTransport(&transport{intake: s.sendIntake, inbox: s.sendInbox, maxHops: opts.MaxHops})
+	opts.HealthPath = cmp.Or(opts.HealthPath, "/health")
+	orDefault(&opts.HealthEvery, time.Second)
+	orDefault(&opts.MaxHops, DefaultMaxHops)
+	orDefault(&opts.MessageTimeout, 30*time.Second)
+	orDefault(&opts.Grace, 10*time.Second)
+	u := *opts.App
+	u.Path = strings.TrimRight(u.Path, "/") + opts.HealthPath
+	s := &Server{m: m, kinds: kinds, keeper: keeper, opts: opts, log: opts.Logger}
+	s.health = &health{url: u.String(), every: opts.HealthEvery, client: &http.Client{Timeout: 2 * time.Second}, log: opts.Logger}
 
 	h1 := http.DefaultTransport.(*http.Transport).Clone()
 	h1.MaxIdleConnsPerHost = 256
@@ -103,16 +105,7 @@ func NewServer(m *Manager, opts ServerOptions) *Server {
 		ErrorHandler:   s.proxyError,
 		FlushInterval:  -1, // every write goes out at once: server-sent events and streaming RPCs
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	s.cancel = cancel
-	s.g.Go(func() error { s.watchHealth(ctx); return nil })
 	return s
-}
-
-// Close stops the health poll.
-func (s *Server) Close() {
-	s.cancel()
-	s.g.Wait()
 }
 
 // appTransport sends gRPC to the app over h2c (prior knowledge) and
@@ -130,32 +123,77 @@ func isGRPC(r *http.Request) bool {
 	return strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/grpc")
 }
 
-// Serve serves the handlers until ctx ends: the public listener (HTTP/1.1
-// and h2c, which gRPC clients behind a load balancer use), and the control API
-// on localhost TCP and, if given, a Unix socket. Any of the listeners may be nil.
-func (s *Server) Serve(ctx context.Context, public, control, socket net.Listener) error {
+// httpServer is one of the node's HTTP servers: the public server, or the
+// control server on the control listener and the Unix socket. Every request's
+// context derives from a base context the server owns, not from the context it
+// serves on, and every handler is counted, so that stopping the server can end
+// what is left of its requests and join them.
+type httpServer struct {
+	name    string
+	log     *slog.Logger
+	failed  chan<- error // told why the server failed (a listener did), if not nil
+	lns     []net.Listener
+	handler http.Handler
+	grace   time.Duration
+}
+
+func (h *httpServer) String() string { return h.name }
+
+// publicServer serves clients on ln (HTTP/1.1 and h2c, which gRPC clients
+// behind a load balancer use).
+func (s *Server) publicServer(ln net.Listener, failed chan<- error) *httpServer {
+	return &httpServer{name: "public server", log: s.log, failed: failed, lns: []net.Listener{ln}, handler: s.PublicHandler(), grace: s.opts.Grace}
+}
+
+// controlServer serves the control API on its listeners (localhost TCP and, if
+// not nil, a Unix socket).
+func (s *Server) controlServer(failed chan<- error, lns ...net.Listener) *httpServer {
+	h := &httpServer{name: "control server", log: s.log, failed: failed, handler: s.ControlHandler(), grace: s.opts.Grace}
+	for _, ln := range lns {
+		if ln != nil {
+			h.lns = append(h.lns, ln)
+		}
+	}
+	return h
+}
+
+// Serve serves until ctx ends or a listener fails, then stops: it stops
+// accepting and waits up to the grace period for requests in flight, cancels the
+// base context (which ends upgraded connections: Shutdown and Close leave
+// hijacked connections alone), closes what is left and returns once every
+// handler has.
+func (h *httpServer) Serve(ctx context.Context) error {
+	defer serving(h.log, h.name)()
+	base, cancelBase := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelBase()
+	var handlers inFlight
+	counted := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !handlers.enter() {
+			// Read just as the server closed: its context has ended already.
+			w.Header().Set("Connection", "close")
+			w.Header().Set("Retry-After", "1")
+			writeError(w, r, false, http.StatusServiceUnavailable, "the node is shutting down")
+			return
+		}
+		defer handlers.leave()
+		h.handler.ServeHTTP(w, r)
+	})
 	protos := new(http.Protocols)
 	protos.SetHTTP1(true)
 	protos.SetUnencryptedHTTP2(true)
-	mk := func(h http.Handler) *http.Server {
-		// No read or write timeouts: streams and upgraded connections live long.
-		return &http.Server{Handler: h, Protocols: protos, ReadHeaderTimeout: 10 * time.Second}
-	}
-	// One child per listener, and one that shuts them all down when the context
-	// ends or a listener fails (WithContext cancels the others then).
+	// One child per listener, and one that stops them all when the context ends
+	// or a listener fails (WithContext cancels the others then).
 	g, gctx := errgroup.WithContext(ctx)
-	var servers []*http.Server
-	for _, l := range []struct {
-		ln net.Listener
-		h  http.Handler
-	}{{public, s.PublicHandler()}, {control, s.ControlHandler()}, {socket, s.ControlHandler()}} {
-		if l.ln == nil {
-			continue
+	servers := make([]*http.Server, 0, len(h.lns))
+	for _, ln := range h.lns {
+		// No read or write timeouts: streams and upgraded connections live long.
+		srv := &http.Server{
+			Handler: counted, Protocols: protos, ReadHeaderTimeout: 10 * time.Second,
+			BaseContext: func(net.Listener) context.Context { return base },
 		}
-		srv := mk(l.h)
 		servers = append(servers, srv)
 		g.Go(func() error {
-			if err := srv.Serve(l.ln); !errors.Is(err, http.ErrServerClosed) {
+			if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
 				return err
 			}
 			return nil
@@ -163,14 +201,53 @@ func (s *Server) Serve(ctx context.Context, public, control, socket net.Listener
 	}
 	g.Go(func() error {
 		<-gctx.Done()
-		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		sctx, cancel := context.WithTimeout(context.Background(), h.grace)
 		defer cancel()
+		var sg errgroup.Group
 		for _, srv := range servers {
-			srv.Shutdown(sctx)
+			sg.Go(func() error { srv.Shutdown(sctx); return nil })
 		}
+		sg.Wait()
+		cancelBase()
+		for _, srv := range servers {
+			srv.Close()
+		}
+		handlers.close()
 		return nil
 	})
-	return g.Wait()
+	if err := g.Wait(); err != nil {
+		report(h.failed, fmt.Errorf("%s: %w", h.name, err))
+	}
+	return supervisor.NoRestart(nil)
+}
+
+// inFlight counts calls in progress. Once closed it lets no more in, so closing
+// it joins every call it let in.
+type inFlight struct {
+	mu     sync.Mutex
+	closed bool
+	wg     sync.WaitGroup
+}
+
+// enter counts a call in, false (with nothing counted) once closed.
+func (f *inFlight) enter() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return false
+	}
+	f.wg.Add(1)
+	return true
+}
+
+func (f *inFlight) leave() { f.wg.Done() }
+
+// close lets no more calls in and waits for those in progress. It may be called again.
+func (f *inFlight) close() {
+	f.mu.Lock()
+	f.closed = true
+	f.mu.Unlock()
+	f.wg.Wait()
 }
 
 // PublicHandler serves clients: shard requests are routed by Shardlite-Target
@@ -183,10 +260,10 @@ func (s *Server) PublicHandler() http.Handler {
 				s.ready(w, r)
 				return
 			}
-			writeError(w, r, http.StatusNotFound, "not found")
+			writeError(w, r, false, http.StatusNotFound, "not found")
 			return
 		}
-		s.route(w, r, false)
+		s.route(w, r, origin{kind: fromClient})
 	})
 }
 
@@ -200,7 +277,7 @@ func (s *Server) ControlHandler() http.Handler {
 			s.api(w, r)
 			return
 		}
-		s.route(w, r, true)
+		s.route(w, r, origin{kind: fromCall})
 	})
 }
 
@@ -229,20 +306,20 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		s.ready(w, r)
 	case r.URL.Path == apiPrefix+"sync" && r.Method == http.MethodPost:
 		// Everything committed before the call is in blob storage when this returns.
-		if err := s.m.BarrierFor(r.Context(), r.Header.Get(hdrCaller)); err != nil {
-			s.fail(w, r, err)
+		if err := s.m.Barrier(r.Context()); err != nil {
+			s.fail(w, r, false, err)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 	case strings.HasPrefix(r.URL.Path, apiPrefix+"shards/") && r.Method == http.MethodDelete:
 		target := strings.TrimPrefix(r.URL.Path, apiPrefix+"shards/")
 		if err := s.m.Delete(r.Context(), target); err != nil {
-			s.fail(w, r, err)
+			s.fail(w, r, false, err)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 	default:
-		writeError(w, r, http.StatusNotFound, "no such endpoint")
+		writeError(w, r, false, http.StatusNotFound, "no such endpoint")
 	}
 }
 
@@ -253,26 +330,28 @@ type reqInfo struct {
 	caller string // "" on a client request
 	ref    *Ref
 	public bool
-	log    *slog.Logger
+	own    bool // the node's own request (an intake or a delivery), answered in process
 
 	hops     int       // sent to the app as Shardlite-Hops
 	deadline time.Time // zero if the request has none
-	// internal is set for a request the node makes to itself (an intake, or the
-	// delivery of an inbox row): it isn't gated on the caller, since its row is
-	// durable already.
-	internal bool
-	inboxID  int64 // the inbox row a handler is called for, 0 if none
+	inboxID  int64     // the inbox row a handler is called for, 0 if none
 	// callerGate gates what the calling shard sends for the whole call (the
 	// request body and, after an upgrade, what it writes), nil if the call isn't gated.
 	callerGate *gate
+	// gates counts the request's gates in progress (see route), and held is
+	// what the request holds until it ends.
+	gates inFlight
+	held  []*Ref
 }
 
 type ctxKey struct{}
 
-// route works out the shard, activates it and proxies.
-func (s *Server) route(w http.ResponseWriter, r *http.Request, control bool) {
-	// 1. The header, then the query parameter. Either way the parameter is
-	// stripped, so the app sees its own path and query.
+// route works out the shard, activates it and proxies. o says who asked: the
+// handlers set it from the request, and the node's own requests (send.go) say
+// what they are.
+func (s *Server) route(w http.ResponseWriter, r *http.Request, o origin) {
+	// The header, then the query parameter. Either way the parameter is stripped,
+	// so the app sees its own path and query.
 	target := r.Header.Get(hdrTarget)
 	if q, rest, ok := takeQueryParam(r.URL.RawQuery, queryTarget); ok {
 		r.URL.RawQuery = rest
@@ -280,25 +359,79 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, control bool) {
 			target = q
 		}
 	}
-	info := &reqInfo{target: target, public: !control, log: s.log}
-	info.internal = r.Context().Value(internalCtxKey{}) != nil
+	info := &reqInfo{target: target, public: !o.control(), own: o.internal()}
+	// The proxy can leave goroutines behind that are still reading through a gate
+	// when the handler returns: the second copier of an upgraded connection, or
+	// the transport writing a request body. Their gates end with the request's
+	// context, and the request's shards are released only once none is left.
+	ctx, cancel := context.WithCancel(r.Context())
+	r = r.WithContext(ctx)
+	defer func() {
+		cancel()
+		info.gates.close()
+		for _, ref := range info.held {
+			ref.Release()
+		}
+	}()
 	// The one place that decides a request is an intake. Between nodes it will be
 	// the header, which only a node may set: whatever an app or a client sent is
 	// removed here, so nothing else can ask for it.
 	r.Header.Del(hdrInbox)
-	intake := info.internal && r.Context().Value(intakeCtxKey{}) != nil
-	d, _ := r.Context().Value(deliveryCtxKey{}).(*deliveryInfo)
-	if control {
-		if target == "" {
-			writeError(w, r, http.StatusBadRequest, "a call needs a Shardlite-Target")
+	if err := s.parseCall(r, o, info); err != nil {
+		s.answer(w, r, o.internal(), err)
+		return
+	}
+	if !info.deadline.IsZero() {
+		ctx, cancel := context.WithDeadline(r.Context(), info.deadline)
+		defer cancel()
+		r = r.WithContext(ctx)
+	}
+	if target != "" {
+		if err := s.checkTarget(r, o, info); err != nil {
+			s.answer(w, r, o.internal(), err)
 			return
+		}
+		if err := s.holdShards(r, o, info); err != nil {
+			s.answer(w, r, o.internal(), err)
+			return
+		}
+	}
+	if o.kind == fromIntake {
+		s.serveIntake(w, r, info) // answered by the node, not the app
+		return
+	}
+	s.proxy.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, info)))
+}
+
+// statusError is an answer the node gives with a status of its own.
+type statusError struct {
+	status int
+	msg    string
+}
+
+func (e *statusError) Error() string { return e.msg }
+
+// answer writes the answer for an error from one of route's steps.
+func (s *Server) answer(w http.ResponseWriter, r *http.Request, own bool, err error) {
+	if se, ok := errors.AsType[*statusError](err); ok {
+		writeError(w, r, own, se.status, se.msg)
+		return
+	}
+	s.fail(w, r, own, err)
+}
+
+// parseCall reads what a call says about itself into info: its caller, its hops
+// and its deadline.
+func (s *Server) parseCall(r *http.Request, o origin, info *reqInfo) error {
+	if o.control() {
+		if info.target == "" {
+			return &statusError{http.StatusBadRequest, "a call needs a Shardlite-Target"}
 		}
 		info.caller = r.Header.Get(hdrCaller)
 		if info.caller == "" {
 			info.caller = callerApp
 		} else if _, _, err := ParseTarget(info.caller); err != nil && info.caller != callerApp {
-			writeError(w, r, http.StatusBadRequest, "bad Shardlite-Caller")
-			return
+			return &statusError{http.StatusBadRequest, "bad Shardlite-Caller"}
 		}
 		// Hops: the call is one more than the one the app says it is serving
 		// (an app that doesn't pass the header on starts again at 0). It is refused
@@ -306,14 +439,12 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, control bool) {
 		if v := r.Header.Get(hdrHops); v != "" {
 			d, err := strconv.Atoi(v)
 			if err != nil || d < 0 {
-				writeError(w, r, http.StatusBadRequest, "bad Shardlite-Hops")
-				return
+				return &statusError{http.StatusBadRequest, "bad Shardlite-Hops"}
 			}
 			info.hops = d + 1
 			if info.hops > s.opts.MaxHops {
-				s.log.Warn("call refused: calls are chained too far", "caller", info.caller, "target", target, "hops", info.hops, "max", s.opts.MaxHops)
-				writeError(w, r, http.StatusLoopDetected, fmt.Sprintf("calls are chained more than %d hops", s.opts.MaxHops))
-				return
+				s.log.Warn("call refused: calls are chained too far", "caller", info.caller, "target", info.target, "hops", info.hops, "max", s.opts.MaxHops)
+				return &statusError{http.StatusLoopDetected, fmt.Sprintf("calls are chained more than %d hops", s.opts.MaxHops)}
 			}
 		}
 	}
@@ -322,12 +453,11 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, control bool) {
 	// (the smaller if both). Clients can't send Shardlite-Deadline.
 	var left time.Duration
 	hasDeadline := false
-	if control {
+	if o.control() {
 		if v := r.Header.Get(hdrDeadline); v != "" {
 			ms, err := strconv.ParseInt(v, 10, 64)
 			if err != nil || ms < 0 {
-				writeError(w, r, http.StatusBadRequest, "bad Shardlite-Deadline")
-				return
+				return &statusError{http.StatusBadRequest, "bad Shardlite-Deadline"}
 			}
 			left, hasDeadline = time.Duration(ms)*time.Millisecond, true
 		}
@@ -336,8 +466,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, control bool) {
 		if v := r.Header.Get("Grpc-Timeout"); v != "" {
 			d, err := parseGRPCTimeout(v)
 			if err != nil {
-				writeError(w, r, http.StatusBadRequest, "bad grpc-timeout")
-				return
+				return &statusError{http.StatusBadRequest, "bad grpc-timeout"}
 			}
 			if !hasDeadline || d < left {
 				left, hasDeadline = d, true
@@ -346,69 +475,67 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, control bool) {
 	}
 	if hasDeadline {
 		info.deadline = time.Now().Add(left)
-		ctx, cancel := context.WithDeadline(r.Context(), info.deadline)
-		defer cancel()
-		r = r.WithContext(ctx)
 		if left <= 0 {
-			s.fail(w, r, context.DeadlineExceeded)
-			return
+			return context.DeadlineExceeded
 		}
 	}
-
-	if target != "" {
-		if !control {
-			if err := s.m.opts.Kinds.CheckPublic(target); err != nil {
-				if errors.Is(err, ErrNotPublic) {
-					s.log.Info(`a client named a kind that is not public (set "public": true in the kinds file to allow it)`, "target", target)
-					err = fmt.Errorf("%w: %q", ErrUnknownKind, strings.SplitN(target, "/", 2)[0])
-				}
-				s.fail(w, r, err)
-				return
-			}
-		}
-		if control && strings.EqualFold(r.Header.Get(hdrIfActive), "true") && !s.m.IsActive(target) {
-			// Not activated for a call that only wants shards that are already running.
-			if _, _, err := ParseTarget(target); err != nil {
-				s.fail(w, r, err)
-				return
-			}
-			writeError(w, r, http.StatusNotFound, "shard is not active")
-			return
-		}
-		// A call is bytes leaving the calling shard: everything it sends, for as long
-		// as the call lasts, waits for what that shard committed (docs/internals.md,
-		// Durability gates). The caller stays active until the call ends.
-		if control && info.caller != callerApp && !info.internal {
-			cg, err := s.gateCaller(r, info.caller)
-			if err != nil {
-				s.fail(w, r, err)
-				return
-			}
-			if cg != nil {
-				defer cg.ref.Release()
-				info.callerGate = cg
-				if r.Body != nil && r.Body != http.NoBody {
-					r.Body = gatedRequestBody{r.Body, cg}
-				}
-			}
-		}
-		ref, err := s.m.Acquire(r.Context(), target)
-		if err != nil {
-			s.fail(w, r, err)
-			return
-		}
-		defer ref.Release() // held for the whole request: a stream or an upgraded connection keeps the shard active
-		info.ref, info.path = ref, ref.Path()
-	}
-	if d != nil {
+	if o.kind == fromDelivery {
 		// The handler sees the row's own hops, not one more.
-		info.hops, info.inboxID = d.hops, d.id
+		info.hops, info.inboxID = o.hops, o.inboxID
 	}
-	if intake {
-		s.serveIntake(w, r, info) // answered by the node, not the app
-		return
+	return nil
+}
+
+// checkTarget refuses a target a client may not name, and a call that wants only
+// shards that are already active.
+func (s *Server) checkTarget(r *http.Request, o origin, info *reqInfo) error {
+	if !o.control() {
+		if err := s.kinds.CheckPublic(info.target); err != nil {
+			if errors.Is(err, ErrNotPublic) {
+				s.log.Info(`a client named a kind that is not public (set "public": true in the kinds file to allow it)`, "target", info.target)
+				err = fmt.Errorf("%w: %q", ErrUnknownKind, strings.SplitN(info.target, "/", 2)[0])
+			}
+			return err
+		}
 	}
-	s.proxy.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, info)))
+	if o.control() && strings.EqualFold(r.Header.Get(hdrIfActive), "true") && !s.m.IsActive(info.target) {
+		// Not activated for a call that only wants shards that are already running.
+		if _, _, err := ParseTarget(info.target); err != nil {
+			return err
+		}
+		return &statusError{http.StatusNotFound, "shard is not active"}
+	}
+	return nil
+}
+
+// holdShards gates the caller and acquires the target. Everything it takes is
+// added to info.held, which route releases when the request ends.
+func (s *Server) holdShards(r *http.Request, o origin, info *reqInfo) error {
+	// A call is bytes leaving the calling shard: everything it sends, for as long
+	// as the call lasts, waits for what that shard committed (docs/internals.md,
+	// Durability gates). The caller stays active until the call ends. The node's
+	// own requests aren't gated: their row is durable already.
+	if o.control() && info.caller != callerApp && !o.internal() {
+		cg, err := s.gateCaller(r, info)
+		if err != nil {
+			return err
+		}
+		if cg != nil {
+			info.held = append(info.held, cg.ref)
+			info.callerGate = cg
+			if r.Body != nil && r.Body != http.NoBody {
+				r.Body = gatedBody{r.Body, cg}
+			}
+		}
+	}
+	ref, err := s.m.Acquire(r.Context(), info.target)
+	if err != nil {
+		return err
+	}
+	// Held for the whole request: a stream or an upgraded connection keeps the shard active.
+	info.held = append(info.held, ref)
+	info.ref, info.path = ref, ref.Path()
+	return nil
 }
 
 // gateCaller holds a call until the calling shard's earlier commits are
@@ -417,8 +544,8 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, control bool) {
 // the caller releases it when the call ends. It is nil, with nothing held, when
 // the call isn't gated: the caller isn't active on this node (it committed
 // nothing here to wait for) or its setting is off.
-func (s *Server) gateCaller(r *http.Request, caller string) (*gate, error) {
-	ref := s.m.hold(caller)
+func (s *Server) gateCaller(r *http.Request, info *reqInfo) (*gate, error) {
+	ref := s.m.hold(info.caller)
 	if ref == nil {
 		return nil, nil
 	}
@@ -427,7 +554,7 @@ func (s *Server) gateCaller(r *http.Request, caller string) (*gate, error) {
 		ref.Release()
 		return nil, nil
 	}
-	g := &gate{m: s.m, ref: ref, sync: true, ctx: r.Context()}
+	g := &gate{m: s.m, ref: ref, sync: true, ctx: r.Context(), calls: &info.gates}
 	if err := g.wait(1, nil); err != nil { // the request line and headers
 		ref.Release()
 		return nil, err
@@ -476,11 +603,7 @@ func (s *Server) rewrite(pr *httputil.ProxyRequest) {
 	pr.Out.Host = pr.In.Host
 	// Nothing the sender wrote in a Shardlite-* header gets through. The node
 	// sets the ones the app may trust.
-	for k := range pr.Out.Header {
-		if strings.HasPrefix(http.CanonicalHeaderKey(k), hdrPrefix) {
-			delete(pr.Out.Header, k)
-		}
-	}
+	stripShardliteHeaders(pr.Out.Header)
 	if info == nil {
 		return
 	}
@@ -491,9 +614,10 @@ func (s *Server) rewrite(pr *httputil.ProxyRequest) {
 	if !info.deadline.IsZero() {
 		// The time still left, so the app (and its own calls) stop when the node would.
 		left := max(time.Until(info.deadline), time.Millisecond)
-		pr.Out.Header.Set(hdrDeadline, strconv.FormatInt((left+time.Millisecond-1).Milliseconds(), 10))
+		ms := strconv.FormatInt((left + time.Millisecond - 1).Milliseconds(), 10) // rounded up
+		pr.Out.Header.Set(hdrDeadline, ms)
 		if pr.Out.Header.Get("Grpc-Timeout") != "" {
-			pr.Out.Header.Set("Grpc-Timeout", strconv.FormatInt((left+time.Millisecond-1).Milliseconds(), 10)+"m")
+			pr.Out.Header.Set("Grpc-Timeout", ms+"m")
 		}
 	}
 	if info.target != "" {
@@ -531,7 +655,7 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 	if err := s.m.Gate(ctx, info.ref, sync); err != nil {
 		return err
 	}
-	g := &gate{m: s.m, ref: info.ref, sync: sync, ctx: ctx, resp: resp}
+	g := &gate{m: s.m, ref: info.ref, sync: sync, ctx: ctx, resp: resp, calls: &info.gates}
 	if rwc, ok := resp.Body.(io.ReadWriteCloser); ok && resp.StatusCode == http.StatusSwitchingProtocols {
 		resp.Body = gatedConn{rwc, g, info.callerGate}
 	} else {
@@ -571,17 +695,27 @@ func stripShardliteHeaders(h http.Header) {
 // what a calling shard sends (a request body, an upgraded connection's writes)
 // on the caller.
 type gate struct {
-	m    *Manager
+	m    *Shards
 	ref  *Ref
 	sync bool
 	ctx  context.Context
 	resp *http.Response // the response being gated, nil for a caller's gate
+	// calls are the request's gates in progress: once the request has ended, a
+	// gate fails without looking at the shard, whose reference is released.
+	calls *inFlight
 }
+
+// errRequestEnded is what a gate returns once its request has ended.
+var errRequestEnded = errors.New("the request has ended")
 
 // wait gates a chunk that was just read (n bytes, or the end of the body, whose
 // trailers are output too).
 func (g *gate) wait(n int, err error) error {
 	if n > 0 || errors.Is(err, io.EOF) {
+		if !g.calls.enter() {
+			return errRequestEnded
+		}
+		defer g.calls.leave()
 		return g.m.Gate(g.ctx, g.ref, g.sync)
 	}
 	return nil
@@ -597,25 +731,16 @@ func (g *gate) read(n int, err error) (int, error) {
 	return n, err
 }
 
+// gatedBody is a body whose chunks are gated: a response's on the callee that
+// produced it, and a call's request body on the caller. Each chunk, and the end
+// of the body with its trailers, gets through only once what the shard
+// committed before it is durable.
 type gatedBody struct {
 	io.ReadCloser
 	g *gate
 }
 
 func (b gatedBody) Read(p []byte) (int, error) {
-	n, err := b.ReadCloser.Read(p)
-	return b.g.read(n, err)
-}
-
-// gatedRequestBody is the body of a call, gated on the caller: each chunk the
-// caller sends, and the end of the body with its trailers, reaches the callee
-// only once what the caller committed before it is durable.
-type gatedRequestBody struct {
-	io.ReadCloser
-	g *gate
-}
-
-func (b gatedRequestBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	return b.g.read(n, err)
 }
@@ -647,11 +772,12 @@ func (s *Server) proxyError(w http.ResponseWriter, r *http.Request, err error) {
 	if errors.Is(err, context.Canceled) && r.Context().Err() != nil {
 		return // the client went away
 	}
-	s.fail(w, r, err)
+	info, _ := r.Context().Value(ctxKey{}).(*reqInfo)
+	s.fail(w, r, info != nil && info.own, err)
 }
 
 // fail answers with the status an error maps to.
-func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
+func (s *Server) fail(w http.ResponseWriter, r *http.Request, own bool, err error) {
 	status := http.StatusBadGateway
 	switch {
 	case errors.Is(err, ErrUnknownKind), errors.Is(err, ErrBadTarget):
@@ -670,7 +796,7 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 			w.Header().Set("Retry-After", "1")
 		}
 	}
-	writeError(w, r, status, err.Error())
+	writeError(w, r, own, status, err.Error())
 }
 
 // grpcCodes maps the statuses the node produces onto gRPC status codes.
@@ -688,10 +814,10 @@ var grpcCodes = map[int]int{
 // writeError answers with an error the node produced itself. For a request
 // with content-type application/grpc it is a gRPC status (a "trailers-only"
 // response: HTTP 200 with grpc-status and grpc-message), which is what a
-// gRPC client understands.
-func writeError(w http.ResponseWriter, r *http.Request, status int, msg string) {
+// gRPC client understands. own says the request is the node's own (answered in process), which is not given a gRPC status.
+func writeError(w http.ResponseWriter, r *http.Request, own bool, status int, msg string) {
 	// The node's own requests read the status themselves, whatever it carries.
-	if isGRPC(r) && r.Context().Value(internalCtxKey{}) == nil {
+	if isGRPC(r) && !own {
 		code, ok := grpcCodes[status]
 		if !ok {
 			code = 13 // INTERNAL
@@ -729,11 +855,11 @@ func grpcMessage(s string) string {
 // kinds file is valid and the node's lease is good.
 func (s *Server) Ready() (bool, string) {
 	switch {
-	case !s.healthy.Load():
+	case !s.health.Healthy():
 		return false, "the app is not healthy"
-	case !s.m.opts.Kinds.Valid():
+	case !s.kinds.Valid():
 		return false, "the kinds file is not valid"
-	case s.m.n.Keeper.Check() != nil:
+	case s.keeper.Check() != nil:
 		return false, "the node's lease is not valid"
 	}
 	return true, "ok"
@@ -752,33 +878,44 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// watchHealth polls the app's health endpoint.
-func (s *Server) watchHealth(ctx context.Context) {
-	client := &http.Client{Timeout: 2 * time.Second}
-	u := *s.opts.App
-	u.Path = strings.TrimRight(u.Path, "/") + s.opts.HealthPath
+// health polls the app's health endpoint.
+type health struct {
+	url    string
+	every  time.Duration
+	client *http.Client
+	log    *slog.Logger
+	ok     atomic.Bool
+}
+
+func (*health) String() string { return "health poll" }
+
+// Healthy reports whether the last poll got a 2xx answer.
+func (h *health) Healthy() bool { return h.ok.Load() }
+
+func (h *health) Serve(ctx context.Context) error {
+	defer serving(h.log, h.String())()
 	check := func() {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.url, nil)
 		if err != nil {
-			s.healthy.Store(false)
+			h.ok.Store(false)
 			return
 		}
-		resp, err := client.Do(req)
+		resp, err := h.client.Do(req)
 		if err != nil {
-			s.healthy.Store(false)
+			h.ok.Store(false)
 			return
 		}
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
-		s.healthy.Store(resp.StatusCode/100 == 2)
+		h.ok.Store(resp.StatusCode/100 == 2)
 	}
 	check()
-	t := time.NewTicker(s.opts.HealthEvery)
+	t := time.NewTicker(h.every)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return supervisor.NoRestart(nil)
 		case <-t.C:
 			check()
 		}

@@ -1,6 +1,6 @@
 // Command testapp is a stand-in for an application: it opens SQLite shard
-// files with the mattn driver in WAL mode with default locking and writes to
-// them on command, from its own process.
+// files with the modernc driver (the one Litestream uses) in WAL mode with
+// default locking and writes to them on command, from its own process.
 //
 // Protocol: one command per line on stdin, fields separated by tabs. Each
 // command gets one reply line on stdout: "ok [value]" or "err message".
@@ -17,7 +17,7 @@
 //	loop   <id> <n> <mode>        n times: insert a row, then PRAGMA wal_checkpoint(mode); replies with rows,busy_results
 //	churn  <id> <n>               n times: insert a row, then close and reopen the connection
 //	ack    <id> <n>               insert (n) into the acks table, one transaction
-//	probe  <id> <path>            ask, with a throwaway descriptor on <path>-shm, whether another process holds the database open (reply "held pid=N" or "free")
+//	probe  <id> <path>            ask, with a throwaway descriptor on <path>-shm, whether another process holds the database open (reply "held" or "free")
 //	exit
 package main
 
@@ -30,7 +30,7 @@ import (
 	"strconv"
 	"strings"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
@@ -69,7 +69,7 @@ func (a *app) open(id, path, busy string) error {
 		busy = "5000"
 	}
 	a.busy[id] = busy
-	db, err := sql.Open("sqlite3", "file:"+path+"?_journal_mode=WAL&_busy_timeout="+busy+"&_synchronous=NORMAL")
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout("+busy+")&_pragma=synchronous(NORMAL)")
 	if err != nil {
 		return err
 	}
@@ -89,9 +89,9 @@ func (a *app) do(f []string) (string, error) {
 	cmd, id := f[0], f[1]
 	if cmd == "probe" {
 		// The app has no sqlite handle on this file, or its own locks are ignored anyway.
-		held, pid, err := capture.ProbeOwner(f[2])
+		held, err := capture.ProbeOnce(f[2])
 		if held {
-			return fmt.Sprintf("held pid=%d", pid), err
+			return "held", err
 		}
 		return "free", err
 	}
@@ -104,7 +104,7 @@ func (a *app) do(f []string) (string, error) {
 		return strconv.Quote(out), err
 	}
 	if cmd == "openro" {
-		db, err := sql.Open("sqlite3", "file:"+f[2]+"?_journal_mode=WAL&_busy_timeout=5000")
+		db, err := sql.Open("sqlite", "file:"+f[2]+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
 		if err != nil {
 			return "", err
 		}
@@ -215,7 +215,7 @@ func (a *app) do(f []string) (string, error) {
 
 // queryRows runs one query on a connection of its own and formats the rows.
 func queryRows(path, query string) (string, error) {
-	db, err := sql.Open("sqlite3", "file:"+path+"?_busy_timeout=5000")
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
 	if err != nil {
 		return "", err
 	}

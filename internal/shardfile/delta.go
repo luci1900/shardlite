@@ -29,11 +29,10 @@ const DefaultDeltaAge = 15 * time.Minute
 
 // DefaultDeltaSize is how many bytes of tail a shard may hold before a delta is
 // written, whatever its age: it bounds the memory the tails take.
-const DefaultDeltaSize = 1 << 20
+const DefaultDeltaSize = 256 << 10
 
 // Hooks let tests stop between steps. A returned error aborts the operation
-// at that point, as a crash would. The node also uses AfterFileWrite: it writes a wake hint there
-// (docs/internals.md, Message delivery), and a hint that can't be written leaves the snapshot to the next pass.
+// at that point, as a crash would.
 type Hooks struct {
 	AfterFileWrite  func() error // delta or base written, manifest not yet updated
 	AfterRebaseSwap func() error // rebase's manifest update done, superseded files not yet deleted
@@ -453,5 +452,9 @@ func (h *Handle) getFile(ctx context.Context, f File) (*spool.File, error) {
 		return nil, err
 	}
 	defer rc.Close()
-	return download(h.F, rc)
+	dir, err := h.F.tempDir()
+	if err != nil {
+		return nil, err
+	}
+	return spool.Collect(dir, 0, rc) // whatever its size
 }

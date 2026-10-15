@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-	"time"
 
 	"golang.org/x/sync/errgroup"
 
@@ -18,7 +17,7 @@ import (
 
 func TestManifestStoreCompareAndSwap(t *testing.T) {
 	t.Parallel()
-	e, ctx := harness.New(t, time.Hour), context.Background()
+	e, ctx := harness.New(t), context.Background()
 	ms := shardfile.NewManifestStore(e.Store)
 	m := &shardfile.Manifest{Generation: "g", Owner: "n1", NodeEpoch: 1, Files: []string{}, Journal: "n1"}
 
@@ -59,8 +58,8 @@ func TestManifestStoreCompareAndSwap(t *testing.T) {
 
 func TestClaim(t *testing.T) {
 	t.Parallel()
-	e, ctx := harness.New(t, time.Hour), context.Background()
-	h, created, err := e.Files.Open(ctx, "users/1")
+	e, ctx := harness.New(t), context.Background()
+	h, created, err := e.Files.Open(ctx, "users/1", false)
 	if err != nil || !created {
 		t.Fatal(err)
 	}
@@ -80,11 +79,11 @@ func TestClaim(t *testing.T) {
 		t.Fatal(err)
 	}
 	n2files := &shardfile.Files{Blob: blob.NewStore(e.Blob, "n2", l2.Epoch, blob.Options{}), Node: "n2", Leases: other, TempDir: t.TempDir()}
-	h2, _, err := n2files.Open(ctx, "users/2")
+	h2, _, err := n2files.Open(ctx, "users/2", false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	mine, _, err := e.Files.Open(ctx, "users/2")
+	mine, _, err := e.Files.Open(ctx, "users/2", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +106,7 @@ func TestClaim(t *testing.T) {
 // everybody agrees on the winner's generation, and only the winner created it.
 func TestCreatorsRacing(t *testing.T) {
 	t.Parallel()
-	e, ctx := harness.New(t, time.Hour), context.Background()
+	e, ctx := harness.New(t), context.Background()
 	other := coord.NewRegistry(e.Blob, "n2", coord.RegistryOptions{})
 	l2, err := other.Acquire(ctx, coord.NodeInfo{Name: "n2"})
 	if err != nil {
@@ -167,8 +166,8 @@ func TestCreatorsRacing(t *testing.T) {
 // nothing, and deleting a shard with no manifest is done.
 func TestDeleteShard(t *testing.T) {
 	t.Parallel()
-	e, ctx := harness.New(t, time.Hour), context.Background()
-	h, _, err := e.Files.Open(ctx, "users/e1")
+	e, ctx := harness.New(t), context.Background()
+	h, _, err := e.Files.Open(ctx, "users/e1", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +175,7 @@ func TestDeleteShard(t *testing.T) {
 	if _, err := e.Files.Blob.Create(ctx, key, strings.NewReader("x")); err != nil {
 		t.Fatal(err)
 	}
-	other, _, err := e.Files.Open(ctx, "users/e1")
+	other, _, err := e.Files.Open(ctx, "users/e1", false)
 	if err != nil {
 		t.Fatal(err)
 	}

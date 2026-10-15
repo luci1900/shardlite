@@ -51,7 +51,7 @@ func restoreDump(t *testing.T, e *harness.Env, name string) string {
 
 func TestDeltaEqualsReplayingTail(t *testing.T) {
 	t.Parallel()
-	e := harness.New(t, 10*time.Millisecond)
+	e := harness.New(t)
 	ctx := context.Background()
 	app := e.StartApp(shard)
 	app.Must(t, "insert", "a", "200", "1000") // about 50 pages, so a delta is clearly smaller than the base
@@ -109,7 +109,7 @@ func mustFile(t *testing.T, s string) shardfile.File {
 
 func TestMaybeSnapshotByAge(t *testing.T) {
 	t.Parallel()
-	e := harness.New(t, 10*time.Millisecond)
+	e := harness.New(t)
 	ctx := context.Background()
 	app := e.StartApp(shard)
 	h, sh := e.NewShard(shard)
@@ -126,7 +126,7 @@ func TestMaybeSnapshotByAge(t *testing.T) {
 
 func TestCrashBetweenFileAndManifest(t *testing.T) {
 	t.Parallel()
-	e := harness.New(t, 10*time.Millisecond)
+	e := harness.New(t)
 	ctx := context.Background()
 	app := e.StartApp(shard)
 	h, sh := e.NewShard(shard)
@@ -176,7 +176,7 @@ func TestCrashBetweenFileAndManifest(t *testing.T) {
 // A failed manifest update (storage error) behaves the same as a crash before it.
 func TestManifestUpdateFails(t *testing.T) {
 	t.Parallel()
-	e := harness.New(t, 10*time.Millisecond)
+	e := harness.New(t)
 	ctx := context.Background()
 	app := e.StartApp(shard)
 	h, sh := e.NewShard(shard)
@@ -208,7 +208,7 @@ type mustDoer interface {
 // start again from transaction 1 (whose local file the delta removed).
 func TestUploadFailsAfterDelta(t *testing.T) {
 	t.Parallel()
-	e := harness.New(t, 10*time.Millisecond)
+	e := harness.New(t)
 	ctx := context.Background()
 	app := e.StartApp(shard)
 	h, sh := e.NewShard(shard)
@@ -262,9 +262,9 @@ func TestLostResponses(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("manifest create", func(t *testing.T) {
-		e := harness.New(t, 10*time.Millisecond)
+		e := harness.New(t)
 		fired := lose(e, blob.OpCreate, "manifests/")
-		h, created, err := e.Files.Open(ctx, shard)
+		h, created, err := e.Files.Open(ctx, shard, false)
 		if err != nil || !created || !fired.Load() {
 			t.Fatalf("created=%v fired=%v err=%v", created, fired.Load(), err)
 		}
@@ -275,7 +275,7 @@ func TestLostResponses(t *testing.T) {
 	})
 
 	t.Run("manifest update", func(t *testing.T) {
-		e := harness.New(t, 10*time.Millisecond)
+		e := harness.New(t)
 		ctx := context.Background()
 		app := e.StartApp(shard)
 		h, sh := e.NewShard(shard)
@@ -295,9 +295,9 @@ func TestLostResponses(t *testing.T) {
 	})
 
 	t.Run("conflict is not mistaken for our own write", func(t *testing.T) {
-		e := harness.New(t, 10*time.Millisecond)
-		h, _, _ := e.Files.Open(ctx, shard)
-		other, _, _ := e.Files.Open(ctx, shard) // somebody else holding the same manifest
+		e := harness.New(t)
+		h, _, _ := e.Files.Open(ctx, shard, false)
+		other, _, _ := e.Files.Open(ctx, shard, false) // somebody else holding the same manifest
 		if err := other.Touch(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -307,7 +307,7 @@ func TestLostResponses(t *testing.T) {
 	})
 
 	t.Run("ltx file create", func(t *testing.T) {
-		e := harness.New(t, 10*time.Millisecond)
+		e := harness.New(t)
 		app := e.StartApp(shard)
 		h, sh := e.NewShard(shard)
 		write(t, e, app, func() error { return sh.Sync(ctx) }, 0)
@@ -320,7 +320,7 @@ func TestLostResponses(t *testing.T) {
 	})
 
 	t.Run("a different object under the name is a conflict", func(t *testing.T) {
-		e := harness.New(t, 10*time.Millisecond)
+		e := harness.New(t)
 		app := e.StartApp(shard)
 		h, sh := e.NewShard(shard)
 		write(t, e, app, func() error { return sh.Sync(ctx) }, 0)
@@ -334,7 +334,7 @@ func TestLostResponses(t *testing.T) {
 	})
 
 	t.Run("delete", func(t *testing.T) {
-		e := harness.New(t, 10*time.Millisecond)
+		e := harness.New(t)
 		app := e.StartApp(shard)
 		h, sh := e.NewShard(shard)
 		for i := range 3 {
@@ -365,7 +365,7 @@ func TestLostResponses(t *testing.T) {
 // shutdown, with the shard kept).
 func TestManifestUpdateWithAnUnknownOutcomeDoesNotLeaveAStaleHandle(t *testing.T) {
 	t.Parallel()
-	e := harness.New(t, 10*time.Millisecond)
+	e := harness.New(t)
 	ctx := context.Background()
 	app := e.StartApp(shard)
 	h, sh := e.NewShard(shard)
@@ -404,7 +404,7 @@ func TestManifestUpdateWithAnUnknownOutcomeDoesNotLeaveAStaleHandle(t *testing.T
 // write lands, and the next call (with a live context) must still work.
 func TestManifestUpdateCancelledAfterLandingDoesNotLeaveAStaleHandle(t *testing.T) {
 	t.Parallel()
-	e := harness.New(t, 10*time.Millisecond)
+	e := harness.New(t)
 	app := e.StartApp(shard)
 	h, sh := e.NewShard(shard)
 	write(t, e, app, func() error { return sh.Sync(context.Background()) }, 0)

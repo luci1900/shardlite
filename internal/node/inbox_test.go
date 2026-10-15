@@ -15,7 +15,7 @@ import (
 	"github.com/luci1900/shardlite/internal/blob"
 )
 
-// fakeClock is the manager's Clock in tests that move time: nothing that waits
+// fakeClock is the shards' Clock in tests that move time: nothing that waits
 // on it (a timer, a ticker, a backoff) fires until Advance moves it past.
 type fakeClock struct {
 	mu     sync.Mutex
@@ -55,14 +55,6 @@ func (c *fakeClock) stopper(t *fakeTimer) func() bool {
 		delete(c.timers, t)
 		return was
 	}
-}
-
-func (c *fakeClock) AfterFunc(d time.Duration, f func()) func() bool {
-	t, due := c.add(d, 0, f)
-	if due {
-		go c.fire(t) // as time.AfterFunc does: the caller may hold a lock that f takes
-	}
-	return c.stopper(t)
 }
 
 func (c *fakeClock) NewTimer(d time.Duration) (<-chan time.Time, func() bool) {
@@ -115,8 +107,8 @@ func (c *fakeClock) Advance(d time.Duration) {
 	}
 }
 
-func withClock(c Clock) func(*ManagerOptions) {
-	return func(o *ManagerOptions) { o.Clock = c }
+func withClock(c Clock) func(*ShardsOptions) {
+	return func(o *ShardsOptions) { o.Clock = c }
 }
 
 // setRow sets a keyed row in the shard's own inbox, replacing the one with the same key.
@@ -186,7 +178,7 @@ func TestOwnRowOfALostCommitNeverFires(t *testing.T) {
 	r.setRow("wallet/rm3", "k", "/never", time.Now().Unix()-5)
 	r.closeInApp("wallet/rm3")
 	r.crash()
-	r.n.Close(context.Background(), false)
+	r.stopJournal()
 	r.restart(manualFlush)
 	ref := r.acquire("wallet/rm3")
 	defer ref.Release()
@@ -355,15 +347,12 @@ func TestNodeMakesNoCommitsForInboxRows(t *testing.T) {
 	r.record(rec, "")
 	r.sql("users/nc1", fmt.Sprintf(`INSERT INTO _shardlite_inbox (path, due) VALUES ('/ignored', %d)`, time.Now().Unix()-1))
 	eventually(t, "the row to be given up", func() bool { return strings.Contains(logs.String(), "giving up on an inbox row") })
-	sh := r.m.active["users/nc1"].cap.Load()
-	before, err := sh.Header()
-	if err != nil {
-		t.Fatal(err)
-	}
+	sh := r.shard("users/nc1").cap.load()
+	before := header(t, sh)
 	pos := sh.Position()
 	r.settle("users/nc1") // the node's own cycles would have committed by now
 	r.cycle()
-	if after, _ := sh.Header(); after != before || sh.Position() != pos {
+	if header(t, sh) != before || sh.Position() != pos {
 		t.Fatal("the node committed to a shard with only an inbox row")
 	}
 }
@@ -416,12 +405,12 @@ func TestOwnRowAnHourAwayWakesTheShard(t *testing.T) {
 					t.Fatalf("hints %v, want %s", keys, hint)
 				}
 				clk.Advance(3601 * time.Second)
-				r.m.scanWakes(context.Background())
+				r.m.wakes.scan(context.Background())
 			case "after a crash":
 				eventually(t, "the hint, written while the shard is active", func() bool { return len(r.wakes()) == 1 })
 				r.closeInApp("users/wh1")
 				r.crash()
-				r.n.Close(context.Background(), false)
+				r.stopJournal()
 				clk.Advance(3601 * time.Second)
 				r.restart(opts)
 			case "new machine":
@@ -478,9 +467,9 @@ func TestInboxRowDueNowKeepsTheShardActive(t *testing.T) {
 	r.record(rec, "")
 	r.setRow("users/dn1", "k", "/now", clk.Now().Unix()-5)
 	r.closeInApp("users/dn1") // idle timeout is 300 ms
-	// Move the clock past the idle timeout until the janitor has looked at the
+	// Move the clock past the idle timeout until the idle timer has looked at the
 	// shard and kept it (it sets the shard's next look when it does).
-	advanceUntil(t, clk, 100*time.Millisecond, "the janitor to keep the shard", r.lookedAt("users/dn1"))
+	advanceUntil(t, clk, 100*time.Millisecond, "the idle timer to keep the shard", r.lookedAt("users/dn1"))
 	if !r.m.IsActive("users/dn1") {
 		t.Fatal("a shard with an inbox row due was deactivated")
 	}
@@ -502,10 +491,11 @@ func TestAutoDeleteShardWithARowDueLaterStaysActiveUntilItIsConsumed(t *testing.
 	due := clk.Now().Unix() + 3600
 	r.setRow("lobby/rm1", "timeout", "/tick", due)
 	r.closeInApp("lobby/rm1")
-	advanceUntil(t, clk, time.Second, "the janitor to keep the shard", r.lookedAt("lobby/rm1"))
+	advanceUntil(t, clk, time.Second, "the idle timer to keep the shard", r.lookedAt("lobby/rm1"))
+	a := r.shard("lobby/rm1")
 	for range 5 {
-		passes := r.m.Stats.Janitor.Load() // the janitor ticks on the clock: well past the idle timeout, short of the row
-		advanceUntil(t, clk, time.Second, "a pass of the janitor", func() bool { return r.m.Stats.Janitor.Load() > passes })
+		looks := a.looks.idle.Load() // well past the idle timeout, short of the row
+		advanceUntil(t, clk, time.Second, "a look of the idle timer", func() bool { return a.looks.idle.Load() > looks })
 	}
 	if !r.m.IsActive("lobby/rm1") {
 		t.Fatal("an auto-delete shard with a row due later was deactivated")
@@ -535,7 +525,7 @@ func TestAutoDeleteShardIsDeletedOnceItsRowIsCancelled(t *testing.T) {
 	clk := newFakeClock()
 	r := newSRigWith(t, both(quick, withClock(clk)))
 	r.setRow("lobby/rm2", "timeout", "/tick", clk.Now().Unix()+3600)
-	advanceUntil(t, clk, time.Second, "the janitor to keep the shard", func() bool { return r.lookedAt("lobby/rm2")() })
+	advanceUntil(t, clk, time.Second, "the idle timer to keep the shard", func() bool { return r.lookedAt("lobby/rm2")() })
 	r.sql("lobby/rm2", `DELETE FROM _shardlite_inbox WHERE key = 'timeout'`)
 	r.closeInApp("lobby/rm2")
 	advanceUntil(t, clk, time.Second, "deletion", func() bool { return r.m.Stats.AutoDeletes.Load() == 1 && r.inactive("lobby/rm2")() })
@@ -596,7 +586,7 @@ func TestShutdownDeletesAnAutoDeleteShardWithNoRows(t *testing.T) {
 func TestHintWriteFailingAtShutdownIsRetried(t *testing.T) {
 	t.Parallel()
 	var logs syncBuffer
-	// The slow kind has an idle timeout of an hour, so the janitor does not
+	// The slow kind has an idle timeout of an hour, so the idle timer does not
 	// deactivate the shard (and use up the failures) before the shutdown does.
 	r := newSRigWith(t, both(quick, logTo(&logs), drainFor(200*time.Millisecond)))
 	var failures atomic.Int32

@@ -49,7 +49,7 @@ func TestReadOnlyShardLeavesNothing(t *testing.T) {
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the file is still there: %v", err)
 	}
-	if rows, _ := r.m.idx.all(); len(rows) != 0 {
+	if rows, _ := r.m.cache.idx.all(); len(rows) != 0 {
 		t.Fatalf("index rows left: %+v", rows)
 	}
 	creates := r.m.Stats.Creates.Load()
@@ -214,7 +214,7 @@ func TestNeverWrittenShardIsKeptWhenItsManifestChanged(t *testing.T) {
 	})
 	ref.Release()
 	eventually(t, "the delete to lose", changed.Load)
-	r.afterPasses(1) // the janitor has looked again and kept the shard
+	r.afterLooks(1, "users/e7") // the idle timer has looked again and kept the shard
 	if !r.m.IsActive("users/e7") {
 		t.Fatal("the shard was deactivated although its manifest could not be deleted")
 	}
@@ -252,7 +252,7 @@ func (r *mrig) mustBeGone(target, path string) {
 			r.t.Fatalf("%s is still there: %v", p, err)
 		}
 	}
-	if rows, _ := r.m.idx.all(); len(rows) != 0 {
+	if rows, _ := r.m.cache.idx.all(); len(rows) != 0 {
 		r.t.Fatalf("index rows left: %+v", rows)
 	}
 }
@@ -324,7 +324,7 @@ func TestAutoDeleteShardLeavesNothingAfterDeactivation(t *testing.T) {
 // A shard that lived long enough for a background delta has the delta deleted too.
 func TestAutoDeleteShardDeletesItsBackgroundDelta(t *testing.T) {
 	t.Parallel()
-	r := newMRigWith(t, func(o *ManagerOptions) { o.DeltaAge = 30 * time.Millisecond })
+	r := newMRigWith(t, func(o *ShardsOptions) { o.Lifecycle.DeltaAge = 30 * time.Millisecond })
 	ctx := context.Background()
 	ref := r.acquire("lobby/l3")
 	r.write(ref, "a")
@@ -368,10 +368,10 @@ func TestAutoDeleteShardSurvivesACrash(t *testing.T) {
 			}
 			r.app.Must(t, "close", "a")
 			r.crash()
-			r.n.Close(ctx, false)
+			r.stopJournal()
 
 			r.startNode()
-			r.startManager(nil)
+			r.startShards(nil)
 			ref = r.acquire(target)
 			defer ref.Release()
 			m, err := r.manifest(target)
@@ -405,7 +405,7 @@ func (r *mrig) writeAndRelease(target string) (path, generation string) {
 	return path, m.Generation
 }
 
-func withDeltas(o *ManagerOptions) { o.DeltaAge = 30 * time.Millisecond }
+func withDeltas(o *ShardsOptions) { o.Lifecycle.DeltaAge = 30 * time.Millisecond }
 
 // The delete after deactivation goes manifest first. If the manifest can't be
 // deleted nothing is deleted and the shard stays active, with its data; the next
@@ -436,7 +436,7 @@ func TestAutoDeleteFailingManifestDeleteKeepsTheShard(t *testing.T) {
 	r.app.Must(t, "close", "a")
 	ref.Release()
 	eventually(t, "a failed delete", func() bool { return tries.Load() >= 1 })
-	r.afterPasses(1)
+	r.afterLooks(1, "lobby/f1")
 	if !r.m.IsActive("lobby/f1") {
 		t.Fatal("the shard was deactivated although its manifest could not be deleted")
 	}
@@ -517,11 +517,11 @@ func TestAutoDeleteCrashAfterTheManifestDelete(t *testing.T) {
 		t.Fatalf("manifest: %v, want none by now", err)
 	}
 	r.crash()
-	r.n.Close(context.Background(), false)
+	r.stopJournal()
 	r.local.SetHook(nil)
 
 	r.startNode()
-	r.startManager(nil)
+	r.startShards(nil)
 	ref = r.acquire("lobby/f3")
 	defer ref.Release()
 	if m, err := r.manifest("lobby/f3"); err != nil || m.Generation == old.Generation {

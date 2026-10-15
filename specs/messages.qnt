@@ -202,29 +202,26 @@ module messages {
 
   // -- Shipping and life cycle
 
+  // The node reads the shard after the flush and writes the hint for its earliest inbox row (reconcile), which
+  // the model takes as part of the flush. (If that write fails the shard is not read again until it changes,
+  // which is why a delta checks too. The Go tests cover that.)
   action flush(i) = all {
     val sh = s.shards.get(i)
     all {
       sh.active,
       sh.file != sh.durable,
-      s' = withShard(s, i, { ...sh, durable: sh.file, tailed: true })
+      s' = { ...withShard(s, i, { ...sh, durable: sh.file, tailed: true }),
+             hints: if (sh.file.inbox.size() > 0 or sh.file.later.size() > 0) s.hints.union(Set(i)) else s.hints }
     }
   }
 
-  // A delta turns the tail into files. The tail is the only sign an adopter has that a shard may have
-  // work, so a shard with a live outbox row gets its hint before the tail goes (and the delta waits if the hint
-  // can't be written, which is the same thing as the hint and the delta being one step here).
+  // A delta turns the tail into files. The tail is what tells an adopter that a shard may have work, so after
+  // this a crash is adopted with no hint for outbox rows that are still undelivered. That is accepted (see
+  // outboxMayWait). Inbox rows already have their hint, from the flush.
   action delta(i) = all {
-    val sh = s.shards.get(i)
-    all {
-      sh.active,
-      sh.tailed,
-      // The hint for inbox rows is written moments after their flush and a delta needs a tail minutes old, so
-      // the model has the hint first. (If the hint write keeps failing the code could be caught out here.)
-      (sh.durable.later.size() == 0 and sh.durable.inbox.size() == 0) or s.hints.contains(i),
-      s' = { ...withShard(s, i, { ...sh, tailed: false }),
-             hints: if (sh.file.outbox.size() > 0) s.hints.union(Set(i)) else s.hints }
-    }
+    s.shards.get(i).active,
+    s.shards.get(i).tailed,
+    s' = withShard(s, i, { ...s.shards.get(i), tailed: false })
   }
 
   action activate(i) = all {
@@ -371,18 +368,24 @@ module messages {
       listToSet(sh.durable.effects).intersect(sh.durable.inbox.union(sh.durable.later)).size() == 0
   })
 
-  // This was violated until a delta wrote the hint: a shard with a durable outbox row whose tail had become a
-  // delta and which then crashed was adopted with no tail to replay, so no hint was written and the shard was
-  // inactive with work and no way to be woken except a request that happened to reach it. Removing the
-  // hint from `delta` makes this fail again (a durable outbox row, a delta, a crash, an adoption).
-  // A shard that is not active and not waiting for an adopter, with work in its tables, has a wake hint, so
-  // the work is not stranded.
+  // The promise about waking: a shard that is not active and not waiting for an adopter, with inbox rows (a
+  // timer, or a message not yet handled), has a wake hint, so it is woken when they are due.
   val notStranded = SHARDS.forall(i => {
     val sh = s.shards.get(i)
-    (not(sh.active) and not(sh.orphan) and hasWork(sh.durable)) implies s.hints.contains(i)
+    (not(sh.active) and not(sh.orphan) and (sh.durable.inbox.size() > 0 or sh.durable.later.size() > 0))
+      implies s.hints.contains(i)
   })
 
-  // Everything except notStranded, for checking the delivery properties on their own.
+  // What is not promised: an outbox row that was still undelivered when the shard's tail became a delta, followed
+  // by a crash, waits for the shard's next request, call or timer. A recurring row in the sender's own inbox
+  // covers it. The witness below shows the case is reachable. (Delivery has to have been failing for minutes,
+  // since a delta needs a tail that old.)
+  val neverOutboxWaits = SHARDS.forall(i => {
+    val sh = s.shards.get(i)
+    not(not(sh.active) and not(sh.orphan) and sh.durable.outbox.size() > 0 and not(s.hints.contains(i)))
+  })
+
+  // The delivery properties on their own.
   val core = and { noPhantom, noLoss, ackedIsDurable, handledOnce }
 
   val safe = and { noPhantom, noLoss, ackedIsDurable, handledOnce, notStranded }

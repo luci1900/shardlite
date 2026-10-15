@@ -3,6 +3,7 @@ package node_test
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -16,6 +17,7 @@ import (
 	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
+	"github.com/luci1900/shardlite/internal/supervisor"
 )
 
 type rig struct {
@@ -24,6 +26,8 @@ type rig struct {
 	dir   string
 	meta  string
 	app   *apptest.App
+	tails map[*node.Node]*node.TailSet // the shards each node's lease counts
+	stops map[*node.Node]func()        // each node's stop of its writer and keeper
 }
 
 func newRig(t *testing.T) *rig {
@@ -34,15 +38,22 @@ func newRig(t *testing.T) *rig {
 // start is a node whose lease is never renewed by itself (the tests decide
 // what the lease says), with an hour of validity.
 func (r *rig) start() (*node.Node, error) {
-	return node.Start(context.Background(), node.Config{
+	n, err := node.Start(context.Background(), node.Config{
 		Name:    "n1",
 		TempDir: r.t.TempDir(),
 		Backend: r.local,
-		Flush:   10 * time.Millisecond,
 		Blob:    blob.Options{Backoff: time.Millisecond},
 		Lease:   coord.RegistryOptions{TTL: time.Hour, Blob: blob.Options{Backoff: time.Millisecond}},
 		Keeper:  coord.KeeperOptions{Interval: 30 * time.Minute, Margin: time.Minute},
 	})
+	if err == nil {
+		if r.tails == nil {
+			r.tails = map[*node.Node]*node.TailSet{}
+		}
+		r.tails[n] = &node.TailSet{}
+		n.SetTails(r.tails[n])
+	}
+	return n, err
 }
 
 func (r *rig) mustStart() *node.Node {
@@ -51,7 +62,11 @@ func (r *rig) mustStart() *node.Node {
 	if err != nil {
 		r.t.Fatal(err)
 	}
-	r.t.Cleanup(func() { n.Close(context.Background(), false) })
+	if r.stops == nil {
+		r.stops = map[*node.Node]func(){}
+	}
+	r.stops[n] = supervisor.Background(slog.Default(), "journal", n.Writer, n.Keeper)
+	r.t.Cleanup(r.stops[n])
 	return n
 }
 
@@ -69,7 +84,7 @@ func (r *rig) create(n *node.Node, name string) *liveShard {
 	ctx := context.Background()
 	s := &liveShard{name: name, path: filepath.Join(r.dir, strings.ReplaceAll(name, "/", "-")+".db"), id: strings.ReplaceAll(name, "/", "-")}
 	r.app.Must(r.t, "open", s.id, s.path)
-	h, created, err := n.Files.Open(ctx, name)
+	h, created, err := n.Files.Open(ctx, name, false)
 	if err != nil || !created {
 		r.t.Fatalf("open %s: created=%v err=%v", name, created, err)
 	}
@@ -77,7 +92,7 @@ func (r *rig) create(n *node.Node, name string) *liveShard {
 	if err != nil {
 		r.t.Fatal(err)
 	}
-	n.Track(sh)
+	r.tails[n].Track(sh)
 	s.h, s.sh = h, sh
 	return s
 }
@@ -139,7 +154,7 @@ func TestRestartAdoptsItsOwnJournal(t *testing.T) {
 				t.Fatal(err)
 			}
 			// A shard deleted since: its manifest is gone, its entries are never read.
-			if err := n1.Files.Manifests.Delete(ctx, "users/3", deleted.h.ETag); err != nil {
+			if err := shardfile.NewManifestStore(n1.Store).Delete(ctx, "users/3", deleted.h.ETag); err != nil {
 				t.Fatal(err)
 			}
 			r.commit(quiet, 1)
@@ -275,7 +290,7 @@ func TestAdoptionWithExpiredSegments(t *testing.T) {
 	ok := r.create(n1, "users/2")
 	r.commit(s, 3) // each sync waits for its own segment
 	r.commit(ok, 1)
-	n1.Writer.Close()
+	r.stops[n1]()
 	// The lease says the journal runs from segment 1 up to the writer's next number (a day later, say).
 	l1 := n1.Keeper.Lease()
 	info := n1.Info()
@@ -319,7 +334,7 @@ func TestHoleInTheMiddleOfTheRangeFailsTheStart(t *testing.T) {
 	if info.JournalFrom > 1 {
 		t.Fatalf("range starts at %d", info.JournalFrom)
 	}
-	n1.Writer.Close()
+	r.stops[n1]()
 	// A segment in the middle of the range disappears.
 	if err := n1.Store.Delete(ctx, segment.Key("n1", info.JournalFrom+2), ""); err != nil {
 		t.Fatal(err)

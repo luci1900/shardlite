@@ -1,0 +1,459 @@
+package node
+
+import (
+	"context"
+	"errors"
+	"runtime"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"golang.org/x/sync/errgroup"
+
+	"github.com/luci1900/shardlite/internal/blob"
+)
+
+// Tests of the table and the shard actor (docs/concurrency.md, The tree).
+
+// blockCreates holds every create of a key with prefix in the bucket until the
+// returned function is called: entered gets a value as each one arrives, and
+// inside counts those held now.
+func (r *mrig) blockCreates(prefix string) (entered chan string, inside *atomic.Int32, unblock func()) {
+	entered = make(chan string, 64)
+	inside = new(atomic.Int32)
+	gate := make(chan struct{})
+	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
+		if op != blob.OpCreate || after || !strings.HasPrefix(key, prefix) {
+			return nil
+		}
+		inside.Add(1)
+		defer inside.Add(-1)
+		entered <- key
+		select {
+		case <-gate:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	var once sync.Once
+	return entered, inside, func() { once.Do(func() { close(gate) }) }
+}
+
+// notYet fails the test if ch delivers within a short while: for a request that
+// must be waiting.
+func notYet[T any](t *testing.T, what string, ch <-chan T) {
+	t.Helper()
+	select {
+	case <-ch:
+		t.Fatalf("%s did not wait", what)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// Two requests for a shard that isn't active share one activation: the second
+// finds the first one's entry and waits for it.
+func TestTwoActivationsOfOneNameShareOne(t *testing.T) {
+	t.Parallel()
+	r := newMRig(t)
+	entered, _, unblock := r.blockCreates("manifests/users/sa1")
+	defer unblock()
+	refs := make(chan *Ref, 2)
+	var g errgroup.Group
+	defer g.Wait()
+	acquire := func() {
+		g.Go(func() error {
+			ref, err := r.m.Acquire(context.Background(), "users/sa1")
+			if err != nil {
+				return err
+			}
+			refs <- ref
+			return nil
+		})
+	}
+	acquire()
+	<-entered // the first activation is creating the shard's manifest
+	acquire()
+	if e := r.m.tab.load("users/sa1"); e == nil || !e.is(entryActivating) {
+		t.Fatal("no activating entry for the shard")
+	}
+	notYet(t, "a request for a shard being activated", refs)
+	unblock()
+	if err := g.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	a, b := <-refs, <-refs
+	defer a.Release()
+	defer b.Release()
+	if a.a != b.a {
+		t.Fatal("the two requests got different shards")
+	}
+	if n, c := r.m.Stats.Activations.Load(), r.m.Stats.Creates.Load(); n != 1 || c != 1 {
+		t.Fatalf("%d activations and %d creates, want one of each", n, c)
+	}
+}
+
+// A request that arrives while its shard is being let go of waits for the
+// release, then activates the shard again: it never gets the shard that is
+// going.
+func TestAnActivationRacingARelease(t *testing.T) {
+	t.Parallel()
+	r := newMRig(t)
+	ctx := context.Background()
+	ref := r.acquire("slow/ar1")
+	r.write(ref, "a")
+	if err := r.m.Gate(ctx, ref, true); err != nil {
+		t.Fatal(err)
+	}
+	want := r.liveDump(ref.Path())
+	r.app.Must(t, "close", "a")
+	ref.Release()
+	old := ref.a
+
+	entered, _, unblock := r.blockCreates("shards/slow/ar1/") // the release's delta
+	defer unblock()
+	released := make(chan error, 1)
+	go func() {
+		ok, err := old.release(ctx)
+		if err == nil && !ok {
+			err = errors.New("not released")
+		}
+		released <- err
+	}()
+	<-entered
+	if !old.e.is(entryBusy) {
+		t.Fatal("the entry of a shard being let go of is not busy")
+	}
+	got := make(chan *Ref, 1)
+	go func() {
+		ref, err := r.m.Acquire(ctx, "slow/ar1")
+		if err != nil {
+			t.Error(err)
+		}
+		got <- ref
+	}()
+	notYet(t, "a request for a shard being let go of", got)
+	unblock()
+	if err := <-released; err != nil {
+		t.Fatal(err)
+	}
+	ref = <-got
+	if ref == nil {
+		t.FailNow()
+	}
+	defer ref.Release()
+	<-old.ended
+	if ref.a == old {
+		t.Fatal("the request got the shard that was let go of")
+	}
+	if n, hits := r.m.Stats.Activations.Load(), r.m.Stats.CachedHits.Load(); n != 2 || hits != 1 {
+		t.Fatalf("%d activations, %d from the cache: want the shard activated again from its cached file", n, hits)
+	}
+	if r.liveDump(ref.Path()) != want {
+		t.Fatal("the shard differs after it was activated again")
+	}
+}
+
+// A request that found an entry just before it was removed looks the name up
+// again, and removing an entry never removes the one that took its place.
+func TestARequestRacingTheRemovalOfItsEntry(t *testing.T) {
+	t.Parallel()
+	r := newMRig(t)
+	ctx := context.Background()
+	// A cached shard's entry (an eviction, say) that a request finds and waits on.
+	e, ok := r.m.tab.claim("users/rr1")
+	if !ok {
+		t.Fatal("could not claim a name with no entry")
+	}
+	if _, ok := r.m.tab.claim("users/rr1"); ok {
+		t.Fatal("claimed a name twice")
+	}
+	got := make(chan *Ref, 1)
+	go func() {
+		ref, err := r.m.Acquire(ctx, "users/rr1")
+		if err != nil {
+			t.Error(err)
+		}
+		got <- ref
+	}()
+	notYet(t, "a request for a name with a busy entry", got)
+	r.m.tab.remove(e, nil)
+	ref := <-got
+	if ref == nil {
+		t.FailNow()
+	}
+	defer ref.Release()
+	if ref.a.e == e || r.m.Stats.Activations.Load() != 1 {
+		t.Fatal("the request did not activate the shard under an entry of its own")
+	}
+	// The removed entry, as a request that loaded it just before sees it.
+	if ok, wait, err := e.take(r.m.now()); ok || wait != nil || err != nil {
+		t.Fatalf("a removed entry: ok %v, wait %v, err %v, want a look again", ok, wait != nil, err)
+	}
+	r.m.tab.remove(e, nil)
+	r.m.tab.forget(e)
+	if r.m.tab.load("users/rr1") != ref.a.e {
+		t.Fatal("removing an old entry again removed the one that took its place")
+	}
+	if r.refs("users/rr1") != 1 {
+		t.Fatalf("%d references, want the request's", r.refs("users/rr1"))
+	}
+}
+
+// A request never waits for a delta: references are taken in the entry, not
+// through the shard's loop, and gates wait for the flush loop alone.
+func TestADeltaNeverDelaysARequest(t *testing.T) {
+	t.Parallel()
+	r := newMRigWith(t, func(o *ShardsOptions) { o.Lifecycle.DeltaAge = time.Millisecond })
+	ctx := context.Background()
+	ref := r.acquire("wallet/dd1")
+	defer ref.Release()
+	entered, _, unblock := r.blockCreates("shards/wallet/dd1/")
+	defer unblock()
+	r.write(ref, "a")
+	if err := r.m.Gate(ctx, ref, true); err != nil {
+		t.Fatal(err)
+	}
+	<-entered // the shard's loop is in a delta, held in blob storage
+	quick, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	for range 3 {
+		other, err := r.m.Acquire(quick, "wallet/dd1")
+		if err != nil {
+			t.Fatalf("a request waited for the delta: %v", err)
+		}
+		other.Release()
+	}
+	r.app.Must(t, "insert", "a", "1", "100")
+	if err := r.m.Gate(quick, ref, true); err != nil {
+		t.Fatalf("a gate waited for the delta: %v", err)
+	}
+	if len(entered) != 0 {
+		t.Fatal("a second delta started")
+	}
+	unblock()
+	eventually(t, "the delta", func() bool {
+		m, err := r.manifest("wallet/dd1")
+		return err == nil && len(m.Files) > 0
+	})
+}
+
+// A shard is let go of once it has been idle for its kind's timeout on the
+// shards' clock, counted from its last use: a request in between starts the
+// count again.
+func TestIdleDeactivationOnTheFakeClock(t *testing.T) {
+	t.Parallel()
+	clk := newFakeClock()
+	r := newMRigWith(t, withClock(clk)) // users' idle timeout is 300 ms
+	ref := r.acquire("users/fi1")
+	r.write(ref, "a")
+	if err := r.m.Gate(context.Background(), ref, true); err != nil {
+		t.Fatal(err)
+	}
+	r.app.Must(t, "close", "a")
+	ref.Release()
+	a := ref.a
+
+	clk.Advance(200 * time.Millisecond)
+	r.acquire("users/fi1").Release() // used at 200 ms: idle until 500 ms
+	clk.Advance(100 * time.Millisecond)
+	waitCounter(t, "the idle timer's look at 300 ms", &a.looks.idle, 1)
+	if !r.m.IsActive("users/fi1") {
+		t.Fatal("let go of 100 ms after its last use")
+	}
+	clk.Advance(199 * time.Millisecond)
+	if !r.m.IsActive("users/fi1") || a.looks.idle.Load() != 1 {
+		t.Fatalf("looked at again (%d looks) before the timeout since the last use", a.looks.idle.Load())
+	}
+	clk.Advance(time.Millisecond)
+	waitCounter(t, "the idle timer's look at 500 ms", &a.looks.idle, 2)
+	<-a.ended
+	if r.m.IsActive("users/fi1") || !r.cached("users/fi1") {
+		t.Fatal("not let go of after its idle timeout")
+	}
+}
+
+// At most the deactivation limit of shards are let go of at once, however many
+// are asked to be.
+func TestTheDeactivationLimitHolds(t *testing.T) {
+	t.Parallel()
+	r := newMRigWith(t, func(o *ShardsOptions) { o.limits.deactivate = 2 })
+	ctx := context.Background()
+	var shards []*shard
+	for _, name := range []string{"slow/l1", "slow/l2", "slow/l3", "slow/l4", "slow/l5"} {
+		ref := r.acquire(name)
+		r.write(ref, name)
+		if err := r.m.Gate(ctx, ref, true); err != nil {
+			t.Fatal(err)
+		}
+		r.app.Must(t, "close", name)
+		ref.Release()
+		shards = append(shards, ref.a)
+	}
+	entered, inside, unblock := r.blockCreates("shards/slow/") // the releases' deltas
+	defer unblock()
+	var g errgroup.Group
+	for _, a := range shards {
+		g.Go(func() error {
+			ok, err := a.release(ctx)
+			if err == nil && !ok {
+				err = errors.New(a.Name + " not released")
+			}
+			return err
+		})
+	}
+	<-entered
+	<-entered
+	time.Sleep(100 * time.Millisecond) // the others had time to start theirs
+	if n := inside.Load(); n != 2 {
+		t.Fatalf("%d deactivations at once, want the limit of 2", n)
+	}
+	unblock()
+	if err := g.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range shards {
+		if r.m.IsActive(a.Name) {
+			t.Fatalf("%s is still active", a.Name)
+		}
+	}
+}
+
+// A delta waits for a place under the snapshot limit, and a rebase for one
+// under the rebase limit too. A shard's loop waiting for one never holds up a
+// request.
+func TestSnapshotsWaitForAPlace(t *testing.T) {
+	t.Parallel()
+	for _, rebase := range []bool{false, true} {
+		name := map[bool]string{false: "delta", true: "rebase"}[rebase]
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			r := newMRigWith(t, func(o *ShardsOptions) {
+				o.Lifecycle.DeltaAge = time.Millisecond
+				o.limits.snapshot, o.limits.rebase = 1, 1
+				if rebase {
+					o.Lifecycle.MaxFiles = 1
+				}
+			})
+			ctx := context.Background()
+			ref := r.acquire("slow/sw1")
+			defer ref.Release()
+			files := func() int {
+				m, err := r.manifest("slow/sw1")
+				if err != nil {
+					return 0
+				}
+				return len(m.Files)
+			}
+			// A commit, and the delta timer's snapshot of it if it may take one.
+			commit := func(settle bool) {
+				r.write(ref, "a")
+				if err := r.m.Gate(ctx, ref, true); err != nil {
+					t.Fatal(err)
+				}
+				if settle {
+					eventually(t, "the tail to be in a delta", func() bool { n, _ := ref.a.cap.load().TailInfo(); return n == 0 })
+				}
+			}
+			commit(true)
+			sem, want := r.m.deps.snapshots, files()
+			if rebase {
+				sem = r.m.deps.rebases
+				sem <- struct{}{} // the only place is taken
+				// Deltas until the shard has more files than MaxFiles: then its next
+				// snapshot is a rebase.
+				for files() < 2 {
+					commit(true)
+				}
+				want = 2
+			} else {
+				sem <- struct{}{}
+				commit(false)
+			}
+			time.Sleep(100 * time.Millisecond) // a few looks of the delta timer
+			if got := files(); got != want {
+				t.Fatalf("%d files while the %s limit is taken, want %d", got, name, want)
+			}
+			quick, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			other, err := r.m.Acquire(quick, "slow/sw1")
+			if err != nil {
+				t.Fatalf("a request waited for the shard's loop: %v", err)
+			}
+			other.Release()
+			<-sem
+			if rebase {
+				want = 1
+			} else {
+				want++
+			}
+			eventually(t, "the "+name, func() bool { return files() == want })
+		})
+	}
+}
+
+// shardGoroutines lists the goroutines running the shards' code (their captures' loops too) or suture's.
+func shardGoroutines() []string {
+	buf := make([]byte, 1<<22)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	var out []string
+	for i, g := range strings.Split(string(buf), "\n\n") {
+		if i == 0 {
+			continue
+		}
+		for _, f := range []string{"node.(*shard)", "capture.(*Shard)", "node.(*msgOwner)", "node.(*wakeHints)", "node.(*messenger)", "node.(*Shards)", "node.(*table)", "node.(*Flusher)", "thejerf/suture"} {
+			if strings.Contains(g, f) {
+				out = append(out, g)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// Once the shards are let go of, every goroutine they ran has ended: each
+// shard's loop and supervisor and its deliveries, even one still waiting for
+// the app's answer. Not parallel: it looks at every goroutine.
+func TestShardsGoroutinesAreJoinedWhenTheyAreLetGo(t *testing.T) {
+	before := shardGoroutines()
+	r := newSRigWith(t, quick)
+	rec := &recorder{keep: true, hold: make(chan struct{})}
+	defer close(rec.hold)
+	r.record(rec, "")
+	// A delivery that takes a while to end once it is cancelled: only a join waits for it.
+	hook := inboxHookFn(func(ctx context.Context, call func() (int, error)) (int, error) {
+		status, err := call()
+		if ctx.Err() != nil {
+			time.Sleep(200 * time.Millisecond)
+		}
+		return status, err
+	})
+	r.inboxHook.Store(&hook)
+	r.setRow("slow/gj1", "k", "/held", time.Now().Unix())
+	eventually(t, "the delivery to reach the app", func() bool {
+		rec.mu.Lock()
+		defer rec.mu.Unlock()
+		return len(rec.got) > 0
+	})
+	r.acquire("users/gj2").Release() // and a shard with nothing to deliver
+	r.closeInApp("slow/gj1")
+	if err := r.mrig.stop(); err != nil {
+		t.Fatal(err)
+	}
+	r.stopJournal() // its supervisor is one of suture's goroutines too
+	if left := startedSince(before, shardGoroutines()); len(left) > 0 {
+		t.Fatalf("%d goroutines of the shards are left after they were let go of:\n\n%s", len(left), strings.Join(left, "\n\n"))
+	}
+	if n := len(r.m.Active()); n != 0 {
+		t.Fatalf("%d shards still active", n)
+	}
+}

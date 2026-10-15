@@ -72,9 +72,7 @@ func (s *Store) wait(ctx context.Context, attempt int) error {
 // Transient reports whether err is an outcome that retrying may fix: the
 // request certainly did nothing (ErrNotApplied) or may have done something
 // (ErrUnknown). Any other failure (a bad key, no permission) won't go away.
-func Transient(err error) bool { return retryable(err) }
-
-func retryable(err error) bool { return errors.Is(err, ErrNotApplied) || errors.Is(err, ErrUnknown) }
+func Transient(err error) bool { return errors.Is(err, ErrNotApplied) || errors.Is(err, ErrUnknown) }
 
 // settleCtx is the context for reading back after an unknown outcome: the
 // caller's values, not its cancellation, and a time limit of its own.
@@ -250,7 +248,7 @@ func (s *Store) Delete(ctx context.Context, key string, expected ETag) error {
 			return nil
 		case errors.Is(err, ErrNotFound) && ambiguous:
 			return nil
-		case retryable(err):
+		case Transient(err):
 			ambiguous = ambiguous || errors.Is(err, ErrUnknown)
 			last = err
 		default:
@@ -274,7 +272,7 @@ func read[T any](ctx context.Context, s *Store, call func() (T, error)) (T, erro
 		if err == nil {
 			return v, nil
 		}
-		if !retryable(err) {
+		if !Transient(err) {
 			return zero, err
 		}
 		last = err
@@ -310,7 +308,7 @@ func (s *Store) List(ctx context.Context, prefix string) iter.Seq2[ObjectInfo, e
 			started := false
 			failed := false
 			for info, err := range s.b.List(ctx, prefix) {
-				if err != nil && !started && retryable(err) && attempt+1 < s.opts.Attempts {
+				if err != nil && !started && Transient(err) && attempt+1 < s.opts.Attempts {
 					failed = true
 					break
 				}

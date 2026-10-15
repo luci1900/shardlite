@@ -18,7 +18,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"golang.org/x/sync/errgroup"
 	"io"
 	"log/slog"
 	"sync"
@@ -28,13 +27,14 @@ import (
 	"github.com/superfly/ltx"
 
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/notify"
 	"github.com/luci1900/shardlite/internal/spool"
+	"github.com/luci1900/shardlite/internal/supervisor"
 )
 
 const (
 	magic         = "SHLSEG01"
 	trailerSize   = 16
-	DefaultFlush  = 250 * time.Millisecond
 	seqKeyDigits  = 20
 	maxFooterSize = 1 << 30
 )
@@ -42,7 +42,7 @@ const (
 var (
 	// ErrFenced means another writer took a segment number: this writer must stop for good.
 	ErrFenced = errors.New("segment: writer fenced")
-	// ErrClosed is returned to waiters of a writer that was closed.
+	// ErrClosed is returned by a writer that has stopped being served.
 	ErrClosed = errors.New("segment: writer closed")
 	// ErrFence is returned by ReadFooter for an empty object.
 	ErrFence = errors.New("segment: fence")
@@ -77,14 +77,9 @@ func Key(node string, seq uint64) string {
 
 // Options configure a Writer.
 type Options struct {
-	Interval time.Duration // flush interval, DefaultFlush if zero
 	StartSeq uint64        // first segment number, 1 if zero
 	Retry    time.Duration // first wait before retrying an upload whose outcome is unknown, 25 ms if zero (doubling up to 40 times that)
-	// Check, if set, is asked before a segment's waiters are told it was written
-	// and before new files are accepted. A node whose lease is no longer good
-	// returns an error here, and nothing more is acknowledged.
-	Check  func() error
-	Logger *slog.Logger // slog.Default() if nil
+	Logger   *slog.Logger  // slog.Default() if nil
 	// A segment is built in memory up to SpoolLimit bytes (spool.DefaultLimit if
 	// zero) and in a temporary file in TempDir beyond it, and so are the files
 	// appended to it. A segment is never held in the scratch directory, which is
@@ -98,42 +93,32 @@ type pendingEntry struct {
 	body *spool.File // a reference of its own, closed once the segment holds it
 }
 
-// Writer batches appended LTX files into one segment per flush interval.
+// Writer batches appended LTX files into one segment per Flush. It flushes only
+// when asked. It is a service: Serve is its uploader, which writes the segments
+// one at a time and in order, so nothing newer is ever written before an older
+// segment. Nothing is written until it is served, and once Serve has returned
+// the writer is closed for good.
 type Writer struct {
 	store *blob.Store
 	node  string
 	opts  Options
 
-	uploadMu sync.Mutex // one segment upload at a time
+	kick    *notify.Kick   // wakes the uploader: a Flush wants what is queued written
+	written notify.Counter // entries written so far, in the order they were appended
+	done    chan struct{}  // closed once Serve has returned
 
 	mu       sync.Mutex
 	pending  []pendingEntry
-	waiters  []chan error
-	inflight *upload // a segment whose outcome isn't known yet, retried before anything newer
+	appended uint64 // entries accepted so far
 	seq      uint64
-	stopErr  error // set once fenced or closed
+	stopErr  error         // set once fenced or closed
+	fenced   chan struct{} // closed once fenced
 
 	flushes atomic.Int64
-	ctx     context.Context // done when the writer is closed
-	cancel  context.CancelFunc
-	g       errgroup.Group // owns the flush loop; Close joins it
 }
 
-// upload is one segment on its way to blob storage. A retry sends the same
-// body under the same write id, so blob.Store can tell a lost response from
-// somebody else's object.
-type upload struct {
-	seq     uint64
-	body    *spool.File // closed once the segment is written, or the writer is
-	id      blob.WriteID
-	waiters []chan error
-}
-
-// NewWriter starts a writer whose flush loop runs until Close.
+// NewWriter makes a writer. Nothing is written until it is served and flushed.
 func NewWriter(store *blob.Store, node string, opts Options) *Writer {
-	if opts.Interval <= 0 {
-		opts.Interval = DefaultFlush
-	}
 	if opts.Retry <= 0 {
 		opts.Retry = 25 * time.Millisecond
 	}
@@ -146,11 +131,13 @@ func NewWriter(store *blob.Store, node string, opts Options) *Writer {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	w := &Writer{store: store, node: node, opts: opts, seq: opts.StartSeq, ctx: ctx, cancel: cancel}
-	w.g.Go(func() error { w.loop(ctx); return nil })
-	return w
+	return &Writer{store: store, node: node, opts: opts, seq: opts.StartSeq, fenced: make(chan struct{}),
+		kick: notify.NewKick(), done: make(chan struct{})}
 }
+
+// Fenced is closed once the writer found another writer's segment under one of
+// its numbers (ErrFenced): it has stopped for good.
+func (w *Writer) Fenced() <-chan struct{} { return w.fenced }
 
 // Flushes is the number of segments written so far.
 func (w *Writer) Flushes() int64 { return w.flushes.Load() }
@@ -162,9 +149,9 @@ func (w *Writer) NextSeq() uint64 {
 	return w.seq
 }
 
-// Append queues one LTX file. The returned channel receives nil once the
-// segment holding it has been written, or the error that stopped it.
-func (w *Writer) Append(shard, generation string, position uint64, ltxBytes []byte) <-chan error {
+// Append queues one LTX file. It fails with ErrFenced or ErrClosed if the
+// writer has stopped. Flush waits until the segment holding it is written.
+func (w *Writer) Append(shard, generation string, position uint64, ltxBytes []byte) error {
 	f := spool.Bytes(ltxBytes)
 	defer f.Close()
 	return w.AppendFile(shard, generation, position, f)
@@ -172,186 +159,179 @@ func (w *Writer) Append(shard, generation string, position uint64, ltxBytes []by
 
 // AppendFile is Append for a file that may be in a temporary file. The writer
 // takes a reference of its own, so the caller still closes its own.
-func (w *Writer) AppendFile(shard, generation string, position uint64, ltxFile *spool.File) <-chan error {
-	ch := make(chan error, 1)
+func (w *Writer) AppendFile(shard, generation string, position uint64, ltxFile *spool.File) error {
 	hdr, _, err := ltx.PeekHeader(ltxFile.Reader())
 	if err != nil {
-		ch <- fmt.Errorf("segment: bad ltx file for %s: %w", shard, err)
-		return ch
+		return fmt.Errorf("segment: bad ltx file for %s: %w", shard, err)
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.stopErr != nil {
-		ch <- w.stopErr
-		return ch
-	}
-	if w.opts.Check != nil {
-		if err := w.opts.Check(); err != nil {
-			ch <- err
-			return ch
-		}
+		return w.stopErr
 	}
 	w.pending = append(w.pending, pendingEntry{
 		Entry: Entry{Shard: shard, Generation: generation, Position: position, Count: uint64(hdr.MaxTXID-hdr.MinTXID) + 1, Length: ltxFile.Size()},
 		body:  ltxFile.Retain(),
 	})
-	w.waiters = append(w.waiters, ch)
-	return ch
+	w.appended++
+	return nil
 }
 
-func (w *Writer) loop(ctx context.Context) {
-	t := time.NewTicker(w.opts.Interval)
-	defer t.Stop()
+// Flush asks for the entries queued so far to be written, as one segment if
+// none of them is on its way yet, and returns once they are. If ctx ends first,
+// Flush returns its error and the uploader goes on: a queued entry is never
+// dropped. Only a fence (somebody else's object under a segment's number) or
+// the end of Serve fails the entries, and Flush then returns ErrFenced or
+// ErrClosed.
+func (w *Writer) Flush(ctx context.Context) error {
+	w.mu.Lock()
+	err, target := w.stopErr, w.appended
+	w.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if w.written.Load() >= target {
+		return nil
+	}
+	w.kick.Kick()
+	select {
+	case <-w.written.Reached(target):
+		return nil
+	case <-w.done: // fenced or closed
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
+	if w.written.Load() >= target {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.stopErr != nil {
+		return w.stopErr
+	}
+	return ErrClosed // set before done is closed
+}
+
+func (w *Writer) String() string { return "writer" }
+
+// Serve is the uploader: each wake-up writes whatever is queued as one
+// segment. It returns once ctx ends, giving up the segment it is writing, or
+// once the writer is fenced. Either way it fails whatever is still queued, and
+// the writer is closed for good.
+func (w *Writer) Serve(ctx context.Context) error {
+	defer close(w.done)
+	defer w.close()
 	for {
 		select {
 		case <-ctx.Done():
-			return
-		case <-t.C:
-			_ = w.Flush(ctx)
+			return supervisor.NoRestart(nil)
+		case <-w.kick.C():
+		}
+		if !w.writeNext(ctx) {
+			return supervisor.NoRestart(nil)
 		}
 	}
 }
 
-// Flush writes the pending entries as one segment now, if there are any, and
-// returns once it is written. Concurrent flushes run one after the other.
-//
-// A segment whose upload fails is retried with the same body and write id
-// until the outcome is known, and nothing newer is written before it. If ctx
-// ends first, Flush returns its error and the segment stays in flight for the
-// next Flush (or the flush loop) to finish. Only a fence (somebody else's
-// object under the segment's number) or Close fails the segment's waiters.
-func (w *Writer) Flush(ctx context.Context) error {
-	w.uploadMu.Lock()
-	defer w.uploadMu.Unlock()
+// writeNext writes what is queued as the next segment, if anything is. A
+// segment whose upload fails is retried with the same body and write id until
+// the outcome is known, so blob.Store can tell a lost response from somebody
+// else's object. It reports whether the writer goes on: false once it is
+// fenced or closed.
+func (w *Writer) writeNext(ctx context.Context) bool {
+	w.mu.Lock()
+	pending, seq := w.pending, w.seq
+	w.pending = nil
+	w.mu.Unlock()
+	if len(pending) == 0 {
+		return true
+	}
+	// The segment is built without the lock: it can be a lot of copying, and
+	// other shards keep appending meanwhile.
+	body, err := w.build(ctx, seq, pending)
+	for _, p := range pending {
+		p.body.Close() // the segment has its own copy, or the writer is closed
+	}
+	if err == nil {
+		err = w.send(ctx, seq, body, w.store.NewWriteID())
+		body.Close()
+	}
+	switch {
+	case err == nil:
+	case errors.Is(err, blob.ErrExists):
+		// Someone else's object holds our number (blob.Store has already ruled out
+		// our own earlier attempts), so a newer writer owns this journal. Fail
+		// whatever queued up behind it too.
+		w.mu.Lock()
+		w.stopErr = ErrFenced
+		close(w.fenced)
+		w.closePending()
+		w.pending = nil
+		w.mu.Unlock()
+		return false
+	default: // closed: Serve fails what is still queued as it returns
+		return false
+	}
+	w.mu.Lock()
+	w.seq++
+	w.mu.Unlock()
+	w.flushes.Add(1)
+	w.written.Add(uint64(len(pending)))
+	return true
+}
 
-	// ctx ends when the caller's does or when the writer is closed.
-	ctx, cancel := context.WithCancelCause(ctx)
-	defer cancel(nil)
-	stop := context.AfterFunc(w.ctx, func() { cancel(ErrClosed) })
-	defer stop()
-
-	// A segment left in flight goes first, then whatever was queued behind it.
+// build lays out a segment, trying again (with the same backoff as send) until
+// it succeeds or ctx ends: the entries can't be given up.
+func (w *Writer) build(ctx context.Context, seq uint64, pending []pendingEntry) (*spool.File, error) {
+	backoff := w.opts.Retry
 	for {
-		w.mu.Lock()
-		if w.stopErr != nil {
-			err := w.stopErr
-			w.mu.Unlock()
-			return err
+		body, err := w.encode(pending)
+		if err == nil {
+			return body, nil
 		}
-		resumed := w.inflight != nil
-		if !resumed {
-			if len(w.pending) == 0 {
-				w.mu.Unlock()
-				return nil
-			}
-			// The segment is built without the lock: it can be a lot of copying, and
-			// other shards keep appending meanwhile. Only this flush builds segments
-			// (it holds uploadMu), so nothing else touches the inflight upload.
-			pending, waiters := w.pending, w.waiters
-			w.pending, w.waiters = nil, nil
-			w.mu.Unlock()
-			body, err := w.encode(pending)
-			w.mu.Lock()
-			if err != nil {
-				// Nothing is lost: the entries go back, ahead of what came in meanwhile.
-				w.pending = append(pending, w.pending...)
-				w.waiters = append(waiters, w.waiters...)
-				w.mu.Unlock()
-				return err
-			}
-			for _, p := range pending {
-				p.body.Close() // the segment has its own copy
-			}
-			if w.stopErr != nil {
-				// Closed or fenced while it was being built.
-				err := w.stopErr
-				w.mu.Unlock()
-				body.Close()
-				for _, ch := range waiters {
-					ch <- err
-				}
-				return err
-			}
-			w.inflight = &upload{seq: w.seq, body: body, id: w.store.NewWriteID(), waiters: waiters}
+		w.opts.Logger.Error("building a segment failed, will keep trying", "node", w.node, "segment", seq, "err", err)
+		if err := sleep(ctx, backoff); err != nil {
+			return nil, err
 		}
-		up := w.inflight
-		w.mu.Unlock()
-
-		err := w.send(ctx, up)
-
-		w.mu.Lock()
-		switch {
-		case err == nil:
-			w.inflight = nil
-			w.seq++
-			w.flushes.Add(1)
-			up.body.Close()
-		case errors.Is(err, blob.ErrExists):
-			// Someone else's object holds our number (blob.Store has already ruled out
-			// our own earlier attempts), so a newer writer owns this journal. Fail
-			// whatever queued up behind it too.
-			err = ErrFenced
-			w.stopErr = ErrFenced
-			waiters := append(up.waiters, w.waiters...)
-			up.body.Close()
-			w.closePending()
-			w.inflight, w.pending, w.waiters = nil, nil, nil
-			w.mu.Unlock()
-			for _, ch := range waiters {
-				ch <- err
-			}
-			return err
-		default:
-			// The writer was closed (Close fails the waiters) or the caller gave
-			// up: the segment stays in flight.
-			w.mu.Unlock()
-			if w.ctx.Err() != nil {
-				return ErrClosed
-			}
-			return err
-		}
-		w.mu.Unlock()
-		// The segment is written, but a node whose lease has run out doesn't know
-		// it still owns what the segment holds, so it acknowledges nothing.
-		var ack error
-		if w.opts.Check != nil {
-			ack = w.opts.Check()
-		}
-		for _, ch := range up.waiters {
-			ch <- ack
-		}
-		if !resumed {
-			return nil
-		}
+		backoff = min(backoff*2, 40*w.opts.Retry)
 	}
 }
 
 // send retries one segment's create until the outcome is known: it was
-// written (nil), somebody else holds the number (blob.ErrExists) or ctx ended.
-func (w *Writer) send(ctx context.Context, up *upload) error {
+// written (nil), somebody else holds the number (blob.ErrExists) or the writer
+// was closed (ErrClosed, once ctx ends).
+func (w *Writer) send(ctx context.Context, seq uint64, body *spool.File, id blob.WriteID) error {
 	backoff := w.opts.Retry
 	for {
-		_, err := w.store.CreateWithID(ctx, Key(w.node, up.seq), up.body.Reader(), up.id)
+		_, err := w.store.CreateWithID(ctx, Key(w.node, seq), body.Reader(), id)
 		if err == nil || errors.Is(err, blob.ErrExists) {
 			return err
 		}
 		if ctx.Err() != nil {
-			return context.Cause(ctx)
+			return ErrClosed
 		}
 		if !blob.Transient(err) {
 			// Retrying won't fix this (a bad key, no permission), but the segment
 			// can't be given up either: its commits are in nobody else's hands.
 			w.opts.Logger.Error("segment upload failed with an error retrying cannot fix, will keep trying",
-				"node", w.node, "segment", up.seq, "err", err)
+				"node", w.node, "segment", seq, "err", err)
 		}
-		t := time.NewTimer(backoff)
-		select {
-		case <-t.C:
-		case <-ctx.Done():
-			t.Stop()
-			return context.Cause(ctx)
+		if err := sleep(ctx, backoff); err != nil {
+			return err
 		}
 		backoff = min(backoff*2, 40*w.opts.Retry)
+	}
+}
+
+// sleep waits d, or returns ErrClosed if ctx ends first.
+func sleep(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ErrClosed
 	}
 }
 
@@ -393,29 +373,16 @@ func (w *Writer) closePending() {
 	}
 }
 
-// Close stops the flush loop and fails whatever is still pending with ErrClosed.
-func (w *Writer) Close() {
-	w.cancel()
-	w.g.Wait()
-	w.uploadMu.Lock()
-	defer w.uploadMu.Unlock()
+// close fails whatever is still queued with ErrClosed, and accepts nothing more.
+// Serve runs it as it returns.
+func (w *Writer) close() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.stopErr == nil {
 		w.stopErr = ErrClosed
 	}
-	if w.inflight != nil {
-		for _, ch := range w.inflight.waiters {
-			ch <- ErrClosed
-		}
-		w.inflight.body.Close()
-		w.inflight = nil
-	}
-	for _, ch := range w.waiters {
-		ch <- ErrClosed
-	}
 	w.closePending()
-	w.pending, w.waiters = nil, nil
+	w.pending = nil
 }
 
 // ReadFooter returns the entries of a segment. A fence returns ErrFence.
@@ -496,39 +463,23 @@ func readRange(ctx context.Context, store *blob.Store, key string, off, n int64)
 	return b, nil
 }
 
-// Scan calls fn for every entry of a node's segments in order, starting at
-// segment from, until it reaches a number that doesn't exist. Fences are skipped.
-func Scan(ctx context.Context, store *blob.Store, node string, from uint64, fn func(seq uint64, e Entry) error) error {
-	for seq := from; ; seq++ {
-		entries, err := ReadFooter(ctx, store, node, seq)
-		if errors.Is(err, blob.ErrNotFound) {
-			return nil
-		} else if errors.Is(err, ErrFence) {
-			continue
-		} else if err != nil {
-			return err
-		}
-		for _, e := range entries {
-			if err := fn(seq, e); err != nil {
-				return err
-			}
-		}
-	}
-}
-
-// ErrMissing is returned by ScanTo for a segment that should exist and doesn't.
+// ErrMissing is returned by Scan for a segment that should exist and doesn't.
 var ErrMissing = errors.New("segment: missing")
 
-// ScanTo calls fn for every entry of segments from to to (inclusive), in order,
-// skipping fences. Unlike Scan it does not stop at a number that doesn't
-// exist: a node writes its segments one after the other, so a number below the
-// fence that is missing has expired or been lost, and the segments after it
-// must not be silently ignored. It returns ErrMissing (wrapped, with the
-// number) for the first one.
-func ScanTo(ctx context.Context, store *blob.Store, node string, from, to uint64, fn func(seq uint64, e Entry) error) error {
-	for seq := from; seq <= to; seq++ {
+// Scan calls fn for every entry of a node's segments in order, starting at
+// segment from, skipping fences. With to zero it stops at the first number that
+// doesn't exist. Otherwise it reads through to (inclusive) and does not stop at
+// a number that doesn't exist: a node writes its segments one after the other,
+// so a number below the fence that is missing has expired or been lost, and the
+// segments after it must not be silently ignored. It returns ErrMissing
+// (wrapped, with the number) for the first one.
+func Scan(ctx context.Context, store *blob.Store, node string, from, to uint64, fn func(seq uint64, e Entry) error) error {
+	for seq := from; to == 0 || seq <= to; seq++ {
 		entries, err := ReadFooter(ctx, store, node, seq)
 		if errors.Is(err, blob.ErrNotFound) {
+			if to == 0 {
+				return nil
+			}
 			return fmt.Errorf("%w: %s", ErrMissing, Key(node, seq))
 		} else if errors.Is(err, ErrFence) {
 			continue
@@ -564,14 +515,6 @@ func Bounds(ctx context.Context, store *blob.Store, node string) (lowest, highes
 		highest = max(highest, n)
 	}
 	return lowest, highest, nil
-}
-
-// NextSeq returns the first free segment number of a node's journal: one more
-// than the highest number present (fences included), or 1 for an empty journal.
-// A restarted node starts its writer here.
-func NextSeq(ctx context.Context, store *blob.Store, node string) (uint64, error) {
-	_, highest, err := Bounds(ctx, store, node)
-	return highest + 1, err
 }
 
 // Fence is what an adopter does to a dead node's journal: starting from the
