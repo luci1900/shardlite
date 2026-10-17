@@ -14,8 +14,6 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-
-	"github.com/luci1900/shardlite/internal/supervisor"
 )
 
 // DefaultIdleTimeout is how long a shard stays active without requests when
@@ -28,10 +26,6 @@ type Kind struct {
 	Sync        bool          // durability gates hold responses until the writes before them are in blob storage ("sync": "on", the default)
 	IdleTimeout time.Duration // how long an unused shard stays active
 	Public      bool          // clients may name it; otherwise only calls from the app reach it
-	// AutoDelete kinds are ordinary ones whose shards are deleted when they
-	// deactivate (docs/guide.md, Auto-delete kinds), if they were created while the
-	// kind had it and hold no rows in the outbox or inbox.
-	AutoDelete bool
 }
 
 var (
@@ -72,7 +66,6 @@ type kindJSON struct {
 	Sync        string `json:"sync"` // "on" (the default) or "off": a string, like Shardlite-Sync, so more modes can follow
 	IdleTimeout string `json:"idle_timeout"`
 	Public      bool   `json:"public"`
-	AutoDelete  bool   `json:"auto_delete"`
 }
 
 type kindsJSON struct {
@@ -112,7 +105,7 @@ func ParseKinds(data []byte, defaultIdle time.Duration) (map[string]Kind, error)
 		default:
 			return nil, fmt.Errorf(`kinds file: %s: sync is "on" or "off", not %q`, name, k.Sync)
 		}
-		out[name] = Kind{Name: name, Sync: sync, IdleTimeout: idle, Public: k.Public, AutoDelete: k.AutoDelete}
+		out[name] = Kind{Name: name, Sync: sync, IdleTimeout: idle, Public: k.Public}
 	}
 	return out, nil
 }
@@ -206,7 +199,7 @@ func (k *kindsReload) Serve(ctx context.Context) error {
 				k.log.Info("kinds file reloaded", "path", k.kinds.path)
 			}
 		case <-ctx.Done():
-			return supervisor.NoRestart(nil)
+			return nil
 		}
 	}
 }

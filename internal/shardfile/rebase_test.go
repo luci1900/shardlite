@@ -385,7 +385,7 @@ func tailFiles(sh *capture.Shard) int32 {
 func countFiles(t *testing.T, e *harness.Env) int {
 	t.Helper()
 	n := 0
-	for _, err := range e.Store.List(context.Background(), "shards/"+shard+"/") {
+	for _, err := range e.Store.List(context.Background(), shardfile.ShardPrefix(shard)) {
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -433,11 +433,11 @@ func TestLargeFilesGoThroughTemporaryFiles(t *testing.T) {
 			return nil
 		}
 		switch {
-		case op == blob.OpCreate && strings.HasPrefix(key, "shards/"):
+		case op == blob.OpCreate && strings.HasPrefix(key, shardfile.FilesPrefix):
 			if int32(inTemp()) > base.Load() { // the body being uploaded is a file
 				seen.Add(1)
 			}
-		case op == blob.OpGet && strings.HasPrefix(key, "shards/"):
+		case op == blob.OpGet && strings.HasPrefix(key, shardfile.FilesPrefix):
 			gets.Add(1)
 		}
 		return nil

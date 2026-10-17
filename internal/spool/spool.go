@@ -44,11 +44,11 @@ func (f *File) Size() int64 { return f.size }
 func (f *File) InFile() bool { return f.f != nil }
 
 // Reader returns a new reader at the start. Each call gives an independent one.
-func (f *File) Reader() io.ReadSeeker {
+func (f *File) Reader() *io.SectionReader {
 	if f.f != nil {
 		return io.NewSectionReader(f.f, 0, f.size)
 	}
-	return bytes.NewReader(f.mem)
+	return io.NewSectionReader(bytes.NewReader(f.mem), 0, f.size)
 }
 
 // Bytes reads everything into memory. For tests and small things.

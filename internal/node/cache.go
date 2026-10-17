@@ -15,7 +15,6 @@ import (
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/shardfile"
-	"github.com/luci1900/shardlite/internal/supervisor"
 )
 
 // CacheOptions configure the local cache of deactivated shards.
@@ -26,7 +25,7 @@ type CacheOptions struct {
 
 // cache is the node's local cache of shard files (docs/concurrency.md, The
 // tree): the index, the trim to its limit and the files still held from before
-// a restart, whose loop is a part of Shards. Whatever it does to a shard that
+// a restart, whose loop is a part of the Catalog. Whatever it does to a shard that
 // isn't active (eviction, the sweep of a held file, the delete of a cached
 // shard) runs under an entry of its own in the table, so an activation of the
 // shard waits for it.
@@ -148,7 +147,7 @@ func (c *cache) Serve(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return supervisor.NoRestart(nil)
+			return nil
 		case <-tick:
 		}
 		c.evictIfNeeded(ctx)
@@ -261,8 +260,15 @@ func (c *cache) evict(ctx context.Context, row indexRow) (bool, error) {
 	case err != nil:
 		return false, err
 	case h.Manifest.Owner == c.node:
-		if err := h.ReleaseOwnership(ctx); err != nil && !errors.Is(err, blob.ErrConflict) {
-			return false, err // storage trouble: keep the files, try again later
+		switch err := h.ReleaseOwnership(ctx); {
+		case errors.Is(err, blob.ErrUnknown):
+			// The release may have landed. The cached row would let the next
+			// activation serve the shard with no request to blob storage, while the
+			// manifest names no journal, so it goes as if the release had landed: the
+			// next activation claims and restores.
+			c.log.Warn("the release of an evicted shard has an unknown outcome, dropping it as released", "shard", cur.Name, "err", err)
+		case err != nil && !errors.Is(err, blob.ErrConflict):
+			return false, err // storage trouble: nothing happened, keep the files and try again later
 		}
 	}
 	removeLocal(cur.Path)

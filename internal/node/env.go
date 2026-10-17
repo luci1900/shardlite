@@ -17,7 +17,7 @@ import (
 // cluster. The settings the app's code relies on are in the kinds file.
 type Env struct {
 	Name        string        // SHARDLITE_NODE: the node's name (the host name by default)
-	Address     string        // SHARDLITE_ADDRESS: how other nodes reach this one (unused until there are other nodes)
+	Advertise   string        // SHARDLITE_ADVERTISE_PEER: how other nodes reach the peer listener (host:port), the peer listener's bound address if unset and not a wildcard
 	Blob        string        // SHARDLITE_BLOB: s3://bucket
 	S3Endpoint  string        // SHARDLITE_S3_ENDPOINT: the URL of an S3-compatible store or emulator (AWS if unset)
 	Prefix      string        // SHARDLITE_PREFIX: prefix of every object path, for example "staging/"
@@ -33,11 +33,12 @@ type Env struct {
 	DeltaSize   int64         // SHARDLITE_DELTA_SIZE: how many bytes of tail make a delta due, 256KB
 	App         string        // SHARDLITE_APP: the app's base URL, for example http://127.0.0.1:9000
 	HealthPath  string        // SHARDLITE_HEALTH_PATH: the app's health endpoint, /health
-	Listen      string        // SHARDLITE_LISTEN: the public listener, :8080
-	Control     string        // SHARDLITE_CONTROL: the control API on localhost TCP, 127.0.0.1:7000
-	Socket      string        // SHARDLITE_SOCKET: the control API on a Unix socket, if set
+	Public      string        // SHARDLITE_LISTEN_PUBLIC: the public listener, :2280
+	Peer        string        // SHARDLITE_LISTEN_PEER: the listener for traffic from other nodes, :2281
+	Control     string        // SHARDLITE_LISTEN_CONTROL: the control API on localhost TCP, 127.0.0.1:2282
+	Socket      string        // SHARDLITE_LISTEN_CONTROL_SOCKET: the control API on a Unix socket, if set
 	MaxHops     int           // SHARDLITE_MAX_HOPS: calls and messages chained past this many hops are refused with 508 (given up on for messages), 32
-	Pprof       string        // SHARDLITE_PPROF: address for Go's pprof handlers, for diagnosis (off if unset)
+	Pprof       string        // SHARDLITE_LISTEN_PPROF: address for Go's pprof handlers, for diagnosis (off if unset)
 }
 
 // defaultScratch is SHARDLITE_SCRATCH_DIR on Linux when it isn't set: tmpfs
@@ -49,11 +50,11 @@ var goos = runtime.GOOS // for tests
 // ParseEnv reads the configuration from getenv (os.Getenv in the binary).
 func ParseEnv(getenv func(string) string) (Env, error) {
 	e := Env{
-		Name: getenv("SHARDLITE_NODE"), Address: getenv("SHARDLITE_ADDRESS"), Blob: getenv("SHARDLITE_BLOB"), S3Endpoint: getenv("SHARDLITE_S3_ENDPOINT"),
+		Name: getenv("SHARDLITE_NODE"), Advertise: getenv("SHARDLITE_ADVERTISE_PEER"), Blob: getenv("SHARDLITE_BLOB"), S3Endpoint: getenv("SHARDLITE_S3_ENDPOINT"),
 		Prefix: getenv("SHARDLITE_PREFIX"), KindsFile: getenv("SHARDLITE_KINDS"),
 		Data: getenv("SHARDLITE_DATA"), Scratch: getenv("SHARDLITE_SCRATCH_DIR"), App: getenv("SHARDLITE_APP"),
-		HealthPath: getenv("SHARDLITE_HEALTH_PATH"), Listen: getenv("SHARDLITE_LISTEN"),
-		Control: getenv("SHARDLITE_CONTROL"), Socket: getenv("SHARDLITE_SOCKET"), Pprof: getenv("SHARDLITE_PPROF"),
+		HealthPath: getenv("SHARDLITE_HEALTH_PATH"), Public: getenv("SHARDLITE_LISTEN_PUBLIC"),
+		Control: getenv("SHARDLITE_LISTEN_CONTROL"), Peer: getenv("SHARDLITE_LISTEN_PEER"), Socket: getenv("SHARDLITE_LISTEN_CONTROL_SOCKET"), Pprof: getenv("SHARDLITE_LISTEN_PPROF"),
 		Flush: 250 * time.Millisecond, LeaseTTL: 10 * time.Second, FlushMin: DefaultFlushMin, DeltaAge: shardfile.DefaultDeltaAge, DeltaSize: shardfile.DefaultDeltaSize,
 	}
 	if e.Name == "" {
@@ -64,8 +65,9 @@ func ParseEnv(getenv func(string) string) (Env, error) {
 		e.Name = h
 	}
 	e.HealthPath = cmp.Or(e.HealthPath, "/health")
-	e.Listen = cmp.Or(e.Listen, ":8080")
-	e.Control = cmp.Or(e.Control, "127.0.0.1:7000")
+	e.Public = cmp.Or(e.Public, ":2280")
+	e.Control = cmp.Or(e.Control, "127.0.0.1:2282")
+	e.Peer = cmp.Or(e.Peer, ":2281")
 	for _, d := range []struct {
 		name string
 		dst  *time.Duration

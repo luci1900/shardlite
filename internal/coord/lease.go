@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
@@ -22,6 +23,10 @@ var (
 	// ErrLeaseExpired means the holder's own safety margin ran out before a
 	// renewal got through.
 	ErrLeaseExpired = errors.New("coord: lease expired")
+	// ErrNotAdoptable means a lease an adopter read has changed since, or was
+	// never its to adopt: the node renewed, restarted or was released, or
+	// another node marked or finished its adoption. The adopter leaves it.
+	ErrNotAdoptable = errors.New("coord: lease is not adoptable")
 )
 
 // DefaultTTL is how long a lease is valid after its last renewal.
@@ -40,36 +45,66 @@ type NodeInfo struct {
 	JournalNext uint64 `json:"journal_next"`
 }
 
+// Incarnation is one life of a node: its name and the epoch of its lease.
+type Incarnation struct {
+	Node  string `json:"node"`
+	Epoch uint64 `json:"epoch"`
+}
+
 // NodeLease is a node's lease as of one write.
 type NodeLease struct {
 	NodeInfo
-	Epoch     uint64        `json:"epoch"` // +1 each time the node acquires its lease
-	Renewed   time.Time     `json:"renewed"`
-	TTL       time.Duration `json:"ttl"`
-	Released  bool          `json:"released,omitempty"` // a graceful shutdown: nothing is owned any more
-	AdoptedBy string        `json:"adopted_by,omitempty"`
+	Epoch    uint64        `json:"epoch"` // +1 each time the node acquires its lease
+	Renewed  time.Time     `json:"renewed"`
+	TTL      time.Duration `json:"ttl"`
+	Released bool          `json:"released,omitempty"` // a graceful shutdown: nothing is owned any more
+	// AdoptedBy is the incarnation adopting the node's journal, nil if none. A
+	// node adopting its own journal at startup names itself.
+	AdoptedBy *Incarnation `json:"adopted_by,omitempty"`
+	// Adopted is the highest epoch up to which every epoch's journal has been
+	// adopted (or the node released its lease at it), 0 if none. A shard whose
+	// owner's epoch is at most Adopted has nothing left in that journal.
+	Adopted uint64 `json:"adopted,omitempty"`
 
 	ETag blob.ETag `json:"-"`
 	// Previous is the lease an Acquire replaced, nil if the node never had one.
 	Previous *NodeLease `json:"-"`
 }
 
-// ExpiresAt is when other nodes stop treating the lease as valid.
+// Incarnation returns the life this lease is for.
+func (l *NodeLease) Incarnation() Incarnation { return Incarnation{l.Name, l.Epoch} }
+
+// ExpiresAt is when the lease runs out by its holder's clock.
 func (l *NodeLease) ExpiresAt() time.Time { return l.Renewed.Add(l.TTL) }
 
-// ValidAt reports whether other nodes would treat the lease as valid at t.
+// ValidAt reports whether the lease looks valid at t: not released, not
+// adopted by another node, not adopted up to its epoch and not past its expiry.
+// The expiry compares the holder's clock with t, so it is a hint only (for
+// failing fast, say): nothing that decides ownership may rest on it
+// (docs/internals.md, Node leases).
 func (l *NodeLease) ValidAt(t time.Time) bool {
-	return !l.Released && l.AdoptedBy == "" && t.Before(l.ExpiresAt())
+	return !l.Released && !l.adoptedByOther() && l.Adopted < l.Epoch && t.Before(l.ExpiresAt())
 }
 
+// adoptedByOther reports whether another incarnation is adopting the journal.
+func (l *NodeLease) adoptedByOther() bool {
+	return l.AdoptedBy != nil && *l.AdoptedBy != l.Incarnation()
+}
+
+// Prefix is the key prefix of the leases (state, one per node).
+const Prefix = "state/nodes/"
+
 // Key is the object key of a node's lease.
-func Key(node string) string { return "nodes/" + node }
+func Key(node string) string { return Prefix + node }
 
 // RegistryOptions tune a Registry.
 type RegistryOptions struct {
 	TTL  time.Duration // DefaultTTL if zero
 	Blob blob.Options
 	Now  func() time.Time // time.Now if nil, for tests
+	// AdoptionPoll is how often Acquire looks again while another node is
+	// adopting the lease, 1 s if zero.
+	AdoptionPoll time.Duration
 }
 
 // Registry keeps nodes' leases in blob storage.
@@ -87,6 +122,9 @@ func NewRegistry(b blob.Backend, node string, opts RegistryOptions) *Registry {
 	}
 	if opts.Now == nil {
 		opts.Now = time.Now
+	}
+	if opts.AdoptionPoll <= 0 {
+		opts.AdoptionPoll = time.Second
 	}
 	var r [8]byte
 	_, _ = rand.Read(r[:])
@@ -119,16 +157,34 @@ func (r *Registry) Get(ctx context.Context, node string) (*NodeLease, error) {
 
 // Acquire takes the node's lease with a new epoch, whether or not the
 // previous one is still valid: the caller knows its previous process is gone.
-// The lease keeps the previous life's journal range until the first Renew, so a
-// crash before the journal is adopted leaves the range in place.
+// The lease keeps the previous life's journal range until the adoption of it
+// finishes (FinishAdoption), so a crash before then leaves the range in place.
+// If an epoch is left to adopt, the new lease names its own incarnation as the
+// adopter: the caller adopts its journal before it does anything else.
+//
+// While another node that looks alive is adopting the lease, Acquire waits for
+// it to finish (or to die), polling: taking the lease from under it would let
+// its fence land in the new life's journal (docs/internals.md, Takeover).
 func (r *Registry) Acquire(ctx context.Context, info NodeInfo) (NodeLease, error) {
 	for {
 		prev, err := r.Get(ctx, info.Name)
 		next := NodeLease{NodeInfo: info, Epoch: 1, TTL: r.opts.TTL}
 		next.JournalFrom, next.JournalNext = 1, 1
 		if err == nil {
+			if busy, err := r.adoptedByLive(ctx, prev); err != nil {
+				return NodeLease{}, err
+			} else if busy {
+				if err := sleep(ctx, r.opts.AdoptionPoll); err != nil {
+					return NodeLease{}, err
+				}
+				continue
+			}
 			next.Epoch = prev.Epoch + 1
 			next.JournalFrom, next.JournalNext = prev.JournalFrom, prev.JournalNext
+			next.Adopted = prev.Adopted
+			if prev.Adopted < prev.Epoch {
+				next.AdoptedBy = &Incarnation{info.Name, next.Epoch}
+			}
 			next.Previous = prev
 		} else if !errors.Is(err, blob.ErrNotFound) {
 			return NodeLease{}, err
@@ -154,6 +210,35 @@ func (r *Registry) Acquire(ctx context.Context, info NodeInfo) (NodeLease, error
 	}
 }
 
+// adoptedByLive reports whether another node is adopting l and looks alive. Its
+// liveness is judged by its own lease's expiry, which is a hint: waiting on a
+// node that is in fact dead only delays the start until its lease looks
+// expired, and not waiting on a live one costs a restart, never data.
+func (r *Registry) adoptedByLive(ctx context.Context, l *NodeLease) (bool, error) {
+	if l.AdoptedBy == nil || l.AdoptedBy.Node == l.Name || l.Adopted >= l.Epoch {
+		return false, nil
+	}
+	a, err := r.Get(ctx, l.AdoptedBy.Node)
+	switch {
+	case errors.Is(err, blob.ErrNotFound):
+		return false, nil
+	case err != nil:
+		return false, err
+	}
+	return a.Epoch == l.AdoptedBy.Epoch && a.ValidAt(r.opts.Now()), nil
+}
+
+func sleep(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	case <-t.C:
+		return nil
+	}
+}
+
 // Renew rewrites the lease at the same epoch. info can change (counts and the
 // journal range). ErrLeaseLost if somebody else changed it.
 func (r *Registry) Renew(ctx context.Context, lease NodeLease, info NodeInfo) (NodeLease, error) {
@@ -171,19 +256,113 @@ func (r *Registry) Renew(ctx context.Context, lease NodeLease, info NodeInfo) (N
 }
 
 // Release marks the lease released, keeping its epoch so epochs never repeat.
+// Every shard has been let go of, so nothing is left in the journal: the lease
+// records its epoch as adopted, and nobody adopts it.
 func (r *Registry) Release(ctx context.Context, lease NodeLease) error {
 	next := lease
 	next.Previous = nil
 	next.Released = true
+	next.AdoptedBy = nil
+	next.Adopted = max(next.Adopted, next.Epoch)
 	_, err := r.write(ctx, lease, &next)
 	return err
+}
+
+// Listed is a lease as a listing of state/nodes/ shows it, without reading it.
+type Listed struct {
+	Name         string
+	ETag         blob.ETag
+	LastModified time.Time // the store's clock at the lease's last write: a hint of when to look, never a decision
+}
+
+// List lists every node's lease from state/nodes/, in key order, without reading them.
+func (r *Registry) List(ctx context.Context) ([]Listed, error) {
+	var out []Listed
+	for info, err := range r.store.List(ctx, Prefix) {
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, Listed{Name: strings.TrimPrefix(info.Key, Prefix), ETag: info.ETag, LastModified: info.LastModified})
+	}
+	return out, nil
+}
+
+// Adopt marks dead, a lease the caller has read and confirmed expired, as
+// adopted by the incarnation by, with one compare-and-swap on the ETag it was
+// read at. ErrNotAdoptable if it has changed since or was released or adopted
+// up to its epoch already. A lease another node is adopting is the caller's to
+// judge (its adopter must be dead) before it calls Adopt. It returns the lease
+// as written, for FinishAdoption.
+func (r *Registry) Adopt(ctx context.Context, dead NodeLease, by Incarnation) (NodeLease, error) {
+	if dead.Released || dead.Adopted >= dead.Epoch {
+		return NodeLease{}, fmt.Errorf("%w: %s at epoch %d", ErrNotAdoptable, dead.Name, dead.Epoch)
+	}
+	next := dead
+	next.Previous = nil
+	next.AdoptedBy = &by
+	etag, err := r.store.Update(ctx, Key(dead.Name), encodeLease(&next), dead.ETag)
+	if errors.Is(err, blob.ErrConflict) || errors.Is(err, blob.ErrNotFound) {
+		return NodeLease{}, fmt.Errorf("%w: %s changed since it was read", ErrNotAdoptable, dead.Name)
+	} else if err != nil {
+		return NodeLease{}, err
+	}
+	next.ETag = etag
+	return next, nil
+}
+
+// FinishAdoption records that every epoch up to epoch has had its journal
+// adopted, with a fence at fence, by compare-and-swap on l as the adopter last
+// wrote it (Adopt's result, or Acquire's for a node adopting its own journal).
+// The adoption mark is cleared, and the journal's range starts after the fence,
+// so the node's next life starts its journal there. If the lease has changed
+// but is adopted up to epoch already (another adopter took over and finished),
+// that counts as done. If it is still marked by the same adopter at the same
+// epoch, the change was the adopter's own (a node adopting its own journal
+// renews its lease meanwhile, and a write whose answer was lost leaves an old
+// ETag), and the finish is written over it. Otherwise ErrNotAdoptable: the node
+// restarted or another adopter took over, and this adoption is over.
+func (r *Registry) FinishAdoption(ctx context.Context, l NodeLease, epoch, fence uint64) (NodeLease, error) {
+	finish := func(base NodeLease) (NodeLease, error) {
+		next := base
+		next.Previous = nil
+		next.AdoptedBy = nil
+		next.Adopted = max(next.Adopted, epoch)
+		next.JournalFrom, next.JournalNext = fence+1, fence+1
+		etag, err := r.store.Update(ctx, Key(l.Name), encodeLease(&next), base.ETag)
+		next.ETag = etag
+		return next, err
+	}
+	changed := func(err error) bool { return errors.Is(err, blob.ErrConflict) || errors.Is(err, blob.ErrNotFound) }
+	notAdoptable := fmt.Errorf("%w: %s changed during its adoption", ErrNotAdoptable, l.Name)
+	next, err := finish(l)
+	if changed(err) {
+		cur, gerr := r.Get(ctx, l.Name)
+		switch {
+		case gerr == nil && cur.Adopted >= epoch:
+			return *cur, nil
+		case gerr == nil && l.AdoptedBy != nil && cur.AdoptedBy != nil && *cur.AdoptedBy == *l.AdoptedBy && cur.Epoch == l.Epoch && !cur.Released:
+			next, err = finish(*cur)
+		case gerr != nil && !errors.Is(gerr, blob.ErrNotFound):
+			return NodeLease{}, gerr
+		default:
+			return NodeLease{}, notAdoptable
+		}
+	}
+	switch {
+	case changed(err):
+		return NodeLease{}, notAdoptable
+	case err != nil:
+		return NodeLease{}, err
+	}
+	return next, nil
 }
 
 // write replaces lease with next. A write of ours whose outcome stayed unknown
 // (a renewal cut short by the keeper stopping, say) can have landed without us
 // hearing, which leaves us holding an old ETag. So on a conflict, if what is
-// there is still our epoch and nobody has released or adopted it, it is our own
-// earlier write, and next replaces that. Anything else is ErrLeaseLost.
+// there is still our epoch and nobody has released it, another node marked it
+// or it was adopted up to our epoch, it is our own earlier write, and next
+// replaces that. Anything else is ErrLeaseLost.
 func (r *Registry) write(ctx context.Context, lease NodeLease, next *NodeLease) (blob.ETag, error) {
 	lost := fmt.Errorf("%w: %s", ErrLeaseLost, lease.Name)
 	etag, err := r.store.Update(ctx, Key(lease.Name), encodeLease(next), lease.ETag)
@@ -196,7 +375,7 @@ func (r *Registry) write(ctx context.Context, lease NodeLease, next *NodeLease) 
 		return "", lost
 	case err != nil:
 		return "", err
-	case cur.Epoch != lease.Epoch || cur.Released || cur.AdoptedBy != "":
+	case cur.Epoch != lease.Epoch || cur.Released || cur.adoptedByOther() || cur.Adopted >= cur.Epoch:
 		return "", lost
 	}
 	etag, err = r.store.Update(ctx, Key(lease.Name), encodeLease(next), cur.ETag)

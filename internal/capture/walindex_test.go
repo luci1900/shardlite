@@ -41,6 +41,9 @@ func newShard(t *testing.T, e *env, path string) *capture.Shard {
 func TestWalIndexBeforeOpenIsAnError(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "users-1.db")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	w, err := capture.MapWalIndex(path)
 	if err != nil {
 		t.Fatal(err)
@@ -48,6 +51,32 @@ func TestWalIndexBeforeOpenIsAnError(t *testing.T) {
 	defer w.Close()
 	if _, err := w.Read(); !errors.Is(err, capture.ErrFault) {
 		t.Fatalf("read of an empty -shm: %v", err)
+	}
+}
+
+// A missing -shm is made with the database file's permissions, as SQLite would
+// make it, whatever the node's umask: SQLite reuses the file, so an app running
+// as another user in the database's group would otherwise find it read-only.
+func TestWalIndexCreatesShmWithTheDatabaseMode(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "users-1.db")
+	if err := os.WriteFile(path, nil, 0o660); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o660); err != nil { // the umask may have narrowed it
+		t.Fatal(err)
+	}
+	w, err := capture.MapWalIndex(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	fi, err := os.Stat(path + "-shm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o660 {
+		t.Fatalf("-shm mode %v, want %v", fi.Mode().Perm(), os.FileMode(0o660))
 	}
 }
 

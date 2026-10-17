@@ -3,11 +3,13 @@ package blob
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // loseResponse makes the first call of op that has reached the backend and
@@ -172,6 +174,40 @@ func TestNotAppliedIsRetried(t *testing.T) {
 	}
 }
 
+// A write whose first attempt landed unheard, and whose retries and read-backs
+// then all fail, has an unknown outcome: never "not applied", which would tell
+// the caller that nothing happened.
+func TestUnknownStaysUnknownAfterNotApplied(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	for _, op := range []Op{OpUpdate, OpDelete} {
+		s, l := newStore(t)
+		etag, err := s.Create(ctx, "k", strings.NewReader("v1"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var landed atomic.Bool
+		l.SetHook(func(ctx context.Context, o Op, key string, after bool) error {
+			if o == op && after && !landed.Load() {
+				landed.Store(true)
+				return errors.New("response lost")
+			}
+			if landed.Load() && !after {
+				return errors.New("unreachable")
+			}
+			return nil
+		})
+		if op == OpUpdate {
+			_, err = s.Update(ctx, "k", strings.NewReader("v2"), etag)
+		} else {
+			err = s.Delete(ctx, "k", etag)
+		}
+		if !errors.Is(err, ErrUnknown) || errors.Is(err, ErrNotApplied) {
+			t.Fatalf("%s: got %v, want ErrUnknown and not ErrNotApplied", op, err)
+		}
+	}
+}
+
 func TestPersistentFailureIsReturned(t *testing.T) {
 	t.Parallel()
 	s, l := newStore(t)
@@ -229,6 +265,7 @@ func TestRetryResendsTheWholeBody(t *testing.T) {
 	defer f.Close()
 	want := strings.Repeat("0123456789", 1000)
 	f.WriteString(want)
+	body := io.NewSectionReader(f, 0, int64(len(want)))
 
 	var attempts atomic.Int32
 	l.SetHook(func(ctx context.Context, o Op, key string, after bool) error {
@@ -240,8 +277,8 @@ func TestRetryResendsTheWholeBody(t *testing.T) {
 		}
 		return nil
 	})
-	f.Seek(0, io.SeekEnd) // wherever it was left
-	if _, err := s.Create(ctx, "big", f); err != nil {
+	body.Seek(0, io.SeekEnd) // wherever it was left
+	if _, err := s.Create(ctx, "big", body); err != nil {
 		t.Fatal(err)
 	}
 	rc, _, err := s.Get(ctx, "big")
@@ -255,5 +292,119 @@ func TestRetryResendsTheWholeBody(t *testing.T) {
 	}
 	if attempts.Load() < 3 {
 		t.Fatalf("only %d attempts", attempts.Load())
+	}
+}
+
+// bodyKeeper is a backend that keeps the reader of its first Create, after
+// reading half of it, so a test can see whether a later attempt disturbed it.
+type bodyKeeper struct {
+	Backend
+	first io.ReadSeeker
+	half  int
+}
+
+func (k *bodyKeeper) Create(ctx context.Context, key string, body io.ReadSeeker, id WriteID) (ETag, error) {
+	if k.first == nil {
+		k.first = body
+		buf := make([]byte, k.half)
+		io.ReadFull(body, buf)
+		return "", fmt.Errorf("%w: busy", ErrNotApplied)
+	}
+	return k.Backend.Create(ctx, key, body, id)
+}
+
+// Attempts share no offset: the transport can still be reading an earlier
+// attempt's body when the next one starts, so a reader an attempt left
+// half-way must be untouched by the attempts after it.
+func TestAttemptsReadTheBodyThroughReadersOfTheirOwn(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	k := &bodyKeeper{Backend: NewMemory(), half: 5}
+	s := NewStore(k, "n1", 1, Options{Backoff: time.Millisecond})
+	if _, err := s.Create(ctx, "k", strings.NewReader("0123456789")); err != nil {
+		t.Fatal(err)
+	}
+	if got := readAll(t, mustGet(t, s, "k")); got != "0123456789" {
+		t.Fatalf("stored %q", got)
+	}
+	rest, err := io.ReadAll(k.first)
+	if err != nil || string(rest) != "56789" {
+		t.Fatalf("the first attempt's reader now yields %q (%v), want the half it had left", rest, err)
+	}
+}
+
+func mustGet(t *testing.T, s *Store, key string) io.ReadCloser {
+	t.Helper()
+	rc, _, err := s.Get(context.Background(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rc
+}
+
+// conflictOnMissing is a store that answers a conditional delete of a missing
+// key with a failed precondition, as RustFS does.
+type conflictOnMissing struct{ Backend }
+
+func (c conflictOnMissing) Delete(ctx context.Context, key string, expected ETag) error {
+	if _, err := c.Backend.Head(ctx, key); err != nil && expected != "" {
+		return fmt.Errorf("%w: precondition failed", ErrConflict)
+	}
+	return c.Backend.Delete(ctx, key, expected)
+}
+
+// A conditional delete that landed and lost its response is retried into a
+// "conflict" on such a store. The object is gone, so the delete is done.
+func TestConditionalDeleteLostResponseOnAStoreThatAnswersConflict(t *testing.T) {
+	t.Parallel()
+	l := WithHook(conflictOnMissing{NewMemory()})
+	s := NewStore(l, "n1", 1, Options{Backoff: time.Millisecond})
+	ctx := context.Background()
+	e1, _ := s.Create(ctx, "k", strings.NewReader("v1"))
+	fired := loseResponse(l, OpDelete)
+	if err := s.Delete(ctx, "k", e1); err != nil || fired.Load() != 1 {
+		t.Fatalf("err=%v fired=%d", err, fired.Load())
+	}
+	// Without an unknown outcome before it, the same answer is a conflict the caller sees.
+	l.SetHook(nil)
+	if err := s.Delete(ctx, "k", e1); !errors.Is(err, ErrConflict) {
+		t.Fatalf("got %v, want ErrConflict", err)
+	}
+}
+
+// lostDelete fails its first delete with an unknown outcome after running
+// between, which does not apply it.
+type lostDelete struct {
+	Backend
+	between func()
+	calls   atomic.Int32
+}
+
+func (d *lostDelete) Delete(ctx context.Context, key string, expected ETag) error {
+	if d.calls.Add(1) == 1 {
+		d.between()
+		return fmt.Errorf("%w: response lost", ErrUnknown)
+	}
+	return d.Backend.Delete(ctx, key, expected)
+}
+
+// After an unknown outcome, a conflict with the object still there is a real one.
+func TestConditionalDeleteConflictAfterUnknownIsReal(t *testing.T) {
+	t.Parallel()
+	mem := NewMemory()
+	ctx := context.Background()
+	e1, _ := NewStore(mem, "n1", 1, Options{}).Create(ctx, "k", strings.NewReader("v1"))
+	d := &lostDelete{Backend: mem, between: func() {
+		if _, err := NewStore(mem, "n2", 1, Options{}).Update(ctx, "k", strings.NewReader("v2"), e1); err != nil {
+			t.Error(err)
+		}
+	}}
+	s := NewStore(d, "n1", 1, Options{Backoff: time.Millisecond})
+	err := s.Delete(ctx, "k", e1)
+	if !errors.Is(err, ErrConflict) || errors.Is(err, ErrUnknown) {
+		t.Fatalf("got %v, want ErrConflict", err)
+	}
+	if _, err := mem.Head(ctx, "k"); err != nil {
+		t.Fatalf("the object should be there: %v", err)
 	}
 }

@@ -202,8 +202,8 @@ func run(root, kind string) []result {
 		"SHARDLITE_NODE=bench", "SHARDLITE_BLOB=s3://" + *s3Bucket, "SHARDLITE_S3_ENDPOINT=" + *s3URL, fmt.Sprintf("SHARDLITE_PREFIX=bench/%s/%d/", kind, time.Now().UnixNano()),
 		"AWS_ACCESS_KEY_ID=" + envOr("AWS_ACCESS_KEY_ID", "shardlite"), "AWS_SECRET_ACCESS_KEY=" + envOr("AWS_SECRET_ACCESS_KEY", "shardlite-secret"), "AWS_REGION=" + envOr("AWS_REGION", "us-east-1"), "SHARDLITE_KINDS=" + kf,
 		"SHARDLITE_DATA=" + filepath.Join(d, "data"), "SHARDLITE_SCRATCH_DIR=" + filepath.Join(d, "meta"),
-		"SHARDLITE_APP=http://" + appAddr, "SHARDLITE_LISTEN=" + pub, "SHARDLITE_CONTROL=" + ctl,
-		"SHARDLITE_FLUSH=" + flush.String(), "SHARDLITE_PPROF=127.0.0.1:6060",
+		"SHARDLITE_APP=http://" + appAddr, "SHARDLITE_LISTEN_PUBLIC=" + pub, "SHARDLITE_LISTEN_CONTROL=" + ctl, "SHARDLITE_LISTEN_PEER=127.0.0.1:0",
+		"SHARDLITE_FLUSH=" + flush.String(), "SHARDLITE_LISTEN_PPROF=127.0.0.1:6060",
 	})
 	defer node.cmd.Process.Kill()
 	node.waitFor(`shardlite is up`, 30*time.Second)

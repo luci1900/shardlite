@@ -30,7 +30,7 @@ The same goes for shardlite's own state about a shard: it lives in the shard, an
 ## Non-goals
 
 - **No queries or transactions across shards.** Reading two shards means two separate reads, at your own risk. Anything that needs agreement between shards goes through one shard that owns that agreement (see [Consistency model](#consistency-model)). Unlike Orleans, there are no opt-in distributed transactions.
-- No replication between nodes. Each shard has one writer, and blob storage provides durability. Stale reads come from snapshot reads instead (later, see the [roadmap](roadmap.md#later)).
+- No replication between nodes. Each shard has one writer, and blob storage provides durability. Reads that may be stale, from any node, come from snapshot reads instead (later, see the [roadmap](roadmap.md#later)).
 - No general-purpose distributed database features (cross-shard indexes, query planning).
 
 ## Concepts
@@ -65,7 +65,7 @@ flowchart TB
     appB --- diskB[("Local disk: cache")]
   end
 
-  nodeA <-->|HTTP/2| nodeB
+  nodeA <-->|HTTP| nodeB
 
   nodeA --> blob
   nodeB --> blob
@@ -76,7 +76,7 @@ The node does all of the distributed work: leases, ownership, routing, shipping 
 
 ## Consistency model
 
-- One shard, one writer. A SQLite transaction within one shard is the strongest guarantee.
+- One shard, one writer. Within a shard, transactions are SQLite's (serializable), and with sync on (the default) every read and write of the shard is linearizable: the guarantee CockroachDB gives for a key, for a whole database. It assumes working clocks (their rates, not their synchronisation), and a request can ask for reads that hold under any clocks and pauses. The levels and their conditions are in [Consistency](guide.md#consistency).
 - Across shards, consistency is the app's problem.
 - Anything needing agreement goes through a shard that owns it:
   - A trade is a `trade/{id}` shard running a saga: reserve on both player shards, then commit or release, with idempotent steps and resumable state.
@@ -95,8 +95,11 @@ The node does all of the distributed work: leases, ownership, routing, shipping 
 - SlateDB: an LSM tree on object storage. Its fencing of WAL writers by conditional creates is the model for node journals.
 - mvsqlite: SQLite pages stored in a key-value store.
 - ActorDB: a SQLite database per actor, with a schema per actor type, Raft replication and transactions across actors, queried as a database server rather than opened locally.
-- Durable Objects: SQLite storage with output gates.
+- Durable Objects: SQLite storage with output gates. Its alarms are durable timers too, kept in the object's storage and retried with backoff, but one per object, where a shard's inbox holds any number.
 - [Durable Actors](https://github.com/TerseAI/durable-actors) (Terse, 2026): an open-source take on Durable Objects. Actors are written in its TypeScript or Python SDK and run inside its runtime, with a Postgres control plane and an LTX chain per actor in object storage. Its `terse-ltx` and `terse-litestream` crates come from it.
 - Pat Helland, "Life beyond Distributed Transactions": entities that change atomically only within themselves and talk through at-least-once messages, remembering what each partner has sent. Shardlite's model, almost exactly.
 - SQL Server Service Broker: queues as tables inside the database, sent and received in the same transactions as the data, delivered exactly once and in order between databases.
+- Akka Persistence's at-least-once delivery: an actor keeps the messages it has sent but not had confirmed in its own persisted state, and sends them again until they are, as a shard keeps its outbox.
+- Orleans reminders (and Dapr's and Service Fabric's): durable timers for actors, kept in a table the whole cluster shares rather than in the actor's state. A shard's timers are rows in its own inbox, and the only global part is a wake hint with no payload.
+- Restate: virtual objects with durable state, timers and messages between services, journaled in Restate's own log rather than in each object's database.
 - Spanner: commit wait, which holds acknowledgements until TrueTime uncertainty has passed.

@@ -8,7 +8,6 @@ import (
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/segment"
-	"github.com/luci1900/shardlite/internal/supervisor"
 )
 
 // maxSweepEvery is the longest wait between two sweeps.
@@ -16,7 +15,7 @@ const maxSweepEvery = 10 * time.Minute
 
 // sweeper is the node's own journal sweeper (docs/internals.md, Cleaning the
 // journal): every tenth of age (at most every ten minutes) until ctx ends it
-// lists journal/{node}/ and deletes the non-empty segments last modified more
+// lists data/journal/{node}/ and deletes the non-empty segments last modified more
 // than age ago. Empty segments (fences) are never deleted, since a zombie
 // paused for longer than age could otherwise write into a freed number. It
 // works through the blob store's List and Delete alone, so it is the same on
@@ -28,10 +27,15 @@ const maxSweepEvery = 10 * time.Minute
 // It starts only once Run does, so the node's old segments have been adopted
 // before any of them can expire. age must be positive. Run runs it as one of the
 // node's services.
+//
+// An adopter sweeps a dead node's journal with it too, once (sweepJournal), with
+// an age of zero (every non-empty segment) and below set to its fence: segments from the fence on may be
+// the node's next life's, written since the adoption finished.
 type sweeper struct {
 	store *blob.Store
 	node  string
 	age   time.Duration
+	below uint64 // only segments numbered below this, if set
 	log   *slog.Logger
 }
 
@@ -44,7 +48,7 @@ func (s *sweeper) Serve(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return supervisor.NoRestart(nil)
+			return nil
 		case <-t.C:
 			if _, err := s.sweepJournal(ctx, time.Now()); err != nil && ctx.Err() == nil {
 				s.log.Warn("sweeping the node journal failed, trying again later", "err", err)
@@ -62,7 +66,10 @@ func (s *sweeper) sweepJournal(ctx context.Context, now time.Time) (deleted int,
 		if err != nil {
 			return deleted, err
 		}
-		if info.Size > 0 && now.Sub(info.LastModified) > s.age {
+		if s.below > 0 && info.Key >= segment.Key(s.node, s.below) {
+			break // keys sort by number
+		}
+		if info.Size > 0 && (s.age == 0 || now.Sub(info.LastModified) > s.age) {
 			old = append(old, info.Key)
 		}
 	}

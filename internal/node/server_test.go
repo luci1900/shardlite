@@ -2,6 +2,8 @@ package node
 
 import (
 	"bufio"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
@@ -9,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
+	"net/textproto"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -29,7 +33,7 @@ import (
 
 // srig is a node serving in front of a fake app. The fake app is in the test
 // process, but it never opens a shard itself: commits go through the separate
-// testapp process (see shards_test.go for why).
+// testapp process (see catalog_test.go for why).
 type srig struct {
 	*mrig
 	fake    *httptest.Server
@@ -51,7 +55,7 @@ type srig struct {
 
 func newSRig(t *testing.T) *srig { return newSRigWith(t, nil) }
 
-func newSRigWith(t *testing.T, mutate func(*ShardsOptions)) *srig {
+func newSRigWith(t *testing.T, mutate func(*CatalogOptions)) *srig {
 	t.Helper()
 	r := &srig{mrig: newUnstartedMRig(t, nil), opened: map[string]bool{}}
 	r.fake = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
@@ -85,7 +89,7 @@ func newSRigWith(t *testing.T, mutate func(*ShardsOptions)) *srig {
 
 // serverTransport makes the server the shards are built with, and returns its
 // transport behind the hooks.
-func (r *srig) serverTransport(m *Shards) *transport {
+func (r *srig) serverTransport(m *Catalog) *transport {
 	u, _ := url.Parse(r.fake.URL)
 	r.srv = NewServer(m, m.opts.Kinds, m.n.Keeper, ServerOptions{App: u, HealthEvery: 20 * time.Millisecond, Grace: 500 * time.Millisecond})
 	tr := r.srv.transport()
@@ -126,8 +130,8 @@ func (r *srig) startServer() {
 	r.pub, r.ctl = "http://"+pub.Addr().String(), "http://"+ctl.Addr().String()
 	ctx, cancel := context.WithCancel(context.Background())
 	var g errgroup.Group
-	g.Go(func() error { return srv.publicServer(pub, nil).Serve(ctx) })
-	g.Go(func() error { return srv.controlServer(nil, ctl, sock).Serve(ctx) })
+	g.Go(func() error { return srv.publicServer(pub).Serve(ctx) })
+	g.Go(func() error { return srv.controlServer(ctl, sock).Serve(ctx) })
 	g.Go(func() error { return srv.health.Serve(ctx) })
 	var once sync.Once
 	r.stop = func() { once.Do(func() { cancel(); g.Wait() }) }
@@ -264,6 +268,111 @@ func TestServerRouting(t *testing.T) {
 	resp, _ = r.req("POST", r.ctl, "/svc/Method", map[string]string{"Shardlite-Target": "typo/1", "Content-Type": "application/grpc+proto"}, "")
 	if resp.Header.Get("Grpc-Status") != "3" {
 		t.Fatalf("grpc error on the control API: %v", resp.Header)
+	}
+}
+
+// The load balancer is the trust boundary: the app sees the chain it sent with
+// its own address added, and the protocol and host the client used. Without
+// them the app sees the node's own view of the request.
+func TestServerKeepsForwardedHeadersFromTheLoadBalancer(t *testing.T) {
+	t.Parallel()
+	r := newSRig(t)
+	var last atomic.Pointer[http.Request]
+	r.app_(func(w http.ResponseWriter, q *http.Request) {
+		last.Store(q.Clone(context.Background()))
+		io.WriteString(w, "ok")
+	})
+	seen := func(hdr map[string]string) (xff, proto, host string) {
+		t.Helper()
+		hdr["Shardlite-Target"] = "slow/x1"
+		if resp, _ := r.req("GET", r.pub, "/x", hdr, ""); resp.StatusCode != 200 {
+			t.Fatalf("status %d", resp.StatusCode)
+		}
+		q := last.Load()
+		return q.Header.Get("X-Forwarded-For"), q.Header.Get("X-Forwarded-Proto"), q.Header.Get("X-Forwarded-Host")
+	}
+
+	xff, proto, host := seen(map[string]string{
+		"X-Forwarded-For": "203.0.113.9, 198.51.100.7", "X-Forwarded-Proto": "https", "X-Forwarded-Host": "app.example.com",
+	})
+	if xff != "203.0.113.9, 198.51.100.7, 127.0.0.1" || proto != "https" || host != "app.example.com" {
+		t.Fatalf("with the load balancer's headers: %q %q %q", xff, proto, host)
+	}
+	xff, proto, host = seen(map[string]string{})
+	if xff != "127.0.0.1" || proto != "http" || host != strings.TrimPrefix(r.pub, "http://") {
+		t.Fatalf("without them: %q %q %q", xff, proto, host)
+	}
+}
+
+// A proxy passes bodies through as they are: it adds no Accept-Encoding to the
+// app's request for a client that sent none, and it hands on a compressed
+// answer without decoding it.
+func TestServerLeavesCompressionToTheClient(t *testing.T) {
+	t.Parallel()
+	r := newSRig(t)
+	var asked atomic.Value // the request's Accept-Encoding
+	var zipped bytes.Buffer
+	zw := gzip.NewWriter(&zipped)
+	io.WriteString(zw, "hello")
+	zw.Close()
+	r.app_(func(w http.ResponseWriter, q *http.Request) {
+		asked.Store(q.Header.Get("Accept-Encoding"))
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Write(zipped.Bytes())
+	})
+
+	c := &http.Client{Timeout: 20 * time.Second, Transport: &http.Transport{DisableKeepAlives: true, DisableCompression: true}}
+	q, _ := http.NewRequest("GET", r.pub+"/z", nil)
+	q.Header.Set("Shardlite-Target", "slow/z1")
+	resp, err := c.Do(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if ae := asked.Load(); ae != "" {
+		t.Fatalf("the app saw Accept-Encoding %v (nil if it saw no request)", ae)
+	}
+	if resp.Header.Get("Content-Encoding") != "gzip" || !bytes.Equal(body, zipped.Bytes()) {
+		t.Fatalf("the answer was changed on the way: %q %x", resp.Header.Get("Content-Encoding"), body)
+	}
+}
+
+// CGI-style frameworks give Shardlite_Caller the same variable as
+// Shardlite-Caller, so the underscore spelling must not get through either way.
+func TestServerStripsUnderscoreHeaders(t *testing.T) {
+	t.Parallel()
+	r := newSRig(t)
+	var last atomic.Pointer[http.Request]
+	r.app_(func(w http.ResponseWriter, q *http.Request) {
+		last.Store(q.Clone(context.Background()))
+		w.Header().Set("Shardlite_Foo", "x")
+		w.Header().Set("SHARDLITE_BAR", "y")
+		w.Header().Set("X-Plain", "y")
+	})
+
+	resp, _ := r.req("GET", r.pub, "/x", map[string]string{
+		"Shardlite-Target": "slow/u1", "Shardlite_Caller": "users/9", "SHARDLITE_FOO": "1", "X-Plain": "z",
+	}, "")
+	q := last.Load()
+	if resp.StatusCode != 200 || q == nil {
+		t.Fatalf("%d", resp.StatusCode)
+	}
+	for k, v := range q.Header {
+		if strings.HasPrefix(strings.ToLower(k), "shardlite") && k != "Shardlite-Target" && k != "Shardlite-Path" && k != "Shardlite-Hops" {
+			t.Fatalf("%s: %v reached the app", k, v)
+		}
+	}
+	if q.Header.Get("X-Plain") != "z" {
+		t.Fatal("ordinary headers must pass")
+	}
+	for k, v := range resp.Header {
+		if strings.HasPrefix(strings.ToLower(k), "shardlite") {
+			t.Fatalf("response header %s: %v reached the client", k, v)
+		}
+	}
+	if resp.Header.Get("X-Plain") != "y" {
+		t.Fatal("ordinary headers must pass")
 	}
 }
 
@@ -458,6 +567,45 @@ func TestServerUpgrade(t *testing.T) {
 	conn.Close()
 	// Once it is closed the shard is free to go.
 	eventually(t, "the hold to be released", func() bool { return r.refs("slow/ws") == 0 })
+}
+
+// The app's 1xx responses (103 Early Hints) are dropped: ReverseProxy would
+// write them before the gate and the stripping of Shardlite-* headers, and a
+// shard's output must pass the gate before the client sees any of it.
+func TestServerDropsInformationalResponses(t *testing.T) {
+	t.Parallel()
+	r := newSRig(t)
+	r.app_(func(w http.ResponseWriter, q *http.Request) {
+		w.Header().Set("Link", "</style.css>; rel=preload")
+		w.Header().Set("Shardlite-Secret", "x")
+		w.WriteHeader(http.StatusEarlyHints)
+		w.Header().Del("Link")
+		w.Header().Del("Shardlite-Secret")
+		io.WriteString(w, "done")
+	})
+
+	var informational atomic.Int32
+	trace := &httptrace.ClientTrace{Got1xxResponse: func(int, textproto.MIMEHeader) error {
+		informational.Add(1)
+		return nil
+	}}
+	q, _ := http.NewRequestWithContext(httptrace.WithClientTrace(context.Background(), trace), "GET", r.pub+"/e", nil)
+	q.Header.Set("Shardlite-Target", "slow/e1")
+	resp, err := r.client.Do(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 || string(body) != "done" {
+		t.Fatalf("%d %q", resp.StatusCode, body)
+	}
+	if n := informational.Load(); n != 0 {
+		t.Fatalf("the client got %d informational responses", n)
+	}
+	if resp.Header.Get("Link") != "" || resp.Header.Get("Shardlite-Secret") != "" {
+		t.Fatalf("headers of the dropped response were left behind: %v", resp.Header)
+	}
 }
 
 // Stopping the servers ends what is left of their requests and joins them: a

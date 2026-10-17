@@ -3,6 +3,7 @@ package capture
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"runtime/debug"
 	"syscall"
@@ -38,11 +39,39 @@ type WalIndex struct {
 	mem []byte
 }
 
-// MapWalIndex maps the -shm file of dbPath, creating it if it is missing. It
-// must be called when this process has no other descriptor open on the file
-// (and before Litestream opens the shard).
+// openShm opens the -shm file of dbPath, creating it if it is missing. SQLite
+// reuses a -shm that exists, so one made here has to be the one SQLite would
+// have made: with the database file's permissions and owner. The mode is set
+// after the file is created so the node's umask can't narrow it, as it would
+// for a database that another user shares through its group.
+func openShm(dbPath string) (*os.File, error) {
+	fi, err := os.Stat(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	name := dbPath + "-shm"
+	f, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, fi.Mode().Perm())
+	if errors.Is(err, fs.ErrExist) {
+		return os.OpenFile(name, os.O_RDWR, 0)
+	} else if err != nil {
+		return nil, err
+	}
+	if err := f.Chmod(fi.Mode().Perm()); err != nil {
+		f.Close()
+		return nil, err
+	}
+	// Changing the owner only works for a process that may, as with SQLite.
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		_ = f.Chown(int(st.Uid), int(st.Gid))
+	}
+	return f, nil
+}
+
+// MapWalIndex maps the -shm file of dbPath, creating it if it is missing (the
+// database file must exist). It must be called when this process has no other
+// descriptor open on the file (and before Litestream opens the shard).
 func MapWalIndex(dbPath string) (*WalIndex, error) {
-	f, err := os.OpenFile(dbPath+"-shm", os.O_RDWR|os.O_CREATE, 0o644)
+	f, err := openShm(dbPath)
 	if err != nil {
 		return nil, err
 	}

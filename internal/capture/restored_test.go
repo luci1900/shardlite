@@ -511,7 +511,7 @@ func TestLargeCommitSpillsAndLeavesNothingBehind(t *testing.T) {
 			// segment's own, both in temporary files.
 			var atUpload atomic.Int32
 			e.Blob.SetHook(func(_ context.Context, op blob.Op, key string, after bool) error {
-				if op == blob.OpCreate && !after && strings.HasPrefix(key, "journal/") {
+				if op == blob.OpCreate && !after && strings.HasPrefix(key, segment.Root) {
 					// The most there were at any upload: a later, smaller segment (the writer
 					// cuts one every few milliseconds) finds the commit's file already gone.
 					n := int32(inTemp())

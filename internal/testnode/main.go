@@ -48,8 +48,8 @@ import (
 	"github.com/luci1900/shardlite/internal/coord"
 	"github.com/luci1900/shardlite/internal/node"
 	"github.com/luci1900/shardlite/internal/segment"
+	"github.com/luci1900/shardlite/internal/service"
 	"github.com/luci1900/shardlite/internal/shardfile"
-	"github.com/luci1900/shardlite/internal/supervisor"
 )
 
 type shard struct {
@@ -102,7 +102,7 @@ func (n *testNode) at(point string) {
 }
 
 func (n *testNode) hook(ctx context.Context, op blob.Op, key string, after bool) error {
-	if op != blob.OpCreate || !strings.HasPrefix(key, "journal/") {
+	if op != blob.OpCreate || !strings.HasPrefix(key, segment.Root) {
 		return nil
 	}
 	if after {
@@ -167,7 +167,7 @@ func main() {
 	nd.SetTails(&n.tails)
 	// Run serves the writer and the keeper in the real node; this one serves them
 	// while main runs.
-	defer supervisor.Background(slog.Default(), "journal", nd.Writer, nd.Keeper)()
+	defer service.Background(slog.Default(), nd.Writer, nd.Keeper)()
 	// The writer flushes only when asked: this node does it on a timer.
 	flushCtx, stopFlushing := context.WithCancel(context.Background())
 	defer stopFlushing()
@@ -277,7 +277,7 @@ func (n *testNode) do(f []string) (string, error) {
 		return "", nil
 	case "open":
 		path := f[2]
-		h, created, err := n.files.Open(ctx, name, false)
+		h, created, err := n.files.Open(ctx, name)
 		if err != nil {
 			return "", err
 		}
@@ -318,7 +318,7 @@ func (n *testNode) do(f []string) (string, error) {
 		// Activate the shard from the file and WAL a release left, as the node does
 		// for a cached shard: nothing is downloaded. The shard must have been
 		// released after a delta, so that the manifest covers the file.
-		h, created, err := n.files.Open(ctx, name, false)
+		h, created, err := n.files.Open(ctx, name)
 		if err != nil {
 			return "", err
 		} else if created {
@@ -327,7 +327,7 @@ func (n *testNode) do(f []string) (string, error) {
 		return "", n.activate(ctx, name, f[2], h, &capture.Restored{Position: h.Manifest.LastPosition()})
 	case "openempty":
 		// A shard with a manifest but nothing durable: capture the file the app created again.
-		h, _, err := n.files.Open(ctx, name, false)
+		h, _, err := n.files.Open(ctx, name)
 		if err != nil {
 			return "", err
 		}

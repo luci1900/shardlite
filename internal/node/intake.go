@@ -20,8 +20,8 @@ import (
 const hdrInbox = "Shardlite-Inbox"
 
 // insertInbox puts a message into the shard's inbox as from sender, due now, in
-// a transaction of its own. Intakes for one shard go one at a time because Use runs on the
-// capture's loop.
+// a transaction of its own. Intakes for one shard go one at a time because Use holds the
+// capture's lock.
 func (a *shard) insertInbox(ctx context.Context, sender, path, contentType string, hops int, body []byte) error {
 	due := a.d.now().Unix()
 	err := a.useDB(ctx, func(db *sql.DB) error {

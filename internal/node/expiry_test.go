@@ -9,13 +9,15 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/coord"
 	"github.com/luci1900/shardlite/internal/segment"
+	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
-// segments counts the non-empty and empty (fence) objects under journal/.
+// segments counts the non-empty and empty (fence) objects under the journal prefix.
 func (r *mrig) segments() (data, fences int) {
 	r.t.Helper()
-	for info, err := range r.local.List(context.Background(), "journal/") {
+	for info, err := range r.local.List(context.Background(), segment.Root) {
 		if err != nil {
 			r.t.Fatal(err)
 		}
@@ -36,7 +38,7 @@ func TestTailOlderThanTheAlertAgeRaisesIt(t *testing.T) {
 	r := newMRig(t)
 	r.crash()
 	const deltaAge, expiry = 170 * time.Millisecond, 2 * time.Second // the alert is at 510 ms
-	r.startShards(func(o *ShardsOptions) { o.Lifecycle.DeltaAge = deltaAge })
+	r.startShards(func(o *CatalogOptions) { o.Lifecycle.DeltaAge = deltaAge })
 	r.startSweeper(expiry)
 
 	ctx := context.Background()
@@ -47,7 +49,7 @@ func TestTailOlderThanTheAlertAgeRaisesIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if (op == blob.OpUpdate || op == blob.OpCreate) && strings.HasPrefix(key, "manifests/") {
+		if (op == blob.OpUpdate || op == blob.OpCreate) && strings.HasPrefix(key, shardfile.ManifestPrefix) {
 			return errors.New("storage refuses manifests")
 		}
 		return nil
@@ -69,7 +71,7 @@ func TestTailAlertWhenDeltasFail(t *testing.T) {
 	t.Parallel()
 	r := newMRig(t)
 	r.crash()
-	r.startShards(func(o *ShardsOptions) { o.Lifecycle.DeltaAge = 100 * time.Millisecond }) // the alert is at 300 ms
+	r.startShards(func(o *CatalogOptions) { o.Lifecycle.DeltaAge = 100 * time.Millisecond }) // the alert is at 300 ms
 	ctx := context.Background()
 	ref := r.acquire("slow/failing")
 	defer ref.Release()
@@ -78,7 +80,7 @@ func TestTailAlertWhenDeltasFail(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if (op == blob.OpUpdate || op == blob.OpCreate) && strings.HasPrefix(key, "manifests/") {
+		if (op == blob.OpUpdate || op == blob.OpCreate) && strings.HasPrefix(key, shardfile.ManifestPrefix) {
 			return errors.New("storage refuses manifests")
 		}
 		return nil
@@ -96,7 +98,7 @@ func TestRestartAfterSegmentsExpired(t *testing.T) {
 	t.Parallel()
 	r := newMRig(t)
 	r.crash()
-	r.startShards(func(o *ShardsOptions) { o.Lifecycle.DeltaAge = 30 * time.Millisecond })
+	r.startShards(func(o *CatalogOptions) { o.Lifecycle.DeltaAge = 30 * time.Millisecond })
 	ctx := context.Background()
 
 	want := map[string]string{}
@@ -267,7 +269,7 @@ func TestSweepDeletesOldSegmentsKeepsFencesAndRecent(t *testing.T) {
 	fence := r.putSegment("n1", 1002, "")
 	r.putSegment("n1", 1003, "recent")
 	foreign := r.putSegment("other", 1, "someone else's")
-	lease := "nodes/n1"
+	lease := coord.Key("n1")
 
 	// With a fake now: the first two are older than the age, the third is not.
 	// (Their real modification times are all about now.)
@@ -311,7 +313,7 @@ func TestSweeperUsesOnlyListAndDelete(t *testing.T) {
 	var mu sync.Mutex
 	ops := map[blob.Op]int{}
 	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if !after && strings.HasPrefix(key, "journal/") {
+		if !after && strings.HasPrefix(key, segment.Root) {
 			mu.Lock()
 			ops[op]++
 			mu.Unlock()
@@ -349,7 +351,7 @@ func TestJournalSweeperRunsAndStopJoins(t *testing.T) {
 
 // sweeper builds the node's journal sweeper from the node's parts, as Run does.
 func (r *mrig) sweeper(age time.Duration) *sweeper {
-	return &sweeper{r.n.Store, r.n.Name, age, r.n.Logger}
+	return &sweeper{store: r.n.Store, node: r.n.Name, age: age, log: r.n.Logger}
 }
 
 // startSweeper runs the node's journal sweeper, as Run does, until the returned

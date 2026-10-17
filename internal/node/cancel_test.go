@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
 // A client that goes away while its response is held at the gate: the node
@@ -138,7 +139,7 @@ func TestCallerCancelsDuringActivation(t *testing.T) {
 	entered, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if !after && op == blob.OpCreate && strings.HasPrefix(key, "manifests/") {
+		if !after && op == blob.OpCreate && strings.HasPrefix(key, shardfile.ManifestPrefix) {
 			once.Do(func() { close(entered) })
 			<-release // a slow activation
 		}

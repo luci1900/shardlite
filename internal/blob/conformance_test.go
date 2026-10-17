@@ -124,20 +124,20 @@ func conformance(t *testing.T, mk backendFactory) {
 	})
 
 	run("ETagsAgree", func(t *testing.T, b Backend, s *Store) {
-		created, err := s.Create(ctx, "shards/users/42/k3x9/1-2.12.ltx", strings.NewReader("contents"))
+		created, err := s.Create(ctx, "data/shards/users/42/k3x9/1-2.12.ltx", strings.NewReader("contents"))
 		if err != nil {
 			t.Fatal(err)
 		}
-		info, err := s.Head(ctx, "shards/users/42/k3x9/1-2.12.ltx")
+		info, err := s.Head(ctx, "data/shards/users/42/k3x9/1-2.12.ltx")
 		if err != nil || info.ETag != created || strings.ContainsAny(string(info.ETag), `"`) {
 			t.Fatalf("head: %+v %v (create gave %q)", info, err, created)
 		}
-		rc, got, err := s.Get(ctx, "shards/users/42/k3x9/1-2.12.ltx")
+		rc, got, err := s.Get(ctx, "data/shards/users/42/k3x9/1-2.12.ltx")
 		rc.Close()
 		if err != nil || got != created {
 			t.Fatalf("get: %q %v", got, err)
 		}
-		for li, err := range s.List(ctx, "shards/") {
+		for li, err := range s.List(ctx, "data/shards/") {
 			if err != nil || li.ETag != created {
 				t.Fatalf("list: %+v %v", li, err)
 			}
@@ -244,7 +244,7 @@ func conformance(t *testing.T, mk backendFactory) {
 	})
 
 	run("ListByPrefix", func(t *testing.T, b Backend, s *Store) {
-		for _, k := range []string{"journal/n1/2", "journal/n1/1", "journal/n2/1", "nodes/n1", "journal/n10/1"} {
+		for _, k := range []string{"data/journal/n1/2", "data/journal/n1/1", "data/journal/n2/1", "state/nodes/n1", "data/journal/n10/1"} {
 			s.Create(ctx, k, strings.NewReader(k))
 		}
 		list := func(prefix string) string {
@@ -257,7 +257,7 @@ func conformance(t *testing.T, mk backendFactory) {
 			}
 			return strings.Join(got, ",")
 		}
-		if got := list("journal/n1/"); got != "journal/n1/1:12,journal/n1/2:12" {
+		if got := list("data/journal/n1/"); got != "data/journal/n1/1:17,data/journal/n1/2:17" {
 			t.Fatalf("got %v", got)
 		}
 		if got := list("nothing/"); got != "" {
@@ -348,23 +348,23 @@ func conformance(t *testing.T, mk backendFactory) {
 
 	run("WithPrefixesAreSeparate", func(t *testing.T, b Backend, s *Store) {
 		x, y := storeOf(WithPrefix(b, "x/")), storeOf(WithPrefix(b, "y/"))
-		if _, err := x.Create(ctx, "nodes/n1", strings.NewReader("x")); err != nil {
+		if _, err := x.Create(ctx, "state/nodes/n1", strings.NewReader("x")); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := y.Create(ctx, "nodes/n1", strings.NewReader("y")); err != nil {
+		if _, err := y.Create(ctx, "state/nodes/n1", strings.NewReader("y")); err != nil {
 			t.Fatal(err)
 		}
 		var keys []string
-		for info, err := range x.List(ctx, "nodes/") {
+		for info, err := range x.List(ctx, "state/nodes/") {
 			if err != nil {
 				t.Fatal(err)
 			}
 			keys = append(keys, info.Key)
 		}
-		if len(keys) != 1 || keys[0] != "nodes/n1" {
+		if len(keys) != 1 || keys[0] != "state/nodes/n1" {
 			t.Fatalf("listing: %v", keys)
 		}
-		if _, err := s.Head(ctx, "nodes/n1"); !errors.Is(err, ErrNotFound) {
+		if _, err := s.Head(ctx, "state/nodes/n1"); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("head without the prefix: %v", err)
 		}
 	})

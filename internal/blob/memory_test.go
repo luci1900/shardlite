@@ -139,24 +139,24 @@ func TestWithPrefix(t *testing.T) {
 	m := NewMemory()
 	b := WithPrefix(m, "staging/")
 	ctx := context.Background()
-	if _, err := b.Create(ctx, "nodes/n1", strings.NewReader("x"), WriteID{}); err != nil {
+	if _, err := b.Create(ctx, "state/nodes/n1", strings.NewReader("x"), WriteID{}); err != nil {
 		t.Fatal(err)
 	}
 	// It is stored under the prefix, and invisible without it.
-	if _, err := m.Head(ctx, "staging/nodes/n1"); err != nil {
+	if _, err := m.Head(ctx, "staging/state/nodes/n1"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.Head(ctx, "nodes/n1"); !errors.Is(err, ErrNotFound) {
+	if _, err := m.Head(ctx, "state/nodes/n1"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("head without the prefix: %v", err)
 	}
 	var keys []string
-	for info, err := range b.List(ctx, "nodes/") {
+	for info, err := range b.List(ctx, "state/nodes/") {
 		if err != nil {
 			t.Fatal(err)
 		}
 		keys = append(keys, info.Key)
 	}
-	if len(keys) != 1 || keys[0] != "nodes/n1" {
+	if len(keys) != 1 || keys[0] != "state/nodes/n1" {
 		t.Fatalf("listing: %v", keys)
 	}
 }

@@ -3,6 +3,8 @@ package capture_test
 import (
 	"bytes"
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -18,9 +20,9 @@ import (
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/segment"
+	"github.com/luci1900/shardlite/internal/service"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
-	"github.com/luci1900/shardlite/internal/supervisor"
 )
 
 type env struct {
@@ -43,7 +45,7 @@ func newEnv(t *testing.T) *env {
 
 // serveWriter serves w, as the node's tree does, until the test ends.
 func serveWriter(t *testing.T, w *segment.Writer) {
-	t.Cleanup(supervisor.Background(slog.Default(), "writer", w))
+	t.Cleanup(service.Background(slog.Default(), w))
 }
 
 // entriesFor returns every segment entry of a shard, in journal order.
@@ -451,5 +453,74 @@ func TestCommitsInOneWindowKeepOnlyTheLatestPages(t *testing.T) {
 	t.Logf("%d commits in one window: %d LTX files, %d pages and %d bytes in all, for a database of %d pages", commits, files, totalPages, totalBytes, dbPages)
 	if files > 5 || totalPages > files*dbPages {
 		t.Fatalf("%d files and %d pages for %d commits of the same %d pages", files, totalPages, commits, dbPages)
+	}
+}
+
+// A panic under the shard's lock ends the activation, so a caller that recovers
+// it (as net/http does for a handler) can't go on to use Litestream in whatever
+// state the panic left.
+func TestPanicUnderTheLockEndsTheActivation(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	path := filepath.Join(e.dir, "users-1.db")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sh := newShard(t, e, path)
+	defer sh.Abandon()
+	ctx := context.Background()
+	func() {
+		defer func() {
+			if r := recover(); r != "boom" {
+				t.Fatalf("recovered %v, want the panic", r)
+			}
+		}()
+		sh.Use(ctx, func(*sql.DB) error { panic("boom") })
+	}()
+	if sh.Open() {
+		t.Fatal("the shard is still open after a panic under its lock")
+	}
+	if err := sh.Use(ctx, func(*sql.DB) error { return nil }); !errors.Is(err, capture.ErrClosed) {
+		t.Fatalf("use after the panic: %v, want ErrClosed", err)
+	}
+}
+
+// UseAt reports the captured position fn saw when nothing was committed while
+// it ran (whether or not the commits before it were captured yet), and 0 when
+// something was.
+func TestUseAtReportsTheExactPosition(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	path := filepath.Join(e.dir, "users-1.db")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sh := newShard(t, e, path)
+	defer sh.Abandon()
+	ctx := context.Background()
+	if err := sh.Capture(ctx); err != nil {
+		t.Fatal(err)
+	}
+	app, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(wal)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	if _, err := app.Exec(`CREATE TABLE t (x)`); err != nil { // not captured yet
+		t.Fatal(err)
+	}
+	var n int
+	at, err := sh.UseAt(ctx, func(db *sql.DB) error {
+		return db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_schema WHERE name = 't'`).Scan(&n)
+	})
+	if err != nil || n != 1 || at == 0 || at != sh.Position() {
+		t.Fatalf("idle: at %d (position %d), saw the table %d times, err %v", at, sh.Position(), n, err)
+	}
+	at, err = sh.UseAt(ctx, func(*sql.DB) error {
+		_, err := app.Exec(`INSERT INTO t VALUES (1)`) // committed while fn runs
+		return err
+	})
+	if err != nil || at != 0 {
+		t.Fatalf("with a commit during fn: at %d, err %v", at, err)
 	}
 }

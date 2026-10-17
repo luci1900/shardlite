@@ -1,6 +1,6 @@
 // Command e2eapp runs the end-to-end test app (see ../../e2eapp).
 //
-//	e2eapp -listen 127.0.0.1:0 -control 127.0.0.1:7000
+//	e2eapp -listen 127.0.0.1:0 -control 127.0.0.1:2282
 //
 // It prints "listening ADDR" once it is serving.
 package main
@@ -18,7 +18,7 @@ import (
 
 func main() {
 	listen := flag.String("listen", "127.0.0.1:0", "address to serve on")
-	control := flag.String("control", "127.0.0.1:7000", "the node's control API")
+	control := flag.String("control", "127.0.0.1:2282", "the node's control API")
 	idle := flag.Duration("idle-close", 500*time.Millisecond, "close a shard's database after this long unused")
 	flag.Parse()
 

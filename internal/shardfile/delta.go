@@ -36,6 +36,25 @@ const DefaultDeltaSize = 256 << 10
 type Hooks struct {
 	AfterFileWrite  func() error // delta or base written, manifest not yet updated
 	AfterRebaseSwap func() error // rebase's manifest update done, superseded files not yet deleted
+	// Wake gives the manifest's wake time, which is written in the same update as the
+	// files. It is called once the tail is taken and the file is written, just before
+	// the update, with the position the files now reach, and an error from it fails
+	// the operation with the manifest as it was. Nil leaves the manifest's wake as it is.
+	Wake func(ctx context.Context, end uint64) (int64, error)
+}
+
+// setWake sets m's wake time from the Wake hook, if there is one, for files
+// that reach end.
+func (hk Hooks) setWake(ctx context.Context, m *Manifest, end uint64) error {
+	if hk.Wake == nil {
+		return nil
+	}
+	w, err := hk.Wake(ctx, end)
+	if err != nil {
+		return fmt.Errorf("wake time: %w", err)
+	}
+	m.Wake = w
+	return nil
 }
 
 // Policy says when a snapshot is written, and when it is a rebase and not a delta.
@@ -186,7 +205,7 @@ func reencode(w io.Writer, files []capture.TailFile, rg Range) error {
 // say) is the same write: the handle keeps the write id until the manifest
 // has adopted the file, so blob.Store can tell the earlier attempt's object
 // from somebody else's without comparing bytes.
-func (h *Handle) putFile(ctx context.Context, f File, body io.ReadSeeker) error {
+func (h *Handle) putFile(ctx context.Context, f File, body blob.Body) error {
 	key := FileKey(h.Name, h.Manifest.Generation, f)
 	id, ok := h.writes[key]
 	if !ok {
@@ -260,6 +279,9 @@ func (h *Handle) putTail(ctx context.Context, tail []capture.TailFile, hooks Hoo
 	}
 	next := h.Manifest.clone()
 	next.Files = append(next.Files, file.String())
+	if err := hooks.setWake(ctx, next, r.Max); err != nil {
+		return err
+	}
 	if edit != nil {
 		edit(next)
 	}
@@ -364,6 +386,9 @@ func (h *Handle) Rebase(ctx context.Context, sh *capture.Shard, hooks Hooks) (bo
 	}
 	next := h.Manifest.clone()
 	next.Files = []string{base.String()}
+	if err := hooks.setWake(ctx, next, position); err != nil {
+		return false, err
+	}
 	if err := h.update(ctx, "rebase", next); err != nil {
 		return false, err
 	}

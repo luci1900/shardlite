@@ -147,7 +147,7 @@ func TestCrashBetweenFileAndManifest(t *testing.T) {
 		t.Fatalf("manifest %+v err=%v", m, err)
 	}
 	var keys int
-	for _, err := range e.Store.List(ctx, "shards/"+shard+"/") {
+	for _, err := range e.Store.List(ctx, shardfile.ShardPrefix(shard)) {
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -263,8 +263,8 @@ func TestLostResponses(t *testing.T) {
 
 	t.Run("manifest create", func(t *testing.T) {
 		e := harness.New(t)
-		fired := lose(e, blob.OpCreate, "manifests/")
-		h, created, err := e.Files.Open(ctx, shard, false)
+		fired := lose(e, blob.OpCreate, shardfile.ManifestPrefix)
+		h, created, err := e.Files.Open(ctx, shard)
 		if err != nil || !created || !fired.Load() {
 			t.Fatalf("created=%v fired=%v err=%v", created, fired.Load(), err)
 		}
@@ -280,7 +280,7 @@ func TestLostResponses(t *testing.T) {
 		app := e.StartApp(shard)
 		h, sh := e.NewShard(shard)
 		write(t, e, app, func() error { return sh.Sync(ctx) }, 0)
-		fired := lose(e, blob.OpUpdate, "manifests/")
+		fired := lose(e, blob.OpUpdate, shardfile.ManifestPrefix)
 		if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); err != nil || !fired.Load() {
 			t.Fatalf("fired=%v err=%v", fired.Load(), err)
 		}
@@ -296,8 +296,8 @@ func TestLostResponses(t *testing.T) {
 
 	t.Run("conflict is not mistaken for our own write", func(t *testing.T) {
 		e := harness.New(t)
-		h, _, _ := e.Files.Open(ctx, shard, false)
-		other, _, _ := e.Files.Open(ctx, shard, false) // somebody else holding the same manifest
+		h, _, _ := e.Files.Open(ctx, shard)
+		other, _, _ := e.Files.Open(ctx, shard) // somebody else holding the same manifest
 		if err := other.Touch(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -311,7 +311,7 @@ func TestLostResponses(t *testing.T) {
 		app := e.StartApp(shard)
 		h, sh := e.NewShard(shard)
 		write(t, e, app, func() error { return sh.Sync(ctx) }, 0)
-		fired := lose(e, blob.OpCreate, "shards/")
+		fired := lose(e, blob.OpCreate, shardfile.FilesPrefix)
 		if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); err != nil || !fired.Load() {
 			t.Fatalf("fired=%v err=%v", fired.Load(), err)
 		}
@@ -343,13 +343,13 @@ func TestLostResponses(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		fired := lose(e, blob.OpDelete, "shards/")
+		fired := lose(e, blob.OpDelete, shardfile.FilesPrefix)
 		if _, err := h.Rebase(ctx, sh, shardfile.Hooks{}); err != nil || !fired.Load() {
 			t.Fatalf("fired=%v err=%v", fired.Load(), err)
 		}
 		e.Blob.SetHook(nil)
 		n := 0
-		for range e.Store.List(ctx, "shards/"+shard+"/") {
+		for range e.Store.List(ctx, shardfile.ShardPrefix(shard)) {
 			n++
 		}
 		if n != 1 {
@@ -373,7 +373,7 @@ func TestManifestUpdateWithAnUnknownOutcomeDoesNotLeaveAStaleHandle(t *testing.T
 	var down atomic.Bool
 	down.Store(true)
 	e.Blob.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if down.Load() && strings.HasPrefix(key, "manifests/") {
+		if down.Load() && strings.HasPrefix(key, shardfile.ManifestPrefix) {
 			if op == blob.OpUpdate && after {
 				return errors.New("response lost") // it happened
 			}
@@ -410,7 +410,7 @@ func TestManifestUpdateCancelledAfterLandingDoesNotLeaveAStaleHandle(t *testing.
 	write(t, e, app, func() error { return sh.Sync(context.Background()) }, 0)
 	ctx, cancel := context.WithCancel(context.Background())
 	e.Blob.SetHook(func(c context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpUpdate && after && strings.HasPrefix(key, "manifests/") {
+		if op == blob.OpUpdate && after && strings.HasPrefix(key, shardfile.ManifestPrefix) {
 			cancel() // the update has happened; the caller is told to stop
 			return context.Canceled
 		}

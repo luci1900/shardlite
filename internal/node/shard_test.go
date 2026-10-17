@@ -13,6 +13,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
 // Tests of the table and the shard actor (docs/concurrency.md, The tree).
@@ -58,7 +59,7 @@ func notYet[T any](t *testing.T, what string, ch <-chan T) {
 func TestTwoActivationsOfOneNameShareOne(t *testing.T) {
 	t.Parallel()
 	r := newMRig(t)
-	entered, _, unblock := r.blockCreates("manifests/users/sa1")
+	entered, _, unblock := r.blockCreates(shardfile.ManifestKey("users/sa1"))
 	defer unblock()
 	refs := make(chan *Ref, 2)
 	var g errgroup.Group
@@ -112,7 +113,7 @@ func TestAnActivationRacingARelease(t *testing.T) {
 	ref.Release()
 	old := ref.a
 
-	entered, _, unblock := r.blockCreates("shards/slow/ar1/") // the release's delta
+	entered, _, unblock := r.blockCreates(shardfile.ShardPrefix("slow/ar1")) // the release's delta
 	defer unblock()
 	released := make(chan error, 1)
 	go func() {
@@ -206,11 +207,11 @@ func TestARequestRacingTheRemovalOfItsEntry(t *testing.T) {
 // through the shard's loop, and gates wait for the flush loop alone.
 func TestADeltaNeverDelaysARequest(t *testing.T) {
 	t.Parallel()
-	r := newMRigWith(t, func(o *ShardsOptions) { o.Lifecycle.DeltaAge = time.Millisecond })
+	r := newMRigWith(t, func(o *CatalogOptions) { o.Lifecycle.DeltaAge = time.Millisecond })
 	ctx := context.Background()
 	ref := r.acquire("wallet/dd1")
 	defer ref.Release()
-	entered, _, unblock := r.blockCreates("shards/wallet/dd1/")
+	entered, _, unblock := r.blockCreates(shardfile.ShardPrefix("wallet/dd1"))
 	defer unblock()
 	r.write(ref, "a")
 	if err := r.m.Gate(ctx, ref, true); err != nil {
@@ -279,7 +280,7 @@ func TestIdleDeactivationOnTheFakeClock(t *testing.T) {
 // are asked to be.
 func TestTheDeactivationLimitHolds(t *testing.T) {
 	t.Parallel()
-	r := newMRigWith(t, func(o *ShardsOptions) { o.limits.deactivate = 2 })
+	r := newMRigWith(t, func(o *CatalogOptions) { o.limits.deactivate = 2 })
 	ctx := context.Background()
 	var shards []*shard
 	for _, name := range []string{"slow/l1", "slow/l2", "slow/l3", "slow/l4", "slow/l5"} {
@@ -292,7 +293,7 @@ func TestTheDeactivationLimitHolds(t *testing.T) {
 		ref.Release()
 		shards = append(shards, ref.a)
 	}
-	entered, inside, unblock := r.blockCreates("shards/slow/") // the releases' deltas
+	entered, inside, unblock := r.blockCreates(shardfile.FilesPrefix + "slow/") // the releases' deltas
 	defer unblock()
 	var g errgroup.Group
 	for _, a := range shards {
@@ -330,7 +331,7 @@ func TestSnapshotsWaitForAPlace(t *testing.T) {
 		name := map[bool]string{false: "delta", true: "rebase"}[rebase]
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			r := newMRigWith(t, func(o *ShardsOptions) {
+			r := newMRigWith(t, func(o *CatalogOptions) {
 				o.Lifecycle.DeltaAge = time.Millisecond
 				o.limits.snapshot, o.limits.rebase = 1, 1
 				if rebase {
@@ -394,7 +395,7 @@ func TestSnapshotsWaitForAPlace(t *testing.T) {
 	}
 }
 
-// shardGoroutines lists the goroutines running the shards' code (their captures' loops too) or suture's.
+// shardGoroutines lists the goroutines running the shards' code or a service group's.
 func shardGoroutines() []string {
 	buf := make([]byte, 1<<22)
 	for {
@@ -410,7 +411,7 @@ func shardGoroutines() []string {
 		if i == 0 {
 			continue
 		}
-		for _, f := range []string{"node.(*shard)", "capture.(*Shard)", "node.(*msgOwner)", "node.(*wakeHints)", "node.(*messenger)", "node.(*Shards)", "node.(*table)", "node.(*Flusher)", "thejerf/suture"} {
+		for _, f := range []string{"node.(*shard)", "capture.(*Shard)", "node.(*msgOwner)", "node.(*wakeHints)", "node.(*messenger)", "node.(*Catalog)", "node.(*table)", "node.(*Flusher)", "service.(*Group)"} {
 			if strings.Contains(g, f) {
 				out = append(out, g)
 				break
@@ -449,7 +450,7 @@ func TestShardsGoroutinesAreJoinedWhenTheyAreLetGo(t *testing.T) {
 	if err := r.mrig.stop(); err != nil {
 		t.Fatal(err)
 	}
-	r.stopJournal() // its supervisor is one of suture's goroutines too
+	r.stopJournal() // its group's goroutines count too
 	if left := startedSince(before, shardGoroutines()); len(left) > 0 {
 		t.Fatalf("%d goroutines of the shards are left after they were let go of:\n\n%s", len(left), strings.Join(left, "\n\n"))
 	}

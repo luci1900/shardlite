@@ -15,8 +15,8 @@ import (
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/coord"
 	"github.com/luci1900/shardlite/internal/segment"
+	"github.com/luci1900/shardlite/internal/service"
 	"github.com/luci1900/shardlite/internal/shardfile"
-	"github.com/luci1900/shardlite/internal/supervisor"
 )
 
 // Env is one node's worth of storage.
@@ -47,7 +47,7 @@ func New(t testing.TB) *Env {
 	e := &Env{T: t, Dir: t.TempDir(), Meta: t.TempDir(), Blob: local, Store: store, Node: "n1", Reg: reg, Lease: lease}
 	e.Files = &shardfile.Files{Blob: store, Node: e.Node, Leases: reg, TempDir: t.TempDir()}
 	e.W = segment.NewWriter(store, e.Node, segment.Options{TempDir: e.Files.TempDir})
-	t.Cleanup(supervisor.Background(slog.Default(), "writer", e.W))
+	t.Cleanup(service.Background(slog.Default(), e.W))
 	return e
 }
 
@@ -73,7 +73,7 @@ func (e *Env) Path(shard string) string {
 // created) file.
 func (e *Env) NewShard(shard string) (*shardfile.Handle, *capture.Shard) {
 	e.T.Helper()
-	h, created, err := e.Files.Open(context.Background(), shard, false)
+	h, created, err := e.Files.Open(context.Background(), shard)
 	if err != nil {
 		e.T.Fatal(err)
 	}

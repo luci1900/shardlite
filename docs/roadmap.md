@@ -1,52 +1,20 @@
 # shardlite roadmap
 
-## Plans
-
-Work is done in plans: a brief in [plans/](../plans/) for one piece of a stage, which names the documents to read first and what done means, with a report of its findings written next to it. When a plan is done, its results are folded into the documents and this roadmap, so the documents always describe the current design. Plans are numbered by stage, with a major and a minor number: `stage-1.1.md` is the first plan after stage 1's initial work.
-
 ## Stages
 
 Each stage ends with something runnable, riskiest parts first. Stages 0 to 3 make v1.
 
 ### 0. WAL capture with Litestream
 
-- Litestream as a library, driven by the node, with shardlite's storage client writing level 0 files into segments.
-- Restoring a shard and continuing to capture it, with the first snapshot skipped.
-- Deltas with the LTX library.
-- Measuring the cost per active shard at thousands of shards.
-- Fault-injection tests from the start, including apps that checkpoint themselves and crashes between every step.
-
 ### 1. One durable node
-
-Useful on its own: SQLite per actor with continuous backup.
-
-- The node journal as numbered segments, and LTX files per shard with deltas and rebases from Litestream's snapshots (stage 1y), with no path holding a whole shard file in memory.
-- No shard-sized copies in memory (stage 1z): Litestream continues from a restored shard's state without a first snapshot, and tail files spill to temporary files past the spool limit.
-- Restore from a base, deltas and tail, with tests that kill processes between every step.
-- Serving over HTTP/1.1, HTTP/2 (including gRPC), server-sent events and WebSocket.
-- Activation, the local cache of deactivated shards and creating shards on first use.
-- Durability gates (sync on or off), with flushes started as soon as output waits, background deltas triggered by tail size as well as age, the tail alert, journal expiry and rebases following from fewer settings, and an empty cache after a restart (stage 1.2).
-- The localhost control API: `Shardlite-Target` calls (with `Shardlite-If-Active`), `sync` and delete.
-- Hop limit and deadline propagation.
-- Messages: an outbox and an inbox in each shard, with delayed calls to the shard itself.
-- A node lease and manifests (the `coord.Registry` and `shardfile.ManifestStore` types), so restarts are fenced.
-- S3-compatible blob storage, tested against a local emulator. Manifests of deleted and never-written shards are deleted by conditional delete.
-- Startup checks that refuse to start: the store's conditional writes misbehave, or the data directory is on a network filesystem.
-- Startup checks that warn: the scratch directory not on tmpfs, and `vm.max_map_count` or the open file limit too low for the expected active shards.
-- Cancellation propagation (mostly there through request contexts: a test that a cancelled call stops its held and gated requests).
-- Ephemeral kinds, replaced by auto-delete kinds (stage 1.1): normal shards that are deleted when they deactivate.
-- The node as a supervision tree: every goroutine has an owner that joins it, a shard is an actor with a lifecycle loop and a messages owner, the servers join their requests, the tree's dependencies wired in one place, and the locks that stood in for ownership are gone. One SQLite driver (modernc) is linked, so the node builds without cgo. The tests are rebuilt around a fast suite (about 40 seconds, under a minute with `-race`) that runs under a watcher which dumps and kills a stuck test binary.
-- Fewer parts (stage 1.4): no lock nests, is held across I/O or a wait on another goroutine, or stands in for ownership. Each captured shard has a capture loop that owns Litestream's database, the wal-index mapping and the client's tail, so the capture hold, its nested locks and a header read that waits are gone (a busy loop counts as changed). The first fatal error, the lease, the flusher's finished cycles and the last header became atomics or a counter. Restore and adoption build a shard's tail in one place, the node's requests to itself carry an explicit origin instead of context keys, the messages transport is passed when the shards are built, and leases and manifests are concrete types.
-- The long suite in CI (stage 1.5): `internal/tools/testwatch/long.sh` runs the main module with `-tags fault` against RustFS (with and without `-race`), the `e2e` module (with `-race`) and, on Linux, the per-shard cost and filesystem checks, all under the stuck-test watcher. GitHub Actions on Linux runs the fast suite (with and without `-race`, after build, vet and `gofmt`) and, if asked, the long suite. Both run only when started by hand.
-- Services and the journal, tidied (stage 1.7): one question about the journal (`Node.Err`), Run's tree as four stages stopped in order with the drain as a step of Run, health, the journal sweeper and the kinds reload as types, every listener bound before the shards are built, and a journal writer that knows nothing of leases (acknowledgements come only through the flusher, which checks the lease after each flush).
 
 ### 2. A cluster
 
 The lease, fencing and adoption protocol is specified in [Quint](https://quint-lang.org), with lost requests and lost responses modelled, and checked before it is implemented.
 
 - Leases and manifests across nodes, with fencing.
-- Finding the owner: reading the manifest on a miss, caching where shards live, and correcting the cache when a forward reaches a node that no longer owns the shard.
-- Forwarding between nodes over HTTP/2 on a trusted private network: requests, streams and WebSockets, calls with their gates, cancellation as stream resets, deadlines and hops.
+- Finding the owner: reading the manifest on a miss, caching where shards live, and correcting the cache when a forward reaches a node that no longer owns the shard, and retrying the request once at the owner that node names.
+- Forwarding between nodes over HTTP on a trusted private network: requests, streams and WebSockets, calls with their gates, cancellation as stream resets, deadlines and hops.
 - Messages between nodes: intakes forwarded like calls, with `Shardlite-Inbox` honoured only from nodes, and wake hints waking shards through routing on whichever node owns them. Wake scans spread over the nodes, as lease listings are.
 - An unreachable owner: the forwarding node reads its lease and answers at once (`503`, or the gRPC equivalent) until the lease expires and the shard can be claimed after adoption.
 - Listing leases to notice dead nodes, adopting a crashed node's journal and fencing it.
@@ -72,24 +40,27 @@ The lease, fencing and adoption protocol is specified in [Quint](https://quint-l
 - LTX files over S3's 5 GB limit for a single PUT, with multipart uploads (LTX files have unique names, so a plain multipart upload can replace the conditional create they use now).
 - Distributed tracing with W3C trace context, and counting shardless requests that lead to calls to a shard.
 - Metrics for everything the node does: requests, activations, flushes and gate waits, deltas and rebases, storage calls, leases and the egress proxy when it exists.
-- Hash prefixes on per-shard keys (`manifests/7f/users/42`, and the same for LTX files), so a launch spike spreads over many S3 prefixes instead of hitting the limit per prefix (about 3,500 writes a second, raised only gradually) on `manifests/users/`. Changing the key layout later means moving objects, so it should be settled before production data exists.
+- Hash prefixes on per-shard keys (`state/shards/7f/users/42`, and the same for LTX files), so a launch spike spreads over many S3 prefixes instead of hitting the limit per prefix (about 3,500 writes a second, raised only gradually) on `state/shards/users/`. Changing the key layout later means moving objects, so it should be settled before production data exists.
 - Format versions for everything shardlite stores, with a marker per deployment that a node from an older release refuses.
 - The `shardlite` command for operators: `ls`, `export`, `import` and `verify`, through the running node, or directly on blob storage when no lease is live.
 - A crashed shard costs only that shard. A panic in a shard's own goroutines quarantines it (its requests get `503` and an alert is logged) while the rest of the node carries on, instead of crashing the process. Once no process has the file open, the node lets the shard go from its local file: a new base written from the file and swapped into the manifest by compare-and-swap, which holds every commit (including ones never captured) and supersedes the journal. The next request activates it as usual. Its messages can restart on their own instead, since their state is rebuilt from the shard's tables.
 - No uncaptured commits lost to a held file. A shard file that an app still has open across a restart is deleted once the app closes it, with whatever it committed that was never captured. Letting it go from the file, as for a crashed shard, keeps those commits.
 - Saving shards when the segment writer panics: letting them go from their local files (a few rebases at a time) until the shutdown deadline, instead of leaving all of them to adoption.
 - A soak test: the fault rig running for hours against a cluster, with kills, pauses, partitions, slow storage and restarts, checking the same guarantees as the per-scenario tests.
+- A linearizability check of single shards under faults, as Jepsen does: clients record every read and write with its start and end, and a checker (Jepsen with Knossos, or Porcupine, which is in Go) confirms the history is linearizable per shard for kinds with sync on, while the fault rig kills, pauses and partitions nodes and skews clocks within the limit. Clocks pushed past the limit should show the node stopping rather than a violation.
 - A startup check that refuses to start on a non-empty prefix without this deployment's format marker.
 - A sweeper that deletes LTX files no manifest refers to (left by crashes mid-write, deltas never adopted and rebases that failed after their upload), once they are older than any write still in flight could be.
 
 ## Later
 
 - Large shards: a rebase uploads the whole database, so shards of gigabytes may want a higher file limit or a middle level of merged deltas.
+- Batched deletes of acknowledged outbox rows: each is deleted in a commit of its own by its delivery. Deletes waiting a few milliseconds to share a commit would cut the commits a busy sender makes, if they show up in profiles.
 - Holding requests that reach a shard during a handoff until the new owner is ready, instead of answering `503`. Worth it if a launch's error rates show the `503`s from rebalancing hurt (see [Routing and forwarding](internals.md#routing-and-forwarding)).
 - Keeping the local cache across a node restart, for deployments where node redeploys are frequent or a cold cache is costly (large shards, or nodes redeployed with every app deploy as a sidecar). It needs the cache to be trustworthy after an OS crash: the index and shard files made durable at deactivation, or discarded when the boot id changes, or checked against whole-database checksums once LTX files carry them.
 - Cancelling a running rebase when its shard deactivates, if waiting for it (about 9 s for 1 GB) ever matters. The upload can simply be abandoned.
 - The [egress proxy](#egress-proxy) that gates external HTTP calls.
 - HTTP/3 and WebTransport.
+- Forwarded WebSockets as streams on the connection nodes already share, through extended `CONNECT` (RFC 8441 for HTTP/2, RFC 9220 for HTTP/3), instead of a TCP connection of their own per socket. Over HTTP/3, QUIC also keeps one socket's packet loss from stalling the others. Worth it once the library supports it by default (Go's `net/http` has it off, and its client can't send one), or if descriptors between nodes show up as a cost.
 - Encryption and authentication of [traffic between nodes](#securing-traffic-between-nodes).
 - Shard versions: a shard's state as of one manifest version (its current one, after a delta if it is active, or an old one where the bucket keeps versions), materialised from its base and deltas by the restore path that already exists. One primitive, used four ways:
   - **Snapshot reads:** read-only access to any shard from any node or tool, without touching the owner. A request asks for one with a header, or `Shardlite-Max-Age: 30` allows one. The node serves it through the app with `Shardlite-Path` pointing at a read-only copy in its local cache and a header giving the snapshot's age, with no activation or claim. For an active shard it is stale by up to the tail age limit, and asking the owner for its tail brings it up to date. Uses: offline players' profiles, admin and support UIs, and exports as plain SQLite files for analytics (with DuckDB, for example).
@@ -97,6 +68,12 @@ The lease, fencing and adoption protocol is specified in [Quint](https://quint-l
   - **Staging and load-test copies** of production: forking every shard under another prefix, with nothing passing through the nodes.
   - **Point-in-time restore** as an ops tool: making an old version current again. Having every node write deltas for its active shards before each deploy gives a rollback point if a migration goes badly wrong, at the cost of writes made since.
 - Explicit creation as a shard kind setting: shards of that kind are only created by the app, and requests for missing ones get a `404` from the node.
+- Several apps behind one node, for teams that want to deploy their own process for their own kinds, all in one trust domain. Today a local reverse proxy as `SHARDLITE_APP` does the same with no change to the node.
+  - Each kind names its app in the kinds file (`"wallet": {"app": "billing"}`), and the environment gives each app's address (`SHARDLITE_APP_BILLING=http://127.0.0.1:9001`). Kinds that name none, and shardless requests, go to the default app (`SHARDLITE_APP`).
+  - The node polls each app's health. It reports ready while the default app is healthy, and requests for a kind whose app isn't get `503`, so one team's bad deploy doesn't take nodes out of the load balancer.
+  - Every node that serves runs every app, so placement never needs to know which apps a node runs.
+  - Designed with pinning (stage 3): where a shard's traffic goes is then one rule, the pinning process if there is one, else its kind's app, else the default app.
+  - Messages and calls between kinds of different apps work as they do now, since the node routes them.
 - Activation repartitioning, as in Orleans: move shards that call each other a lot onto the same node.
 - Schema versions reported by the app (`Shardlite-Version` on a response, or a reserved table row), opaque numbers that only go up, kept in the manifest when they change. They are hints: a missing or wrong one costs efficiency, never correctness, since the app still refuses shards that are too new. Uses:
   - Version-aware placement: during a rolling deploy, shards migrated by a new app version are never moved to nodes running an older one.
@@ -111,7 +88,7 @@ The lease, fencing and adoption protocol is specified in [Quint](https://quint-l
 - Kinds file read from blob storage, so every node reads the same version.
 - Whole-database checksums in LTX files, so every restore verifies it produced exactly the right database. Needs a checksum per page for every active shard.
 - Leaving journal expiry to the store where it has something cheaper than listing and deleting (a lifecycle rule that can keep fences, for example), with the node's sweeper turned off there.
-- Gossip between nodes to spread load counts faster than lease renewals, if rebalancing needs fresher figures.
+- Gossip between nodes to spread load counts faster than lease renewals, if rebalancing needs fresher figures. The same channel could carry changes of owner (handoffs, rebalancing and takeovers), applied only to owner cache entries a node already has, so the first request after a move goes straight to the new owner instead of getting a `421`. Worth it if moves show up as bursts of `421`s, during a drain for example. Claims of shards nobody has cached aren't sent, since that would make gossip a second directory beside the manifests.
 - Maybe: per-shard encryption keys kept with the manifest. Deleting the key makes every copy unreadable at once (old LTX files, dead node journals, versioned buckets), and gives encryption at rest.
 
 ## Later designs

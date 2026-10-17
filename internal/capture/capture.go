@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/benbjohnson/litestream"
@@ -84,30 +85,32 @@ func (c Config) spoolLimit() int {
 	return spool.DefaultLimit
 }
 
-// Shard is one captured SQLite database. It is an actor: one loop (loop) owns
-// Litestream's database, the mapped wal-index and the client's state, and
-// everything that touches Litestream runs on it, one at a time (do). Litestream
-// calls the client from inside a sync, a snapshot or a close, so those calls
-// run on the loop too. The loop runs while Litestream has the shard open: from
-// New until Close, or a Release that leaves capture closed (or Abandon). Once it has ended,
+// Shard is one captured SQLite database. Its lock (mu) guards Litestream's
+// database, the mapped wal-index and the client's state: everything that
+// touches Litestream runs holding it, one at a time, on the caller's goroutine
+// (do). Litestream calls the client from inside a sync, a snapshot or a close,
+// so those calls run under the lock too. The activation runs from New until
+// Close, or a Release that leaves capture closed (or Abandon). Once it is over,
 // the shard is its caller's alone (whoever closed or released it): Tail,
-// DropTail, Discard and DB then run on the caller's goroutine (call).
+// DropTail, Discard and DB still take the lock (call), but nothing else waits
+// for it.
 type Shard struct {
 	cfg     Config
 	metaDir string
 	client  *client
 
-	ops   chan func()   // requests for the loop (do)
-	ended chan struct{} // closed once the loop has returned
+	// mu is the lock: a channel with room for one, so a caller can stop waiting
+	// for it when its context ends.
+	mu   chan struct{}
+	over atomic.Bool // the activation is over: do runs nothing more
 
-	// The loop's (see above).
+	// Under mu (see above).
 	db *litestream.DB
 	// wi maps the wal-index header (see WalIndex). It is made before Litestream
-	// opens the shard and dropped after Litestream closes it. Only the loop
+	// opens the shard and dropped after Litestream closes it. Only holders of mu
 	// changes it, under wiMu, so Header can read it from any goroutine.
 	wiMu sync.RWMutex
 	wi   *WalIndex
-	over bool // the activation is over: the loop returns after the op that set it
 	// kept is the Litestream commit number of the level 0 file DropTail has left
 	// because it was the newest: the seed of a restored shard to begin with.
 	kept uint64
@@ -138,7 +141,7 @@ func New(cfg Config) (sh *Shard, err error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.DiscardHandler)
 	}
-	s := &Shard{cfg: cfg, metaDir: MetaDir(cfg.MetaRoot, cfg.Name, cfg.Generation), client: newClient(cfg), ops: make(chan func()), ended: make(chan struct{})}
+	s := &Shard{cfg: cfg, metaDir: MetaDir(cfg.MetaRoot, cfg.Name, cfg.Generation), client: newClient(cfg), mu: make(chan struct{}, 1)}
 	// A fresh start: whatever an earlier activation left is gone.
 	if err := os.RemoveAll(s.metaDir); err != nil {
 		return nil, err
@@ -149,54 +152,53 @@ func New(cfg Config) (sh *Shard, err error) {
 	if cfg.Restored != nil {
 		s.kept = uint64(seedTXID)
 	}
-	// Litestream is opened before the loop starts, so this goroutine owns it until then.
 	if s.db, err = s.openLitestream(cfg.Restored != nil); err != nil {
 		os.RemoveAll(s.metaDir)
 		return nil, err
 	}
-	go s.loop() // joined by Close, by a Release that ends the activation, or by Abandon
 	return s, nil
 }
 
-// loop runs what do sends it, one at a time, until the activation is over.
-func (s *Shard) loop() {
-	defer close(s.ended)
-	for !s.over {
-		(<-s.ops)()
-	}
-}
-
-// do runs fn on the loop and returns its error. It gives up only while fn
-// waits to be taken: when ctx ends, or with ErrClosed once the loop has ended.
-// Once the loop has fn, do waits for it to finish, so nothing fn touches is in
-// use after do returns, and ctx only ends the wait for whatever the loop is
-// doing before.
+// do runs fn holding the lock and returns its error, or ErrClosed once the
+// activation is over. It gives up only while it waits for the lock, when ctx
+// ends. fn runs to the end once it has started, and ctx only ends the wait for
+// whatever holds the lock before it.
+//
+// A panic in fn ends the activation before it goes on: a caller that recovers
+// it (net/http recovers a handler's) leaves Litestream in whatever state the
+// panic left, so nothing may use the shard again.
 func (s *Shard) do(ctx context.Context, fn func() error) error {
-	var err error
-	done := make(chan struct{})
 	select {
-	case s.ops <- func() { err = fn(); close(done) }:
-	case <-s.ended:
-		return ErrClosed
+	case s.mu <- struct{}{}:
 	case <-ctx.Done():
 		return context.Cause(ctx)
 	}
-	<-done
+	defer func() { <-s.mu }()
+	if s.over.Load() {
+		return ErrClosed
+	}
+	finished := false
+	defer func() {
+		if !finished {
+			s.over.Store(true)
+		}
+	}()
+	err := fn()
+	finished = true
 	return err
 }
 
-// call runs fn on the loop, or on the caller's goroutine once the loop has
-// ended: the shard is the caller's alone then (see Shard).
+// call runs fn holding the lock, whether or not the activation is over (the
+// shard is its caller's alone then, see Shard).
 func (s *Shard) call(fn func()) {
-	if s.do(context.Background(), func() error { fn(); return nil }) != nil {
-		fn()
-	}
+	s.mu <- struct{}{}
+	defer func() { <-s.mu }()
+	fn()
 }
 
-// end marks the activation over and drops the mapping. It runs on the loop,
-// whose caller then waits for ended.
+// end marks the activation over and drops the mapping. Its caller holds the lock.
 func (s *Shard) end() {
-	s.over = true
+	s.over.Store(true)
 	s.unmap()
 }
 
@@ -205,7 +207,7 @@ func (s *Shard) end() {
 // the other way round). An error means the header can't be trusted, and
 // callers should treat the shard as changed: Litestream hasn't opened the
 // database yet, or the shard is closed (ErrClosed). The mapping is read on the
-// caller's goroutine, not the loop's, so a flush cycle or a gate never waits
+// caller's goroutine without the lock, so a flush cycle or a gate never waits
 // behind a sync, and the shard is never reported busy because of one; the only
 // wait is for an unmap, which is a system call.
 func (s *Shard) Header() (Header, error) {
@@ -217,8 +219,8 @@ func (s *Shard) Header() (Header, error) {
 	return s.header()
 }
 
-// header reads the mapping. The loop calls it directly (it is the only writer
-// of s.wi); others go through Header.
+// header reads the mapping. Holders of the lock call it directly (they are the
+// only writers of s.wi); others go through Header.
 func (s *Shard) header() (Header, error) {
 	h, err := s.wi.Read()
 	if err == nil && h == (Header{}) {
@@ -272,6 +274,10 @@ func (s *Shard) openLitestream(seeded bool) (*litestream.DB, error) {
 	s.wiMu.Unlock()
 	// The node drives Litestream. No background polling.
 	db.MonitorInterval = 0
+	// The client only fails for good (the writer is fenced or closed), so
+	// Litestream's retries on close, 30 seconds by default, could only hold up
+	// a release. One attempt.
+	db.ShutdownSyncTimeout = 0
 	if s.cfg.Tune != nil {
 		s.cfg.Tune(db)
 	}
@@ -296,8 +302,8 @@ func (s *Shard) openLitestream(seeded bool) (*litestream.DB, error) {
 // is what the node wants, so we use it as is. Litestream's sync runs on a
 // context that is never cancelled: a sync cut off in the middle of its work
 // would leave Litestream unsure what the replica has. It does no network I/O
-// (the client only queues), so ctx only ends the wait for whatever the shard's
-// loop is doing before it.
+// (the client only queues), so ctx only ends the wait for whatever holds the
+// shard's lock before it.
 func (s *Shard) Capture(ctx context.Context) error {
 	return s.do(ctx, func() error {
 		if s.db == nil {
@@ -324,7 +330,7 @@ func (s *Shard) durable(ctx context.Context) error {
 	return s.cfg.Writer.Flush(ctx)
 }
 
-// closeForRelease is the first step of Release, on the loop: Litestream's
+// closeForRelease is the first step of Release, under the lock: Litestream's
 // connection is closed (its final sync queues what is left), and what the
 // database looked like just after is read. The mapping is kept: Release
 // compares this header with one read after its -shm check. A mapping holds no
@@ -333,13 +339,16 @@ func (s *Shard) closeForRelease(ctx context.Context) (c closed, err error) {
 	if s.db == nil {
 		return c, ErrClosed
 	}
-	// Whether the app ever wrote is read before Litestream's final sync. If that
-	// sync captures anything more, something was written after the read.
+	// Whether the shard holds anything of the app's is read between two syncs.
+	// The first captures what was committed before the read, so if the final
+	// sync (Litestream's close) captures anything more, something was written
+	// after the read.
+	serr := s.db.SyncAndWait(context.Background())
 	empty, eerr := s.holdsNothing(ctx)
 	pos := s.client.position()
 	err = s.db.Close(context.WithoutCancel(ctx))
 	s.db = nil
-	c.empty = eerr == nil && empty && s.client.position() == pos
+	c.empty = serr == nil && eerr == nil && empty && s.client.position() == pos
 	c.hdr, c.hdrErr = s.header()
 	return c, err
 }
@@ -347,8 +356,8 @@ func (s *Shard) closeForRelease(ctx context.Context) (c closed, err error) {
 // closed is what closeForRelease learned about the database just after
 // Litestream closed it.
 type closed struct {
-	// empty says the shard held nothing of the app's: the app never wrote to it
-	// (or removed everything it wrote).
+	// empty says the shard held nothing of the app's: the app never wrote to it,
+	// removed everything it wrote or marked it for deletion.
 	empty bool
 	// hdr is the wal-index header, to tell whether the app committed after
 	// Litestream's final sync.
@@ -356,16 +365,27 @@ type closed struct {
 	hdrErr error
 }
 
-// holdsNothing reports whether the database holds nothing of the app's: no
-// tables or indexes (an index counts as its table's, so the automatic one of a reserved table's text key is ignored) besides Litestream's own and shardlite's (the _shardlite_
-// tables), user_version and application_id both 0, and no rows in
-// _shardlite_outbox or _shardlite_inbox (a row the node gave up on is the app's data too). It asks through
-// Litestream's own connection, so the node opens nothing of the shard's (see
-// shm.go for why that matters).
+// MarkedQuery says whether the app has marked the shard for deletion (a
+// _shardlite_delete table).
+const MarkedQuery = `SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE name = '_shardlite_delete' AND type = 'table')`
+
+// holdsNothing reports whether the database holds nothing of the app's. Either
+// the app marked it for deletion (a _shardlite_delete table, whatever else is in
+// it), or it has no tables or indexes besides Litestream's own and shardlite's
+// (the _shardlite_ tables; an index counts as its table's, so the automatic one
+// of a reserved table's text key is ignored), user_version and application_id
+// are both 0, and _shardlite_outbox and _shardlite_inbox have no rows (a row the
+// node gave up on is the app's data too). It asks through Litestream's own
+// connection, so the node opens nothing of the shard's (see shm.go for why that
+// matters).
 func (s *Shard) holdsNothing(ctx context.Context) (bool, error) {
 	sqldb := s.db.SQLDB()
 	if sqldb == nil {
 		return false, errors.New("capture: litestream has not opened the database")
+	}
+	var marked bool
+	if err := sqldb.QueryRowContext(ctx, MarkedQuery).Scan(&marked); err != nil || marked {
+		return marked, err
 	}
 	var objects, userVersion, applicationID int64
 	err := sqldb.QueryRowContext(ctx, `SELECT
@@ -397,29 +417,62 @@ func (s *Shard) holdsNothing(ctx context.Context) (bool, error) {
 var ErrClosed = errors.New("capture: the shard's database is closed")
 
 // Use runs fn with Litestream's connection pool (never a descriptor of the
-// node's own), on the shard's loop. So it never runs during a sync, a snapshot
+// node's own), under the shard's lock. So it never runs during a sync, a snapshot
 // or the final sync of a release, and what fn commits is captured by the next
 // sync. fn must not call the shard.
 func (s *Shard) Use(ctx context.Context, fn func(*sql.DB) error) error {
-	return s.do(ctx, func() error {
-		db := s.db
-		if db == nil {
+	return s.do(ctx, func() error { return s.use(fn) })
+}
+
+// UseAt is Use, and also reports the position fn's reads saw, if they saw
+// exactly a captured state. Under the same lock, a sync before fn captures what
+// is committed so far, and a sync after it that captures nothing new shows that
+// nothing was committed in between, so fn saw exactly the position the first
+// sync reached (no other sync runs meanwhile). at is 0 if the second sync
+// captured more: fn may have seen commits that weren't captured. A checkpoint
+// changes nothing here, since it commits nothing.
+func (s *Shard) UseAt(ctx context.Context, fn func(*sql.DB) error) (at uint64, err error) {
+	err = s.do(ctx, func() error {
+		if s.db == nil {
 			return ErrClosed
 		}
-		if db.SQLDB() == nil {
-			// Litestream opens its connection at the first sync after Open, so a shard
-			// whose capture was reopened (a release that did not go through) has none
-			// if the sync that followed failed. Sync it now, as the next flush cycle
-			// would.
-			if err := db.SyncAndWait(context.Background()); err != nil {
-				return err
-			}
-			if db.SQLDB() == nil {
-				return ErrClosed
-			}
+		if err := s.db.SyncAndWait(context.Background()); err != nil {
+			return err
 		}
-		return fn(db.SQLDB())
+		before := s.client.view.Load().position
+		if err := s.use(fn); err != nil {
+			return err
+		}
+		if err := s.db.SyncAndWait(context.Background()); err != nil {
+			return err
+		}
+		if s.client.view.Load().position == before {
+			at = before
+		}
+		return nil
 	})
+	return at, err
+}
+
+// use runs fn on Litestream's connection. The caller holds the lock.
+func (s *Shard) use(fn func(*sql.DB) error) error {
+	db := s.db
+	if db == nil {
+		return ErrClosed
+	}
+	if db.SQLDB() == nil {
+		// Litestream opens its connection at the first sync after Open, so a shard
+		// whose capture was reopened (a release that did not go through) has none
+		// if the sync that followed failed. Sync it now, as the next flush cycle
+		// would.
+		if err := db.SyncAndWait(context.Background()); err != nil {
+			return err
+		}
+		if db.SQLDB() == nil {
+			return ErrClosed
+		}
+	}
+	return fn(db.SQLDB())
 }
 
 // Snapshot returns a full snapshot of the shard as an LTX file, and the
@@ -428,7 +481,7 @@ func (s *Shard) Use(ctx context.Context, fn func(*sql.DB) error) error {
 // must be closed: until it is, Litestream holds off its checkpoints.
 //
 // The position is the one the client has numbered, and it is right because of
-// the order of things. In one step on the shard's loop, which keeps syncs out,
+// the order of things. In one step under the shard's lock, which keeps syncs out,
 // a sync brings Litestream and the client level (every commit Litestream has
 // written locally has been through the client), SnapshotReader fixes the
 // position it covers (Litestream's own commit number, which is only meaningful
@@ -477,7 +530,6 @@ func (s *Shard) Close(ctx context.Context) error {
 	}) != nil {
 		return nil
 	}
-	<-s.ended
 	if !open {
 		return nil
 	}
@@ -492,10 +544,9 @@ func (s *Shard) Close(ctx context.Context) error {
 
 // Abandon ends the activation as a crash would, for a node that stops without
 // letting go of the shard: nothing is synced or written, and Litestream keeps the
-// shard's files open until the process exits. Only the loop ends (and is joined).
+// shard's files open until the process exits. Only the activation ends.
 func (s *Shard) Abandon() {
 	s.do(context.Background(), func() error { s.end(); return nil })
-	<-s.ended
 }
 
 // Release is how the node lets go of a shard (deactivation, move, eviction).
@@ -515,41 +566,32 @@ func (s *Shard) Abandon() {
 // rather than kept.
 func (s *Shard) Release(ctx context.Context) (released, empty bool, err error) {
 	var c closed
-	ends := false
 	if err := s.do(ctx, func() error {
 		var err error
 		if c, err = s.closeForRelease(ctx); err != nil && !errors.Is(err, ErrClosed) {
 			s.end() // Litestream is closed or half closed: capture stays closed
 		}
-		ends = s.over
 		return err
 	}); err != nil {
-		if ends {
-			<-s.ended
-		}
 		return false, false, err
 	}
-	// Off the loop: the flush cycle this waits for may be waiting to give the
-	// loop a sync of this shard, which finds the database closed and returns.
+	// Without the lock: the flush cycle this waits for may be waiting for it to
+	// sync this shard, which finds the database closed and returns.
 	ferr := s.durable(ctx)
 
 	// The last step runs even if ctx ended: the shard has to end up in one state.
 	err = s.do(context.WithoutCancel(ctx), func() error {
 		var err error
 		released, err = s.settle(c, ferr)
-		ends = s.over
 		return err
 	})
-	if ends {
-		<-s.ended
-	}
 	if err != nil || !released {
 		return false, false, err
 	}
 	return true, c.empty, os.RemoveAll(s.metaDir)
 }
 
-// settle is the last step of Release, on the loop, with nothing of the node's
+// settle is the last step of Release, under the lock, with nothing of the node's
 // open on the shard: the -shm check, then the header compared with the one
 // read after Litestream closed. It ends the activation if the shard can be let
 // go of, and otherwise reopens capture.
@@ -591,18 +633,11 @@ func (s *Shard) settle(c closed, ferr error) (released bool, err error) {
 
 // Open reports whether Litestream has the shard open: false once it is closed
 // or released, or after a release that failed before capture was reopened.
-func (s *Shard) Open() bool {
-	select {
-	case <-s.ended:
-		return false
-	default:
-		return true
-	}
-}
+func (s *Shard) Open() bool { return !s.over.Load() }
 
 // DB exposes the current Litestream DB for tests and measurements. It waits
-// for whatever the loop is doing. A test that syncs with it from outside the
-// loop must not do so at the shard's first sync, when Litestream asks the
+// for whatever holds the lock. A test that syncs with it without the lock must
+// not do so at the shard's first sync, when Litestream asks the
 // client what it has.
 func (s *Shard) DB() (db *litestream.DB) {
 	s.call(func() { db = s.db })

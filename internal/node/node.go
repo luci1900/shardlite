@@ -11,12 +11,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/coord"
 	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/shardfile"
-	"github.com/luci1900/shardlite/internal/supervisor"
 )
 
 // Config describes a node.
@@ -32,7 +33,7 @@ type Config struct {
 	Logger *slog.Logger
 	// TempDir is where deltas, snapshots and downloads too large for memory are
 	// built (in the data directory, never the scratch directory, which is tmpfs).
-	// It is made when it is first needed. Shards empties it of what a crash left.
+	// It is made when it is first needed. The catalog empties it of what a crash left.
 	TempDir string
 	// SpoolLimit is how large a commit file, segment or delta gets before it is
 	// held in a temporary file in TempDir instead of memory (spool.DefaultLimit if
@@ -60,11 +61,11 @@ type Node struct {
 func (n *Node) Err() error {
 	select {
 	case <-n.Writer.Fenced():
-		return supervisor.Fatal(fmt.Errorf("the node's journal writer is fenced: %w", segment.ErrFenced))
+		return fmt.Errorf("the node's journal writer is fenced: %w", segment.ErrFenced)
 	default:
 	}
 	if err := n.Keeper.Check(); err != nil {
-		return supervisor.Fatal(fmt.Errorf("the node's lease is gone: %w", err))
+		return fmt.Errorf("the node's lease is gone: %w", err)
 	}
 	return nil
 }
@@ -72,8 +73,10 @@ func (n *Node) Err() error {
 // Start takes the node's lease with a new epoch and recovers from whatever the
 // previous process left (docs/internals.md, Restarting): it fences its own journal from
 // the range recorded in the lease, writes a delta for every shard with a tail
-// there and records the new range. A restart is treated as a crash, so this is
-// the one recovery path.
+// there and records the adoption with the new range. A restart is treated as a
+// crash, so this is the one recovery path. If the previous life released its
+// lease, or another node finished adopting it, there is nothing to adopt: the
+// node only fences, to find where its journal starts.
 //
 // If it fails after taking the lease, the lease keeps the previous range, so
 // starting again repeats the adoption under a new epoch.
@@ -95,24 +98,36 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		Files:    &shardfile.Files{Blob: store, Node: cfg.Name, Leases: reg, TempDir: cfg.TempDir, SpoolLimit: cfg.SpoolLimit},
 	}
 
+	// Record the range before anything is written to it. Until now the lease
+	// carried the previous process's range.
 	start := uint64(1)
-	if lease.Previous != nil {
-		rep, err := n.Files.AdoptJournal(ctx, cfg.Name, lease.JournalFrom, lease.JournalNext, func(ctx context.Context, shard string) error {
-			_, err := hintStore{store}.writeWake(ctx, shard, time.Now())
-			return err
-		}, cfg.Logger)
+	switch prev := lease.Previous; {
+	case prev != nil && prev.Adopted < prev.Epoch:
+		var rep shardfile.AdoptReport
+		rep, lease, err = n.adoptOwn(ctx, lease)
 		n.Adopted = rep
 		if err != nil {
 			return nil, err
 		}
 		start = rep.Fence + 1
-	}
-
-	// Record the range before anything is written to it. Until now the lease
-	// carried the previous process's range.
-	info.JournalFrom, info.JournalNext = start, start
-	if lease, err = reg.Renew(ctx, lease, info); err != nil {
-		return nil, fmt.Errorf("record journal range: %w", err)
+		if lease, err = reg.FinishAdoption(ctx, lease, prev.Epoch, rep.Fence); err != nil {
+			return nil, fmt.Errorf("record the adoption of the journal: %w", err)
+		}
+	case prev != nil:
+		// The range starts where the previous life (or its adopter) left it. The
+		// fence finds the first free number in case anything was written since.
+		fence, err := segment.Fence(ctx, store, cfg.Name, lease.JournalNext)
+		if err != nil {
+			return nil, fmt.Errorf("fence the journal: %w", err)
+		}
+		n.Adopted.Fence = fence
+		start = fence + 1
+		fallthrough
+	default:
+		info.JournalFrom, info.JournalNext = start, start
+		if lease, err = reg.Renew(ctx, lease, info); err != nil {
+			return nil, fmt.Errorf("record journal range: %w", err)
+		}
 	}
 
 	n.Writer = segment.NewWriter(store, cfg.Name, segment.Options{
@@ -128,8 +143,38 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 	return n, nil
 }
 
+// adoptOwn adopts the journal the node's previous life left (Start). It writes
+// a delta for every shard with a tail there, which can take longer than the
+// lease's TTL, so a keeper of its own renews the lease meanwhile: other nodes
+// would otherwise take the node for dead and adopt it themselves. The keeper
+// publishes the lease as Acquire wrote it, with the previous life's journal
+// range, so a crash before the adoption finishes leaves that range for the next
+// life. The adoption stops if the lease is lost. It returns the lease as the
+// keeper last renewed it, for FinishAdoption.
+func (n *Node) adoptOwn(ctx context.Context, lease coord.NodeLease) (shardfile.AdoptReport, coord.NodeLease, error) {
+	kopts := n.Config.Keeper
+	kopts.Info = nil // the lease's own
+	kopts.Logger = n.Logger
+	k := coord.NewKeeper(n.Registry, lease, kopts)
+	kctx, stop := context.WithCancel(ctx)
+	g, actx := errgroup.WithContext(kctx)
+	g.Go(func() error {
+		k.Serve(actx)
+		return k.Check() // nil unless the lease was lost or ran out
+	})
+	rep, err := n.Files.AdoptJournal(actx, n.Name, lease.JournalFrom, lease.JournalNext, func(ctx context.Context, shard string) error {
+		_, err := hintStore{n.Store}.writeWake(ctx, shard, time.Now())
+		return err
+	}, n.Logger)
+	stop()
+	if kerr := g.Wait(); kerr != nil {
+		return rep, lease, fmt.Errorf("adopting the journal: %w", kerr)
+	}
+	return rep, k.Lease(), err
+}
+
 // Tails is where the lease's shard count and journal range come from: whatever
-// runs the node's shards (Shards, or a TailSet for programs that capture shards
+// runs the node's shards (the Catalog, or a TailSet for programs that capture shards
 // themselves).
 type Tails interface {
 	// Tails returns how many shards are captured and the lowest segment number
@@ -160,7 +205,7 @@ func (n *Node) Info() coord.NodeInfo {
 }
 
 // TailSet is a set of captured shards as Tails, for programs that capture
-// shards without Shards (the test node, and tests of the node's journal).
+// shards without the Catalog (the test node, and tests of the node's journal).
 type TailSet struct {
 	mu sync.Mutex
 	m  map[*capture.Shard]struct{}

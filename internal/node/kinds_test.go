@@ -51,6 +51,7 @@ func TestParseKinds(t *testing.T) {
 	}
 	for name, bad := range map[string]string{
 		"unknown field": `{"kinds": {"users": {"synk": true}}}`,
+		"auto_delete":   `{"kinds": {"users": {"auto_delete": true}}}`,
 		"sync value":    `{"kinds": {"users": {"sync": "maybe"}}}`,
 		"sync boolean":  `{"kinds": {"users": {"sync": true}}}`,
 		"bad duration":  `{"kinds": {"users": {"idle_timeout": "soon"}}}`,
@@ -116,7 +117,7 @@ func TestParseEnv(t *testing.T) {
 		t.Fatal(err)
 	}
 	if e.Name != "node-a" || e.Prefix != "staging/" || e.Flush != 100*time.Millisecond || e.IdleTimeout != 2*time.Minute || e.CacheLimit != 20<<30 ||
-		e.HealthPath != "/health" || e.Listen != ":8080" || e.Control != "127.0.0.1:7000" || e.LeaseTTL != 10*time.Second ||
+		e.HealthPath != "/health" || e.Public != ":2280" || e.Control != "127.0.0.1:2282" || e.LeaseTTL != 10*time.Second ||
 		e.MaxHops != 32 {
 		t.Fatalf("%+v", e)
 	}
@@ -134,16 +135,5 @@ func TestParseEnv(t *testing.T) {
 		if _, err := ParseEnv(func(x string) string { return bad[x] }); err == nil {
 			t.Errorf("%s=%q accepted", k, v)
 		}
-	}
-}
-
-func TestParseKindsAutoDelete(t *testing.T) {
-	t.Parallel()
-	m, err := ParseKinds([]byte(`{"kinds": {"lobby": {"auto_delete": true, "sync": "on"}, "users": {}}}`), time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !m["lobby"].AutoDelete || m["users"].AutoDelete {
-		t.Fatalf("auto_delete is off by default and on when set: %+v", m)
 	}
 }

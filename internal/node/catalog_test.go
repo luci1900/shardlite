@@ -24,6 +24,7 @@ import (
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/coord"
 	"github.com/luci1900/shardlite/internal/notify"
+	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
 )
@@ -33,8 +34,8 @@ const testKinds = `{"kinds": {
 	"wallet": {"public": true, "idle_timeout": "300ms"},
 	"slow":   {"public": true, "sync": "off", "idle_timeout": "1h"},
 	"audit":  {},
-	"lobby":  {"public": true, "auto_delete": true, "idle_timeout": "300ms"},
-	"arena":  {"public": true, "auto_delete": true, "sync": "off", "idle_timeout": "300ms"}
+	"lobby":  {"public": true, "idle_timeout": "300ms"},
+	"arena":  {"public": true, "sync": "off", "idle_timeout": "300ms"}
 }}`
 
 type mrig struct {
@@ -42,18 +43,19 @@ type mrig struct {
 	stopJournal func()       // stops the writer and the keeper of the current node
 	local       *blob.Hooked // the bucket, behind its fault hook
 	skew        atomic.Int64 // nanoseconds the bucket's clock runs behind, to age objects
+	leaseAhead  atomic.Int64 // nanoseconds the keeper's clock runs ahead, to expire the lease
 	data        string
 	meta        string
 	kinds       *Kinds
 	kindsPath   string
 	app         *apptest.App
 	n           *Node
-	m           *Shards
+	m           *Catalog
 	stopM       func() error // stops the shards' Serve and returns what it returned
 
 	// newTransport makes the shards' transport (the server's, for the rigs that
 	// have one). The default reaches nobody.
-	newTransport func(*Shards) *transport
+	newTransport func(*Catalog) *transport
 
 	cmu    sync.Mutex
 	counts map[string]int
@@ -61,10 +63,10 @@ type mrig struct {
 
 func newMRig(t *testing.T) *mrig { return newMRigWith(t, nil) }
 
-func newMRigWith(t *testing.T, mutate func(*ShardsOptions)) *mrig { return newMRigOn(t, mutate, nil) }
+func newMRigWith(t *testing.T, mutate func(*CatalogOptions)) *mrig { return newMRigOn(t, mutate, nil) }
 
 // newMRigOn is newMRigWith over the given backend (in memory if nil).
-func newMRigOn(t *testing.T, mutate func(*ShardsOptions), backend blob.Backend) *mrig {
+func newMRigOn(t *testing.T, mutate func(*CatalogOptions), backend blob.Backend) *mrig {
 	t.Helper()
 	r := newUnstartedMRig(t, backend)
 	r.startNode()
@@ -92,7 +94,7 @@ func newUnstartedMRig(t *testing.T, backend blob.Backend) *mrig {
 	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
 		if !after {
 			r.cmu.Lock()
-			r.counts[string(op)+" "+strings.SplitN(key, "/", 2)[0]]++
+			r.counts[string(op)+" "+key]++
 			r.cmu.Unlock()
 		}
 		return nil
@@ -114,15 +116,16 @@ func (r *mrig) startNode() {
 func (r *mrig) tryStartNode() (*Node, error) {
 	return Start(context.Background(), Config{
 		Name: "n1", Backend: r.local, TempDir: filepath.Join(r.data, tempDirName),
-		Blob:   blob.Options{Backoff: time.Millisecond},
-		Lease:  coord.RegistryOptions{TTL: time.Hour, Blob: blob.Options{Backoff: time.Millisecond}},
-		Keeper: coord.KeeperOptions{Interval: 100 * time.Millisecond, Margin: time.Minute},
+		Blob:  blob.Options{Backoff: time.Millisecond},
+		Lease: coord.RegistryOptions{TTL: time.Hour, Blob: blob.Options{Backoff: time.Millisecond}},
+		Keeper: coord.KeeperOptions{Interval: 100 * time.Millisecond, Margin: time.Minute,
+			Now: func() time.Time { return time.Now().Add(time.Duration(r.leaseAhead.Load())) }},
 	})
 }
 
-func (r *mrig) startShards(mutate func(*ShardsOptions)) {
+func (r *mrig) startShards(mutate func(*CatalogOptions)) {
 	r.t.Helper()
-	o := ShardsOptions{Kinds: r.kinds, Data: r.data, Scratch: r.meta,
+	o := CatalogOptions{Kinds: r.kinds, Data: r.data, Scratch: r.meta,
 		Flush:     FlushOptions{Interval: 20 * time.Millisecond},
 		Cache:     CacheOptions{Every: 20 * time.Millisecond},
 		Lifecycle: LifecycleOptions{SnapshotEvery: 20 * time.Millisecond, HoldOff: 100 * time.Millisecond, IdleRecheck: 20 * time.Millisecond}}
@@ -131,14 +134,14 @@ func (r *mrig) startShards(mutate func(*ShardsOptions)) {
 	}
 	newTransport := r.newTransport
 	if newTransport == nil {
-		newTransport = func(*Shards) *transport {
+		newTransport = func(*Catalog) *transport {
 			unserved := errors.New("the node is not serving")
 			return &transport{maxHops: DefaultMaxHops,
 				intake: func(context.Context, *shard, string, *outRow) (int, error) { return 0, unserved },
 				inbox:  func(context.Context, *shard, *inRow) (int, error) { return 0, unserved }}
 		}
 	}
-	m, err := NewShards(r.n, o, newTransport)
+	m, err := NewCatalog(r.n, o, newTransport)
 	if err != nil {
 		r.t.Fatal(err)
 	}
@@ -180,7 +183,13 @@ func (r *mrig) crash() {
 func (r *mrig) calls(op, prefix string) int {
 	r.cmu.Lock()
 	defer r.cmu.Unlock()
-	return r.counts[op+" "+prefix]
+	n := 0
+	for k, c := range r.counts {
+		if strings.HasPrefix(k, op+" "+prefix) {
+			n += c
+		}
+	}
+	return n
 }
 
 func (r *mrig) acquire(target string) *Ref {
@@ -399,7 +408,7 @@ func TestCreateRaceClaimsTheOther(t *testing.T) {
 	r := newMRig(t)
 	raced := false
 	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpCreate && key == "manifests/users/2" && !after && !raced {
+		if op == blob.OpCreate && key == shardfile.ManifestKey("users/2") && !after && !raced {
 			raced = true
 			body, _ := json.Marshal(shardfile.Manifest{Generation: "other", Files: []string{}})
 			if _, err := r.local.Create(ctx, key, bytes.NewReader(body), blob.WriteID{Node: "n2", Epoch: 1, N: 1}); err != nil {
@@ -472,7 +481,7 @@ func TestGates(t *testing.T) {
 	// returns now did not wait for one.
 	stall := make(chan struct{})
 	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if !after && op == blob.OpCreate && strings.HasPrefix(key, "journal/") {
+		if !after && op == blob.OpCreate && strings.HasPrefix(key, segment.Root) {
 			select {
 			case <-stall:
 			case <-ctx.Done():
@@ -574,7 +583,7 @@ func TestCachedShardNeedsNoBlobCalls(t *testing.T) {
 	}
 
 	before := map[string]int{}
-	for _, p := range []string{"manifests", "shards", "journal"} {
+	for _, p := range []string{shardfile.ManifestPrefix, shardfile.FilesPrefix, segment.Root} {
 		for _, op := range []string{"get", "head", "get-range", "create", "update", "list"} {
 			before[op+" "+p] = r.calls(op, p)
 		}
@@ -676,12 +685,21 @@ func TestRestartStartsWithAnEmptyCache(t *testing.T) {
 	if names, _ := r.m.Cached(); len(names) != 0 {
 		t.Fatalf("the cache has %v", names)
 	}
+	journalReads := func() int {
+		return r.calls("get", segment.Root) + r.calls("head", segment.Root) + r.calls("get-range", segment.Root)
+	}
+	before := journalReads()
 	for _, id := range []string{"users/6", "users/7"} {
 		ref := r.acquire(id)
 		if got := r.liveDump(ref.Path()); got != want[id] {
 			t.Fatalf("%s differs from blob storage", id)
 		}
 		ref.Release()
+	}
+	// Their manifests still name this node's journal, but a claimed shard has no
+	// tail anywhere, so the restores read only its files.
+	if got := journalReads() - before; got != 0 {
+		t.Fatalf("%d reads of the journal while restoring", got)
 	}
 	if r.m.Stats.CachedHits.Load() != 0 || r.m.Stats.Restores.Load() != 2 || r.m.Stats.Discards.Load() != 0 {
 		t.Fatalf("stats: %+v", &r.m.Stats)
@@ -951,7 +969,7 @@ func TestDelete(t *testing.T) {
 	if _, err := r.manifest("slow/del"); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("manifest: %v", err)
 	}
-	for info, err := range r.n.Store.List(ctx, "shards/slow/del/") {
+	for info, err := range r.n.Store.List(ctx, shardfile.ShardPrefix("slow/del")) {
 		t.Fatalf("LTX file left: %v %v", info.Key, err)
 	}
 	if _, err := os.Stat(path); err == nil {
@@ -1003,7 +1021,7 @@ func TestBackgroundDeltasAndRebases(t *testing.T) {
 	t.Parallel()
 	r := newMRig(t)
 	r.crash()
-	r.startShards(func(o *ShardsOptions) { o.Lifecycle.DeltaAge = 30 * time.Millisecond; o.Lifecycle.MaxFiles = 3 })
+	r.startShards(func(o *CatalogOptions) { o.Lifecycle.DeltaAge = 30 * time.Millisecond; o.Lifecycle.MaxFiles = 3 })
 	ctx := context.Background()
 	ref := r.acquire("slow/bg")
 	defer ref.Release()
@@ -1199,7 +1217,7 @@ func TestReleasesShareSegments(t *testing.T) {
 	}
 	// Uploading a segment takes a while, so flushes that don't share would show.
 	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpCreate && !after && strings.HasPrefix(key, "journal/") {
+		if op == blob.OpCreate && !after && strings.HasPrefix(key, segment.Root) {
 			time.Sleep(40 * time.Millisecond)
 		}
 		return nil
@@ -1242,7 +1260,7 @@ func TestBackgroundSnapshotsAreNotRebasedByAge(t *testing.T) {
 	r := newMRig(t)
 	r.crash()
 	clock := newFakeClock()
-	r.startShards(func(o *ShardsOptions) {
+	r.startShards(func(o *CatalogOptions) {
 		o.Lifecycle.DeltaAge = 20 * time.Millisecond
 		o.Lifecycle.MaxFiles = 100
 		o.Clock = clock
@@ -1286,13 +1304,13 @@ func TestBackgroundSnapshotsAreNotRebasedByAge(t *testing.T) {
 	}
 }
 
-// Shards stops in order: once the shards are being let go of, the wake scan no
+// The catalog stops in order: once the shards are being let go of, the wake scan no
 // longer activates anything (a hint that comes due during a release wakes
 // nothing), and the flusher still runs (a gate during a release goes through,
 // and so does each release's own final sync, which no longer has a fallback).
 func TestShardsStopInOrder(t *testing.T) {
 	t.Parallel()
-	r := newMRigWith(t, func(o *ShardsOptions) { o.Wakes.Every = 20 * time.Millisecond })
+	r := newMRigWith(t, func(o *CatalogOptions) { o.Wakes.Every = 20 * time.Millisecond })
 	ctx := context.Background()
 	// A cached shard, which a hint would wake.
 	ref := r.acquire("users/so1")
@@ -1310,7 +1328,7 @@ func TestShardsStopInOrder(t *testing.T) {
 	}
 	ref.Release()
 	r.app.Must(t, "close", "so2")
-	entered, _, unblock := r.blockCreates("shards/wallet/so2/")
+	entered, _, unblock := r.blockCreates(shardfile.ShardPrefix("wallet/so2"))
 	defer unblock()
 	activations := r.m.Stats.Activations.Load()
 	stopped := make(chan error, 1)

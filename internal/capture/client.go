@@ -50,10 +50,9 @@ func CloseTail(files []TailFile) {
 // node's pending segment, numbers them with the shard's own positions and
 // keeps them in memory as the shard's tail.
 //
-// Litestream calls it from inside a sync, a snapshot or a close, which run on
-// the shard's loop, and the shard calls it there too, so its state is the
-// loop's (and the caller's once the loop has ended, see Shard). Others read
-// view.
+// Litestream calls it from inside a sync, a snapshot or a close, which run
+// under the shard's lock, and the shard calls it under the lock too, so the
+// lock guards its state (see Shard). Others read view.
 type client struct {
 	cfg Config
 
@@ -63,10 +62,10 @@ type client struct {
 	high    uint64 // highest Litestream commit number uploaded in this activation
 	nextPos uint64
 
-	view atomic.Pointer[tailView] // published by the loop whenever the tail or the position changes
+	view atomic.Pointer[tailView] // published under the shard's lock whenever the tail or the position changes
 }
 
-// tailView is what the shard tells others without its loop: TailFrom (the
+// tailView is what the shard tells others without its lock: TailFrom (the
 // lease reads it), TailInfo and TailBytes (the watchdog and the delta timer)
 // and Position. It is never changed once published.
 type tailView struct {

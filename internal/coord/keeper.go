@@ -6,8 +6,6 @@ import (
 	"log/slog"
 	"sync/atomic"
 	"time"
-
-	"github.com/luci1900/shardlite/internal/supervisor"
 )
 
 // KeeperOptions tune a Keeper.
@@ -16,6 +14,7 @@ type KeeperOptions struct {
 	Margin   time.Duration   // treat the lease as expired this long before its TTL runs out, 2 s if zero
 	Info     func() NodeInfo // what to publish at each renewal (counts, journal range)
 	Logger   *slog.Logger
+	Now      func() time.Time // time.Now if nil, for tests
 }
 
 // Keeper renews a node's lease and answers the one question
@@ -23,12 +22,17 @@ type KeeperOptions struct {
 //
 // The holder judges its own lease expired a safety margin before others do,
 // counting from the moment it began the write that last renewed it (the
-// lease's Renewed time), so a slow write or a clock that runs a little behind
-// can't leave it acting on a lease others consider dead. Expiry is final: a
+// lease's Renewed time), so a slow write can't leave it acting on a lease
+// others consider dead. Others judge by elapsed time too: an adopter waits until
+// it has seen the lease unchanged for a TTL on its own clock, so only the
+// clocks' rates have to agree (docs/internals.md, Node leases). The deadline is
+// kept by both the monotonic and the wall clock, whichever runs out first: the
+// monotonic clock doesn't count time a machine spends suspended, and a VM
+// pause can hide from it. Expiry is final: a
 // node whose lease has run out may have lost shards to other nodes, so it
 // stops for good and a restart takes a new epoch.
 //
-// A Keeper renews only while it is served (it is a suture service): a lease
+// A Keeper renews only while it is served (it is a service): a lease
 // that is never served runs out like any other.
 type Keeper struct {
 	reg  *Registry
@@ -56,6 +60,9 @@ func NewKeeper(reg *Registry, lease NodeLease, opts KeeperOptions) *Keeper {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
+	if opts.Now == nil {
+		opts.Now = time.Now
+	}
 	k := &Keeper{reg: reg, opts: opts, lost: make(chan struct{})}
 	k.lease.Store(&lease)
 	return k
@@ -63,13 +70,20 @@ func NewKeeper(reg *Registry, lease NodeLease, opts KeeperOptions) *Keeper {
 
 func (k *Keeper) validUntil(l NodeLease) time.Time { return l.Renewed.Add(l.TTL - k.opts.Margin) }
 
+// expired reports whether now is past until by either clock. A time with a
+// monotonic reading compares by it, and Round(0) drops it to compare the wall
+// clock.
+func expired(now, until time.Time) bool {
+	return !now.Before(until) || !now.Round(0).Before(until.Round(0))
+}
+
 // Lease returns the latest lease.
 func (k *Keeper) Lease() NodeLease { return *k.lease.Load() }
 
 // Check returns nil while the lease is good for acknowledging work, and the
 // reason (ErrLeaseLost or ErrLeaseExpired) once it is not.
 func (k *Keeper) Check() error {
-	if k.err.Load() == nil && !time.Now().Before(k.validUntil(k.Lease())) {
+	if k.err.Load() == nil && expired(k.opts.Now(), k.validUntil(k.Lease())) {
 		k.fail(ErrLeaseExpired)
 	}
 	if e := k.err.Load(); e != nil {
@@ -108,13 +122,19 @@ func (k *Keeper) Serve(ctx context.Context) error {
 		case <-ctx.Done():
 			wake.Stop()
 			expire.Stop()
-			return supervisor.NoRestart(nil)
+			return nil
 		case <-expire.C:
 			wake.Stop()
 			k.fail(ErrLeaseExpired)
-			return supervisor.NoRestart(nil)
+			return nil
 		case <-wake.C:
 			expire.Stop()
+		}
+		// The timers run on the monotonic clock. A pause it didn't count shows on
+		// the wall clock.
+		if expired(k.opts.Now(), until) {
+			k.fail(ErrLeaseExpired)
+			return nil
 		}
 
 		// A renewal that is still going when the margin runs out is worth nothing.
@@ -127,10 +147,10 @@ func (k *Keeper) Serve(ctx context.Context) error {
 			k.lease.Store(&renewed)
 			delay = time.Until(renewed.Renewed.Add(k.opts.Interval))
 		case ctx.Err() != nil:
-			return supervisor.NoRestart(nil)
+			return nil
 		case errors.Is(err, ErrLeaseLost):
 			k.fail(err)
-			return supervisor.NoRestart(nil)
+			return nil
 		default:
 			// Storage trouble. Try again soon, until the margin runs out.
 			k.opts.Logger.Warn("lease renewal failed", "node", cur.Name, "err", err)

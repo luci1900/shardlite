@@ -13,12 +13,13 @@ import (
 
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/segment"
 )
 
 // longInterval makes the flush interval so long that a cycle in a test can only
 // be one that output asked for, and sets the early-cycle timing.
-func longInterval(coalesce, min time.Duration) func(*ShardsOptions) {
-	return func(o *ShardsOptions) {
+func longInterval(coalesce, min time.Duration) func(*CatalogOptions) {
+	return func(o *CatalogOptions) {
 		o.Flush.Interval, o.Flush.Coalesce, o.Flush.Min = time.Hour, coalesce, min
 	}
 }
@@ -27,7 +28,7 @@ func longInterval(coalesce, min time.Duration) func(*ShardsOptions) {
 func (r *mrig) journalPuts() (times func() []time.Time) {
 	var at apptest.Log[time.Time]
 	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpCreate && after && strings.HasPrefix(key, "journal/") {
+		if op == blob.OpCreate && after && strings.HasPrefix(key, segment.Root) {
 			at.Add(time.Now())
 		}
 		return nil
@@ -122,7 +123,7 @@ func TestCyclesAreSpacedByFlushMin(t *testing.T) {
 func TestNothingWaitingRunsCyclesOnTheTick(t *testing.T) {
 	t.Parallel()
 	const interval = 300 * time.Millisecond
-	r := newMRigWith(t, func(o *ShardsOptions) { o.Flush.Interval = interval })
+	r := newMRigWith(t, func(o *CatalogOptions) { o.Flush.Interval = interval })
 	times := r.journalPuts()
 	ref := r.acquire("wallet/f3")
 	defer ref.Release()
@@ -205,7 +206,7 @@ func TestWaiterGivingUpInACycleDoesNotCancelIt(t *testing.T) {
 	var stall atomic.Bool
 	release := make(chan struct{})
 	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpCreate && !after && strings.HasPrefix(key, "journal/") && stall.Load() {
+		if op == blob.OpCreate && !after && strings.HasPrefix(key, segment.Root) && stall.Load() {
 			<-release
 		}
 		return nil
@@ -254,7 +255,7 @@ func TestBarrierIsReleasedByAnEarlyCycle(t *testing.T) {
 // sender's row is a write nobody waits for, so the tick reads it.)
 func TestIntakeIsReleasedByAnEarlyCycle(t *testing.T) {
 	t.Parallel()
-	r := newSRigWith(t, both(quick, func(o *ShardsOptions) { o.Flush.Interval, o.Flush.Coalesce = 2*time.Second, time.Millisecond }))
+	r := newSRigWith(t, both(quick, func(o *CatalogOptions) { o.Flush.Interval, o.Flush.Coalesce = 2*time.Second, time.Millisecond }))
 	rec := &recorder{}
 	r.record(rec, "")
 	var took atomic.Int64
@@ -287,7 +288,7 @@ func TestTailPassingTheSizeGetsADeltaBeforeTheAge(t *testing.T) {
 	t.Parallel()
 	r := newMRig(t)
 	r.crash()
-	r.startShards(func(o *ShardsOptions) { o.Lifecycle.DeltaAge, o.Lifecycle.DeltaSize = time.Hour, 8<<10 })
+	r.startShards(func(o *CatalogOptions) { o.Lifecycle.DeltaAge, o.Lifecycle.DeltaSize = time.Hour, 8<<10 })
 	ctx := context.Background()
 	ref := r.acquire("wallet/d1")
 	defer ref.Release()
@@ -320,7 +321,7 @@ func TestSmallTailGetsADeltaAtTheAge(t *testing.T) {
 	r := newMRig(t)
 	r.crash()
 	const age = 600 * time.Millisecond
-	r.startShards(func(o *ShardsOptions) { o.Lifecycle.DeltaAge = age })
+	r.startShards(func(o *CatalogOptions) { o.Lifecycle.DeltaAge = age })
 	ctx := context.Background()
 	start := time.Now() // the tail starts with the shard's first commit
 	ref := r.acquire("wallet/d2")

@@ -4,8 +4,6 @@ import (
 	"context"
 	"log/slog"
 	"time"
-
-	"github.com/luci1900/shardlite/internal/supervisor"
 )
 
 // tailAlertAge is how old a tail gets before it raises the alert: three times
@@ -22,7 +20,7 @@ func JournalExpiry(deltaAge time.Duration) time.Duration {
 // tailAlertEvery is how often a shard repeats the tail-age alert.
 const tailAlertEvery = time.Minute
 
-// watchdog is the part of Shards that raises the tail-age alert, on its own
+// watchdog is the part of the Catalog that raises the tail-age alert, on its own
 // timer, apart from the shards' loops, since a shard whose delta keeps failing
 // (or hangs, holding its loop) must still raise it. Its period is on the Clock,
 // and the ages it compares are real time.
@@ -44,7 +42,7 @@ func (w *watchdog) Serve(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return supervisor.NoRestart(nil)
+			return nil
 		case <-tick:
 		}
 		w.tab.shards(w.check, entryActive, entryBusy)

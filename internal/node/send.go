@@ -18,10 +18,15 @@ import (
 // request comes from a row that is durable already, so it isn't gated on the
 // caller, and a gRPC failure is read from its status rather than turned into a
 // gRPC response.
+//
+// A request another node forwarded keeps the kind it had there (a client's or a
+// call) and is marked forwarded: the node it came from has gated its caller and
+// counted its hops.
 type origin struct {
-	kind    originKind
-	inboxID int64 // the row a delivery is for
-	hops    int   // the row's own hops, which the handler sees
+	kind      originKind
+	forwarded bool
+	inboxID   int64 // the row a delivery is for
+	hops      int   // the row's own hops, which the handler sees
 }
 
 type originKind int

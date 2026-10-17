@@ -177,23 +177,32 @@ const (
 //     connections after the request was sent are ErrUnknown;
 //   - a request that was never fully sent (connection refused, DNS, TLS, a context
 //     that ended first) is ErrNotApplied, and one that was fully sent when the
-//     context ended is ErrUnknown;
+//     context or a timeout of the transport's ended it is ErrUnknown;
+//   - a read that fails without a response, a timeout of the transport's included,
+//     is ErrNotApplied (it changed nothing), except when the caller's context
+//     ended: that error is returned as it is;
 //   - other 4xx (access denied, bad request) are plain errors, which are not retried.
-func classify(err error, k kind, wasSent bool) error {
+//
+// The SDK's error stays in the chain (%w), so errors.As finds its smithy.APIError.
+// It holds none of the outcomes above, so wrapping it can't change how an error
+// classifies. A timeout of the transport's does match context.DeadlineExceeded.
+func classify(ctx context.Context, err error, k kind, wasSent bool) error {
 	if err == nil {
 		return nil
 	}
 	if _, sent := errors.AsType[*smithyhttp.RequestSendError](err); sent || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		if k == kindRead {
-			// Nothing to have changed: reads simply retry. A cancelled context is the caller's.
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			// Nothing to have changed: reads simply retry. The caller's context ending
+			// is theirs to see, but an error that matches a deadline while the
+			// caller's context is still live is the transport's own timeout.
+			if ctx.Err() != nil {
 				return err
 			}
-			return fmt.Errorf("%w: %v", ErrNotApplied, err)
+			return fmt.Errorf("%w: %w", ErrNotApplied, err)
 		}
-		// A cancelled context or a passed deadline is unknown only if the request was
-		// fully written; otherwise the store never had it. Either way the context's
-		// own error stays findable.
+		// Whether the context or the transport ended it, the failure is unknown only
+		// if the request was fully written; otherwise the store never had it. Either
+		// way the underlying error stays findable.
 		if wasSent {
 			return fmt.Errorf("%w: %w", ErrUnknown, err)
 		}
@@ -209,24 +218,24 @@ func classify(err error, k kind, wasSent bool) error {
 		case code == "NoSuchBucket", code == "AccessDenied", code == "InvalidAccessKeyId", code == "SignatureDoesNotMatch":
 			return fmt.Errorf("blob: s3: %w", err) // the setup is wrong: retrying won't help
 		case status == http.StatusNotFound:
-			return fmt.Errorf("%w: %v", ErrNotFound, err)
+			return fmt.Errorf("%w: %w", ErrNotFound, err)
 		case status == http.StatusPreconditionFailed:
 			if k == kindCreate {
-				return fmt.Errorf("%w: %v", ErrExists, err)
+				return fmt.Errorf("%w: %w", ErrExists, err)
 			}
-			return fmt.Errorf("%w: %v", ErrConflict, err)
+			return fmt.Errorf("%w: %w", ErrConflict, err)
 		case status == http.StatusConflict && code == "ConditionalRequestConflict",
 			status == http.StatusTooManyRequests,
 			status == http.StatusServiceUnavailable && code == "SlowDown":
-			return fmt.Errorf("%w: %v", ErrNotApplied, err)
+			return fmt.Errorf("%w: %w", ErrNotApplied, err)
 		case status == http.StatusRequestTimeout, code == "RequestTimeout", status >= 500, status < 400:
 			// (a status under 400 here is a good response the SDK could not read)
-			return fmt.Errorf("%w: %v", ErrUnknown, err)
+			return fmt.Errorf("%w: %w", ErrUnknown, err)
 		}
 		return fmt.Errorf("blob: s3: %w", err)
 	}
 	if _, ok := errors.AsType[*smithy.DeserializationError](err); ok {
-		return fmt.Errorf("%w: %v", ErrUnknown, err) // the response was cut short
+		return fmt.Errorf("%w: %w", ErrUnknown, err) // the response was cut short
 	}
 	return fmt.Errorf("blob: s3: %w", err)
 }
@@ -246,7 +255,7 @@ func bodySize(body io.ReadSeeker) (int64, error) {
 func (s *S3) put(ctx context.Context, k kind, key string, body io.ReadSeeker, id WriteID, in *s3.PutObjectInput) (ETag, error) {
 	n, err := bodySize(body)
 	if err != nil {
-		return "", fmt.Errorf("%w: sizing the body: %v", ErrNotApplied, err)
+		return "", fmt.Errorf("%w: sizing the body: %w", ErrNotApplied, err)
 	}
 	in.Bucket, in.Key, in.Body = aws.String(s.bucket), aws.String(key), body
 	in.ContentLength = aws.Int64(n)
@@ -256,7 +265,7 @@ func (s *S3) put(ctx context.Context, k kind, key string, body io.ReadSeeker, id
 	var tr sent
 	out, err := s.c.PutObject(tr.trace(ctx), in)
 	if err != nil {
-		return "", classify(err, k, tr.ok.Load())
+		return "", classify(ctx, err, k, tr.ok.Load())
 	}
 	return s3ETag(out.ETag), nil
 }
@@ -274,7 +283,7 @@ func (s *S3) Update(ctx context.Context, key string, body io.ReadSeeker, expecte
 func (s *S3) Get(ctx context.Context, key string) (io.ReadCloser, ETag, error) {
 	out, err := s.c.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
 	if err != nil {
-		return nil, "", classify(err, kindRead, false)
+		return nil, "", classify(ctx, err, kindRead, false)
 	}
 	return out.Body, s3ETag(out.ETag), nil
 }
@@ -291,7 +300,7 @@ func (s *S3) GetRange(ctx context.Context, key string, offset, length int64) (io
 	}
 	out, err := s.c.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key), Range: aws.String(rng)})
 	if err != nil {
-		return nil, classify(err, kindRead, false)
+		return nil, classify(ctx, err, kindRead, false)
 	}
 	return out.Body, nil
 }
@@ -299,7 +308,7 @@ func (s *S3) GetRange(ctx context.Context, key string, offset, length int64) (io
 func (s *S3) Head(ctx context.Context, key string) (ObjectInfo, error) {
 	out, err := s.c.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
 	if err != nil {
-		return ObjectInfo{}, classify(err, kindRead, false)
+		return ObjectInfo{}, classify(ctx, err, kindRead, false)
 	}
 	info := ObjectInfo{Key: key, Size: aws.ToInt64(out.ContentLength), ETag: s3ETag(out.ETag), LastModified: aws.ToTime(out.LastModified)}
 	if v, ok := out.Metadata[writeMeta]; ok {
@@ -320,7 +329,7 @@ func (s *S3) Delete(ctx context.Context, key string, expected ETag) error {
 	var tr sent
 	_, err := s.c.DeleteObject(tr.trace(ctx), in)
 	if err != nil {
-		if cerr := classify(err, kindDelete, tr.ok.Load()); expected != "" || !errors.Is(cerr, ErrNotFound) {
+		if cerr := classify(ctx, err, kindDelete, tr.ok.Load()); expected != "" || !errors.Is(cerr, ErrNotFound) {
 			return cerr
 		}
 	}
@@ -335,7 +344,7 @@ func (s *S3) List(ctx context.Context, prefix string) iter.Seq2[ObjectInfo, erro
 		for p.HasMorePages() {
 			page, err := p.NextPage(ctx)
 			if err != nil {
-				yield(ObjectInfo{}, classify(err, kindRead, false))
+				yield(ObjectInfo{}, classify(ctx, err, kindRead, false))
 				return
 			}
 			for _, o := range page.Contents {

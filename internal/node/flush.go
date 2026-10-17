@@ -14,7 +14,6 @@ import (
 	"github.com/luci1900/shardlite/internal/coord"
 	"github.com/luci1900/shardlite/internal/notify"
 	"github.com/luci1900/shardlite/internal/segment"
-	"github.com/luci1900/shardlite/internal/supervisor"
 )
 
 // Defaults of the flush timing, chosen from the measurements in plans/stage-1.2-report.md.
@@ -131,7 +130,7 @@ func (f *Flusher) Serve(ctx context.Context) error {
 		if !early {
 			select {
 			case <-ctx.Done():
-				return supervisor.NoRestart(nil)
+				return nil
 			case <-tick.C:
 			case <-f.kick:
 				if f.noEarly || !f.pending() {
@@ -139,13 +138,13 @@ func (f *Flusher) Serve(ctx context.Context) error {
 				}
 				early = true
 				if !sleep(ctx, f.coalesce) { // so that output arriving together shares the cycle
-					return supervisor.NoRestart(nil)
+					return nil
 				}
 			}
 		}
 		// Never closer to the last start than the minimum, whatever starts this one.
 		if !last.IsZero() && !sleep(ctx, f.min-time.Since(last)) {
-			return supervisor.NoRestart(nil)
+			return nil
 		}
 		if early && !f.pending() {
 			kicked = false // everybody who waited has gone: nobody is flushed for
@@ -238,7 +237,7 @@ func (f *Flusher) cycle(ctx context.Context) {
 		p.a.cap.synced(nil)
 		p.a.cap.captured(p.h, p.ok)
 		if o := p.a.msgs.load(); o != nil {
-			o.reads.captured.Kick() // its new rows can be read, and are durable
+			o.kick() // its new rows can be read, and are durable
 		}
 	}
 	f.done.Inc()
@@ -293,19 +292,24 @@ func (f *Flusher) Wait(ctx context.Context, mark uint64) error {
 // Barrier is what POST /_shardlite/sync does: it returns once everything
 // committed before the call is in blob storage (the next completed cycle), and
 // fails once the node's lease is lost.
-func (m *Shards) Barrier(ctx context.Context) error { return m.flush.Wait(ctx, m.flush.Mark()) }
+func (m *Catalog) Barrier(ctx context.Context) error { return m.flush.Wait(ctx, m.flush.Mark()) }
 
 // Gate holds a chunk of a shard's output until what the shard committed before
 // it is durable (docs/internals.md, Durability gates):
 //
-//   - with sync off the chunk goes straight out;
+//   - whatever the setting, the node's lease must be good: a node whose lease
+//     has run out may have lost the shard to another node, and answers nothing;
+//   - with sync off the chunk then goes straight out;
 //   - with sync on it waits for a flush cycle that began after the chunk was
 //     read, unless the shard has had no new frames since its last capture (a
 //     shard whose header can't be read counts as having them).
 //
 // Call it once the chunk has been read from the app. sync is the kind's
 // setting or a Shardlite-Sync override.
-func (m *Shards) Gate(ctx context.Context, r *Ref, sync bool) error {
+func (m *Catalog) Gate(ctx context.Context, r *Ref, sync bool) error {
+	if err := m.n.Keeper.Check(); err != nil {
+		return err
+	}
 	if !sync {
 		return nil
 	}

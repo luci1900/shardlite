@@ -75,6 +75,15 @@ type ObjectInfo struct {
 	WriteID      WriteID // of the write that created this version (zero in listings from stores whose listings carry no metadata)
 }
 
+// Body is what a Store writes: bytes that can be read at any offset and don't
+// change (*bytes.Reader, *strings.Reader and *io.SectionReader are). A Store
+// reads each attempt through a reader of its own, so attempts share no offset
+// with each other or with the caller.
+type Body interface {
+	io.ReaderAt
+	Size() int64
+}
+
 // Backend does single attempts and nothing else.
 type Backend interface {
 	// Create writes the object only if the key doesn't exist (ErrExists otherwise).

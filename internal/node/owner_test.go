@@ -8,8 +8,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,45 +18,17 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/luci1900/shardlite/internal/apptest"
+	"github.com/luci1900/shardlite/internal/blob"
 )
 
 // The messages owner on its own: a SQLite database with the reserved tables in
-// place of the shard's capture, a fake store for the hints and a fake transport.
-
-// fakeWakes is a hint store that records what it is asked. With hold set, a
-// write waits for hold to be closed (or for its context).
-type fakeWakes struct {
-	hold    chan struct{}
-	started apptest.Log[string] // writes begun
-	writes  apptest.Log[string] // writes done
-	deletes apptest.Log[string]
-}
-
-func (f *fakeWakes) writeWake(ctx context.Context, shard string, t time.Time) (string, error) {
-	key := wakeKey(t, shard)
-	f.started.Add(key)
-	if f.hold != nil {
-		select {
-		case <-f.hold:
-		case <-ctx.Done():
-			return key, context.Cause(ctx)
-		}
-	}
-	f.writes.Add(key)
-	return key, nil
-}
-
-func (f *fakeWakes) deleteWakes(ctx context.Context, keys ...string) error {
-	for _, k := range keys {
-		f.deletes.Add(k)
-	}
-	return nil
-}
+// place of the shard's capture (with a lock for the capture lock) and a fake
+// transport.
 
 // fakeGate is durability for the owner's own tests. Every read is durable at
 // once, unless hold is set: then each read waits for the test to close the
 // channel it was given (in held), and fail is what check says then. The owner
-// never reads for itself (cycleAfter never fires): the test reads (r.read).
+// never reads again for itself (cycleAfter never fires).
 type fakeGate struct {
 	mu   sync.Mutex
 	hold bool
@@ -85,25 +57,41 @@ func (g *fakeGate) check() error {
 
 func (g *fakeGate) cycleAfter(uint64) <-chan struct{} { return nil }
 
-// release ends the wait of the i-th held read, with check saying fail.
-func (g *fakeGate) release(i int, fail error) {
+func (g *fakeGate) set(hold bool, fail error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.fail = fail
+	g.hold, g.fail = hold, fail
+}
+
+func (g *fakeGate) waiting() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.held)
+}
+
+// release ends the wait of the i-th held read.
+func (g *fakeGate) release(i int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	close(g.held[i])
 }
 
 type orig struct {
-	t     *testing.T
-	db    *sql.DB
-	wakes *fakeWakes
-	gate  *fakeGate
-	mg    *messenger
-	o     *msgOwner
-	stop  func() // ends the owner's Serve and waits for it
+	t    *testing.T
+	db   *sql.DB
+	gate *fakeGate
+	mg   *messenger
+	a    *shard
+	k    *kept
+	o    *msgOwner
+	stop func() // ends the owner's Serve and waits for it
+
+	capture sync.Mutex             // the capture lock: one call to the shard's connection at a time
+	calls   atomic.Int64           // calls to the shard's connection begun
+	hook    atomic.Pointer[func()] // run once, inside the next call
 }
 
-func newOwnerRig(t *testing.T, wakes *fakeWakes, tr *transport) *orig {
+func newOwnerRig(t *testing.T, tr *transport) *orig {
 	t.Helper()
 	dir := t.TempDir()
 	db, err := sql.Open("sqlite", "file:"+filepath.Join(dir, "shard.db")+"?_pragma=busy_timeout(5000)")
@@ -125,20 +113,31 @@ func newOwnerRig(t *testing.T, wakes *fakeWakes, tr *transport) *orig {
 	}
 	mg := newMessenger(MessageOptions{Backoff: 20 * time.Millisecond, MaxBackoff: 50 * time.Millisecond, MaxAge: 24 * time.Hour, ReceiverLimit: 32, NodeLimit: 256},
 		kinds, realClock{}, slog.New(slog.DiscardHandler), &Stats{}, tr)
-	a := &shard{Name: "users/o1"}
-	r := &orig{t: t, db: db, wakes: wakes, gate: &fakeGate{}, mg: mg}
-	r.o = newMsgOwner(mg, a, func(_ context.Context, fn func(*sql.DB) error) error { return fn(db) }, wakes, r.gate, newKept())
+	r := &orig{t: t, db: db, gate: &fakeGate{}, mg: mg, a: &shard{Name: "users/o1"}, k: newKept()}
 	r.serve()
 	return r
 }
 
-// serve runs the owner until stop.
+// use is the shard's connection, under the capture lock.
+func (r *orig) use(_ context.Context, fn func(*sql.DB) error) error {
+	r.calls.Add(1)
+	r.capture.Lock()
+	defer r.capture.Unlock()
+	if h := r.hook.Swap(nil); h != nil {
+		(*h)()
+	}
+	return fn(r.db)
+}
+
+// serve starts a new owner with the rig's kept, and runs it until stop.
 func (r *orig) serve() {
+	r.o = newMsgOwner(r.mg, r.a, r.use, r.gate, r.k)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
+	o := r.o
 	go func() {
 		defer close(done)
-		r.o.Serve(ctx)
+		o.Serve(ctx)
 	}()
 	var once sync.Once
 	r.stop = func() { once.Do(func() { cancel(); <-done }) }
@@ -152,110 +151,184 @@ func (r *orig) exec(stmt string) {
 	}
 }
 
-// read has the owner read the shard now, as a kick from the flush cycle would,
-// and returns once it has.
-func (r *orig) read(ctx context.Context) error {
-	_, err := do(ctx, r.o.ev, r.o.ended, func() struct{} { r.o.read(); return struct{}{} })
-	return err
+// settled is true once the owner has finished every read asked of it.
+func (r *orig) settled() bool { return r.o.answered.Load() == r.o.asked.Load() }
+
+// read has the owner read the shard, as a kick from the flush cycle would, and
+// waits for the read to finish.
+func (r *orig) read() {
+	r.t.Helper()
+	r.o.kick()
+	apptest.Eventually(r.t, 10*time.Second, "the owner's read", r.settled)
 }
 
-// asks runs q on the owner's loop.
-func (r *orig) asks(q func(o *msgOwner) bool) bool {
-	v, err := do(context.Background(), r.o.ev, r.o.ended, func() bool { return q(r.o) })
-	return err == nil && v
+func (r *orig) inFlight() int {
+	r.k.mu.Lock()
+	defer r.k.mu.Unlock()
+	return len(r.k.inFlight)
 }
 
-// within fails the test if f takes longer than d.
-func within(t *testing.T, d time.Duration, what string, f func()) {
-	t.Helper()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		f()
-	}()
-	select {
-	case <-done:
-	case <-time.After(d):
-		t.Fatalf("%s took more than %v", what, d)
+func (r *orig) outboxRows() int {
+	r.t.Helper()
+	var n int
+	if err := r.db.QueryRow(`SELECT count(*) FROM _shardlite_outbox`).Scan(&n); err != nil {
+		r.t.Fatal(err)
 	}
+	return n
 }
 
-func TestOwnerReadsWhileAHintWriteIsSlow(t *testing.T) {
+// A delivery that is acknowledged while a read runs deletes its row once the
+// read is done, and the read, which saw the row in flight, doesn't start it again.
+func TestOwnerNeverStartsARowTwice(t *testing.T) {
 	t.Parallel()
-	wakes := &fakeWakes{hold: make(chan struct{})}
-	r := newOwnerRig(t, wakes, &transport{maxHops: DefaultMaxHops})
-	later := time.Now().Add(time.Hour).Unix()
-	r.exec(`INSERT INTO _shardlite_inbox (path, due) VALUES ('/later', ` + strconv.FormatInt(later, 10) + `)`)
-	ctx := context.Background()
-	if err := r.read(ctx); err != nil {
-		t.Fatal(err)
-	}
-	wakes.started.WaitLen(t, 10*time.Second, "the hint write to begin", 1)
-	// The write is held in the store: reads, the flush cycle's word and the
-	// lifecycle loop's question are all answered meanwhile.
-	r.exec(`INSERT INTO _shardlite_inbox (path, due) VALUES ('/later2', ` + strconv.FormatInt(later+60, 10) + `)`)
-	within(t, 2*time.Second, "reads during a slow hint write", func() {
-		for range 5 {
-			if err := r.read(ctx); err != nil {
-				t.Error(err)
-			}
+	var sent apptest.Log[string]
+	ack := make(chan struct{})
+	tr := &transport{maxHops: DefaultMaxHops, intake: func(ctx context.Context, _ *shard, _ string, row *outRow) (int, error) {
+		sent.Add(row.path)
+		select {
+		case <-ack:
+			return http.StatusAccepted, nil
+		case <-ctx.Done():
+			return 0, context.Cause(ctx)
 		}
-		if live, err := r.o.holds(ctx, true); err != nil || !live {
-			t.Errorf("holds: %v, %v, want true", live, err)
-		}
-	})
-	if n := wakes.writes.Len(); n != 0 {
-		t.Fatalf("%d hint writes finished while the store held them", n)
-	}
-	if !r.asks(func(o *msgOwner) bool { return o.hints.busy && o.timer.armed() }) {
-		t.Fatal("the owner is not writing a hint, or has no inbox timer")
-	}
-	close(wakes.hold)
-	got := wakes.writes.WaitLen(t, 10*time.Second, "the hint", 1)
-	if want := wakeKey(time.Unix(later, 0), "users/o1"); got[0] != want {
-		t.Fatalf("hint %s, want %s", got[0], want)
-	}
-	apptest.Eventually(t, 10*time.Second, "the hint to be noted", func() bool {
-		return r.asks(func(o *msgOwner) bool { return !o.hints.busy && o.k.hints[got[0]] })
-	})
-	if n := wakes.started.Len(); n != 1 {
-		t.Fatalf("%d hint writes, want one for the minute of the earliest row", n)
-	}
-}
+	}}
+	r := newOwnerRig(t, tr)
+	apptest.Eventually(t, 10*time.Second, "the read at activation", r.settled)
+	r.exec(`INSERT INTO _shardlite_outbox (target, path) VALUES ('users/o2', '/once')`)
+	r.read()
+	sent.WaitLen(t, 10*time.Second, "the delivery", 1)
 
-func TestOwnerEventsAfterItHasEndedDoNotBlock(t *testing.T) {
-	t.Parallel()
-	r := newOwnerRig(t, &fakeWakes{}, &transport{maxHops: DefaultMaxHops})
-	r.exec(`INSERT INTO _shardlite_outbox (target, path) VALUES ('users/o2', '/x')`)
+	// The next read is held inside its call to the shard's connection.
+	inRead, goOn := make(chan struct{}), make(chan struct{})
+	hold := func() { close(inRead); <-goOn }
+	r.hook.Store(&hold)
+	r.o.kick()
+	<-inRead
+	before := r.calls.Load()
+	close(ack) // acknowledged: the delivery wants to delete its row
+	apptest.Eventually(t, 10*time.Second, "the delete to wait for the capture lock", func() bool { return r.calls.Load() > before })
+	close(goOn)
+
+	apptest.Eventually(t, 10*time.Second, "the row to be deleted", func() bool { return r.outboxRows() == 0 && r.inFlight() == 0 })
+	r.read()
 	r.stop()
-	// No deadline on any of these: each has to give up because the owner ended.
-	ctx := context.Background()
-	within(t, 5*time.Second, "calls to an owner that has ended", func() {
-		if err := r.read(ctx); !errors.Is(err, errLoopEnded) {
-			t.Errorf("read: %v, want errLoopEnded", err)
-		}
-		r.o.reads.captured.Kick()
-		if _, err := r.o.holds(ctx, true); !errors.Is(err, errLoopEnded) {
-			t.Errorf("holds: %v, want errLoopEnded", err)
-		}
-		if _, err := r.o.live(ctx, false, false); !errors.Is(err, errLoopEnded) {
-			t.Errorf("live: %v, want errLoopEnded", err)
-		}
-		if err := r.o.hintsBeforeRelease(ctx); !errors.Is(err, errLoopEnded) {
-			t.Errorf("hints before a release: %v, want errLoopEnded", err)
-		}
-		r.o.woken(ctx, []string{wakeKey(time.Now(), "users/o1")})
-		r.o.stopDeliveries(ctx)
-		if _, ok := r.o.verify(rowKey{inbox: true, id: 1}); ok {
-			t.Error("verify answered after the owner ended")
-		}
-		if r.o.send(ctx, func() {}) {
-			t.Error("an event was taken after the owner ended")
-		}
-	})
+	if got := sent.All(); len(got) != 1 {
+		t.Fatalf("sent %v, want /once once", got)
+	}
 }
 
-func TestOwnerReleaseWithDeliveriesInFlight(t *testing.T) {
+// An outbox row given up on gets its error, and is skipped for the rest of the
+// activation (by later reads and by a new owner of the same activation). It is
+// tried once more after the next activation.
+func TestOwnerGivesUpOnAnOutboxRowForTheActivation(t *testing.T) {
+	t.Parallel()
+	var sent atomic.Int64
+	tr := &transport{maxHops: DefaultMaxHops, intake: func(context.Context, *shard, string, *outRow) (int, error) {
+		sent.Add(1)
+		return http.StatusBadRequest, &answerError{body: "no such path"}
+	}}
+	r := newOwnerRig(t, tr)
+	r.exec(`INSERT INTO _shardlite_outbox (target, path) VALUES ('users/o2', '/bad')`)
+	r.read()
+	apptest.Eventually(t, 10*time.Second, "the row's error", func() bool {
+		var reason sql.NullString
+		r.db.QueryRow(`SELECT error FROM _shardlite_outbox`).Scan(&reason)
+		return strings.Contains(reason.String, "no such path")
+	})
+	r.read()
+	r.stop()
+	r.serve() // capture resumed after a release that didn't go through
+	r.read()
+	if n := sent.Load(); n != 1 {
+		t.Fatalf("%d attempts in one activation, want 1", n)
+	}
+
+	r.stop()
+	r.k = newKept() // the next activation
+	r.serve()
+	r.read()
+	apptest.Eventually(t, 10*time.Second, "the attempt after the next activation", func() bool { return sent.Load() == 2 })
+}
+
+// An inbox row whose handler answers 2xx without consuming it is given up on:
+// the delivery's own look finds it still there.
+func TestOwnerGivesUpOnAnInboxRowItsHandlerKept(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int64
+	tr := &transport{maxHops: DefaultMaxHops, inbox: func(context.Context, *shard, *inRow) (int, error) {
+		calls.Add(1)
+		return http.StatusOK, nil
+	}}
+	r := newOwnerRig(t, tr)
+	r.exec(`INSERT INTO _shardlite_inbox (path, due) VALUES ('/kept', 0)`)
+	r.read()
+	apptest.Eventually(t, 10*time.Second, "the row to be given up on", func() bool { return r.mg.stats.InboxGivenUp.Load() == 1 })
+	r.k.mu.Lock()
+	given, flying := len(r.k.givenUp), len(r.k.inFlight)
+	r.k.mu.Unlock()
+	if given != 1 || flying != 0 {
+		t.Fatalf("%d rows given up on and %d in flight, want 1 and 0", given, flying)
+	}
+	r.read()
+	r.stop()
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("%d calls, want 1", n)
+	}
+}
+
+// The rows of a read whose cycle failed don't go out, and the next read finds
+// them again.
+func TestOwnerReadsAgainWhenTheCycleFails(t *testing.T) {
+	t.Parallel()
+	var sent apptest.Log[string]
+	tr := &transport{maxHops: DefaultMaxHops, intake: func(_ context.Context, _ *shard, _ string, row *outRow) (int, error) {
+		sent.Add(row.path)
+		return http.StatusAccepted, nil
+	}}
+	r := newOwnerRig(t, tr)
+	apptest.Eventually(t, 10*time.Second, "the read at activation", r.settled)
+	r.exec(`INSERT INTO _shardlite_outbox (target, path) VALUES ('users/o2', '/a')`)
+	r.gate.set(true, errors.New("the sync failed"))
+	r.o.kick()
+	apptest.Eventually(t, 10*time.Second, "the read to wait for its cycle", func() bool { return r.gate.waiting() == 1 })
+	r.gate.release(0)
+	apptest.Eventually(t, 10*time.Second, "the read to finish", r.settled)
+	if sent.Len() != 0 || r.inFlight() != 0 {
+		t.Fatalf("sent %v (%d in flight) while check says the sync failed", sent.All(), r.inFlight())
+	}
+	r.gate.set(false, nil)
+	r.read()
+	if got := sent.WaitLen(t, 10*time.Second, "the row read again", 1); got[0] != "/a" {
+		t.Fatalf("sent %v", got)
+	}
+}
+
+// A kick while a read waits for its cycle (one that began before the read, as
+// when the read races with the cycle that captures what it saw) reads again at
+// once, rather than waiting for a cycle that may be long in coming.
+func TestOwnerReadsAgainWhenKickedWhileWaiting(t *testing.T) {
+	t.Parallel()
+	var sent apptest.Log[string]
+	tr := &transport{maxHops: DefaultMaxHops, intake: func(_ context.Context, _ *shard, _ string, row *outRow) (int, error) {
+		sent.Add(row.path)
+		return http.StatusAccepted, nil
+	}}
+	r := newOwnerRig(t, tr)
+	apptest.Eventually(t, 10*time.Second, "the read at activation", r.settled)
+	r.exec(`INSERT INTO _shardlite_outbox (target, path) VALUES ('users/o2', '/a')`)
+	r.gate.set(true, nil)
+	r.o.kick()
+	apptest.Eventually(t, 10*time.Second, "the read to wait for its cycle", func() bool { return r.gate.waiting() == 1 })
+	r.gate.set(false, nil) // the next read is durable at once; the first one's cycle never completes
+	r.read()
+	if got := sent.WaitLen(t, 10*time.Second, "the row", 1); got[0] != "/a" {
+		t.Fatalf("sent %v", got)
+	}
+}
+
+// Stopping the owner cancels its deliveries and returns once they have ended,
+// with their rows still live and none left in flight.
+func TestOwnerStopJoinsItsDeliveries(t *testing.T) {
 	t.Parallel()
 	var started, ended apptest.Log[string]
 	tr := &transport{maxHops: DefaultMaxHops, intake: func(ctx context.Context, _ *shard, _ string, row *outRow) (int, error) {
@@ -264,156 +337,16 @@ func TestOwnerReleaseWithDeliveriesInFlight(t *testing.T) {
 		ended.Add(row.path)
 		return 0, context.Cause(ctx)
 	}}
-	wakes := &fakeWakes{}
-	r := newOwnerRig(t, wakes, tr)
+	r := newOwnerRig(t, tr)
 	r.exec(`INSERT INTO _shardlite_outbox (target, path) VALUES ('users/o2', '/a'), ('users/o2', '/b'), ('users/o3', '/c')`)
-	ctx := context.Background()
-	if err := r.read(ctx); err != nil {
-		t.Fatal(err)
-	}
+	r.read()
 	started.WaitLen(t, 10*time.Second, "three deliveries in flight", 3)
-
-	// The hints for the release: one for now, since the outbox rows are live.
-	before := time.Now()
-	if err := r.o.hintsBeforeRelease(ctx); err != nil {
-		t.Fatal(err)
-	}
-	got := wakes.writes.All()
-	if len(got) != 1 || (got[0] != wakeKey(before, "users/o1") && got[0] != wakeKey(time.Now(), "users/o1")) {
-		t.Fatalf("hints %v, want one for now", got)
-	}
-	// Stopping the owner cancels the deliveries and returns once they have ended.
 	r.stop()
 	if n := ended.Len(); n != 3 {
 		t.Fatalf("%d deliveries ended by the time the owner stopped, want 3", n)
 	}
-	var n int
-	if err := r.db.QueryRow(`SELECT count(*) FROM _shardlite_outbox`).Scan(&n); err != nil || n != 3 {
-		t.Fatalf("%d outbox rows (%v), want the 3 still live", n, err)
-	}
-	if d := wakes.deletes.All(); len(d) != 0 {
-		t.Fatalf("hints deleted after the release asked for them: %v", d)
-	}
-
-	// The release didn't go through and capture resumed: a new owner carries on
-	// from what the last one knew, so it neither writes the hint again nor loses it.
-	r.o = newMsgOwner(r.mg, r.o.a, r.o.db, wakes, r.gate, r.o.k)
-	r.serve()
-	if err := r.read(ctx); err != nil {
-		t.Fatal(err)
-	}
-	started.WaitLen(t, 10*time.Second, "the rows to be delivered again", 6)
-	if err := r.o.hintsBeforeRelease(ctx); err != nil {
-		t.Fatal(err)
-	}
-	seen := map[string]bool{}
-	for _, k := range wakes.started.All() {
-		if seen[k] {
-			t.Fatalf("hint %s written again by the new owner", k)
-		}
-		seen[k] = true
-	}
-	r.stop()
-	if n := ended.Len(); n != 6 {
-		t.Fatalf("%d deliveries ended by the time the second owner stopped, want 6", n)
-	}
-}
-
-// The owner's parts on their own, without its loop.
-
-// A row goes out only once the read that found it is durable, reads settle in
-// order, and the rows of a read whose cycle failed are read again.
-func TestReadsSettleInOrder(t *testing.T) {
-	t.Parallel()
-	var sent apptest.Log[string]
-	tr := &transport{maxHops: DefaultMaxHops, intake: func(_ context.Context, _ *shard, _ string, row *outRow) (int, error) {
-		sent.Add(row.path)
-		return http.StatusAccepted, nil
-	}}
-	r := newOwnerRig(t, &fakeWakes{}, tr)
-	r.asks(func(*msgOwner) bool { return true }) // after the owner's first read, which was durable at once
-	r.gate.mu.Lock()
-	r.gate.hold = true
-	r.gate.mu.Unlock()
-	ctx := context.Background()
-	r.exec(`INSERT INTO _shardlite_outbox (target, path) VALUES ('users/o2', '/a')`)
-	if err := r.read(ctx); err != nil {
-		t.Fatal(err)
-	}
-	r.exec(`INSERT INTO _shardlite_outbox (target, path) VALUES ('users/o2', '/b')`)
-	if err := r.read(ctx); err != nil {
-		t.Fatal(err)
-	}
-	pending := func() int {
-		n, _ := do(ctx, r.o.ev, r.o.ended, func() int { return len(r.o.reads.waits) })
-		return n
-	}
-	if n := pending(); n != 2 || sent.Len() != 0 {
-		t.Fatalf("%d reads pending and %d rows sent before any was durable", n, sent.Len())
-	}
-
-	// The second read's cycle completing first settles nothing: the first is older.
-	r.gate.release(1, nil)
-	if n := pending(); n != 2 || sent.Len() != 0 {
-		t.Fatalf("%d reads pending and %d rows sent with the oldest still waiting", n, sent.Len())
-	}
-
-	// The cycle failed for both (check says so): nothing goes out, and both rows
-	// are read again by the next read, which is durable at once.
-	r.gate.release(0, errors.New("the sync failed"))
-	apptest.Eventually(t, 10*time.Second, "both reads to settle", func() bool { return pending() == 0 })
-	if got := sent.All(); len(got) != 0 {
-		t.Fatalf("sent %v while check says the sync failed", got)
-	}
-	r.gate.mu.Lock()
-	r.gate.hold, r.gate.fail = false, nil
-	r.gate.mu.Unlock()
-	if err := r.read(ctx); err != nil {
-		t.Fatal(err)
-	}
-	got := sent.WaitLen(t, 10*time.Second, "the rows read again", 2)
-	if slices.Sort(got); !slices.Equal(got, []string{"/a", "/b"}) {
-		t.Fatalf("sent %v, want /a and /b once each", got)
-	}
-}
-
-func TestRowsAreKnownUntilSeenGone(t *testing.T) {
-	t.Parallel()
-	k := newKept()
-	r := rows{known: map[rowKey]bool{}, givenUp: k.givenUp, more: true}
-	out, in := &outRow{id: 1}, &inRow{id: 2, due: 10}
-	asked := &check{row: in.rowKey(), res: make(chan bool, 1)}
-	r.ask(asked)
-	checks := r.begin()
-	if len(checks) != 1 || r.more {
-		t.Fatalf("begin took %d questions and left more %v", len(checks), r.more)
-	}
-	snap := &snapshot{out: []*outRow{out}, in: []*inRow{in}}
-	r.read(snap, checks, []bool{false}, false)
-	if <-asked.res {
-		t.Fatal("the question got the wrong answer")
-	}
-	if !r.skip(out.rowKey()) || !r.skip(in.rowKey()) {
-		t.Fatal("rows just read are not skipped by the next read")
-	}
-	r.forget(snap) // its cycle failed
-	if r.skip(out.rowKey()) || !r.more {
-		t.Fatal("a read whose cycle failed is not read again")
-	}
-	r.read(snap, nil, nil, false)
-	r.written([]outWrite{{id: 1}})
-	if r.skip(out.rowKey()) {
-		t.Fatal("a deleted outbox row is still known")
-	}
-	r.giveUp(in.rowKey())
-	if !r.skip(in.rowKey()) || r.known[in.rowKey()] || !k.givenUp[in.rowKey()] {
-		t.Fatal("a row given up on is not skipped, or not kept")
-	}
-	c := &check{row: rowKey{inbox: true, id: 3}, res: make(chan bool, 1)}
-	r.ask(c)
-	r.failed(r.begin())
-	if len(r.checks) != 1 || !r.more {
-		t.Fatal("a failed read lost its question")
+	if n := r.outboxRows(); n != 3 || r.inFlight() != 0 {
+		t.Fatalf("%d outbox rows and %d in flight, want 3 still live and none in flight", n, r.inFlight())
 	}
 }
 
@@ -435,59 +368,95 @@ func TestInboxTimerFiresOnTheClock(t *testing.T) {
 	clk.Advance(time.Second)
 	<-tm.c
 	tm.fired()
-	if !tm.due || tm.armed() {
-		t.Fatal("a timer that fired doesn't say rows are due")
+	if tm.armed() {
+		t.Fatal("a timer that fired is still armed")
 	}
 }
 
-func TestOutQueueWaitsForMoreAnswers(t *testing.T) {
+// A hint that can't be written before a release keeps the shard active with a
+// messages owner running, and the next idle look tries again.
+func TestHintWriteFailingBeforeAReleaseKeepsTheOwner(t *testing.T) {
 	t.Parallel()
-	var q outQueue
-	if q.c() != nil {
-		t.Fatal("an empty queue is due")
+	var logs syncBuffer
+	r := newSRigWith(t, both(quick, logTo(&logs)))
+	var failing atomic.Bool
+	failing.Store(true)
+	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
+		if !after && failing.Load() && op == blob.OpCreate && strings.HasPrefix(key, wakePrefix) {
+			return errors.New("storage down")
+		}
+		return nil
+	})
+	due := time.Now().Add(time.Hour).Unix()
+	r.setRow("users/hr1", "k", "/later", due)
+	r.closeInApp("users/hr1")
+	eventually(t, "a release to fail on the hint", func() bool {
+		return strings.Contains(logs.String(), "could not deactivate an idle shard") && strings.Contains(logs.String(), "writing a wake hint")
+	})
+	if !r.m.IsActive("users/hr1") {
+		t.Fatal("the shard was let go of without its hint")
 	}
-	q.add(outWrite{id: 1})
-	q.add(outWrite{id: 2})
-	<-q.c()
-	batch := q.take()
-	if len(batch) != 2 || q.c() != nil {
-		t.Fatalf("took %d writes and left the queue due %v", len(batch), q.c() != nil)
+	o := r.shard("users/hr1").msgs.load()
+	select {
+	case <-o.ended:
+		t.Fatal("the shard stayed active with no messages owner")
+	default:
 	}
-	q.add(outWrite{id: 3})
-	q.retry(batch, time.Millisecond)
-	<-q.c()
-	if batch := q.take(); len(batch) != 3 || batch[0].id != 1 || batch[2].id != 3 {
-		t.Fatalf("after a retry: %v", batch)
+	failing.Store(false)
+	eventually(t, "the next idle look to let go of the shard", func() bool { return r.cached("users/hr1") })
+	if keys := r.wakes(); len(keys) != 1 || keys[0] != wakeKey(time.Unix(due, 0), "users/hr1") {
+		t.Fatalf("hints %v", keys)
 	}
 }
 
-func TestWakeHintJobs(t *testing.T) {
+// At shutdown every shard's deliveries are joined before any shard is let go
+// of: here a delivery held in the app, which takes a while to end once it is
+// cancelled, has ended before the other shard's release writes anything.
+func TestShutdownJoinsEveryDeliveryBeforeLettingGo(t *testing.T) {
 	t.Parallel()
-	k := newKept()
-	h := wakeHints{k: k, name: "users/h1"}
-	t0 := time.Now().Truncate(time.Minute)
-	old, cur := wakeKey(t0, "users/h1"), wakeKey(t0.Add(2*time.Minute), "users/h1")
-	k.hints[old] = true
-	h.noteEarliest(&snapshot{earliest: t0.Add(2 * time.Minute).Unix(), hasEarliest: true})
-	if !h.tidy || !h.read1 {
-		t.Fatal("a first durable read doesn't ask for the hints to be brought in line")
+	r := newSRigWith(t, both(quick, drainFor(200*time.Millisecond)))
+	rec := &recorder{keep: true, hold: make(chan struct{})}
+	defer close(rec.hold)
+	r.record(rec, "")
+	var ended, stopping atomic.Bool
+	hook := inboxHookFn(func(ctx context.Context, call func() (int, error)) (int, error) {
+		status, err := call()
+		if ctx.Err() != nil {
+			time.Sleep(200 * time.Millisecond)
+		}
+		ended.Store(true)
+		return status, err
+	})
+	r.inboxHook.Store(&hook)
+	var early atomic.Int32 // writes for the other shard while the delivery was still running
+	var seen atomic.Int32
+	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
+		if !after && stopping.Load() && strings.Contains(key, "lj2") {
+			seen.Add(1)
+			if !ended.Load() {
+				early.Add(1)
+			}
+		}
+		return nil
+	})
+	r.sql("slow/lj2", `INSERT INTO kv (payload) VALUES (x'01')`)
+	r.setRow("slow/lj1", "k", "/held", time.Now().Unix())
+	eventually(t, "the delivery to reach the app", func() bool {
+		rec.mu.Lock()
+		defer rec.mu.Unlock()
+		return len(rec.got) > 0
+	})
+	r.closeInApp("slow/lj1")
+	r.closeInApp("slow/lj2")
+	stopping.Store(true)
+	if err := r.mrig.stop(); err != nil {
+		t.Fatal(err)
 	}
-	job := h.reconcileJob()
-	if len(job.write) != 1 || wakeKey(job.write[0], "users/h1") != cur || len(job.delete) != 1 || job.delete[0] != old {
-		t.Fatalf("reconcile: write %v, delete %v, want %s written and %s deleted", job.write, job.delete, cur, old)
+	if seen.Load() == 0 {
+		t.Fatal("the other shard's release wrote nothing")
 	}
-	k.hints[cur] = true
-	h.tidy = false
-	h.noteEarliest(&snapshot{earliest: t0.Add(2 * time.Minute).Unix(), hasEarliest: true})
-	if h.tidy {
-		t.Fatal("the same earliest row asks for the hints again")
-	}
-	// Before a release, with a live outbox row: one for now, one for the earliest
-	// row, and the old one goes.
-	now := t0.Add(90 * time.Second)
-	job = h.releaseJob(now, true, t0.Add(2*time.Minute).Unix(), true)
-	if len(job.write) != 1 || wakeKey(job.write[0], "users/h1") != wakeKey(now, "users/h1") || len(job.delete) != 1 || job.delete[0] != old {
-		t.Fatalf("release: write %v, delete %v", job.write, job.delete)
+	if n := early.Load(); n != 0 {
+		t.Fatalf("%d writes of the other shard's release before the delivery had ended", n)
 	}
 }
 

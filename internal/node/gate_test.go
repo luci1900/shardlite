@@ -19,13 +19,13 @@ import (
 
 // slowFlush makes the flush interval long enough for a test to tell a request
 // that waited for a flush from one that did not.
-func slowFlush(o *ShardsOptions) { o.Flush.Interval = 300 * time.Millisecond }
+func slowFlush(o *CatalogOptions) { o.Flush.Interval = 300 * time.Millisecond }
 
 // manualFlush stops the flush loop from ever ticking, so the test decides when
 // a cycle runs (r.cycle) and what a request waited for is read off the cycle
 // counter, not the clock. Idle shards stay active too: a deactivation waits for a
 // cycle, which only the test would run.
-func manualFlush(o *ShardsOptions) {
+func manualFlush(o *CatalogOptions) {
 	o.Flush.Interval, o.Cache.Every, o.Flush.NoEarly, o.Lifecycle.NoIdle = time.Hour, time.Hour, true, true
 }
 
@@ -310,5 +310,56 @@ func TestCreationOverHTTP(t *testing.T) {
 	}
 	if _, err := r.manifest("users/write"); err != nil {
 		t.Fatalf("a written shard was deleted: %v", err)
+	}
+}
+
+// Once the node's lease is past its deadline no gate lets output through, sync
+// on or off and with no new frames to wait for: another node may own the shard
+// by now. A response is refused with 503, and a stream is cut at its next chunk.
+func TestGatesCheckTheLease(t *testing.T) {
+	t.Parallel()
+	r := newSRig(t)
+	next := make(chan struct{})
+	r.app_(func(w http.ResponseWriter, q *http.Request) {
+		io.WriteString(w, "data: 1\n\n")
+		if q.URL.Path != "/events" {
+			return
+		}
+		w.(http.Flusher).Flush()
+		select {
+		case <-next:
+		case <-q.Context().Done():
+			return
+		}
+		io.WriteString(w, "data: 2\n\n")
+	})
+	targets := []string{"wallet/l1", "slow/l2"} // sync on and off
+	for _, target := range targets {
+		if resp, _ := r.req("GET", r.pub, "/", map[string]string{"Shardlite-Target": target}, ""); resp.StatusCode != 200 {
+			t.Fatalf("%s: %d", target, resp.StatusCode)
+		}
+		eventually(t, "the shard to be captured", func() bool { return !r.shard(target).cap.hasNewFrames() })
+	}
+	q, _ := http.NewRequest("GET", r.pub+"/events", nil)
+	q.Header.Set("Shardlite-Target", "slow/l3")
+	stream, err := r.client.Do(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Body.Close()
+	br := bufio.NewReader(stream.Body)
+	if line, err := br.ReadString('\n'); err != nil || line != "data: 1\n" {
+		t.Fatalf("%q %v", line, err)
+	}
+
+	r.leaseAhead.Store(int64(2 * time.Hour))
+	for _, target := range targets {
+		if resp, body := r.req("GET", r.pub, "/", map[string]string{"Shardlite-Target": target}, ""); resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") == "" {
+			t.Fatalf("%s with the lease past its deadline: %d %q", target, resp.StatusCode, body)
+		}
+	}
+	close(next)
+	if rest, err := io.ReadAll(br); err == nil || strings.Contains(string(rest), "data: 2") {
+		t.Fatalf("the stream went on with the lease past its deadline: %q %v", rest, err)
 	}
 }

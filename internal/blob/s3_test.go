@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/http/httptrace"
 	"os"
 	"strings"
@@ -14,6 +15,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/aws/smithy-go"
 )
 
 // roundTripFunc is an http.RoundTripper for tests.
@@ -123,6 +126,15 @@ func TestS3StatusMapping(t *testing.T) {
 			if Transient(err) != tc.transient {
 				t.Fatalf("Transient(%v) = %v, want %v", err, Transient(err), tc.transient)
 			}
+			// The SDK's error stays in the chain, and brings no outcome of its own.
+			for _, o := range []error{ErrExists, ErrConflict, ErrNotFound, ErrNotApplied, ErrUnknown} {
+				if errors.Is(err, o) != (o == tc.want) {
+					t.Fatalf("errors.Is(%v, %v) = %v", err, o, !(o == tc.want))
+				}
+			}
+			if ae, ok := errors.AsType[smithy.APIError](err); tc.code != "" && err != nil && (!ok || ae.ErrorCode() != tc.code) {
+				t.Fatalf("%v has no smithy.APIError with code %q in its chain", err, tc.code)
+			}
 		})
 	}
 }
@@ -175,6 +187,67 @@ func TestS3TransportFailures(t *testing.T) {
 	b = fakeS3(t, roundTripFunc(func(r *http.Request) (*http.Response, error) { return nil, r.Context().Err() }))
 	if _, err := b.Create(cctx, "k", strings.NewReader("v"), WriteID{}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled create: %v", err)
+	}
+}
+
+// A timeout of the transport's own (ResponseHeaderTimeout) matches
+// context.DeadlineExceeded, but it is not the caller's deadline: a read that hangs
+// past it is retried, and a write that was fully sent is unknown. The caller's own
+// context ending is returned as it is, and is not retried.
+func TestS3TransportTimeouts(t *testing.T) {
+	t.Parallel()
+	var requests atomic.Int32
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		// Never answers. (A request with an unread body doesn't notice its client leave.)
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer srv.Close()
+	defer close(release)
+	tr := &http.Transport{ResponseHeaderTimeout: 20 * time.Millisecond}
+	defer tr.CloseIdleConnections()
+	b, err := NewS3(context.Background(), S3Options{Bucket: "b", Endpoint: srv.URL, HTTPClient: &http.Client{Transport: tr}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	if _, err := b.Head(ctx, "k"); !errors.Is(err, ErrNotApplied) || errors.Is(err, ErrUnknown) {
+		t.Fatalf("head past the header timeout: %v, want ErrNotApplied", err)
+	}
+	if _, _, err := b.Get(ctx, "k"); !errors.Is(err, ErrNotApplied) {
+		t.Fatalf("get past the header timeout: %v, want ErrNotApplied", err)
+	}
+	requests.Store(0)
+	s := NewStore(b, "n1", 1, Options{Attempts: 3, Backoff: time.Millisecond})
+	if _, err := s.Head(ctx, "k"); !errors.Is(err, ErrNotApplied) {
+		t.Fatalf("store head: %v", err)
+	}
+	if requests.Load() != 3 {
+		t.Fatalf("%d requests, want one per attempt", requests.Load())
+	}
+	if _, err := b.Create(ctx, "k", strings.NewReader("v"), WriteID{}); !errors.Is(err, ErrUnknown) || errors.Is(err, ErrNotApplied) {
+		t.Fatalf("create past the header timeout: %v, want ErrUnknown", err)
+	}
+
+	// The caller's own deadline or cancellation is theirs, and not retried.
+	dctx, cancel := context.WithTimeout(ctx, time.Millisecond)
+	defer cancel()
+	<-dctx.Done()
+	cctx, cancelNow := context.WithCancel(ctx)
+	cancelNow()
+	for ctx, want := range map[context.Context]error{dctx: context.DeadlineExceeded, cctx: context.Canceled} {
+		requests.Store(0)
+		if _, err := s.Head(ctx, "k"); !errors.Is(err, want) || Transient(err) {
+			t.Fatalf("head with the caller's context ended: %v, want %v and not retryable", err, want)
+		}
+		if requests.Load() > 1 {
+			t.Fatalf("%d requests after the caller gave up", requests.Load())
+		}
 	}
 }
 

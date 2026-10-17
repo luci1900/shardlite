@@ -14,6 +14,7 @@ import (
 	"github.com/benbjohnson/litestream"
 
 	"github.com/luci1900/shardlite/internal/apptest"
+	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/harness"
 	"github.com/luci1900/shardlite/internal/segment"
@@ -116,7 +117,7 @@ func TestIdleShardCommits(t *testing.T) {
 			e := harness.New(t)
 			ctx := context.Background()
 			app := e.StartApp(name)
-			h, created, _ := e.Files.Open(ctx, name, false)
+			h, created, _ := e.Files.Open(ctx, name)
 			_ = h
 			_ = created
 			sh, err := capture.New(capture.Config{Name: name, Path: e.Path(name), Generation: h.Manifest.Generation, MetaRoot: e.Meta, Writer: e.W,
@@ -175,7 +176,7 @@ func TestCheckpointsNeverLoseFrames(t *testing.T) {
 			e := harness.New(t)
 			ctx := context.Background()
 			app := e.StartApp(name)
-			h, _, err := e.Files.Open(ctx, name, false)
+			h, _, err := e.Files.Open(ctx, name)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -237,7 +238,7 @@ func TestReleaseChecksShm(t *testing.T) {
 	e := harness.New(t)
 	ctx := context.Background()
 	app := e.StartApp(name)
-	h, _, _ := e.Files.Open(ctx, name, false)
+	h, _, _ := e.Files.Open(ctx, name)
 	sh, err := capture.New(capture.Config{Name: name, Path: e.Path(name), Generation: h.Manifest.Generation, MetaRoot: e.Meta, Writer: e.W})
 	if err != nil {
 		t.Fatal(err)
@@ -293,7 +294,7 @@ func TestCheckAfterClosingKeepsAppLocks(t *testing.T) {
 	e := harness.New(t)
 	ctx := context.Background()
 	app := e.StartApp(name)
-	h, _, _ := e.Files.Open(ctx, name, false)
+	h, _, _ := e.Files.Open(ctx, name)
 	sh, err := capture.New(capture.Config{Name: name, Path: e.Path(name), Generation: h.Manifest.Generation, MetaRoot: e.Meta, Writer: e.W})
 	if err != nil {
 		t.Fatal(err)
@@ -327,7 +328,7 @@ func TestThrowawayProbeDropsLocks(t *testing.T) {
 	e := harness.New(t)
 	ctx := context.Background()
 	app := e.StartApp(name)
-	h, _, _ := e.Files.Open(ctx, name, false)
+	h, _, _ := e.Files.Open(ctx, name)
 	sh, err := capture.New(capture.Config{Name: name, Path: e.Path(name), Generation: h.Manifest.Generation, MetaRoot: e.Meta, Writer: e.W})
 	if err != nil {
 		t.Fatal(err)
@@ -356,7 +357,7 @@ func TestLitestreamFootprint(t *testing.T) {
 	app := e.StartApp(name)
 	app.Must(t, "insert", "a", "5", "100")
 	before := tables(t, e.Path(name))
-	h, _, _ := e.Files.Open(ctx, name, false)
+	h, _, _ := e.Files.Open(ctx, name)
 	sh, err := capture.New(capture.Config{Name: name, Path: e.Path(name), Generation: h.Manifest.Generation, MetaRoot: e.Meta, Writer: e.W})
 	if err != nil {
 		t.Fatal(err)
@@ -398,7 +399,7 @@ func TestReleaseSeesACommitAfterTheFinalSync(t *testing.T) {
 	e := harness.New(t)
 	ctx := context.Background()
 	app := e.StartApp(name)
-	h, _, _ := e.Files.Open(ctx, name, false)
+	h, _, _ := e.Files.Open(ctx, name)
 	late := false
 	sh, err := capture.New(capture.Config{Name: name, Path: e.Path(name), Generation: h.Manifest.Generation, MetaRoot: e.Meta, Writer: e.W,
 		Durable: func(ctx context.Context) error {
@@ -445,7 +446,7 @@ func TestReleaseWhoseWaitFailsReopensCapture(t *testing.T) {
 	e := harness.New(t)
 	ctx := context.Background()
 	app := e.StartApp(name)
-	h, _, _ := e.Files.Open(ctx, name, false)
+	h, _, _ := e.Files.Open(ctx, name)
 	errStorage := errors.New("storage down")
 	fail := true
 	sh, err := capture.New(capture.Config{Name: name, Path: e.Path(name), Generation: h.Manifest.Generation, MetaRoot: e.Meta, Writer: e.W,
@@ -485,5 +486,42 @@ func TestReleaseWhoseWaitFailsReopensCapture(t *testing.T) {
 	}
 	if sh.Open() {
 		t.Fatal("open after it was released")
+	}
+}
+
+// Litestream retries its final sync for 30 seconds by default. The client only
+// fails for good, so closing a shard whose writer has been fenced must fail at
+// once rather than hold the shard's loop.
+func TestCloseWithAFencedWriterDoesNotRetry(t *testing.T) {
+	t.Parallel()
+	e := harness.New(t)
+	ctx := context.Background()
+	app := e.StartApp(name)
+	h, _, _ := e.Files.Open(ctx, name)
+	sh := e.Activate(h, nil)
+	app.Must(t, "insert", "a", "5", "100")
+	if err := sh.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// An adopter fences the journal, and the writer finds out at its next flush.
+	adopter := blob.NewStore(e.Blob, "n2", 1, blob.Options{})
+	if _, err := segment.Fence(ctx, adopter, e.Node, 1); err != nil {
+		t.Fatal(err)
+	}
+	app.Must(t, "insert", "a", "6", "100")
+	if err := sh.Sync(ctx); !errors.Is(err, segment.ErrFenced) {
+		t.Fatalf("sync after the fence: %v, want ErrFenced", err)
+	}
+	// The final sync has a commit to queue, and the writer refuses it.
+	app.Must(t, "insert", "a", "7", "100")
+	done := make(chan error, 1)
+	go func() { done <- sh.Close(ctx) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, segment.ErrFenced) {
+			t.Fatalf("close: %v, want ErrFenced", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("close is still retrying its final sync")
 	}
 }

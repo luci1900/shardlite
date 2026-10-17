@@ -59,7 +59,7 @@ func TestManifestStoreCompareAndSwap(t *testing.T) {
 func TestClaim(t *testing.T) {
 	t.Parallel()
 	e, ctx := harness.New(t), context.Background()
-	h, created, err := e.Files.Open(ctx, "users/1", false)
+	h, created, err := e.Files.Open(ctx, "users/1")
 	if err != nil || !created {
 		t.Fatal(err)
 	}
@@ -79,11 +79,11 @@ func TestClaim(t *testing.T) {
 		t.Fatal(err)
 	}
 	n2files := &shardfile.Files{Blob: blob.NewStore(e.Blob, "n2", l2.Epoch, blob.Options{}), Node: "n2", Leases: other, TempDir: t.TempDir()}
-	h2, _, err := n2files.Open(ctx, "users/2", false)
+	h2, _, err := n2files.Open(ctx, "users/2")
 	if err != nil {
 		t.Fatal(err)
 	}
-	mine, _, err := e.Files.Open(ctx, "users/2", false)
+	mine, _, err := e.Files.Open(ctx, "users/2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ func TestCreatorsRacing(t *testing.T) {
 				if i%2 == 1 {
 					f = n2
 				}
-				h, created, err := f.Create(ctx, shard, false)
+				h, created, err := f.Create(ctx, shard)
 				results[i] = result{h, created, err}
 				return nil
 			})
@@ -167,7 +167,7 @@ func TestCreatorsRacing(t *testing.T) {
 func TestDeleteShard(t *testing.T) {
 	t.Parallel()
 	e, ctx := harness.New(t), context.Background()
-	h, _, err := e.Files.Open(ctx, "users/e1", false)
+	h, _, err := e.Files.Open(ctx, "users/e1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +175,7 @@ func TestDeleteShard(t *testing.T) {
 	if _, err := e.Files.Blob.Create(ctx, key, strings.NewReader("x")); err != nil {
 		t.Fatal(err)
 	}
-	other, _, err := e.Files.Open(ctx, "users/e1", false)
+	other, _, err := e.Files.Open(ctx, "users/e1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +184,7 @@ func TestDeleteShard(t *testing.T) {
 	}
 	stale := *other
 	stale.ETag = "stale"
-	if err := stale.Delete(ctx); !errors.Is(err, blob.ErrConflict) {
+	if err := stale.DeleteShard(ctx); !errors.Is(err, blob.ErrConflict) {
 		t.Fatalf("delete with a stale version: %v", err)
 	}
 	if _, _, err := e.Files.GetManifest(ctx, "users/e1"); err != nil {

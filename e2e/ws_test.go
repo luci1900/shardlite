@@ -178,25 +178,10 @@ func TestWebSocketThroughTheNode(t *testing.T) {
 		}
 	})
 
-	t.Run("an auto-delete kind", func(t *testing.T) {
-		c := dial(t, "lobby/s6")
-		for i := range 3 {
-			if echo, err := wsEcho(ctx, c, fmt.Sprintf("e%d", i)); err != nil || echo != fmt.Sprintf("ok:e%d", i) {
-				t.Fatalf("%q %v", echo, err)
-			}
-		}
-		if n, err := wsEcho(ctx, c, "count"); err != nil || n != "3" {
-			t.Fatalf("count: %q %v", n, err)
-		}
-		if m, _, err := v.files.GetManifest(ctx, "lobby/s6"); err != nil || !m.AutoDelete {
-			t.Fatalf("manifest: %+v %v, want an auto-delete one", m, err)
-		}
-	})
-
 	t.Run("an open connection keeps its shard active", func(t *testing.T) {
-		// arena is auto-delete with an idle timeout of 300 ms, and the node's janitor
-		// looks every second. An auto-delete shard's manifest exists only while the
-		// shard is active, so blob storage tells whether it is, without probing the
+		// arena has an idle timeout of 300 ms, and the node's janitor looks every
+		// second. The shard is marked for deletion, so its manifest exists only while
+		// it is active, and blob storage tells whether it is without probing the
 		// node (which would reset the shard's idle timer).
 		active := func(shard string) bool {
 			_, _, err := v.files.GetManifest(ctx, shard)
@@ -209,8 +194,11 @@ func TestWebSocketThroughTheNode(t *testing.T) {
 		if echo, err := wsEcho(ctx, c, "kept"); err != nil || echo != "ok:kept" {
 			t.Fatalf("%q %v", echo, err)
 		}
+		if reply, err := wsEcho(ctx, c, "mark"); err != nil || reply != "marked" {
+			t.Fatalf("mark: %q %v", reply, err)
+		}
 		if !active("arena/s7") {
-			t.Fatal("no manifest for an active auto-delete shard")
+			t.Fatal("no manifest for an active shard")
 		}
 		// 1.5 s is five idle timeouts, with a janitor pass in it after the shard
 		// had been idle for one, with the connection idle.

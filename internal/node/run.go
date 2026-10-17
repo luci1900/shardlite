@@ -7,17 +7,16 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	_ "net/http/pprof" // served only on SHARDLITE_PPROF's own listener
+	_ "net/http/pprof" // served only on SHARDLITE_LISTEN_PPROF's own listener
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
 	"time"
 
-	"github.com/thejerf/suture/v4"
-
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/coord"
-	"github.com/luci1900/shardlite/internal/supervisor"
+	"github.com/luci1900/shardlite/internal/service"
 )
 
 // RunOption changes how Run is assembled. Tests use them to swap parts the
@@ -27,7 +26,8 @@ type RunOption func(*runOptions)
 type runOptions struct {
 	backend blob.Backend
 	grace   time.Duration // the servers' grace period, ServerOptions' default if zero
-	public  net.Listener  // the public listener, in place of env.Listen
+	public  net.Listener  // the public listener, in place of env.Public
+	shards  func(*CatalogOptions, *Catalog)
 }
 
 // WithBackend makes Run use b as the blob store in place of the S3 bucket of
@@ -43,9 +43,15 @@ func withGrace(d time.Duration) RunOption {
 }
 
 // withPublicListener makes Run serve the public API on ln instead of listening
-// on env.Listen.
+// on env.Public.
 func withPublicListener(ln net.Listener) RunOption {
 	return func(o *runOptions) { o.public = ln }
+}
+
+// withShards calls fn with the shards' options before they are built (and nil),
+// then again with the shards, for tests that tune them or look inside.
+func withShards(fn func(*CatalogOptions, *Catalog)) RunOption {
+	return func(o *runOptions) { o.shards = fn }
 }
 
 // Run is the node: it starts everything from env, serves until ctx ends or a
@@ -53,9 +59,9 @@ func withPublicListener(ln net.Listener) RunOption {
 // (docs/concurrency.md, Shutdown). A lost lease or a fenced writer stops
 // everything at once and keeps the lease. Run returns nil after a shutdown
 // that ctx asked for, and the failure otherwise. It returns only after every
-// goroutine it started has ended. ready (if not nil) is called with the public
-// and control addresses once the node is serving.
-func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, control string), opts ...RunOption) error {
+// goroutine it started has ended. ready (if not nil) is called with the public,
+// control and peer addresses once the node is serving.
+func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, control, peer string), opts ...RunOption) error {
 	var ro runOptions
 	for _, o := range opts {
 		o(&ro)
@@ -100,44 +106,47 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 		return err
 	}
 	checks.warn(env.Scratch)
-	// Shards empties it of what a crash left (clearCache), once adoption is done.
+	// The peer listener is bound before the node starts, since the lease
+	// publishes where other nodes reach it.
+	peer, err := net.Listen("tcp", env.Peer)
+	if err != nil {
+		return err
+	}
+	address, err := peerAddress(env.Advertise, peer)
+	if err != nil {
+		peer.Close()
+		return err
+	}
+	// The catalog empties it of what a crash left (clearCache), once adoption is done.
 	tempDir := filepath.Join(env.Data, tempDirName)
 
 	expiry := JournalExpiry(env.DeltaAge)
 	n, err := Start(ctx, Config{
-		Name: env.Name, Address: env.Address, Backend: backend,
+		Name: env.Name, Address: address, Backend: backend,
 		Lease:   coord.RegistryOptions{TTL: env.LeaseTTL},
 		Keeper:  coord.KeeperOptions{Interval: env.LeaseTTL / 3, Margin: env.LeaseTTL / 5},
 		Logger:  log,
 		TempDir: tempDir,
 	})
 	if err != nil {
+		peer.Close()
 		return err
 	}
 	if n.Adopted.Deltas > 0 || len(n.Adopted.Lost) > 0 {
 		log.Info("adopted the previous process's journal", "deltas", n.Adopted.Deltas, "lost", n.Adopted.Lost, "fence", n.Adopted.Fence)
 	}
-	// The stages are children of one supervisor, served until Run returns (see
+	// The stages are groups of services that Run starts and stops in order (see
 	// below). The journal's stage starts now, so the lease is renewed while the
 	// rest is built: opening the cache can take a while on a large data directory.
-	failed := make(chan error, 1) // the first failure of a service
-	spec := supervisor.Spec(log, stopTimeout)
-	journal := suture.New("journal", spec)
+	journal := service.New(context.Background(), log)
 	journal.Add(n.Writer)
 	journal.Add(n.Keeper)
-	node := suture.New("node", spec)
-	journalToken := node.Add(journal)
-	nodeCtx, stopNode := context.WithCancel(context.Background())
-	served := node.ServeBackground(nodeCtx)
-	stopJournal := func() { // a failure before the other stages run
-		stopNode()
-		<-served
-	}
+	stopJournal := func() { stopStage(log, "the journal", journal) } // a failure before the other stages run
 	// Every listener is bound before the shards are built, since binding is quick
 	// and fails fast while opening the cache can take a while. A listener only
 	// queues connections until its server runs. Nothing after NewShards can fail
 	// before the services start, so a failure closes the listeners and the journal.
-	var lns []net.Listener
+	lns := []net.Listener{peer}
 	fail := func(err error) error {
 		for _, ln := range lns {
 			ln.Close()
@@ -147,7 +156,7 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 	}
 	public := ro.public
 	if public == nil {
-		if public, err = net.Listen("tcp", env.Listen); err != nil {
+		if public, err = net.Listen("tcp", env.Public); err != nil {
 			return fail(err)
 		}
 	}
@@ -177,94 +186,100 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 	}
 
 	var srv *Server
-	m, err := NewShards(n, ShardsOptions{
+	so := CatalogOptions{
 		Kinds: kinds, Data: env.Data, Scratch: env.Scratch, Logger: log,
 		Cache:     CacheOptions{Limit: env.CacheLimit},
 		Flush:     FlushOptions{Interval: env.Flush, Min: env.FlushMin},
 		Lifecycle: LifecycleOptions{DeltaAge: env.DeltaAge, DeltaSize: env.DeltaSize},
-	}, func(m *Shards) *transport {
+		Leases:    LeaseScanOptions{TTL: env.LeaseTTL},
+	}
+	if ro.shards != nil {
+		ro.shards(&so, nil)
+	}
+	m, err := NewCatalog(n, so, func(m *Catalog) *transport {
 		srv = NewServer(m, kinds, n.Keeper, ServerOptions{App: app, HealthPath: env.HealthPath, MaxHops: env.MaxHops, Grace: ro.grace, Logger: log})
 		return srv.transport()
 	})
 	if err != nil {
 		return fail(err)
 	}
+	if ro.shards != nil {
+		ro.shards(nil, m)
+	}
 
 	// Run's services (docs/concurrency.md). From here on everything the node runs
 	// is in one of four stages, which Run stops one after another before it
 	// returns. The journal's stage is already running, and everything else is
-	// built and every listener bound before the other stages start. A stage with
-	// one service has no supervisor of its own: the service sits under node.
+	// built and every listener bound before the other stages start.
 	// The order of a shutdown is the order of the stages, so each outlives
 	// what depends on it:
 	//
 	//	front   the public server and the services that depend on nothing
 	//	drain   not a service: Run delivers the live messages
-	//	control the control server (the app's handlers can still make calls
-	//	        while the drain runs and until the shards are let go of)
+	//	callers the control server (the app's handlers can still make calls
+	//	        while the drain runs and until the shards are let go of) and
+	//	        the peer server (other nodes' requests)
 	//	shards  every request has been joined once both servers have ended
 	//	journal the writer and the keeper, last
 	//
-	// A service that fails, a lost lease or a fenced writer tells Run, which then
-	// runs the same stops as for a shutdown. Each stage has a limit on how long
-	// its stop waits; the drain and the shards have their own.
+	// A service that fails (its stage's Done), a lost lease or a fenced writer
+	// ends the wait below, and Run then runs the same stops as for a shutdown.
+	// Each stage has a limit on how long its stop waits; the drain and the
+	// shards have their own.
 	shardsClosed := make(chan error, 1)
-	front := suture.New("front", spec)
-	front.Add(srv.publicServer(public, failed))
+	front := service.New(context.Background(), log)
+	front.Add(srv.publicServer(public))
 	front.Add(srv.health)
-	front.Add(&sweeper{n.Store, n.Name, expiry, log})
+	front.Add(&sweeper{store: n.Store, node: n.Name, age: expiry, log: log})
 	front.Add(&kindsReload{kinds, log})
 	if pprof != nil {
 		front.Add(&httpServer{name: "pprof", log: log, lns: []net.Listener{pprof}, handler: http.DefaultServeMux, grace: ro.grace})
 	}
-	// Run removes the stages one at a time to stop them in order, and
-	// RemoveAndWait returns once the stage has ended. It waits longer than the
-	// stage does, so the stage's own timeout reports first.
-	frontToken := node.Add(front)
-	controlToken := node.Add(srv.controlServer(failed, control, socket))
-	shardsToken := node.Add(shardsService{m, shardsClosed, log})
-	wait := 2 * stopTimeout
+	callers := service.New(context.Background(), log)
+	callers.Add(srv.controlServer(control, socket))
+	callers.Add(srv.peerServer(peer, env.Name))
+	shards := service.New(context.Background(), log)
+	shards.Go("catalog", func(ctx context.Context) error {
+		defer serving(log, "catalog")()
+		shardsClosed <- m.Serve(ctx) // it returns once ctx has ended and it has stopped
+		return nil
+	})
 
-	log.Info("shardlite is up", "node", env.Name, "epoch", n.Keeper.Lease().Epoch, "public", public.Addr().String(), "control", control.Addr().String(), "app", env.App)
+	log.Info("shardlite is up", "node", env.Name, "epoch", n.Keeper.Lease().Epoch, "public", public.Addr().String(), "control", control.Addr().String(), "peer", peer.Addr().String(), "address", address, "app", env.App)
 	if ready != nil {
-		ready(public.Addr().String(), control.Addr().String())
+		ready(public.Addr().String(), control.Addr().String(), peer.Addr().String())
 	}
-	var cause error
+	failed := true
 	select {
 	case <-ctx.Done():
-	case cause = <-failed:
+		failed = false
+	case <-front.Done():
+	case <-callers.Done():
+	case <-journal.Done():
 	case <-n.Writer.Fenced():
-		cause = n.Err()
 	case <-n.Keeper.Lost():
-		cause = n.Err()
 	}
-	if cause != nil {
+	cause := n.Err()
+	if failed {
 		log.Error("a part of the node failed, stopping the node", "err", cause)
 	}
 
 	log.Info("shutting down")
-	if err := node.RemoveAndWait(frontToken, wait); err != nil {
-		log.Error("the public server and the services that depend on nothing did not stop in time", "err", err)
+	if err := stopStage(log, "the public server and the services that depend on nothing", front); cause == nil {
+		cause = err
 	}
 	// Messages that are still live get a few seconds to go out before the shards
 	// are let go of (the rest get a wake hint as each shard is).
 	log.Debug("service started", "service", "drain")
 	m.Drain(context.Background()) // bounded by ShardsOptions.Drain
 	log.Debug("service stopped", "service", "drain")
-	if err := node.RemoveAndWait(controlToken, wait); err != nil {
-		log.Error("the control server did not stop in time", "err", err)
+	if err := stopStage(log, "the control and peer servers", callers); cause == nil {
+		cause = err
 	}
-	if err := node.RemoveAndWait(shardsToken, wait); err != nil {
-		log.Error("the shards did not stop in time", "err", err)
-	}
-	if err := node.RemoveAndWait(journalToken, wait); err != nil {
-		log.Error("the journal did not stop in time", "err", err)
-	}
-	stopNode()
-	<-served
-	// failed holds the first failure only. The journal's state is read directly,
-	// so a fatal error that came later, or while the stages stopped, is not
-	// missed.
+	stopStage(log, "the shards", shards)
+	stopStage(log, "the journal", journal)
+	// The journal's state is read again, so a lost lease or a fenced writer that
+	// came while the stages stopped is not missed.
 	fatal := n.Err()
 	if cause == nil {
 		cause = fatal
@@ -292,29 +307,27 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 }
 
 const (
-	// letGoDeadline is how long Shards has to let go of every shard, from the
+	// letGoDeadline is how long the catalog has to let go of every shard, from the
 	// moment its own stop starts: a release that hasn't finished by then is
 	// given up on and the lease is kept. Releasing the lease has as long.
 	letGoDeadline = 30 * time.Second
-	// stopTimeout is how long the supervisors inside Shards wait for their
-	// services to stop. It is longer than the deadline, so the deadline is what
-	// ends a release and nothing is left running.
+	// stopTimeout is how long a stop waits for a group of services (a stage of
+	// Run's, or a part of the catalog's). It is longer than the deadline, so the
+	// deadline is what ends a release and nothing is left running.
 	stopTimeout = letGoDeadline + 5*time.Second
 )
 
-// The services Run serves, each a struct with a Serve and a String, as suture
-// wants them. A service says for itself whether it can be restarted: none can,
-// so each returns supervisor.NoRestart when it ends. One that fails reports the
-// error to Run (see report) and ends the same way: Run stops the node in order
-// then, and returning the error to suture would stop everything at once.
-
-// report tells Run that a service failed. Run needs the first failure only, and
-// a service never waits to report one.
-func report(failed chan<- error, err error) {
-	select {
-	case failed <- err:
-	default:
+// stopStage stops one of Run's stages, waiting for it up to stopTimeout (the
+// stage names a service that doesn't stop by then), and returns what its
+// services failed with.
+func stopStage(log *slog.Logger, what string, g *service.Group) error {
+	ctx, cancel := context.WithTimeout(context.Background(), stopTimeout)
+	defer cancel()
+	err := g.Stop(ctx)
+	if err != nil {
+		log.Error(what+" failed or did not stop in time", "err", err)
 	}
+	return err
 }
 
 // serving logs that a service of Run's has started, and returns the func that
@@ -325,17 +338,19 @@ func serving(log *slog.Logger, name string) (stopped func()) {
 	return func() { log.Debug("service stopped", "service", name) }
 }
 
-// shardsService runs the shards, and sends why some could not be let go of
-// (nil if all were) to closed, which decides the lease's fate.
-type shardsService struct {
-	m      *Shards
-	closed chan<- error
-	log    *slog.Logger
-}
-
-func (shardsService) String() string { return "shards" }
-func (s shardsService) Serve(ctx context.Context) error {
-	defer serving(s.log, s.String())()
-	s.closed <- s.m.Serve(ctx) // it returns once ctx has ended and it has stopped
-	return supervisor.NoRestart(nil)
+// peerAddress is how other nodes reach the peer listener: the setting, or the
+// listener's own address when that names a host.
+func peerAddress(set string, peer net.Listener) (string, error) {
+	if set != "" {
+		return set, nil
+	}
+	addr := peer.Addr().String()
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", err
+	}
+	if ip, err := netip.ParseAddr(host); err != nil || ip.IsUnspecified() {
+		return "", fmt.Errorf("SHARDLITE_LISTEN_PEER listens on %s, which other nodes can't reach: set SHARDLITE_ADVERTISE_PEER to the host:port they should use", addr)
+	}
+	return addr, nil
 }

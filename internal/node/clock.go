@@ -33,4 +33,4 @@ func (realClock) NewTicker(d time.Duration) (<-chan time.Time, func()) {
 	return t.C, t.Stop
 }
 
-func (m *Shards) now() time.Time { return m.opts.Clock.Now() }
+func (m *Catalog) now() time.Time { return m.opts.Clock.Now() }

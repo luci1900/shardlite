@@ -82,11 +82,21 @@ func (s *Store) settleCtx(ctx context.Context) (context.Context, context.CancelF
 
 // unknown is the error for an outcome nobody could learn: ErrUnknown, with the
 // reason (and the caller's context error, if that is why it stopped).
+//
+// The cause is only text: a read-back that failed with ErrNotApplied must not
+// make the outcome look like nothing happened. A context error in it stays
+// findable, as for every error the store returns. (The rest of its chain,
+// the SDK's error included, is left out for the same reason.)
 func unknown(cause error, why string) error {
-	if cause == nil {
+	switch {
+	case cause == nil:
 		return fmt.Errorf("%w: %s", ErrUnknown, why)
+	case errors.Is(cause, context.DeadlineExceeded):
+		return fmt.Errorf("%w: %s: %v: %w", ErrUnknown, why, cause, context.DeadlineExceeded)
+	case errors.Is(cause, context.Canceled):
+		return fmt.Errorf("%w: %s: %v: %w", ErrUnknown, why, cause, context.Canceled)
 	}
-	return fmt.Errorf("%w: %s: %w", ErrUnknown, why, cause)
+	return fmt.Errorf("%w: %s: %v", ErrUnknown, why, cause)
 }
 
 // write runs a Create or Update with retries. try makes one attempt with the
@@ -139,15 +149,23 @@ func (s *Store) write(ctx context.Context, key string, conflict error, id WriteI
 			ambiguous = true
 			last = err
 		case errors.Is(err, ErrNotApplied):
-			last = err
+			// After an attempt of unknown outcome, this one not happening says
+			// nothing about that one: the outcome stays unknown.
+			if !ambiguous {
+				last = err
+			}
 		default:
 			return "", err
 		}
 	}
-	// Out of attempts. If the last word was "unknown", look once more.
+	// Out of attempts. If any attempt's outcome is unknown, look once more, and
+	// otherwise it stays unknown, whatever the later attempts said.
 	if ambiguous {
 		if etag, owned, err := settle(); err == nil && owned {
 			return etag, nil
+		}
+		if !errors.Is(last, ErrUnknown) {
+			last = unknown(nil, "an earlier attempt's outcome is unknown")
 		}
 	}
 	return "", last
@@ -166,11 +184,11 @@ func (s *Store) ownedBy(ctx context.Context, key string, id WriteID) (ETag, bool
 // Create writes the object only if the key doesn't exist. ErrExists means
 // somebody else's object is there.
 //
-// The whole body is sent from its start on every attempt, so a retry never
-// needs the bytes in memory: a file, or a reader over a small slice, are both
-// fine.
-func (s *Store) Create(ctx context.Context, key string, body io.ReadSeeker) (ETag, error) {
-	return s.write(ctx, key, ErrExists, s.NewWriteID(), false, s.attempts(body, func(b io.ReadSeeker, id WriteID) (ETag, error) {
+// The whole body is sent from its start on every attempt, through a reader of
+// that attempt's own, so a retry never needs the bytes in memory: a section of
+// a file, or a reader over a small slice, are both fine.
+func (s *Store) Create(ctx context.Context, key string, body Body) (ETag, error) {
+	return s.write(ctx, key, ErrExists, s.NewWriteID(), false, attempts(body, func(b io.ReadSeeker, id WriteID) (ETag, error) {
 		return s.b.Create(ctx, key, b, id)
 	}))
 }
@@ -179,28 +197,27 @@ func (s *Store) Create(ctx context.Context, key string, body io.ReadSeeker) (ETa
 // Create has given up: every call is a retry of the write named by id (from
 // NewWriteID), so "exists" is checked against that id whatever happened
 // before. The body must be the same each time.
-func (s *Store) CreateWithID(ctx context.Context, key string, body io.ReadSeeker, id WriteID) (ETag, error) {
-	return s.write(ctx, key, ErrExists, id, true, s.attempts(body, func(b io.ReadSeeker, id WriteID) (ETag, error) {
+func (s *Store) CreateWithID(ctx context.Context, key string, body Body, id WriteID) (ETag, error) {
+	return s.write(ctx, key, ErrExists, id, true, attempts(body, func(b io.ReadSeeker, id WriteID) (ETag, error) {
 		return s.b.Create(ctx, key, b, id)
 	}))
 }
 
 // Update replaces the object only if its ETag is expected. ErrConflict means
 // somebody else changed it.
-func (s *Store) Update(ctx context.Context, key string, body io.ReadSeeker, expected ETag) (ETag, error) {
-	return s.write(ctx, key, ErrConflict, s.NewWriteID(), false, s.attempts(body, func(b io.ReadSeeker, id WriteID) (ETag, error) {
+func (s *Store) Update(ctx context.Context, key string, body Body, expected ETag) (ETag, error) {
+	return s.write(ctx, key, ErrConflict, s.NewWriteID(), false, attempts(body, func(b io.ReadSeeker, id WriteID) (ETag, error) {
 		return s.b.Update(ctx, key, b, expected, id)
 	}))
 }
 
-// attempts makes the single attempt a write retries: the body is rewound, so
-// each attempt sends all of it.
-func (s *Store) attempts(body io.ReadSeeker, try func(io.ReadSeeker, WriteID) (ETag, error)) func(WriteID) (ETag, error) {
+// attempts makes the single attempt a write retries. Each attempt reads the
+// body through a reader of its own, from the start: the HTTP transport may
+// still be reading an earlier attempt's body after that attempt has returned
+// (when the server answered early, say), so attempts can't share an offset.
+func attempts(body Body, try func(io.ReadSeeker, WriteID) (ETag, error)) func(WriteID) (ETag, error) {
 	return func(id WriteID) (ETag, error) {
-		if _, err := body.Seek(0, io.SeekStart); err != nil {
-			return "", fmt.Errorf("blob: rewinding the body: %w", err) // nothing was sent, and retrying won't help
-		}
-		return try(body, id)
+		return try(io.NewSectionReader(body, 0, body.Size()), id)
 	}
 }
 
@@ -210,12 +227,15 @@ func (s *Store) attempts(body io.ReadSeeker, try func(io.ReadSeeker, WriteID) (E
 // outcome (it may have been ours). Otherwise the object was never there, or
 // somebody else deleted it, and a backend that tells (the local one does, S3
 // doesn't, unconditionally) gives ErrNotFound, which callers accept as done.
+// The same goes for a conflict: some stores answer 412 to a conditional delete
+// of a missing key, so after an unknown outcome the object itself says whether
+// the delete landed.
 func (s *Store) Delete(ctx context.Context, key string, expected ETag) error {
 	var last error
 	ambiguous := false
 	// settle looks at the object on a context of its own after an unknown outcome:
 	// gone means done, and an object that is still the expected one means the
-	// delete did not happen (yet).
+	// delete did not happen (yet), or was refused if cause is the conflict.
 	settle := func(cause error) error {
 		sctx, cancel := s.settleCtx(ctx)
 		defer cancel()
@@ -225,6 +245,8 @@ func (s *Store) Delete(ctx context.Context, key string, expected ETag) error {
 			return nil
 		case err != nil:
 			return unknown(errors.Join(err, cause), "reading back "+key)
+		case errors.Is(cause, ErrConflict):
+			return cause // still there: somebody changed it, as the store said
 		case expected != "" && info.ETag != expected:
 			return ErrConflict // changed since: the delete can no longer apply
 		}
@@ -248,12 +270,23 @@ func (s *Store) Delete(ctx context.Context, key string, expected ETag) error {
 			return nil
 		case errors.Is(err, ErrNotFound) && ambiguous:
 			return nil
+		case errors.Is(err, ErrConflict) && ambiguous:
+			// An earlier attempt may have landed, and some stores answer a
+			// conditional delete of a missing key with a failed precondition.
+			return settle(err)
 		case Transient(err):
+			// After an attempt of unknown outcome, one that didn't happen says
+			// nothing about it: the earlier error stays the one to report.
+			if !ambiguous || errors.Is(err, ErrUnknown) {
+				last = err
+			}
 			ambiguous = ambiguous || errors.Is(err, ErrUnknown)
-			last = err
 		default:
 			return err
 		}
+	}
+	if ambiguous {
+		return settle(last)
 	}
 	return last
 }

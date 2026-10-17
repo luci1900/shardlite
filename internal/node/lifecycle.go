@@ -29,8 +29,7 @@ import (
 func (a *shard) activate(ctx context.Context) error {
 	d := a.d
 	target, kind, id := a.Name, a.Kind, a.ID
-	k, err := d.kinds.Lookup(kind)
-	if err != nil {
+	if _, err := d.kinds.Lookup(kind); err != nil {
 		return err
 	}
 	if row, ok, err := d.cache.idx.get(target); err != nil {
@@ -42,18 +41,19 @@ func (a *shard) activate(ctx context.Context) error {
 		}
 	}
 
-	h, created, err := d.files.Open(ctx, target, k.AutoDelete)
-	if err != nil {
-		return err
+	h, created := a.read, false
+	if h == nil {
+		var err error
+		if h, created, err = d.files.Open(ctx, target); err != nil {
+			return err
+		}
 	}
-	noTail := h.Manifest.Journal == "" // known before the claim sets it
 	if !created {
 		if err := h.Claim(ctx); err != nil {
 			return err
 		}
 	}
 	a.Gen, a.Path = h.Manifest.Generation, d.cache.pathFor(kind, id, h.Manifest.Generation)
-	a.autoDelete = h.Manifest.AutoDelete
 	if err := d.cache.clearLocal(a.Path); err != nil {
 		return err
 	}
@@ -65,7 +65,12 @@ func (a *shard) activate(ctx context.Context) error {
 	if created {
 		d.stats.Creates.Add(1)
 	} else {
-		res, err := d.files.Restore(ctx, target, a.Path, shardfile.RestoreOptions{NoJournal: noTail})
+		// A claimed shard has no tail in any journal: a claim needs the previous
+		// owner's journal adopted (or nothing of the shard in it), and this node's
+		// own tails become deltas before a shard stops being active here, or are
+		// adopted at its next start. So its files are all of it, and the journal
+		// the claim names (this node's own) isn't read.
+		res, err := d.files.Restore(ctx, target, a.Path, shardfile.RestoreOptions{NoJournal: true})
 		switch {
 		case errors.Is(err, shardfile.ErrNothingToRestore):
 			// A manifest with nothing durable behind it (its node died before the
@@ -77,10 +82,12 @@ func (a *shard) activate(ctx context.Context) error {
 		}
 		d.stats.Restores.Add(1)
 	}
-	if err := a.startCapture(ctx, restored); err != nil {
+	// The row goes in before capture starts, so that an activation that fails
+	// leaves no capture running: nothing would ever close it.
+	if err := d.cache.put(a, stateActive, 0); err != nil {
 		return err
 	}
-	return d.cache.put(a, stateActive, 0)
+	return a.startCapture(ctx, restored)
 }
 
 // activateCached reuses a cached file. done is false when the file had to be
@@ -108,14 +115,15 @@ func (a *shard) activateCached(ctx context.Context, row indexRow) (done bool, er
 		return false, d.cache.discard(row)
 	}
 	h := &shardfile.Handle{F: d.files, Name: a.Name, Manifest: &man, ETag: blob.ETag(row.ETag)}
-	a.h, a.Gen, a.Path, a.autoDelete = h, row.Generation, row.Path, h.Manifest.AutoDelete
+	a.h, a.Gen, a.Path = h, row.Generation, row.Path
+	// Before capture starts, as in activate.
+	if err := d.cache.put(a, stateActive, 0); err != nil {
+		return false, err
+	}
 	if err := a.startCapture(ctx, &capture.Restored{Position: row.Position}); err != nil {
 		return false, err
 	}
 	d.stats.CachedHits.Add(1)
-	if err := d.cache.put(a, stateActive, 0); err != nil {
-		return false, err
-	}
 	return true, nil
 }
 
@@ -191,8 +199,9 @@ func (a *shard) resumeIfClosed(ctx context.Context, sh *capture.Shard) {
 
 // deactivate lets go of an idle shard: Release (a final sync and closing every
 // handle, then the -shm check), a delta for its tail, and a row in the cache
-// index. A shard the app never wrote to is left with an empty manifest instead,
-// so requests for ids that don't exist leave almost nothing behind. It reports
+// index. A shard that holds nothing of the app's (it was never written, or the
+// app removed everything) is deleted instead, so requests for ids that don't
+// exist leave nothing behind. It reports
 // whether the shard was let go of. A shard the app still holds, or one in use,
 // stays active.
 func (a *shard) deactivate(ctx context.Context) (bool, error) {
@@ -215,25 +224,19 @@ func (a *shard) deactivate(ctx context.Context) (bool, error) {
 		}
 	}()
 
-	// An auto-delete shard with rows in its outbox or inbox is released like any
-	// other, and carries on at its next activation. Nothing is written for one
-	// that is deleted.
-	o := a.msgs.load()
-	deleteIt := false
-	if a.autoDeletes() {
-		live, err := o.live(ctx, true, false)
-		if err != nil {
-			return false, err
-		}
-		deleteIt = !live
-	}
-	// The hints that wake the shard again go first (a stale one is harmless). If
-	// one can't be written the shard stays active. Then the messages owner stops,
-	// so nothing uses the capture during the final sync.
-	if err := o.hintsBeforeRelease(ctx); err != nil {
+	// The messages owner stops first, so nothing of the node's changes the rows
+	// meanwhile and nothing uses the capture during the final sync. Then the wake
+	// time, read now since the final sync closes the connection, and its hint. If
+	// the hint can't be written the shard stays active and a new owner starts. A
+	// marked shard is deleted by this release, so the marker needs no hint.
+	if err := a.removeOwner(); err != nil {
 		return false, err
 	}
-	if err := a.removeOwner(); err != nil {
+	wake, at, err := a.wake(ctx, false)
+	if err != nil {
+		return false, err
+	}
+	if err := a.hint(ctx, wake); err != nil {
 		return false, err
 	}
 	sh := a.cap.load()
@@ -251,37 +254,40 @@ func (a *shard) deactivate(ctx context.Context) (bool, error) {
 	// the lease's range covers it until then. A resumed capture is counted instead.
 	defer a.cap.uncounted(sh)
 	if empty {
-		// The app never wrote to it: the shard leaves nothing behind. A conflict
-		// means somebody else changed the manifest, and the shard is kept.
-		if err := a.h.Delete(ctx); err == nil || errors.Is(err, blob.ErrNotFound) {
-			sh.Discard()
-			removeLocal(a.Path)
-			d.cache.idx.delete(a.Name)
-			d.stats.Deletes.Add(1) // before the shard stops being active, so whoever sees it gone sees the count
-			a.gone = true
-			return true, nil
-		} else if ctx.Err() == nil {
-			d.log.Warn("could not delete the manifest of a shard the app never wrote to, keeping it", "shard", a.Name, "err", err)
-		}
-	}
-	if deleteIt {
-		// No final delta: the tail goes with the journal.
+		// The shard leaves nothing behind, and no final delta: the tail goes with the
+		// journal. If the manifest can't be deleted (somebody else changed it),
+		// capture resumes and the shard stays active.
 		defer sh.Discard() // the shard is deleted, or resumed with the tail handed on
 		resume := func() error { return a.resume(ctx, sh) }
 		if err := d.cache.deleteReleased(ctx, a.Name, a.Path, a.h, resume); err != nil {
 			return false, err
 		}
-		d.stats.AutoDeletes.Add(1) // before the shard stops being active, as Deletes is
+		d.stats.Deletes.Add(1) // before the shard stops being active, so whoever sees it gone sees the count
 		a.gone = true
 		return true, nil
 	}
 	// A tail is a delta by the time the shard is cached, so the lease's journal range
 	// never has to cover a shard that isn't active.
-	if err := a.h.WriteDelta(ctx, sh, shardfile.Hooks{}); err != nil {
+	// The app may have committed between the read and the final sync: then the
+	// delta records now, with a hint of its own.
+	hooks := shardfile.Hooks{Wake: func(ctx context.Context, end uint64) (int64, error) {
+		if w := a.wakeFor(wake, at, end); w != wake {
+			return w, a.hint(ctx, w)
+		}
+		return wake, nil
+	}}
+	if err := a.h.WriteDelta(ctx, sh, hooks); err != nil {
 		if rerr := a.resume(ctx, sh); rerr != nil {
 			d.log.Error("could not resume capture after a failed delta", "shard", a.Name, "err", rerr)
 		}
 		return false, err
+	}
+	// With no tail there was no delta to record it. Nothing was committed after the
+	// last delta then, so the read was exact. Without commits the wake time only
+	// moves later (a row given up on), so a manifest left as it was only wakes the
+	// shard early.
+	if err := a.h.SetWake(ctx, wake); err != nil {
+		d.log.Warn("could not update a shard's wake time", "shard", a.Name, "err", err)
 	}
 	if err := d.cache.put(a, stateCached, a.h.Manifest.LastPosition()); err != nil {
 		return false, err

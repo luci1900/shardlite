@@ -19,13 +19,13 @@ import (
 
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/service"
 	"github.com/luci1900/shardlite/internal/spool"
-	"github.com/luci1900/shardlite/internal/supervisor"
 )
 
 // serve serves w until the test ends, or until stop is called.
 func serve(t testing.TB, w *Writer) (stop func()) {
-	stop = supervisor.Background(slog.Default(), "writer", w)
+	stop = service.Background(slog.Default(), w)
 	t.Cleanup(stop)
 	return stop
 }
@@ -512,7 +512,7 @@ type failCreate struct {
 }
 
 func (f *failCreate) Create(ctx context.Context, key string, body io.ReadSeeker, id blob.WriteID) (blob.ETag, error) {
-	if e := f.err.Load(); e != nil && strings.HasPrefix(key, "journal/") {
+	if e := f.err.Load(); e != nil && strings.HasPrefix(key, Root) {
 		return "", *e
 	}
 	return f.Backend.Create(ctx, key, body, id)

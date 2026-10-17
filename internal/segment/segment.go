@@ -29,7 +29,6 @@ import (
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/notify"
 	"github.com/luci1900/shardlite/internal/spool"
-	"github.com/luci1900/shardlite/internal/supervisor"
 )
 
 const (
@@ -67,12 +66,15 @@ type Entry struct {
 // Last is the position of the entry's last commit.
 func (e Entry) Last() uint64 { return e.Position + e.Count - 1 }
 
+// Root is the key prefix of all journals (data).
+const Root = "data/journal/"
+
 // Prefix is the key prefix of a node's journal.
-func Prefix(node string) string { return "journal/" + node + "/" }
+func Prefix(node string) string { return Root + node + "/" }
 
 // Key returns the object key of a node's segment.
 func Key(node string, seq uint64) string {
-	return fmt.Sprintf("journal/%s/%0*d", node, seqKeyDigits, seq)
+	return fmt.Sprintf("%s%0*d", Prefix(node), seqKeyDigits, seq)
 }
 
 // Options configure a Writer.
@@ -224,11 +226,11 @@ func (w *Writer) Serve(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return supervisor.NoRestart(nil)
+			return nil
 		case <-w.kick.C():
 		}
 		if !w.writeNext(ctx) {
-			return supervisor.NoRestart(nil)
+			return nil
 		}
 	}
 }

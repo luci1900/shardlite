@@ -98,31 +98,6 @@ func TestProtocolsThroughTheNode(t *testing.T) {
 	}
 	ws.Close(websocket.StatusNormalClosure, "")
 
-	// An auto-delete kind is served over HTTP and WebSocket like any other, and
-	// its shard's manifest says it was created as auto-delete.
-	if st, body, err := s.request("POST", "/add", "lobby/p1", "e-1"); err != nil || st != 200 || jsonField(t, body, "count") != float64(1) {
-		t.Fatalf("add to an auto-delete shard: %d %q %v", st, body, err)
-	}
-	if st, body, _ := s.request("GET", "/count", "lobby/p1", ""); st != 200 || jsonField(t, body, "count") != float64(1) {
-		t.Fatalf("count of an auto-delete shard: %d %q", st, body)
-	}
-	ews, err := dialWS(ctx, s.pub, "lobby/p2")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i := 1; i <= 3; i++ {
-		tok := fmt.Sprintf("ews-%d", i)
-		if echo, err := wsEcho(ctx, ews, tok); err != nil || echo != "ok:"+tok {
-			t.Fatalf("echo from an auto-delete shard: %q %v", echo, err)
-		}
-	}
-	ews.Close(websocket.StatusNormalClosure, "")
-	for _, shard := range []string{"lobby/p1", "lobby/p2"} {
-		if m, _, err := v.files.GetManifest(t.Context(), shard); err != nil || !m.AutoDelete || m.Journal == "" {
-			t.Fatalf("manifest of %s: %+v %v, want an auto-delete one with a journal", shard, m, err)
-		}
-	}
-
 	// gRPC: unary and server-streaming, with trailers, over h2c on both sides of the node.
 	cc := dialGRPC(t, s.pub)
 	gctx := withMD(ctx, "shardlite-target", "wallet/w4")

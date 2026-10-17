@@ -15,9 +15,9 @@ import (
 	"github.com/luci1900/shardlite/internal/coord"
 	"github.com/luci1900/shardlite/internal/node"
 	"github.com/luci1900/shardlite/internal/segment"
+	"github.com/luci1900/shardlite/internal/service"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
-	"github.com/luci1900/shardlite/internal/supervisor"
 )
 
 type rig struct {
@@ -65,7 +65,7 @@ func (r *rig) mustStart() *node.Node {
 	if r.stops == nil {
 		r.stops = map[*node.Node]func(){}
 	}
-	r.stops[n] = supervisor.Background(slog.Default(), "journal", n.Writer, n.Keeper)
+	r.stops[n] = service.Background(slog.Default(), n.Writer, n.Keeper)
 	r.t.Cleanup(r.stops[n])
 	return n
 }
@@ -84,7 +84,7 @@ func (r *rig) create(n *node.Node, name string) *liveShard {
 	ctx := context.Background()
 	s := &liveShard{name: name, path: filepath.Join(r.dir, strings.ReplaceAll(name, "/", "-")+".db"), id: strings.ReplaceAll(name, "/", "-")}
 	r.app.Must(r.t, "open", s.id, s.path)
-	h, created, err := n.Files.Open(ctx, name, false)
+	h, created, err := n.Files.Open(ctx, name)
 	if err != nil || !created {
 		r.t.Fatalf("open %s: created=%v err=%v", name, created, err)
 	}
@@ -252,7 +252,7 @@ func TestFailedAdoptionKeepsTheRange(t *testing.T) {
 	want := apptest.Dump(t, s.path)
 
 	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpCreate && strings.HasPrefix(key, "shards/") {
+		if op == blob.OpCreate && strings.HasPrefix(key, shardfile.FilesPrefix) {
 			return errors.New("storage refuses deltas")
 		}
 		return nil

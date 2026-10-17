@@ -103,7 +103,7 @@ type RestoreOptions struct {
 	Journal      *JournalIndex // the journal to read the tail from, loaded from the manifest's journal if nil
 	BeforeRename func() error  // called with the file complete and synced, for tests
 	TailAge      time.Time     // age given to tail files read from the journal (now if zero)
-	NoJournal    bool          // the caller knows the shard has no tail (its manifest named no journal before it was claimed)
+	NoJournal    bool          // the caller knows the shard has no tail in any journal (an activation, which has just claimed it), so none is read
 }
 
 // Restored is the result of Restore.

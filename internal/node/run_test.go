@@ -3,6 +3,7 @@ package node
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -22,7 +23,7 @@ import (
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/coord"
-	"github.com/luci1900/shardlite/internal/supervisor"
+	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
 // nodeGoroutines lists the goroutines running code of the node's packages (not
@@ -109,8 +110,8 @@ func TestRunLeavesNoGoroutines(t *testing.T) {
 	vars := map[string]string{
 		"SHARDLITE_NODE": "run-test", "SHARDLITE_BLOB": "s3://unused", "SHARDLITE_KINDS": kinds,
 		"SHARDLITE_DATA": filepath.Join(dir, "data"), "SHARDLITE_SCRATCH_DIR": filepath.Join(dir, "meta"),
-		"SHARDLITE_APP": fake.URL, "SHARDLITE_LISTEN": "127.0.0.1:0", "SHARDLITE_CONTROL": "127.0.0.1:0",
-		"SHARDLITE_FLUSH": "50ms", "SHARDLITE_PPROF": "127.0.0.1:0",
+		"SHARDLITE_APP": fake.URL, "SHARDLITE_LISTEN_PUBLIC": "127.0.0.1:0", "SHARDLITE_LISTEN_CONTROL": "127.0.0.1:0", "SHARDLITE_LISTEN_PEER": "127.0.0.1:0",
+		"SHARDLITE_FLUSH": "50ms", "SHARDLITE_LISTEN_PPROF": "127.0.0.1:0",
 	}
 	env, err := ParseEnv(func(k string) string { return vars[k] })
 	if err != nil {
@@ -123,7 +124,7 @@ func TestRunLeavesNoGoroutines(t *testing.T) {
 	addr := make(chan string, 1)
 	ran := make(chan error, 1)
 	go func() {
-		ran <- Run(ctx, env, slog.New(slog.DiscardHandler), func(public, control string) { addr <- public }, WithBackend(blob.NewMemory()))
+		ran <- Run(ctx, env, slog.New(slog.DiscardHandler), func(public, control, peer string) { addr <- public }, WithBackend(blob.NewMemory()))
 	}()
 	var public string
 	select {
@@ -195,7 +196,7 @@ func TestRunFailsWhenAListenerCannotBeBound(t *testing.T) {
 	vars := map[string]string{
 		"SHARDLITE_NODE": "bind-test", "SHARDLITE_BLOB": "s3://unused", "SHARDLITE_KINDS": kinds,
 		"SHARDLITE_DATA": filepath.Join(dir, "data"), "SHARDLITE_SCRATCH_DIR": filepath.Join(dir, "meta"),
-		"SHARDLITE_APP": "http://127.0.0.1:1", "SHARDLITE_LISTEN": "127.0.0.1:0", "SHARDLITE_CONTROL": taken.Addr().String(),
+		"SHARDLITE_APP": "http://127.0.0.1:1", "SHARDLITE_LISTEN_PUBLIC": "127.0.0.1:0", "SHARDLITE_LISTEN_CONTROL": taken.Addr().String(), "SHARDLITE_LISTEN_PEER": "127.0.0.1:0",
 	}
 	env, err := ParseEnv(func(k string) string { return vars[k] })
 	if err != nil {
@@ -277,7 +278,7 @@ func TestRunJoinsRequestsBeforeLettingGo(t *testing.T) {
 	vars := map[string]string{
 		"SHARDLITE_NODE": "run-join-test", "SHARDLITE_BLOB": "s3://unused", "SHARDLITE_KINDS": kinds,
 		"SHARDLITE_DATA": filepath.Join(dir, "data"), "SHARDLITE_SCRATCH_DIR": filepath.Join(dir, "meta"),
-		"SHARDLITE_APP": fake.URL, "SHARDLITE_LISTEN": "127.0.0.1:0", "SHARDLITE_CONTROL": "127.0.0.1:0",
+		"SHARDLITE_APP": fake.URL, "SHARDLITE_LISTEN_PUBLIC": "127.0.0.1:0", "SHARDLITE_LISTEN_CONTROL": "127.0.0.1:0", "SHARDLITE_LISTEN_PEER": "127.0.0.1:0",
 		"SHARDLITE_FLUSH": "50ms",
 	}
 	env, err := ParseEnv(func(k string) string { return vars[k] })
@@ -293,7 +294,7 @@ func TestRunJoinsRequestsBeforeLettingGo(t *testing.T) {
 	up := make(chan addrs, 1)
 	ran := make(chan error, 1)
 	go func() {
-		ran <- Run(ctx, env, slog.New(&log), func(public, control string) { up <- addrs{public, control} }, WithBackend(mem), withGrace(200*time.Millisecond))
+		ran <- Run(ctx, env, slog.New(&log), func(public, control, peer string) { up <- addrs{public, control} }, WithBackend(mem), withGrace(200*time.Millisecond))
 	}()
 	var a addrs
 	select {
@@ -363,6 +364,7 @@ type runRig struct {
 	cancel context.CancelFunc
 	ran    chan error
 	public string
+	peer   string
 }
 
 func startRun(t *testing.T, name string, vars map[string]string, opts ...RunOption) *runRig {
@@ -377,7 +379,7 @@ func startRun(t *testing.T, name string, vars map[string]string, opts ...RunOpti
 	all := map[string]string{
 		"SHARDLITE_NODE": name, "SHARDLITE_BLOB": "s3://unused", "SHARDLITE_KINDS": kinds,
 		"SHARDLITE_DATA": filepath.Join(dir, "data"), "SHARDLITE_SCRATCH_DIR": filepath.Join(dir, "meta"),
-		"SHARDLITE_APP": fake.URL, "SHARDLITE_LISTEN": "127.0.0.1:0", "SHARDLITE_CONTROL": "127.0.0.1:0",
+		"SHARDLITE_APP": fake.URL, "SHARDLITE_LISTEN_PUBLIC": "127.0.0.1:0", "SHARDLITE_LISTEN_CONTROL": "127.0.0.1:0", "SHARDLITE_LISTEN_PEER": "127.0.0.1:0",
 		"SHARDLITE_FLUSH": "50ms",
 	}
 	for k, v := range vars {
@@ -391,10 +393,10 @@ func startRun(t *testing.T, name string, vars map[string]string, opts ...RunOpti
 	r.hooked = blob.WithHook(r.mem)
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
-	up := make(chan string, 1)
+	up := make(chan [2]string, 1)
 	opts = append([]RunOption{WithBackend(r.hooked), withGrace(200 * time.Millisecond)}, opts...)
 	go func() {
-		r.ran <- Run(ctx, env, slog.New(&r.log), func(public, control string) { up <- public }, opts...)
+		r.ran <- Run(ctx, env, slog.New(&r.log), func(public, control, peer string) { up <- [2]string{public, peer} }, opts...)
 	}()
 	t.Cleanup(func() {
 		cancel()
@@ -405,7 +407,8 @@ func startRun(t *testing.T, name string, vars map[string]string, opts ...RunOpti
 		}
 	})
 	select {
-	case r.public = <-up:
+	case a := <-up:
+		r.public, r.peer = a[0], a[1]
 	case err := <-r.ran:
 		r.ran <- err
 		t.Fatalf("Run ended early: %v", err)
@@ -456,9 +459,9 @@ func (r *runRig) in(groups ...[]string) {
 }
 
 // stopOrder is the order of Run's shutdown: the public server, the drain, the
-// control server and the shards. The journal (the writer and the keeper) stops
+// control and peer servers and the shards. The journal (the writer and the keeper) stops
 // last, and has no line of its own.
-var stopOrder = [][]string{{"stop public server"}, {"stop drain"}, {"stop control server"}, {"stop shards"}}
+var stopOrder = [][]string{{"stop public server"}, {"stop drain"}, {"stop control server", "stop peer server"}, {"stop catalog"}}
 
 // Run starts every service at once, with everything built before, and stops
 // them one supervisor at a time: the services that depend on nothing (the health poll,
@@ -466,8 +469,8 @@ var stopOrder = [][]string{{"stop public server"}, {"stop drain"}, {"stop contro
 // first. A shard being let go of holds up the shards' stop.
 func TestRunStartsAndStopsInOrder(t *testing.T) {
 	t.Parallel()
-	r := startRun(t, "run-order-test", map[string]string{"SHARDLITE_PPROF": "127.0.0.1:0"})
-	all := []string{"public server", "control server", "health poll", "shards", "journal sweeper", "kinds reload", "pprof"}
+	r := startRun(t, "run-order-test", map[string]string{"SHARDLITE_LISTEN_PPROF": "127.0.0.1:0"})
+	all := []string{"public server", "control server", "peer server", "health poll", "catalog", "journal sweeper", "kinds reload", "pprof"}
 	r.log.events.WaitFor(t, 5*time.Second, "every service to start", func(e []string) bool {
 		for _, p := range all {
 			if !slices.Contains(e, "start "+p) {
@@ -483,7 +486,7 @@ func TestRunStartsAndStopsInOrder(t *testing.T) {
 	resp.Body.Close()
 	release := make(chan struct{})
 	r.hooked.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if after || op == blob.OpGet || op == blob.OpList || !strings.HasSuffix(key, "manifests/users/o1") {
+		if after || op == blob.OpGet || op == blob.OpList || !strings.HasSuffix(key, shardfile.ManifestKey("users/o1")) {
 			return nil
 		}
 		select {
@@ -508,7 +511,7 @@ func TestRunStartsAndStopsInOrder(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	r.in(stopOrder...)
-	r.in(independent, []string{"stop shards"})
+	r.in(independent, []string{"stop catalog"})
 	if l := r.lease(); !l.Released {
 		t.Fatalf("the lease was not released: %+v", l)
 	}
@@ -526,7 +529,7 @@ func TestRunStopsAtOnceWhenTheLeaseIsLost(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = r.wait()
-	if !errors.Is(err, coord.ErrLeaseLost) || !supervisor.IsFatal(err) {
+	if !errors.Is(err, coord.ErrLeaseLost) {
 		t.Fatalf("Run returned %v, want a fatal lease error", err)
 	}
 	r.in(stopOrder...)
@@ -549,7 +552,7 @@ func TestRunFatalErrorDuringShutdown(t *testing.T) {
 	entered, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	r.hooked.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if after || op == blob.OpGet || op == blob.OpList || !strings.HasSuffix(key, "manifests/users/fs1") {
+		if after || op == blob.OpGet || op == blob.OpList || !strings.HasSuffix(key, shardfile.ManifestKey("users/fs1")) {
 			return nil
 		}
 		once.Do(func() { close(entered) })
@@ -574,7 +577,7 @@ func TestRunFatalErrorDuringShutdown(t *testing.T) {
 	})
 	close(release)
 	err = r.wait()
-	if !errors.Is(err, coord.ErrLeaseLost) || !supervisor.IsFatal(err) {
+	if !errors.Is(err, coord.ErrLeaseLost) {
 		t.Fatalf("Run returned %v, want a fatal lease error", err)
 	}
 	r.in(stopOrder...)
@@ -631,11 +634,71 @@ func TestRunStopsGracefullyWhenAPartFails(t *testing.T) {
 	r := startRun(t, "run-fail-test", nil, withPublicListener(ln))
 	close(ln.broken)
 	err = r.wait()
-	if !errors.Is(err, errListenerBroke) || supervisor.IsFatal(err) {
-		t.Fatalf("Run returned %v, want the listener's error, not fatal", err)
+	if !errors.Is(err, errListenerBroke) {
+		t.Fatalf("Run returned %v, want the listener's error", err)
 	}
 	r.in(stopOrder...)
 	if l := r.lease(); !l.Released {
 		t.Fatalf("the lease was not released: %+v", l)
+	}
+}
+
+// The peer listener answers who the node is over h2c, and nothing else. The
+// lease publishes its address, SHARDLITE_ADVERTISE_PEER if set.
+func TestPeerListenerSaysWhoTheNodeIs(t *testing.T) {
+	t.Parallel()
+	r := startRun(t, "peer-test", map[string]string{"SHARDLITE_ADVERTISE_PEER": "peer-test.internal:2281"})
+	if got := r.lease().Address; got != "peer-test.internal:2281" {
+		t.Fatalf("the lease's address is %q", got)
+	}
+	protos := new(http.Protocols)
+	protos.SetUnencryptedHTTP2(true)
+	client := &http.Client{Transport: &http.Transport{Protocols: protos}}
+	defer client.CloseIdleConnections()
+	resp, err := client.Get("http://" + r.peer + "/_shardlite/node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var got NodeInfoReply
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if resp.ProtoMajor != 2 || got.Name != "peer-test" || got.Epoch != r.lease().Epoch {
+		t.Fatalf("proto %d, reply %+v, lease %+v", resp.ProtoMajor, got, r.lease())
+	}
+	for _, path := range []string{"/", "/_shardlite/ready", "/x?shardlite-target=users/o1"} {
+		resp, err := client.Get("http://" + r.peer + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("%s answered %d, want 404", path, resp.StatusCode)
+		}
+	}
+}
+
+// Without SHARDLITE_ADVERTISE_PEER the node publishes the peer listener's address
+// unless it is a wildcard, which other nodes can't use.
+func TestPeerAddressRule(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	if got, err := peerAddress("", ln); err != nil || got != ln.Addr().String() {
+		t.Fatalf("got %q, %v", got, err)
+	}
+	if got, err := peerAddress("h:1", ln); err != nil || got != "h:1" {
+		t.Fatalf("got %q, %v", got, err)
+	}
+	wild, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wild.Close()
+	if _, err := peerAddress("", wild); err == nil || !strings.Contains(err.Error(), "SHARDLITE_ADVERTISE_PEER") {
+		t.Fatalf("a wildcard was accepted: %v", err)
 	}
 }

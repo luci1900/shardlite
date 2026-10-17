@@ -8,13 +8,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/thejerf/suture/v4"
-
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/notify"
 	"github.com/luci1900/shardlite/internal/segment"
+	"github.com/luci1900/shardlite/internal/service"
 	"github.com/luci1900/shardlite/internal/shardfile"
-	"github.com/luci1900/shardlite/internal/supervisor"
 )
 
 // LifecycleOptions configure each shard's lifecycle loop: its idle and delta
@@ -33,8 +31,8 @@ type LifecycleOptions struct {
 }
 
 // shardDeps is what the shards' loops use, shared by every shard: the parts of
-// Shards and of the node that a shard calls, and the node-wide limits. Shards
-// makes it, and no shard reaches Shards itself.
+// the Catalog and of the node that a shard calls, and the node-wide limits. The
+// Catalog makes it, and no shard reaches the Catalog itself.
 type shardDeps struct {
 	opts    LifecycleOptions
 	kinds   *Kinds
@@ -45,7 +43,7 @@ type shardDeps struct {
 	cache   *cache
 	flush   *Flusher
 	msgs    *messenger
-	hints   wakeStore
+	hints   hintStore
 	files   *shardfile.Files
 	writer  *segment.Writer
 	scratch string // capture's disposable working files
@@ -53,7 +51,7 @@ type shardDeps struct {
 	spool   int    // Config.SpoolLimit
 
 	// base is the context everything the shards do runs on: it ends only once
-	// Shards has let go of them (or abandoned them).
+	// the Catalog has let go of them (or abandoned them).
 	base context.Context
 
 	// The node-wide limits, which shards' loops take a place in.
@@ -65,13 +63,13 @@ type shardDeps struct {
 func (d *shardDeps) now() time.Time { return d.clock.Now() }
 
 // shard is the actor of one shard on this node (docs/concurrency.md, The tree):
-// a service of the table's supervisor whose Serve is its lifecycle loop, with
-// its messages owner beside it on the same supervisor. The loop does one
+// the table runs its Serve, the lifecycle loop, which runs the shard's messages
+// owner while the shard is captured. The loop does one
 // operation at a time: activation (its first job), a delta or rebase when its
 // delta timer says so, deactivation once its idle timer finds it unused for its
 // kind's timeout, and the releases and deletes that other goroutines ask for
 // (do). Everything it does runs on the shards' base context, not on the context
-// suture gives it, so stopping the shards doesn't cut off a release.
+// the table gives it, so stopping the shards doesn't cut off a release.
 //
 // References are not the loop's: requests take them in the shard's entry. The
 // shard's state is in plain parts, each with the methods that change it: its
@@ -83,14 +81,14 @@ type shard struct {
 
 	Name, Kind, ID string
 	Gen, Path      string
-	autoDelete     bool        // the manifest has auto_delete, set when the shard was created (the kind's setting is looked up when it is needed)
-	keptNoted      atomic.Bool // the log line saying why an auto-delete shard is kept has been written
 	h              *shardfile.Handle
+	read           *shardfile.Handle // the manifest Acquire read before adding the entry, nil if it read none; activation starts from it
 
-	ops   chan func()   // requests for the lifecycle loop (do)
-	ready chan struct{} // closed once the shard is activated
-	ended chan struct{} // closed once the lifecycle loop has ended
-	gone  bool          // the shard was let go of or deleted (the loop's own until ended is closed)
+	ctx   context.Context // the table's context for the loop, which the messages owner runs on (set as the loop starts)
+	ops   chan func()     // requests for the lifecycle loop (do)
+	ready chan struct{}   // closed once the shard is activated
+	ended chan struct{}   // closed once the lifecycle loop has ended
+	gone  bool            // the shard was let go of or deleted (the loop's own until ended is closed)
 
 	cap   captureState
 	idle  idleState
@@ -101,6 +99,7 @@ type shard struct {
 
 func newShard(d *shardDeps, e *entry, kind, id string) *shard {
 	a := &shard{d: d, e: e, Name: e.name, Kind: kind, ID: id, ops: make(chan func()), ready: make(chan struct{}), ended: make(chan struct{})}
+	a.msgs.kept = newKept()
 	return a
 }
 
@@ -222,14 +221,15 @@ func (s *idleState) keptBy(live bool, now time.Time, recheck time.Duration) (hel
 }
 
 // ownerSlot is the shard's messages owner: the one running (the last one stays
-// once it is removed), its place in the table's supervisor and what the shard's
-// messages keep across owners. Only the lifecycle loop changes it. Others load
-// the owner.
+// once it is removed), the group it runs in and what the shard's messages keep
+// across owners. Only the lifecycle loop changes it. Others load the owner, or
+// use kept under its lock.
 type ownerSlot struct {
-	cur  atomic.Pointer[msgOwner]
-	tok  suture.ServiceToken
-	on   bool
-	kept *kept // handed to each owner (the loop's own while no owner runs)
+	cur   atomic.Pointer[msgOwner]
+	run   *service.Group
+	on    bool
+	quiet bool  // stopped for the shards' shutdown: no owner starts any more
+	kept  *kept // handed to each owner
 }
 
 func (s *ownerSlot) load() *msgOwner { return s.cur.Load() }
@@ -262,13 +262,14 @@ type shardLooks struct {
 func (a *shard) String() string { return a.Name }
 
 // Serve is the lifecycle loop. It runs until the shard is let go of, its
-// activation fails or ctx ends, and suture removes the shard then.
-func (a *shard) Serve(ctx context.Context) error {
+// activation fails or ctx ends.
+func (a *shard) Serve(ctx context.Context) {
 	defer close(a.ended)
+	a.ctx = ctx
 	d := a.d
 	if err := a.activate(d.base); err != nil {
 		d.tab.remove(a.e, err)
-		return supervisor.NoRestart(nil)
+		return
 	}
 	a.addOwner()
 	d.stats.Activations.Add(1)
@@ -283,8 +284,8 @@ func (a *shard) Serve(ctx context.Context) error {
 		if a.gone {
 			d.tab.remove(a.e, nil)
 		} else {
-			// Not let go of (the node is stopping): the capture loop ends with the
-			// shard's, and nothing more is written.
+			// Not let go of (the node is stopping): the capture's activation ends
+			// with the shard's loop, and nothing more is written.
 			if sh := a.cap.load(); sh != nil {
 				sh.Abandon()
 			}
@@ -303,7 +304,7 @@ func (a *shard) Serve(ctx context.Context) error {
 	for !a.gone {
 		select {
 		case <-ctx.Done():
-			return supervisor.NoRestart(nil) // the shards stopped without letting go of this one
+			return // the shards stopped without letting go of this one
 		case <-idle:
 			wait := a.lookIdle(d.base)
 			if !a.gone {
@@ -317,7 +318,6 @@ func (a *shard) Serve(ctx context.Context) error {
 			op()
 		}
 	}
-	return supervisor.NoRestart(nil)
 }
 
 func (a *shard) idleTimeout() time.Duration {
@@ -380,52 +380,53 @@ func (a *shard) snapshot(ctx context.Context) {
 		}
 		defer func() { <-d.rebases }()
 	}
-	if _, err := a.h.MaybeSnapshot(ctx, sh, d.opts.DeltaAge, policy, shardfile.Hooks{}); err != nil && ctx.Err() == nil {
+	if _, err := a.h.MaybeSnapshot(ctx, sh, d.opts.DeltaAge, policy, shardfile.Hooks{Wake: a.wakeAtDelta}); err != nil && ctx.Err() == nil {
 		d.log.Warn("snapshot failed", "shard", a.Name, "err", err)
 	}
 }
 
-// addOwner adds a messages owner to the table's supervisor, beside the shard:
-// once the shard is captured, and again when capture resumes after a release
-// that didn't go through. Only the shard's loop calls it. Once the table's
-// supervisor has stopped the owner can't be added, and it is ended at once.
+// addOwner starts a messages owner: once the shard is captured, and again when
+// capture resumes after a release that didn't go through. Only the shard's loop
+// calls it, and it runs on the loop's context, so it ends with the loop's too.
 func (a *shard) addOwner() {
 	s := &a.msgs
-	if s.on {
+	if s.on || s.quiet {
 		return
 	}
-	if s.kept == nil {
-		s.kept = newKept()
-	}
-	o := newMsgOwner(a.d.msgs, a, a.useDB, a.d.hints, readGate{a.d.flush, &a.cap}, s.kept)
+	o := newMsgOwner(a.d.msgs, a, a.useDB, readGate{a.d.flush, &a.cap}, s.kept)
 	s.cur.Store(o)
-	tok := a.d.tab.sup.Add(o)
-	if tok == (suture.ServiceToken{}) {
-		o.end() // the shards are stopping
-		return
-	}
-	s.tok, s.on = tok, true
+	s.run = service.New(a.ctx, a.d.log)
+	s.run.Add(o)
+	s.on = true
 }
 
-// removeOwner removes the messages owner and waits for it, its deliveries and
-// its hint child to end. Only the shard's loop calls it.
+// removeOwner removes the messages owner and waits for it and its deliveries
+// to end. Only the shard's loop calls it.
 func (a *shard) removeOwner() error {
 	s := &a.msgs
 	if !s.on {
 		return nil
 	}
-	if err := a.d.tab.sup.RemoveAndWait(s.tok, stopTimeout); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), stopTimeout)
+	defer cancel()
+	if err := s.run.Stop(ctx); err != nil {
 		return fmt.Errorf("stopping the shard's messages: %w", err) // still on: no second owner starts beside it
 	}
 	s.on = false
 	return nil
 }
 
-// quiet stops the shard's deliveries for the shards' shutdown.
-func (a *shard) quiet(ctx context.Context) {
-	if o := a.msgs.load(); o != nil {
-		o.stopDeliveries(ctx)
+// quiet stops the shard's messages owner for the shards' shutdown, through its
+// loop, and no owner starts again: its deliveries are joined when it returns.
+func (a *shard) quiet(ctx context.Context) error {
+	err, lerr := do(ctx, a.ops, a.ended, func() error {
+		a.msgs.quiet = true
+		return a.removeOwner()
+	})
+	if errors.Is(lerr, errLoopEnded) {
+		return nil // its owner was stopped as the loop ended
 	}
+	return errors.Join(lerr, err)
 }
 
 // release lets go of the shard through its loop, as an idle deactivation does
@@ -472,24 +473,4 @@ func (a *shard) waitEnded(ctx context.Context) error {
 	case <-ctx.Done():
 		return context.Cause(ctx)
 	}
-}
-
-// autoDeletes reports whether the shard is deleted when it deactivates and has
-// no rows: its kind has auto_delete and so did the kind when the shard was
-// created. Either alone is not enough, so that marking a kind auto_delete can't
-// delete shards written before, and a shard created as auto-delete is kept once
-// its kind drops the flag. The first time a shard is kept for that, it is logged.
-func (a *shard) autoDeletes() bool {
-	k, err := a.d.kinds.Lookup(a.Kind)
-	if err != nil || k.AutoDelete == a.autoDelete {
-		return err == nil && k.AutoDelete
-	}
-	if a.keptNoted.CompareAndSwap(false, true) {
-		if k.AutoDelete {
-			a.d.log.Warn("keeping a shard that is deactivating: its kind is auto_delete, but the shard was created before that", "shard", a.Name)
-		} else {
-			a.d.log.Warn("keeping a shard that is deactivating: it was created as auto-delete, but its kind no longer is", "shard", a.Name)
-		}
-	}
-	return false
 }

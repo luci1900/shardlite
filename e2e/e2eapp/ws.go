@@ -62,6 +62,12 @@ func (a *App) ws(w http.ResponseWriter, r *http.Request, s *shardReq) {
 		case strings.HasPrefix(text, "big:"):
 			n, _ := strconv.Atoi(text[4:])
 			err = c.Write(ctx, websocket.MessageText, []byte(strings.Repeat("x", n)))
+		case text == "mark": // marks the shard for deletion when it deactivates
+			reply := "marked"
+			if _, merr := s.db.sql.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS _shardlite_delete (x)`); merr != nil {
+				reply = "err:" + merr.Error()
+			}
+			err = c.Write(ctx, websocket.MessageText, []byte(reply))
 		case text == "ping":
 			go func() {
 				pctx, cancel := context.WithTimeout(ctx, 5*time.Second)

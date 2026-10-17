@@ -50,7 +50,7 @@ const adoptWorkers = 64
 //     A wake hint for the current minute is written (by wake, which writes the
 //     hint and counts an existing one as success) before the delta: the shard
 //     may hold messages that were never delivered, and the scan for hints is what
-//     wakes it.
+//     wakes it. The delta sets the manifest's wake time to now to match.
 //
 // A tail with a hole in it is reported in Lost, not as a failure, only if the
 // journal's first segments had expired: refusing to start would not bring those
@@ -173,7 +173,10 @@ func (f *Files) adoptShard(ctx context.Context, node, name string, idx *JournalI
 			capture.CloseTail(tail)
 			return false, fmt.Errorf("writing the wake hint: %w", err)
 		}
-		err = h.putTail(ctx, tail, Hooks{}, func(n *Manifest) { n.Journal = "" })
+		err = h.putTail(ctx, tail, Hooks{}, func(n *Manifest) {
+			n.Journal = ""
+			n.Wake = time.Now().Unix() // it can't read the shard's rows, so the shard is woken to look
+		})
 		capture.CloseTail(tail)
 		if errors.Is(err, blob.ErrConflict) {
 			continue // somebody changed the manifest: look again

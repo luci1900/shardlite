@@ -15,6 +15,8 @@ import (
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/s3test"
+	"github.com/luci1900/shardlite/internal/segment"
+	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
 // The measurements behind the flush and delta defaults (plans/stage-1.2-report.md).
@@ -38,11 +40,11 @@ func s3Latency(r *mrig, puts *counter) {
 			return nil
 		}
 		switch {
-		case strings.HasPrefix(key, "journal/"):
+		case strings.HasPrefix(key, segment.Root):
 			puts.segments.Add(1)
-		case strings.HasPrefix(key, "shards/"):
+		case strings.HasPrefix(key, shardfile.FilesPrefix):
 			puts.files.Add(1)
-		case strings.HasPrefix(key, "manifests/"):
+		case strings.HasPrefix(key, shardfile.ManifestPrefix):
 			puts.manifests.Add(1)
 		default:
 			return nil
@@ -72,7 +74,7 @@ type flushResult struct {
 func loadFlush(t *testing.T, cfg flushCfg, n int, d time.Duration) flushResult {
 	t.Helper()
 	s := s3test.Setup(t)
-	r := newMRigOn(t, func(o *ShardsOptions) {
+	r := newMRigOn(t, func(o *CatalogOptions) {
 		o.Flush.Interval, o.Flush.Min, o.Flush.Coalesce, o.Flush.NoEarly = cfg.interval, cfg.min, cfg.coales, cfg.noEarly
 		o.Cache.Every = time.Hour
 	}, s.Backend(t))
@@ -182,7 +184,7 @@ func TestMeasureDeltas(t *testing.T) {
 	)
 	one := func(name string, age time.Duration, size int64) {
 		s := s3test.Setup(t)
-		r := newMRigOn(t, func(o *ShardsOptions) {
+		r := newMRigOn(t, func(o *CatalogOptions) {
 			o.Lifecycle.DeltaAge, o.Lifecycle.DeltaSize, o.Lifecycle.SnapshotEvery, o.Cache.Every = age, size, 200*time.Millisecond, time.Hour
 		}, s.Backend(t))
 		var puts counter
@@ -232,7 +234,7 @@ func TestMeasureReplay(t *testing.T) {
 	measuring(t, "replay")
 	for _, d := range []time.Duration{10 * time.Second, 30 * time.Second} {
 		s := s3test.Setup(t)
-		r := newMRigOn(t, func(o *ShardsOptions) { o.Cache.Every = time.Hour; o.Lifecycle.DeltaAge = time.Hour }, s.Backend(t))
+		r := newMRigOn(t, func(o *CatalogOptions) { o.Cache.Every = time.Hour; o.Lifecycle.DeltaAge = time.Hour }, s.Backend(t))
 		var puts counter
 		const shards = 20
 		refs := make([]*Ref, shards)

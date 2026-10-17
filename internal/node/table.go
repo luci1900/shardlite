@@ -1,29 +1,84 @@
 package node
 
 import (
+	"context"
 	"errors"
+	"log/slog"
+	"maps"
+	"slices"
 	"sync"
 	"time"
 
-	"github.com/thejerf/suture/v4"
+	"golang.org/x/sync/errgroup"
 )
 
 // errShardsStopped is what a request gets once the shards have stopped.
 var errShardsStopped = errors.New("node: the shards have stopped")
 
-// table maps each shard's name to its entry (docs/concurrency.md, The tree). It
-// is a service whose supervisor runs the shards and their messages owners.
-// Nothing locks the whole table: an activation adds its entry with LoadOrStore,
+// table maps each shard's name to its entry (docs/concurrency.md, The tree), and
+// runs the shards' loops until it stops. Each loop runs its shard's messages
+// owner. Nothing locks the whole table: an activation adds its entry with LoadOrStore,
 // and whoever finds one already there waits for it; removal marks the entry
 // gone under the entry's own mutex, then deletes it with CompareAndDelete, so it
 // can only remove the entry it means to. A request that found an entry just
 // before it was marked gone looks the name up again.
 type table struct {
-	sup     *suture.Supervisor
 	entries syncMap[string, *entry]
+	log     *slog.Logger
+
+	// The shards' loops run on ctx until stop. mu guards running and stopped, so
+	// that no loop starts once stop has begun.
+	ctx     context.Context
+	cancel  context.CancelFunc
+	loops   errgroup.Group
+	mu      sync.Mutex
+	stopped bool
+	running map[*shard]struct{}
 }
 
-func newTable(sup *suture.Supervisor) *table { return &table{sup: sup} }
+func newTable(log *slog.Logger) *table {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &table{log: log, ctx: ctx, cancel: cancel, running: map[*shard]struct{}{}}
+}
+
+// run starts a shard's loop, unless the table has stopped.
+func (t *table) run(a *shard) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.stopped {
+		return false
+	}
+	t.running[a] = struct{}{}
+	t.loops.Go(func() error {
+		a.Serve(t.ctx)
+		t.mu.Lock()
+		delete(t.running, a)
+		t.mu.Unlock()
+		return nil
+	})
+	return true
+}
+
+// stop ends the loops of the shards still running and waits for them until ctx
+// ends. A loop still running then is logged by name and left behind.
+func (t *table) stop(ctx context.Context) {
+	t.mu.Lock()
+	t.stopped = true
+	list := slices.Collect(maps.Keys(t.running))
+	t.mu.Unlock()
+	t.cancel()
+	for _, a := range list {
+		select {
+		case <-a.ended:
+		case <-ctx.Done():
+		}
+		select {
+		case <-a.ended:
+		default:
+			t.log.Error("a shard did not stop in time", "shard", a.Name)
+		}
+	}
+}
 
 // entryState is where an entry is in its life.
 type entryState int
@@ -155,8 +210,8 @@ func (t *table) start(name string, mk func(*entry) *shard) *entry {
 	if had, loaded := t.entries.LoadOrStore(name, e); loaded {
 		return had
 	}
-	if t.sup.Add(e.sh) == (suture.ServiceToken{}) {
-		t.remove(e, errShardsStopped) // the table's supervisor has stopped
+	if !t.run(e.sh) {
+		t.remove(e, errShardsStopped)
 	}
 	return e
 }

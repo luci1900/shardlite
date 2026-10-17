@@ -32,8 +32,8 @@ import (
 const kindsJSON = `{"kinds": {
 	"users":  {"public": true, "sync": "off", "idle_timeout": "2s"},
 	"wallet": {"public": true, "idle_timeout": "2s"},
-	"lobby":  {"public": true, "auto_delete": true, "idle_timeout": "2s"},
-	"arena":  {"public": true, "auto_delete": true, "idle_timeout": "300ms"},
+	"lobby":  {"public": true, "idle_timeout": "2s"},
+	"arena":  {"public": true, "idle_timeout": "300ms"},
 	"audit":  {}
 }}`
 
@@ -195,7 +195,7 @@ func (s *stack) startNode() {
 	env := append(s.blobEnv(), []string{
 		"SHARDLITE_NODE=n1", "SHARDLITE_KINDS=" + filepath.Join(s.dir, "kinds.json"),
 		"SHARDLITE_DATA=" + filepath.Join(s.dir, "data"), "SHARDLITE_SCRATCH_DIR=" + filepath.Join(s.dir, "meta"),
-		"SHARDLITE_APP=http://" + s.appAddr, "SHARDLITE_LISTEN=" + s.pub, "SHARDLITE_CONTROL=" + s.ctl,
+		"SHARDLITE_APP=http://" + s.appAddr, "SHARDLITE_LISTEN_PUBLIC=" + s.pub, "SHARDLITE_LISTEN_CONTROL=" + s.ctl, "SHARDLITE_LISTEN_PEER=127.0.0.1:0",
 		"SHARDLITE_FLUSH=50ms", "SHARDLITE_LEASE_TTL=5s",
 	}...)
 	env = append(env, s.env...)
@@ -302,13 +302,13 @@ func (v *verifier) tokens(shard string) (toks map[string]bool, ok bool, err erro
 func (v *verifier) shards() []string {
 	v.t.Helper()
 	var out []string
-	for info, err := range v.files.Blob.List(context.Background(), "manifests/") {
+	for info, err := range v.files.Blob.List(context.Background(), shardfile.ManifestPrefix) {
 		if err != nil {
 			v.t.Fatal(err)
 		}
-		shard := strings.TrimPrefix(info.Key, "manifests/")
-		if m, _, err := v.files.GetManifest(context.Background(), shard); errors.Is(err, blob.ErrNotFound) || (err == nil && m.AutoDelete) {
-			continue // (an auto-delete shard's manifest goes when it deactivates, which would race with the check)
+		shard := strings.TrimPrefix(info.Key, shardfile.ManifestPrefix)
+		if _, _, err := v.files.GetManifest(context.Background(), shard); errors.Is(err, blob.ErrNotFound) {
+			continue
 		}
 		out = append(out, shard)
 	}

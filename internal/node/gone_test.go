@@ -81,7 +81,7 @@ func TestDeleteLeavesNothing(t *testing.T) {
 	if _, err := r.rawManifest("slow/e4"); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("manifest: %v, want none", err)
 	}
-	for info := range r.n.Store.List(ctx, "shards/slow/e4/") {
+	for info := range r.n.Store.List(ctx, shardfile.ShardPrefix("slow/e4")) {
 		t.Fatalf("an LTX file is left: %v", info.Key)
 	}
 	ref = r.acquire("slow/e4")
@@ -121,7 +121,7 @@ func TestCreateRace(t *testing.T) {
 	r := newMRig(t)
 	raced := false
 	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpCreate && key == "manifests/users/e5" && !after && !raced {
+		if op == blob.OpCreate && key == shardfile.ManifestKey("users/e5") && !after && !raced {
 			raced = true
 			body, _ := json.Marshal(shardfile.Manifest{Generation: "other", Files: []string{}})
 			_, err := r.local.Create(ctx, key, bytes.NewReader(body), blob.WriteID{Node: "n2", Epoch: 1, N: 1})
@@ -160,7 +160,7 @@ func TestDeleteRacingWithAWrite(t *testing.T) {
 	live, _ := r.manifest("users/e6")
 	raced := false
 	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpDelete && key == "manifests/users/e6" && !after && !raced {
+		if op == blob.OpDelete && key == shardfile.ManifestKey("users/e6") && !after && !raced {
 			raced = true // the delete is about to remove the manifest: the owner's own write gets in first
 			cur, err := r.local.Head(ctx, key)
 			if err != nil {
@@ -183,7 +183,7 @@ func TestDeleteRacingWithAWrite(t *testing.T) {
 		t.Fatalf("the live manifest is gone: %+v %v", raw, rerr)
 	}
 	n := 0
-	for range r.n.Store.List(ctx, "shards/users/e6/") {
+	for range r.n.Store.List(ctx, shardfile.ShardPrefix("users/e6")) {
 		n++
 	}
 	if n == 0 {
@@ -201,7 +201,7 @@ func TestNeverWrittenShardIsKeptWhenItsManifestChanged(t *testing.T) {
 	r.app.Must(t, "close", "a")
 	var changed atomic.Bool
 	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpDelete && key == "manifests/users/e7" && !after && changed.CompareAndSwap(false, true) {
+		if op == blob.OpDelete && key == shardfile.ManifestKey("users/e7") && !after && changed.CompareAndSwap(false, true) {
 			cur, err := r.local.Head(ctx, key)
 			if err != nil {
 				return err
@@ -223,13 +223,41 @@ func TestNeverWrittenShardIsKeptWhenItsManifestChanged(t *testing.T) {
 	}
 }
 
-// ---- Auto-delete kinds
+// A shard the app wrote to and later emptied is deleted when it deactivates,
+// with the LTX files of its earlier deltas.
+func TestEmptiedShardLeavesNothing(t *testing.T) {
+	t.Parallel()
+	r := newMRig(t)
+	ctx := context.Background()
+	ref := r.acquire("users/e8")
+	r.write(ref, "a")
+	if err := r.m.Gate(ctx, ref, true); err != nil {
+		t.Fatal(err)
+	}
+	r.app.Must(t, "close", "a")
+	ref.Release()
+	eventually(t, "idle deactivation", r.inactive("users/e8"))
+	if len(r.leftInBlob("users/e8")) == 0 {
+		t.Fatal("no delta at deactivation")
+	}
+	ref = r.acquire("users/e8")
+	path := ref.Path()
+	r.app.Must(t, "openro", "a", path)
+	r.app.Must(t, "exec", "a", "DROP TABLE kv")
+	r.app.Must(t, "exec", "a", "DROP TABLE acks")
+	r.app.Must(t, "close", "a")
+	ref.Release()
+	eventually(t, "idle deactivation", r.inactive("users/e8"))
+	r.mustBeGone("users/e8", path)
+}
+
+// ---- The delete marker
 
 // leftInBlob lists the LTX files that blob storage holds for a shard.
 func (r *mrig) leftInBlob(target string) []string {
 	r.t.Helper()
 	var out []string
-	for info, err := range r.n.Store.List(context.Background(), "shards/"+target+"/") {
+	for info, err := range r.n.Store.List(context.Background(), shardfile.ShardPrefix(target)) {
 		if err != nil {
 			r.t.Fatal(err)
 		}
@@ -257,27 +285,29 @@ func (r *mrig) mustBeGone(target, path string) {
 	}
 }
 
-// The shard is captured and shipped like any other: it has a journal, its output is
-// gated, and its manifest says it was created as auto-delete.
-func TestAutoDeleteShardIsCapturedAndGated(t *testing.T) {
+// markForDeletion makes the app create the delete marker in the shard it has open
+// as "a" (see r.write).
+func (r *mrig) markForDeletion() {
+	r.t.Helper()
+	r.app.Must(r.t, "exec", "a", "CREATE TABLE _shardlite_delete (x)")
+}
+
+// A marked shard is captured and shipped like any other: it has a journal and its
+// output is gated.
+func TestMarkedShardIsCapturedAndGated(t *testing.T) {
 	t.Parallel()
 	r := newMRig(t)
 	ctx := context.Background()
 	ref := r.acquire("lobby/l1")
 	defer ref.Release()
-	if m, err := r.manifest("lobby/l1"); err != nil || !m.AutoDelete || m.Journal != "n1" || m.Owner != "n1" {
-		t.Fatalf("manifest %+v (%v), want an auto-delete one with a journal", m, err)
-	}
-	if m := r.acquire("wallet/l2"); true {
-		defer m.Release()
-		if got, _ := r.manifest("wallet/l2"); got == nil || got.AutoDelete {
-			t.Fatalf("manifest of a durable kind: %+v", got)
-		}
+	if m, err := r.manifest("lobby/l1"); err != nil || m.Journal != "n1" || m.Owner != "n1" {
+		t.Fatalf("manifest %+v (%v), want one with a journal", m, err)
 	}
 	if !ref.Sync() {
 		t.Fatal("the kind's sync setting is ignored")
 	}
 	r.write(ref, "a")
+	r.markForDeletion()
 	if err := r.m.Gate(ctx, ref, true); err != nil {
 		t.Fatal(err)
 	}
@@ -290,15 +320,16 @@ func TestAutoDeleteShardIsCapturedAndGated(t *testing.T) {
 	r.app.Must(t, "close", "a")
 }
 
-// Deactivation deletes the manifest and the local files; the next request starts
-// empty with a new generation.
-func TestAutoDeleteShardLeavesNothingAfterDeactivation(t *testing.T) {
+// Deactivation deletes the manifest and the local files of a marked shard; the next
+// request starts empty with a new generation.
+func TestMarkedShardLeavesNothingAfterDeactivation(t *testing.T) {
 	t.Parallel()
 	r := newMRig(t)
 	ctx := context.Background()
 	ref := r.acquire("lobby/l2")
 	first, _ := r.manifest("lobby/l2")
 	r.write(ref, "a")
+	r.markForDeletion()
 	if err := r.m.Gate(ctx, ref, true); err != nil {
 		t.Fatal(err)
 	}
@@ -307,13 +338,13 @@ func TestAutoDeleteShardLeavesNothingAfterDeactivation(t *testing.T) {
 	ref.Release()
 	eventually(t, "idle deactivation", r.inactive("lobby/l2"))
 	r.mustBeGone("lobby/l2", path)
-	if r.m.Stats.AutoDeletes.Load() != 1 {
-		t.Fatalf("auto-deletes %d", r.m.Stats.AutoDeletes.Load())
+	if r.m.Stats.Deletes.Load() != 1 {
+		t.Fatalf("deletes %d", r.m.Stats.Deletes.Load())
 	}
 	ref = r.acquire("lobby/l2")
 	defer ref.Release()
 	m, err := r.manifest("lobby/l2")
-	if err != nil || m.Generation == first.Generation || !m.AutoDelete {
+	if err != nil || m.Generation == first.Generation {
 		t.Fatalf("manifest %+v (%v), want a new generation (old %s)", m, err, first.Generation)
 	}
 	if dump := r.liveDump(ref.Path()); strings.Contains(dump, "kv: ") {
@@ -322,12 +353,13 @@ func TestAutoDeleteShardLeavesNothingAfterDeactivation(t *testing.T) {
 }
 
 // A shard that lived long enough for a background delta has the delta deleted too.
-func TestAutoDeleteShardDeletesItsBackgroundDelta(t *testing.T) {
+func TestMarkedShardDeletesItsBackgroundDelta(t *testing.T) {
 	t.Parallel()
-	r := newMRigWith(t, func(o *ShardsOptions) { o.Lifecycle.DeltaAge = 30 * time.Millisecond })
+	r := newMRigWith(t, func(o *CatalogOptions) { o.Lifecycle.DeltaAge = 30 * time.Millisecond })
 	ctx := context.Background()
 	ref := r.acquire("lobby/l3")
 	r.write(ref, "a")
+	r.markForDeletion()
 	if err := r.m.Gate(ctx, ref, true); err != nil {
 		t.Fatal(err)
 	}
@@ -345,9 +377,9 @@ func TestAutoDeleteShardDeletesItsBackgroundDelta(t *testing.T) {
 	r.mustBeGone("lobby/l3", path)
 }
 
-// A crash keeps the state of an auto-delete shard: all of it with sync on, and what
-// reached a flush with sync off.
-func TestAutoDeleteShardSurvivesACrash(t *testing.T) {
+// A crash keeps the state of a marked shard: all of it with sync on, and what
+// reached a flush with sync off. It is deleted at a later deactivation.
+func TestMarkedShardSurvivesACrash(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct{ kind, name string }{{"lobby", "sync on"}, {"arena", "sync off"}} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -358,6 +390,7 @@ func TestAutoDeleteShardSurvivesACrash(t *testing.T) {
 			ref := r.acquire(target)
 			first, _ := r.manifest(target)
 			r.write(ref, "a")
+			r.markForDeletion()
 			if tc.kind == "lobby" {
 				if err := r.m.Gate(ctx, ref, true); err != nil {
 					t.Fatal(err)
@@ -373,14 +406,18 @@ func TestAutoDeleteShardSurvivesACrash(t *testing.T) {
 			r.startNode()
 			r.startShards(nil)
 			ref = r.acquire(target)
-			defer ref.Release()
 			m, err := r.manifest(target)
-			if err != nil || m.Generation != first.Generation || !m.AutoDelete {
+			if err != nil || m.Generation != first.Generation {
 				t.Fatalf("manifest %+v (%v), want the old shard", m, err)
 			}
-			if got := strings.Count(r.liveDump(ref.Path()), "kv: "); got != 2 {
-				t.Fatalf("%d rows after a crash, want the 2 of one write", got)
+			dump := r.liveDump(ref.Path())
+			if got := strings.Count(dump, "kv: "); got != 2 || !strings.Contains(dump, "_shardlite_delete") {
+				t.Fatalf("%d rows after a crash, want the 2 of one write, and the marker:\n%s", got, dump)
 			}
+			path := ref.Path()
+			ref.Release()
+			eventually(t, "idle deactivation", r.inactive(target))
+			r.mustBeGone(target, path)
 		})
 	}
 }
@@ -391,6 +428,7 @@ func (r *mrig) writeAndRelease(target string) (path, generation string) {
 	r.t.Helper()
 	ref := r.acquire(target)
 	r.write(ref, "a")
+	r.markForDeletion()
 	if err := r.m.Gate(context.Background(), ref, true); err != nil {
 		r.t.Fatal(err)
 	}
@@ -405,12 +443,12 @@ func (r *mrig) writeAndRelease(target string) (path, generation string) {
 	return path, m.Generation
 }
 
-func withDeltas(o *ShardsOptions) { o.Lifecycle.DeltaAge = 30 * time.Millisecond }
+func withDeltas(o *CatalogOptions) { o.Lifecycle.DeltaAge = 30 * time.Millisecond }
 
 // The delete after deactivation goes manifest first. If the manifest can't be
 // deleted nothing is deleted and the shard stays active, with its data; the next
 // pass tries again.
-func TestAutoDeleteFailingManifestDeleteKeepsTheShard(t *testing.T) {
+func TestMarkedShardWithAFailingManifestDeleteIsKept(t *testing.T) {
 	t.Parallel()
 	r := newMRigWith(t, withDeltas)
 	ref := r.acquire("lobby/f1")
@@ -419,13 +457,14 @@ func TestAutoDeleteFailingManifestDeleteKeepsTheShard(t *testing.T) {
 	fail.Store(true)
 	var tries atomic.Int64
 	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpDelete && key == "manifests/lobby/f1" && !after && fail.Load() {
+		if op == blob.OpDelete && key == shardfile.ManifestKey("lobby/f1") && !after && fail.Load() {
 			tries.Add(1)
 			return errors.New("injected")
 		}
 		return nil
 	})
 	r.write(ref, "a")
+	r.markForDeletion()
 	if err := r.m.Gate(context.Background(), ref, true); err != nil {
 		t.Fatal(err)
 	}
@@ -456,11 +495,11 @@ func TestAutoDeleteFailingManifestDeleteKeepsTheShard(t *testing.T) {
 // Once the manifest is deleted the shard is gone. LTX files that couldn't be
 // deleted are left in blob storage, which nothing refers to, and a new shard of the
 // same id has a new generation.
-func TestAutoDeleteFailingFileDeleteLeavesOrphans(t *testing.T) {
+func TestMarkedShardWithAFailingFileDeleteLeavesOrphans(t *testing.T) {
 	t.Parallel()
 	r := newMRigWith(t, withDeltas)
 	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpDelete && strings.HasPrefix(key, "shards/lobby/f2/") && !after {
+		if op == blob.OpDelete && strings.HasPrefix(key, shardfile.ShardPrefix("lobby/f2")) && !after {
 			return errors.New("injected")
 		}
 		return nil
@@ -486,13 +525,13 @@ func TestAutoDeleteFailingFileDeleteLeavesOrphans(t *testing.T) {
 // A crash after the manifest is deleted and before the files are: the shard is gone
 // for good, its LTX files are orphans, and its local files (still in the index as
 // active) are discarded.
-func TestAutoDeleteCrashAfterTheManifestDelete(t *testing.T) {
+func TestMarkedShardCrashAfterTheManifestDelete(t *testing.T) {
 	t.Parallel()
 	r := newMRigWith(t, withDeltas)
 	reached := make(chan struct{})
 	var once sync.Once
 	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpDelete && strings.HasPrefix(key, "shards/lobby/f3/") && !after {
+		if op == blob.OpDelete && strings.HasPrefix(key, shardfile.ShardPrefix("lobby/f3")) && !after {
 			once.Do(func() { close(reached) })
 			<-ctx.Done() // the node dies here
 			return ctx.Err()
@@ -501,6 +540,7 @@ func TestAutoDeleteCrashAfterTheManifestDelete(t *testing.T) {
 	})
 	ref := r.acquire("lobby/f3")
 	r.write(ref, "a")
+	r.markForDeletion()
 	if err := r.m.Gate(context.Background(), ref, true); err != nil {
 		t.Fatal(err)
 	}
@@ -535,96 +575,5 @@ func TestAutoDeleteCrashAfterTheManifestDelete(t *testing.T) {
 	}
 	if len(r.leftInBlob("lobby/f3")) == 0 {
 		t.Fatal("the orphaned LTX files are gone: the hook did not stop their deletion")
-	}
-}
-
-func (r *mrig) reloadKinds(kinds string) {
-	r.t.Helper()
-	if err := os.WriteFile(r.kindsPath, []byte(kinds), 0o644); err != nil {
-		r.t.Fatal(err)
-	}
-	if err := r.kinds.Reload(); err != nil {
-		r.t.Fatal(err)
-	}
-}
-
-// A shard created before its kind became auto_delete is kept at deactivation, and
-// the node logs why (once per activation). Claiming it doesn't change its flag.
-func TestShardCreatedBeforeItsKindWasAutoDeleteIsKept(t *testing.T) {
-	t.Parallel()
-	var logs syncBuffer
-	r := newMRigWith(t, logTo(&logs))
-	ctx := context.Background()
-	ref := r.acquire("wallet/k1")
-	r.write(ref, "a")
-	if err := r.m.Gate(ctx, ref, true); err != nil {
-		t.Fatal(err)
-	}
-	r.app.Must(t, "close", "a")
-	ref.Release()
-	eventually(t, "deactivation", func() bool { return r.cached("wallet/k1") })
-
-	r.reloadKinds(strings.Replace(testKinds, `"wallet": {"public": true,`, `"wallet": {"public": true, "auto_delete": true,`, 1))
-	for round := 1; round <= 2; round++ {
-		ref = r.acquire("wallet/k1")
-		if got := strings.Count(r.liveDump(ref.Path()), "kv: "); got != 2 {
-			t.Fatalf("round %d: %d rows, want the shard as it was", round, got)
-		}
-		ref.Release()
-		eventually(t, "deactivation", func() bool { return r.cached("wallet/k1") })
-		if m, err := r.manifest("wallet/k1"); err != nil || m.AutoDelete || len(m.Files) == 0 {
-			t.Fatalf("round %d: manifest %+v (%v), want the durable shard kept as it was", round, m, err)
-		}
-		if n := strings.Count(logs.String(), "created before that"); n != round {
-			t.Fatalf("round %d: the reason was logged %d times, want once per activation\n%s", round, n, logs.String())
-		}
-	}
-	if got := strings.Count(r.dumpBlob("wallet/k1"), "kv: "); got != 2 {
-		t.Fatalf("%d rows in blob storage", got)
-	}
-}
-
-// A shard created as auto-delete is kept once its kind drops the flag.
-func TestAutoDeleteShardIsKeptOnceItsKindDropsTheFlag(t *testing.T) {
-	t.Parallel()
-	var logs syncBuffer
-	r := newMRigWith(t, logTo(&logs))
-	ctx := context.Background()
-	ref := r.acquire("lobby/k2")
-	r.write(ref, "a")
-	if err := r.m.Gate(ctx, ref, true); err != nil {
-		t.Fatal(err)
-	}
-	r.app.Must(t, "close", "a")
-	r.reloadKinds(strings.Replace(testKinds, `"auto_delete": true, "idle_timeout": "300ms"},
-	"arena"`, `"idle_timeout": "300ms"},
-	"arena"`, 1))
-	if k, _ := r.kinds.Lookup("lobby"); k.AutoDelete {
-		t.Fatal("the kind still has auto_delete")
-	}
-	ref.Release()
-	eventually(t, "deactivation", func() bool { return r.cached("lobby/k2") })
-	if m, err := r.manifest("lobby/k2"); err != nil || !m.AutoDelete || len(m.Files) == 0 {
-		t.Fatalf("manifest %+v (%v), want the shard kept", m, err)
-	}
-	if !strings.Contains(logs.String(), "no longer is") {
-		t.Fatalf("no log line says why:\n%s", logs.String())
-	}
-	if got := strings.Count(r.dumpBlob("lobby/k2"), "kv: "); got != 2 {
-		t.Fatalf("%d rows in blob storage", got)
-	}
-}
-
-// Deleting an auto-delete shard through the control API works as for any shard.
-func TestDeleteOfAnAutoDeleteShard(t *testing.T) {
-	t.Parallel()
-	r := newMRigWith(t, withDeltas)
-	path, _ := r.writeAndRelease("arena/l4")
-	if err := r.m.Delete(context.Background(), "arena/l4"); err != nil {
-		t.Fatal(err)
-	}
-	r.mustBeGone("arena/l4", path)
-	if r.m.IsActive("arena/l4") {
-		t.Fatal("still active")
 	}
 }

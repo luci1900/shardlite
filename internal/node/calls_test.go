@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/segment"
 )
 
 // cyclesUntil runs flush cycles until ch yields a value (or the test times
@@ -484,7 +485,7 @@ func (r *srig) holdJournal() (release func()) {
 	release = func() { once.Do(func() { close(gate) }) }
 	r.t.Cleanup(release)
 	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if !after && op == blob.OpCreate && strings.HasPrefix(key, "journal/") {
+		if !after && op == blob.OpCreate && strings.HasPrefix(key, segment.Root) {
 			select {
 			case <-gate:
 			case <-ctx.Done():
@@ -499,7 +500,7 @@ func (r *srig) holdJournal() (release func()) {
 // slowJournal makes every journal segment upload take d (a slow flush).
 func (r *srig) slowJournal(d time.Duration) {
 	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if !after && op == blob.OpCreate && strings.HasPrefix(key, "journal/") {
+		if !after && op == blob.OpCreate && strings.HasPrefix(key, segment.Root) {
 			select {
 			case <-time.After(d):
 			case <-ctx.Done():

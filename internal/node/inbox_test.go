@@ -107,8 +107,8 @@ func (c *fakeClock) Advance(d time.Duration) {
 	}
 }
 
-func withClock(c Clock) func(*ShardsOptions) {
-	return func(o *ShardsOptions) { o.Clock = c }
+func withClock(c Clock) func(*CatalogOptions) {
+	return func(o *CatalogOptions) { o.Clock = c }
 }
 
 // setRow sets a keyed row in the shard's own inbox, replacing the one with the same key.
@@ -407,7 +407,11 @@ func TestOwnRowAnHourAwayWakesTheShard(t *testing.T) {
 				clk.Advance(3601 * time.Second)
 				r.m.wakes.scan(context.Background())
 			case "after a crash":
-				eventually(t, "the hint, written while the shard is active", func() bool { return len(r.wakes()) == 1 })
+				// The row's commit is in the journal, so adoption writes the hint.
+				eventually(t, "the row's commit to be durable", func() bool { return r.durableInbox("users/wh1") == 1 })
+				if keys := r.wakes(); len(keys) != 0 {
+					t.Fatalf("hints %v while the row is in the tail", keys)
+				}
 				r.closeInApp("users/wh1")
 				r.crash()
 				r.stopJournal()
@@ -425,7 +429,8 @@ func TestOwnRowAnHourAwayWakesTheShard(t *testing.T) {
 				r.restart(opts)
 			}
 			eventually(t, "the row to fire", func() bool { return len(rec.onPath("/ring")) >= 1 })
-			eventually(t, "the hint to go", func() bool { return len(r.wakes()) == 0 })
+			// The next scan finds the shard with nothing left for the hint, and deletes it.
+			advanceUntil(t, clk, 100*time.Millisecond, "the hint to go", func() bool { return len(r.wakes()) == 0 })
 			if n := r.inboxRows("users/wh1"); n != 0 {
 				t.Fatalf("%d rows left", n)
 			}
@@ -445,16 +450,20 @@ func TestTwentyRowsInOneMinuteWriteOneHint(t *testing.T) {
 	}
 	stmt.WriteString("COMMIT;")
 	r.sql("users/tw1", stmt.String())
-	eventually(t, "the hint", func() bool { return len(r.wakes()) == 1 })
-	r.settle("users/tw1")
-	if n := r.calls("create", "wakes"); n != 1 {
+	deactivate := func() {
+		t.Helper()
+		r.closeInApp("users/tw1")
+		advanceUntil(t, clk, 100*time.Millisecond, "deactivation", func() bool { return r.cached("users/tw1") })
+	}
+	deactivate()
+	if n := r.calls("create", wakePrefix); n != 1 {
 		t.Fatalf("%d hint writes", n)
 	}
-	// Later rows in the same minute change nothing.
+	// A later row in the same minute leaves the one hint.
 	r.setRow("users/tw1", "late", "/x", base+30)
-	r.settle("users/tw1")
-	if n := r.calls("create", "wakes"); n != 1 {
-		t.Fatalf("%d hint writes after another in the same minute", n)
+	deactivate()
+	if keys := r.wakes(); len(keys) != 1 || keys[0] != wakeKey(time.Unix(base, 0), "users/tw1") {
+		t.Fatalf("hints %v after another row in the same minute", keys)
 	}
 }
 
@@ -480,98 +489,72 @@ func TestInboxRowDueNowKeepsTheShardActive(t *testing.T) {
 	advanceUntil(t, clk, time.Second, "deactivation after the row", func() bool { return r.cached("users/dn1") })
 }
 
-// A row due later keeps an auto-delete shard active (deleting it would lose the
-// row), however far away it is. Once the row is consumed the shard is deleted.
-func TestAutoDeleteShardWithARowDueLaterStaysActiveUntilItIsConsumed(t *testing.T) {
+// markSQL is what the app runs to mark a shard for deletion.
+const markSQL = `CREATE TABLE _shardlite_delete (x)`
+
+// A marked shard with an inbox row due later is deleted at deactivation and the
+// row goes with it.
+func TestMarkedShardWithARowDueLaterIsDeletedWithIt(t *testing.T) {
 	t.Parallel()
 	clk := newFakeClock()
 	r := newSRigWith(t, both(quick, withClock(clk)))
 	rec := &recorder{}
 	r.record(rec, "")
-	due := clk.Now().Unix() + 3600
-	r.setRow("lobby/rm1", "timeout", "/tick", due)
+	r.setRow("lobby/rm1", "timeout", "/tick", clk.Now().Unix()+3600)
+	r.sql("lobby/rm1", markSQL)
 	r.closeInApp("lobby/rm1")
-	advanceUntil(t, clk, time.Second, "the idle timer to keep the shard", r.lookedAt("lobby/rm1"))
-	a := r.shard("lobby/rm1")
-	for range 5 {
-		looks := a.looks.idle.Load() // well past the idle timeout, short of the row
-		advanceUntil(t, clk, time.Second, "a look of the idle timer", func() bool { return a.looks.idle.Load() > looks })
-	}
-	if !r.m.IsActive("lobby/rm1") {
-		t.Fatal("an auto-delete shard with a row due later was deactivated")
-	}
-	if _, err := r.manifest("lobby/rm1"); err != nil {
-		t.Fatalf("manifest: %v", err)
-	}
-	if rec.count() != 0 {
-		t.Fatal("fired early")
-	}
-	clk.Advance(time.Hour)
-	eventually(t, "the row to fire", func() bool { return len(rec.onPath("/tick")) == 1 })
-	eventually(t, "the handler's delete", func() bool { return r.inboxRows("lobby/rm1") == 0 })
-	r.closeInApp("lobby/rm1") // the handler's delete opened the shard in the app again
-	advanceUntil(t, clk, time.Second, "deletion", func() bool { return r.m.Stats.AutoDeletes.Load() == 1 && r.inactive("lobby/rm1")() })
+	advanceUntil(t, clk, time.Second, "deletion", func() bool { return r.m.Stats.Deletes.Load() == 1 && r.inactive("lobby/rm1")() })
 	if _, err := r.rawManifest("lobby/rm1"); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("manifest: %v, want none", err)
 	}
-	if keys := r.wakes(); len(keys) != 0 {
-		t.Fatalf("hints %v after the shard went", keys)
+	if rec.count() != 0 {
+		t.Fatal("the dropped row fired")
 	}
 }
 
-// A lobby's timeout row that is cancelled lets the shard go the same way.
-func TestAutoDeleteShardIsDeletedOnceItsRowIsCancelled(t *testing.T) {
+// A marked shard with an inbox row that is due is kept until the handler has
+// consumed the row, then deleted.
+func TestMarkedShardWithARowDueIsDeletedAfterItIsConsumed(t *testing.T) {
 	t.Parallel()
 	clk := newFakeClock()
 	r := newSRigWith(t, both(quick, withClock(clk)))
-	r.setRow("lobby/rm2", "timeout", "/tick", clk.Now().Unix()+3600)
-	advanceUntil(t, clk, time.Second, "the idle timer to keep the shard", func() bool { return r.lookedAt("lobby/rm2")() })
-	r.sql("lobby/rm2", `DELETE FROM _shardlite_inbox WHERE key = 'timeout'`)
-	r.closeInApp("lobby/rm2")
-	advanceUntil(t, clk, time.Second, "deletion", func() bool { return r.m.Stats.AutoDeletes.Load() == 1 && r.inactive("lobby/rm2")() })
-}
-
-// Draining with an inbox row due later releases an auto-delete shard like a normal
-// one: a delta, the release and a wake hint for the row. The hint reactivates it
-// when the row is due, and it is deleted after the row is consumed.
-func TestDrainReleasesAnAutoDeleteShardWithARowDueLater(t *testing.T) {
-	t.Parallel()
-	clk := newFakeClock()
-	opts := both(quick, withClock(clk), drainFor(200*time.Millisecond))
-	r := newSRigWith(t, opts)
 	rec := &recorder{}
 	r.record(rec, "")
-	due := clk.Now().Unix() + 3600
-	hint := wakeKey(time.Unix(due, 0), "lobby/rm3")
-	r.sql("lobby/rm3", `INSERT INTO kv (payload) VALUES (x'01')`)
-	r.setRow("lobby/rm3", "timeout", "/ring", due)
-	r.shutdown("lobby/rm3")
-	if keys := r.wakes(); len(keys) != 1 || keys[0] != hint {
-		t.Fatalf("hints %v, want %s", keys, hint)
-	}
-	m, err := r.manifest("lobby/rm3")
-	if err != nil || !m.AutoDelete || len(m.Files) == 0 {
-		t.Fatalf("manifest %+v (%v), want the shard cached with a delta", m, err)
-	}
-	if r.m.Stats.AutoDeletes.Load() != 0 {
-		t.Fatal("the shard was deleted with a row in it")
-	}
-	clk.Advance(3601 * time.Second)
-	r.restart(opts)
-	eventually(t, "the row to fire", func() bool { return len(rec.onPath("/ring")) == 1 })
-	eventually(t, "the hint to go", func() bool { return len(r.wakes()) == 0 })
-	r.closeInApp("lobby/rm3")
-	advanceUntil(t, clk, time.Second, "deletion", func() bool { return r.m.Stats.AutoDeletes.Load() == 1 && r.inactive("lobby/rm3")() })
-	if _, err := r.rawManifest("lobby/rm3"); !errors.Is(err, blob.ErrNotFound) {
+	r.sql("lobby/rm2", markSQL)
+	r.setRow("lobby/rm2", "now", "/tick", clk.Now().Unix())
+	eventually(t, "the row to fire", func() bool { return len(rec.onPath("/tick")) == 1 })
+	eventually(t, "the handler's delete", func() bool { return r.inboxRows("lobby/rm2") == 0 })
+	r.closeInApp("lobby/rm2") // the handler's delete opened the shard in the app again
+	advanceUntil(t, clk, time.Second, "deletion", func() bool { return r.m.Stats.Deletes.Load() == 1 && r.inactive("lobby/rm2")() })
+	if _, err := r.rawManifest("lobby/rm2"); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("manifest: %v, want none", err)
 	}
 }
 
-// With no rows, shutdown deletes an auto-delete shard.
-func TestShutdownDeletesAnAutoDeleteShardWithNoRows(t *testing.T) {
+// Draining deletes a marked shard like it does at any deactivation, even with an
+// inbox row due later: the row goes with it.
+func TestDrainDeletesAMarkedShardWithARowDueLater(t *testing.T) {
+	t.Parallel()
+	clk := newFakeClock()
+	r := newSRigWith(t, both(quick, withClock(clk), drainFor(200*time.Millisecond)))
+	r.sql("lobby/rm3", `INSERT INTO kv (payload) VALUES (x'01')`)
+	r.sql("lobby/rm3", markSQL)
+	r.setRow("lobby/rm3", "timeout", "/ring", clk.Now().Unix()+3600)
+	r.shutdown("lobby/rm3")
+	if _, err := r.rawManifest("lobby/rm3"); !errors.Is(err, blob.ErrNotFound) {
+		t.Fatalf("manifest: %v, want none", err)
+	}
+	if r.m.Stats.Deletes.Load() != 1 {
+		t.Fatalf("deletes %d", r.m.Stats.Deletes.Load())
+	}
+}
+
+// With no rows, shutdown deletes a marked shard.
+func TestShutdownDeletesAMarkedShardWithNoRows(t *testing.T) {
 	t.Parallel()
 	r := newSRigWith(t, both(quick, drainFor(200*time.Millisecond)))
 	r.sql("lobby/rm4", `INSERT INTO kv (payload) VALUES (x'01')`)
+	r.sql("lobby/rm4", markSQL)
 	r.shutdown("lobby/rm4")
 	if _, err := r.rawManifest("lobby/rm4"); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("manifest: %v, want none", err)
@@ -591,7 +574,7 @@ func TestHintWriteFailingAtShutdownIsRetried(t *testing.T) {
 	r := newSRigWith(t, both(quick, logTo(&logs), drainFor(200*time.Millisecond)))
 	var failures atomic.Int32
 	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if !after && op == blob.OpCreate && strings.HasPrefix(key, "wakes/") && failures.Add(1) <= 10 {
+		if !after && op == blob.OpCreate && strings.HasPrefix(key, wakePrefix) && failures.Add(1) <= 10 {
 			return errors.New("storage down")
 		}
 		return nil

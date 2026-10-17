@@ -50,14 +50,12 @@ CREATE INDEX IF NOT EXISTS _shardlite_inbox_due ON _shardlite_inbox (due);
 `
 
 const (
-	// pendingRowsLimit is how many rows of one shard the node holds in memory at
-	// once (in flight, waiting to be retried or waiting to be deleted). More wait
-	// in the table.
+	// pendingRowsLimit is how many rows of one shard the node has in flight at
+	// once (being sent, waiting to be retried or to be deleted). More wait in the
+	// table.
 	pendingRowsLimit = 1000
 	// pendingBytesLimit bounds the bodies of the rows one read loads.
 	pendingBytesLimit = 32 << 20
-	commitBatch       = 500
-	commitLinger      = 5 * time.Millisecond
 	maxBackoffShift   = 6
 	holdWarnAfter     = time.Minute
 )
@@ -98,15 +96,14 @@ func (r *inRow) rowKey() rowKey  { return rowKey{inbox: true, id: r.id, due: r.d
 
 // snapshot is what one read of a shard found.
 type snapshot struct {
-	out         []*outRow
-	in          []*inRow
-	earliest    int64 // the earliest due time of the inbox rows not given up on
-	hasEarliest bool
-	next        int64 // the earliest due time after the read (the timer's)
-	hasNext     bool
+	out     []*outRow
+	in      []*inRow
+	more    bool  // the limits left rows in the table
+	next    int64 // the earliest due time after the read (the timer's and the hint's)
+	hasNext bool
 }
 
-// transport is how the messenger reaches other shards, given when Shards is
+// transport is how the messenger reaches other shards, given when the Catalog is
 // built (by the server).
 type transport struct {
 	// intake sends an outbox row to target's node, which inserts it into its
@@ -303,14 +300,17 @@ func (mg *messenger) checkRow(row *outRow, maxHops int) error {
 // giveUpOut stops sending an outbox row for as long as the shard stays active:
 // it logs the error, and the row no longer holds the shard or gets a wake hint.
 // The node writes the reason to the row's error and nothing else.
-func (mg *messenger) giveUpOut(o *msgOwner, row *outRow, reason error) {
+func (mg *messenger) giveUpOut(ctx context.Context, o *msgOwner, row *outRow, reason error) {
 	mg.stats.MessagesGivenUp.Add(1)
 	mg.log.Error("giving up on an outbox row: "+reason.Error(), "sender", o.a.Name, "target", row.target, "path", row.path, "id", row.id)
-	o.send(o.dctx, func() {
-		o.rows.giveUp(row.rowKey()) // the hints change
-		o.k.hintDirty = true        // and a hint that only this row needed goes
-		o.write(outWrite{id: row.id, reason: cutReason(reason.Error())})
+	o.k.giveUp(row.rowKey())
+	err := o.db(ctx, func(db *sql.DB) error {
+		_, err := db.ExecContext(ctx, `UPDATE _shardlite_outbox SET error = ? WHERE id = ?`, cutReason(reason.Error()), row.id)
+		return err
 	})
+	if err != nil && ctx.Err() == nil && !errors.Is(err, capture.ErrClosed) {
+		mg.log.Warn("could not write the error of an outbox row", "sender", o.a.Name, "id", row.id, "err", err)
+	}
 }
 
 // giveUp stops delivering an inbox row for as long as the shard stays active:
@@ -319,7 +319,19 @@ func (mg *messenger) giveUpOut(o *msgOwner, row *outRow, reason error) {
 func (mg *messenger) giveUp(o *msgOwner, row *inRow, reason string) {
 	mg.stats.InboxGivenUp.Add(1)
 	mg.log.Error("giving up on an inbox row: "+reason, "shard", o.a.Name, "id", row.id, "key", row.key, "sender", row.sender, "path", row.path, "due", row.due)
-	o.send(o.dctx, func() { o.rows.giveUp(row.rowKey()) })
+	o.k.giveUp(row.rowKey())
+}
+
+// pause waits before attempt n+1 (backoff), and reports false if ctx ends first.
+func (mg *messenger) pause(ctx context.Context, n int) bool {
+	wait, stop := mg.clock.NewTimer(mg.backoff(n))
+	select {
+	case <-wait:
+		return true
+	case <-ctx.Done():
+		stop()
+		return false
+	}
 }
 
 // maxReasonBytes bounds what the node writes to an outbox row's error.
@@ -338,36 +350,57 @@ func cutReason(s string) string {
 }
 
 // deliverOut moves an outbox row into its target's inbox until the intake is
-// acknowledged, retrying with backoff.
-func (mg *messenger) deliverOut(o *msgOwner, row *outRow) {
-	ctx := o.dctx
+// acknowledged, retrying with backoff, then deletes it.
+func (mg *messenger) deliverOut(ctx context.Context, o *msgOwner, row *outRow) {
 	for attempt := 0; ; attempt++ {
-		if ctx.Err() != nil {
-			return
-		}
 		if err := mg.checkRow(row, mg.send.maxHops); err != nil {
-			mg.giveUpOut(o, row, err)
+			mg.giveUpOut(ctx, o, row, err)
 			return
 		}
 		out, err := mg.tryOut(ctx, o, row)
 		switch out {
 		case delivered:
 			mg.stats.MessagesDelivered.Add(1)
-			o.send(ctx, func() { o.write(outWrite{id: row.id}) })
+			o.deleteOut(ctx, row)
 			return
 		case gaveUp:
-			mg.giveUpOut(o, row, err)
+			mg.giveUpOut(ctx, o, row, err)
 			return
 		}
 		mg.stats.MessagesRetried.Add(1)
 		mg.log.Warn("intake not delivered, will retry", "sender", o.a.Name, "target", row.target, "path", row.path, "id", row.id, "attempt", attempt+1, "err", err)
-		wait, stop := mg.clock.NewTimer(mg.backoff(attempt))
-		select {
-		case <-wait:
-		case <-ctx.Done():
-			stop()
+		if !mg.pause(ctx, attempt) {
+			o.k.leave(row.rowKey())
 			return
 		}
+	}
+}
+
+// deleteOut deletes an acknowledged outbox row, retrying until it is deleted
+// or ctx ends (the row then stays live and is sent again after the next
+// activation). The row leaves the rows in flight in the same call to the
+// shard's connection as its delete (see read).
+func (o *msgOwner) deleteOut(ctx context.Context, row *outRow) {
+	key := row.rowKey()
+	for attempt := 0; ; attempt++ {
+		err := o.db(ctx, func(db *sql.DB) error {
+			if _, err := db.ExecContext(ctx, `DELETE FROM _shardlite_outbox WHERE id = ?`, row.id); err != nil {
+				return err
+			}
+			o.k.leave(key)
+			return nil
+		})
+		if err == nil {
+			return
+		}
+		if ctx.Err() == nil && !errors.Is(err, capture.ErrClosed) {
+			o.mg.log.Warn("could not delete a sent message, will retry", "shard", o.a.Name, "id", row.id, "err", err)
+			if o.mg.pause(ctx, attempt) {
+				continue
+			}
+		}
+		o.k.leave(key)
+		return
 	}
 }
 
@@ -408,32 +441,23 @@ func receiverReason(status int, target string, err error) error {
 
 // deliverInbox calls the handler for an inbox row until the row is consumed or
 // given up on, retrying with backoff.
-func (mg *messenger) deliverInbox(o *msgOwner, row *inRow) {
-	ctx := o.dctx
+func (mg *messenger) deliverInbox(ctx context.Context, o *msgOwner, row *inRow) {
 	key := row.rowKey()
 	for attempt := 0; ; attempt++ {
-		if ctx.Err() != nil {
+		// The handler consumes a row (deletes it or sets a new time) in its own
+		// transaction, and an earlier attempt that seemed to fail may have got
+		// through: if the row is gone or changed, this delivery is over.
+		if attempt > 0 && o.gone(ctx, key) {
 			return
-		}
-		if attempt > 0 {
-			// The handler consumes a row (deletes it or sets a new time) in its own
-			// transaction, and an earlier attempt that seemed to fail may have got
-			// through. The next read says: if the row is gone or changed, drop this.
-			if present, ok := o.verify(key); !ok || !present {
-				return
-			}
 		}
 		out, err := mg.tryInbox(ctx, o, row)
 		switch out {
 		case delivered:
 			mg.stats.InboxDelivered.Add(1)
-			// The node never deletes an inbox row. The next read shows whether the
-			// handler consumed it.
-			present, ok := o.verify(key)
-			if !ok || !present {
-				return
+			// The node never deletes an inbox row: the handler must have consumed it.
+			if !o.gone(ctx, key) {
+				mg.giveUp(o, row, "the handler answered 2xx but did not delete the row or change its due time")
 			}
-			mg.giveUp(o, row, "the handler answered 2xx but did not delete the row or change its due time")
 			return
 		case gaveUp:
 			mg.giveUp(o, row, err.Error())
@@ -445,13 +469,42 @@ func (mg *messenger) deliverInbox(o *msgOwner, row *inRow) {
 		}
 		mg.stats.MessagesRetried.Add(1)
 		mg.log.Warn("inbox row not delivered, will retry", "shard", o.a.Name, "id", row.id, "key", row.key, "path", row.path, "attempt", attempt+1, "err", err)
-		wait, stop := mg.clock.NewTimer(mg.backoff(attempt))
-		select {
-		case <-wait:
-		case <-ctx.Done():
-			stop()
+		if !mg.pause(ctx, attempt) {
+			o.k.leave(key)
 			return
 		}
+	}
+}
+
+// gone reports whether an inbox row is no longer in the table with the due time
+// it was delivered with. A row that is gone leaves the rows in flight in the
+// same call to the shard's connection (see read). A look that fails is tried
+// again after a pause, and once ctx ends gone lets the row go and reports true:
+// the delivery is over either way.
+func (o *msgOwner) gone(ctx context.Context, key rowKey) bool {
+	for attempt := 0; ; attempt++ {
+		var gone bool
+		err := o.db(ctx, func(db *sql.DB) error {
+			var one int
+			err := db.QueryRowContext(ctx, `SELECT 1 FROM _shardlite_inbox WHERE id = ? AND due = ?`, key.id, key.due).Scan(&one)
+			if errors.Is(err, sql.ErrNoRows) {
+				gone = true
+				o.k.leave(key)
+				return nil
+			}
+			return err
+		})
+		if err == nil {
+			return gone
+		}
+		if ctx.Err() == nil && !errors.Is(err, capture.ErrClosed) {
+			o.mg.log.Warn("could not look up an inbox row, will retry", "shard", o.a.Name, "id", key.id, "err", err)
+			if o.mg.pause(ctx, attempt) {
+				continue
+			}
+		}
+		o.k.leave(key)
+		return true
 	}
 }
 
@@ -494,49 +547,33 @@ func classify(status int, err error) outcome {
 	return gaveUp
 }
 
-// outWrite is a change the node makes to an outbox row once it is done with it:
-// the delete of an acknowledged row, or the error of one it gave up on.
-type outWrite struct {
-	id     int64
-	reason string // "" for a delete
-}
-
-func writeBatch(ctx context.Context, db *sql.DB, batch []outWrite) error {
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	var deletes []int64
-	for _, w := range batch {
-		if w.reason != "" {
-			if _, err := tx.ExecContext(ctx, `UPDATE _shardlite_outbox SET error = ? WHERE id = ?`, w.reason, w.id); err != nil {
-				return err
-			}
-			continue
-		}
-		deletes = append(deletes, w.id)
-	}
-	for len(deletes) > 0 {
-		chunk := deletes[:min(len(deletes), commitBatch)]
-		deletes = deletes[len(chunk):]
-		ids := make([]any, len(chunk))
-		for i, id := range chunk {
-			ids[i] = id
-		}
-		q := `DELETE FROM _shardlite_outbox WHERE id IN (?` + strings.Repeat(",?", len(ids)-1) + `)`
-		if _, err := tx.ExecContext(ctx, q, ids...); err != nil {
+// live reports whether the shard has an outbox row not given up on, or an inbox
+// row not given up on that is due before before (Unix seconds), as of one
+// snapshot. It reads through the shard's connection, so it fails while the
+// shard is being let go of.
+func (a *shard) live(ctx context.Context, before int64) (bool, error) {
+	var live bool
+	given := a.msgs.kept.given()
+	err := a.useDB(ctx, func(db *sql.DB) error {
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
 			return err
 		}
-	}
-	return tx.Commit()
+		defer tx.Rollback()
+		if live, err = firstOutbox(ctx, tx, given); err != nil || live {
+			return err
+		}
+		_, live, err = firstInbox(ctx, tx, given, `WHERE due < ?`, before)
+		return err
+	})
+	return live, err
 }
 
-// holds reports whether the shard has something to deliver and so must not
+// holds reports whether the shard has something to deliver now and so must not
 // deactivate. It backs off the next look (idleState.wait), and logs if a shard
 // stays held for long. Only the shard's loop calls it.
 func (a *shard) holds(ctx context.Context) bool {
-	live, err := a.msgs.load().holds(ctx, a.autoDeletes())
+	live, err := a.live(ctx, a.d.now().Unix()+1)
 	held, warn := a.idle.keptBy(err == nil && live, a.d.now(), a.d.opts.IdleRecheck)
 	if warn > 0 {
 		a.d.log.Warn("a shard has had undelivered messages or inbox rows for a long time, keeping it active", "shard", a.Name, "for", warn.Round(time.Second))

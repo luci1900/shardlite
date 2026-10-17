@@ -29,7 +29,7 @@ import (
 
 // Options configure an App.
 type Options struct {
-	Control   string        // the node's control API, host:port (127.0.0.1:7000 if empty)
+	Control   string        // the node's control API, host:port (127.0.0.1:2282 if empty)
 	IdleClose time.Duration // close a shard's database after this long unused (500 ms if zero)
 }
 
@@ -48,7 +48,7 @@ type App struct {
 // New returns an App. Close stops it.
 func New(opts Options) *App {
 	if opts.Control == "" {
-		opts.Control = "127.0.0.1:7000"
+		opts.Control = "127.0.0.1:2282"
 	}
 	if opts.IdleClose <= 0 {
 		opts.IdleClose = 500 * time.Millisecond

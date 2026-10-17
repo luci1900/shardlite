@@ -8,8 +8,8 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.3
 	github.com/aws/smithy-go v1.28.5
 	github.com/benbjohnson/litestream v0.5.18-0.20261009180205-fd72802bc885
+	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/superfly/ltx v0.5.2
-	github.com/thejerf/suture/v4 v4.0.6
 	golang.org/x/sync v0.22.0
 	golang.org/x/sys v0.47.0
 	modernc.org/sqlite v1.49.1
@@ -37,7 +37,6 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/hablullah/go-hijri v1.0.2 // indirect
 	github.com/hablullah/go-juliandays v1.0.0 // indirect
-	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
 	github.com/jalaali/go-jalaali v0.0.0-20210801064154-80525e88d958 // indirect
 	github.com/lmittmann/tint v1.1.3 // indirect
 	github.com/magefile/mage v1.14.0 // indirect

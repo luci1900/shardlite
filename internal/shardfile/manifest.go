@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/coord"
@@ -19,16 +18,12 @@ import (
 // Manifest is the per-shard record in blob storage (see docs/internals.md,
 // Manifest). Last owner and pin come with the cluster and pinning.
 type Manifest struct {
-	Generation string   `json:"generation"` // random, set at creation, part of the shard's object paths
-	Owner      string   `json:"owner"`      // the node allowed to write the shard, "" if released
-	NodeEpoch  uint64   `json:"node_epoch"` // the owner's lease epoch when it claimed the shard
-	Files      []string `json:"files"`      // base and deltas, "min-max.epoch" (min-max in the shard's own positions), in order
-	Journal    string   `json:"journal"`    // the node journal holding commits after the last file, "" if there are none
-	// AutoDelete is set at creation if the shard's kind had auto_delete then, and
-	// never changes. The node deletes the shard at deactivation only if both the
-	// kind and the manifest have it, so marking a kind auto_delete can't delete
-	// shards written before.
-	AutoDelete bool `json:"auto_delete,omitempty"`
+	Generation string   `json:"generation"`     // random, set at creation, part of the shard's object paths
+	Owner      string   `json:"owner"`          // the node allowed to write the shard, "" if released
+	NodeEpoch  uint64   `json:"node_epoch"`     // the owner's lease epoch when it claimed the shard
+	Files      []string `json:"files"`          // base and deltas, "min-max.epoch" (min-max in the shard's own positions), in order
+	Journal    string   `json:"journal"`        // the node journal holding commits after the last file, "" if there are none
+	Wake       int64    `json:"wake,omitempty"` // when the shard next needs waking as of its files, a Unix time in seconds, 0 if never
 }
 
 // Range is a range of the shard's own positions covered by one LTX file.
@@ -94,12 +89,24 @@ func (m *Manifest) clone() *Manifest {
 	return &c
 }
 
+// ManifestPrefix is the key prefix of the manifests (state, one per shard).
+const ManifestPrefix = "state/shards/"
+
+// FilesPrefix is the key prefix of all shards' LTX files (data).
+const FilesPrefix = "data/shards/"
+
 // ManifestKey is the object key of a shard's manifest.
-func ManifestKey(shard string) string { return "manifests/" + shard }
+func ManifestKey(shard string) string { return ManifestPrefix + shard }
+
+// ShardPrefix is the key prefix of all of a shard's LTX files.
+func ShardPrefix(shard string) string { return FilesPrefix + shard + "/" }
+
+// GenerationPrefix is the key prefix of the LTX files of one generation of a shard.
+func GenerationPrefix(shard, generation string) string { return ShardPrefix(shard) + generation + "/" }
 
 // FileKey is the object key of one of a shard's LTX files.
 func FileKey(shard, generation string, f File) string {
-	return fmt.Sprintf("shards/%s/%s/%s.ltx", shard, generation, f)
+	return fmt.Sprintf("%s%s.ltx", GenerationPrefix(shard, generation), f)
 }
 
 // NewGeneration returns a random generation name.
@@ -213,10 +220,10 @@ type Handle struct {
 
 // Open loads a shard's manifest, creating it with a new generation if the
 // shard doesn't exist yet. Created reports which happened.
-func (f *Files) Open(ctx context.Context, shard string, autoDelete bool) (h *Handle, created bool, err error) {
+func (f *Files) Open(ctx context.Context, shard string) (h *Handle, created bool, err error) {
 	h, err = f.Attach(ctx, shard)
 	if errors.Is(err, blob.ErrNotFound) {
-		return f.Create(ctx, shard, autoDelete)
+		return f.Create(ctx, shard)
 	}
 	return h, false, err
 }
@@ -232,10 +239,10 @@ func (f *Files) Attach(ctx context.Context, shard string) (*Handle, error) {
 }
 
 // Create creates a shard's manifest, owned by this node, for a caller that has
-// just found none. autoDelete records that the shard's kind has auto_delete. created is false if somebody
-// else created it first: the handle is then theirs, to claim like any other shard.
-func (f *Files) Create(ctx context.Context, shard string, autoDelete bool) (h *Handle, created bool, err error) {
-	m := &Manifest{Generation: NewGeneration(), Owner: f.Node, NodeEpoch: f.Blob.Epoch(), Files: []string{}, Journal: f.Node, AutoDelete: autoDelete}
+// just found none. created is false if somebody else created it first: the
+// handle is then theirs, to claim like any other shard.
+func (f *Files) Create(ctx context.Context, shard string) (h *Handle, created bool, err error) {
+	m := &Manifest{Generation: NewGeneration(), Owner: f.Node, NodeEpoch: f.Blob.Epoch(), Files: []string{}, Journal: f.Node}
 	etag, err := f.manifests().Put(ctx, shard, m, nil)
 	if err == nil {
 		return &Handle{F: f, Name: shard, Manifest: m, ETag: etag}, true, nil
@@ -247,7 +254,7 @@ func (f *Files) Create(ctx context.Context, shard string, autoDelete bool) (h *H
 	// the manifest again since.
 	h, err = f.Attach(ctx, shard)
 	if errors.Is(err, blob.ErrNotFound) {
-		return f.Create(ctx, shard, autoDelete)
+		return f.Create(ctx, shard)
 	}
 	return h, false, err
 }
@@ -298,18 +305,61 @@ func (h *Handle) settle(ctx context.Context) error {
 	return nil
 }
 
-// ErrOwnedElsewhere means another node owns the shard and its lease is valid.
-var ErrOwnedElsewhere = errors.New("shardfile: shard is owned by another node")
+var (
+	// ErrOwnedElsewhere means another node owns the shard: its lease shows
+	// nothing that lets the shard be claimed. Claim returns it as an
+	// *OwnedElsewhereError, which names the owner.
+	ErrOwnedElsewhere = errors.New("shardfile: shard is owned by another node")
+	// ErrOwnerNotAdopted means the shard's owner is dead but its journal, which
+	// may hold the shard's last commits, hasn't been adopted yet: the shard can't
+	// be claimed until it has.
+	ErrOwnerNotAdopted = errors.New("shardfile: the shard's owner is dead and not adopted yet")
+)
+
+// OwnedElsewhereError is ErrOwnedElsewhere with the owner's name.
+type OwnedElsewhereError struct {
+	Shard, Owner string
+}
+
+func (e *OwnedElsewhereError) Error() string {
+	return fmt.Sprintf("%v: %s (%s)", ErrOwnedElsewhere, e.Shard, e.Owner)
+}
+
+func (e *OwnedElsewhereError) Unwrap() error { return ErrOwnedElsewhere }
 
 // Claim makes this node the shard's owner at its current epoch and points the
 // manifest's journal at the node's journal, with one compare-and-swap. Nothing is
-// written if the manifest already says so. A shard owned by another node whose
-// lease is valid is not claimed (ErrOwnedElsewhere).
+// written if the manifest already says so.
+//
+// A shard another node owns is claimed only once nothing of it can be left in
+// that node's journal (docs/internals.md, Takeover): the owner's node is adopted
+// up to the owner's epoch (a release counts), or the owner is dead (a newer epoch,
+// or another node has marked its lease) and an adopter has cleared the manifest's
+// journal. No timestamp is compared: a lease that only looks expired is still
+// the owner's (ErrOwnedElsewhere), and a dead owner not yet adopted gives
+// ErrOwnerNotAdopted.
 //
 // Adopting a journal clears the manifest's journal for every shard it wrote a delta
 // for, so a node that resumes such a shard must claim it before the shard's
 // first new commit reaches the journal: restore finds the tail through the manifest.
 func (h *Handle) Claim(ctx context.Context) error {
+	if err := h.CheckClaimable(ctx); err != nil {
+		return err
+	}
+	m := h.Manifest
+	next := m.clone()
+	next.Owner, next.NodeEpoch, next.Journal = h.F.Node, h.F.Blob.Epoch(), h.F.Node
+	if next.Owner == m.Owner && next.NodeEpoch == m.NodeEpoch && next.Journal == m.Journal {
+		return nil
+	}
+	return h.update(ctx, "claim", next)
+}
+
+// CheckClaimable returns what Claim would return for a shard it can't claim
+// (ErrOwnedElsewhere or ErrOwnerNotAdopted, or a failed read), without writing
+// anything. It lets a node find out that another node owns a shard before it
+// starts to activate it.
+func (h *Handle) CheckClaimable(ctx context.Context) error {
 	if err := h.settle(ctx); err != nil {
 		return err
 	}
@@ -317,18 +367,28 @@ func (h *Handle) Claim(ctx context.Context) error {
 	if m.Owner != "" && m.Owner != h.F.Node && h.F.Leases != nil {
 		l, err := h.F.Leases.Get(ctx, m.Owner)
 		switch {
-		case err == nil && l.Epoch == m.NodeEpoch && l.ValidAt(time.Now()):
-			return fmt.Errorf("%w: %s (%s)", ErrOwnedElsewhere, h.Name, m.Owner)
-		case err != nil && !errors.Is(err, blob.ErrNotFound):
+		case errors.Is(err, blob.ErrNotFound):
+			// A node with no lease has no journal to adopt.
+		case err != nil:
 			return err
+		case l.Adopted >= m.NodeEpoch:
+		case m.Journal == "" && ownerDead(l, m):
+		case ownerDead(l, m):
+			return fmt.Errorf("%w: %s (%s at epoch %d)", ErrOwnerNotAdopted, h.Name, m.Owner, m.NodeEpoch)
+		default:
+			return &OwnedElsewhereError{Shard: h.Name, Owner: m.Owner}
 		}
 	}
-	next := m.clone()
-	next.Owner, next.NodeEpoch, next.Journal = h.F.Node, h.F.Blob.Epoch(), h.F.Node
-	if next.Owner == m.Owner && next.NodeEpoch == m.NodeEpoch && next.Journal == m.Journal {
-		return nil
-	}
-	return h.update(ctx, "claim", next)
+	return nil
+}
+
+// ownerDead reports whether the lease shows the manifest's owner dead without
+// comparing clocks: its node has a newer epoch, or another incarnation has
+// marked the lease (which an adopter does only once it has seen the lease go
+// unrenewed for a TTL).
+func ownerDead(l *coord.NodeLease, m *Manifest) bool {
+	owner := coord.Incarnation{Node: m.Owner, Epoch: m.NodeEpoch}
+	return l.Epoch > m.NodeEpoch || (l.AdoptedBy != nil && *l.AdoptedBy != owner)
 }
 
 // ReleaseOwnership gives the shard up: no owner and no journal. The caller has
@@ -343,14 +403,18 @@ func (h *Handle) ReleaseOwnership(ctx context.Context) error {
 	return h.update(ctx, "release", next)
 }
 
-// Delete removes the shard's manifest by conditional delete at the version the
-// handle holds (blob.ErrConflict if somebody else changed it). It is how a shard
-// that was never written is dropped at deactivation.
-func (h *Handle) Delete(ctx context.Context) error {
+// SetWake sets the manifest's wake time with one compare-and-swap, for a shard
+// that has no tail to write a delta for. Nothing is written if it is unchanged.
+func (h *Handle) SetWake(ctx context.Context, wake int64) error {
 	if err := h.settle(ctx); err != nil {
 		return err
 	}
-	return h.F.manifests().Delete(ctx, h.Name, h.ETag)
+	if h.Manifest.Wake == wake {
+		return nil
+	}
+	next := h.Manifest.clone()
+	next.Wake = wake
+	return h.update(ctx, "wake", next)
 }
 
 // DeleteShard removes a shard: its manifest is deleted by conditional delete (a
@@ -375,10 +439,13 @@ func (f *Files) DeleteShard(ctx context.Context, shard string) error {
 // (blob.ErrConflict) leaves everything as it is.
 func (h *Handle) DeleteShard(ctx context.Context) error {
 	f := h.F
-	if err := h.Delete(ctx); err != nil && !errors.Is(err, blob.ErrNotFound) {
+	if err := h.settle(ctx); err != nil {
 		return err
 	}
-	prefix := fmt.Sprintf("shards/%s/%s/", h.Name, h.Manifest.Generation)
+	if err := f.manifests().Delete(ctx, h.Name, h.ETag); err != nil && !errors.Is(err, blob.ErrNotFound) {
+		return err
+	}
+	prefix := GenerationPrefix(h.Name, h.Manifest.Generation)
 	var keys []string
 	for info, err := range f.Blob.List(ctx, prefix) {
 		if err != nil {
