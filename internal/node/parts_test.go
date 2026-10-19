@@ -6,14 +6,11 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"slices"
-	"strings"
 	"testing"
 	"time"
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/coord"
 	"github.com/luci1900/shardlite/internal/service"
@@ -53,61 +50,6 @@ func partsNode(t *testing.T) (*Node, *Kinds) {
 		t.Fatal(err)
 	}
 	return n, kinds
-}
-
-// The wake scan wakes the shards whose hints are due and that have a manifest,
-// deletes the hints that mean nothing, and leaves alone the ones not due yet.
-func TestWakeScanOnItsOwn(t *testing.T) {
-	t.Parallel()
-	n, kinds := partsNode(t)
-	ctx := context.Background()
-	h, _, err := n.Files.Create(ctx, "users/ws1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Its manifest says it has work due, so its hint wakes it.
-	if err := h.SetWake(ctx, time.Now().Unix()); err != nil {
-		t.Fatal(err)
-	}
-	// This one is at rest (owned here, not active) with no wake time: its hint is stale.
-	if _, _, err := n.Files.Create(ctx, "users/stale"); err != nil {
-		t.Fatal(err)
-	}
-	hints := hintStore{n.Store}
-	now := time.Now()
-	for _, h := range []struct {
-		shard string
-		at    time.Time
-	}{{"users/ws1", now}, {"users/stale", now}, {"users/ghost", now}, {"nokind/x", now}, {"users/later", now.Add(time.Hour)}} {
-		if _, err := hints.writeWake(ctx, h.shard, h.at); err != nil {
-			t.Fatal(err)
-		}
-	}
-	var woken apptest.Log[string]
-	w := &wakeScan{store: n.Store, hints: hints, files: n.Files, keeper: n.Keeper, kinds: kinds, clock: realClock{}, self: n.Name, active: func(string) bool { return false },
-		opts: WakeOptions{Every: time.Hour, ActivationLimit: 2}, log: slog.New(slog.DiscardHandler),
-		acquire: func(_ context.Context, target string) (*Ref, error) {
-			woken.Add(target)
-			return nil, errors.New("not activated in this test")
-		}}
-	w.scan(ctx)
-	if got := woken.All(); !slices.Equal(got, []string{"users/ws1"}) {
-		t.Fatalf("woke %v, want users/ws1", got)
-	}
-	var left []string
-	for info, err := range n.Store.List(ctx, wakePrefix) {
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, shard, _ := strings.Cut(strings.TrimPrefix(info.Key, wakePrefix), "/")
-		left = append(left, shard)
-	}
-	slices.Sort(left)
-	// The woken shard's hint goes once its messages are delivered, not here. The
-	// stale one went without a wake.
-	if !slices.Equal(left, []string{"users/later", "users/ws1"}) {
-		t.Fatalf("hints left: %v", left)
-	}
 }
 
 // The cache evicts over its limit, but never a shard that has an entry in the

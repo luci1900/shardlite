@@ -84,6 +84,7 @@ func TestKillNodeUnderLoad(t *testing.T) {
 	for i := range nShards {
 		wallets[i], users[i] = fmt.Sprintf("wallet/w%d", i), fmt.Sprintf("users/u%d", i)
 	}
+	s.create(t, append(wallets, users...)...)
 
 	ctx, stop := context.WithCancel(context.Background())
 	var wg sync.WaitGroup

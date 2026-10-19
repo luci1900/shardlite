@@ -30,7 +30,7 @@ type File struct {
 	refs atomic.Int32
 }
 
-// Bytes wraps b, which must not be changed afterwards.
+// Bytes wraps b, which must not be changed afterwards (for tests).
 func Bytes(b []byte) *File {
 	f := &File{mem: b, size: int64(len(b))}
 	f.refs.Store(1)

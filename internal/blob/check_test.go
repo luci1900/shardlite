@@ -95,7 +95,7 @@ func TestCheckStoreRefusesAMisbehavingStore(t *testing.T) {
 				t.Fatalf("the error doesn't name the step %q: %v", tc.step, err)
 			}
 			// The scratch key is gone either way.
-			for info := range tc.store.Memory.List(ctx, "") {
+			for info := range tc.store.Memory.List(ctx, "", "") {
 				if strings.Contains(info.Key, "check/") {
 					t.Fatalf("scratch key left: %s", info.Key)
 				}
@@ -116,7 +116,7 @@ func TestCheckStorePasses(t *testing.T) {
 			if err := CheckStore(ctx, b, "n1"); err != nil { // and again: each run uses a key of its own
 				t.Fatal(err)
 			}
-			for info := range b.List(ctx, "check/") {
+			for info := range b.List(ctx, "check/", "") {
 				t.Fatalf("scratch key left: %s", info.Key)
 			}
 		})

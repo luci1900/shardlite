@@ -36,25 +36,27 @@ const DefaultDeltaSize = 256 << 10
 type Hooks struct {
 	AfterFileWrite  func() error // delta or base written, manifest not yet updated
 	AfterRebaseSwap func() error // rebase's manifest update done, superseded files not yet deleted
-	// Wake gives the manifest's wake time, which is written in the same update as the
-	// files. It is called once the tail is taken and the file is written, just before
-	// the update, with the position the files now reach, and an error from it fails
-	// the operation with the manifest as it was. Nil leaves the manifest's wake as it is.
-	Wake func(ctx context.Context, end uint64) (int64, error)
+	// BeforeUpdate is called once the tail is taken, before the file is written
+	// and the manifest updated, with the position the files will reach. An error
+	// from it fails the operation with the manifest as it was. It returns the
+	// manifest's next_reminder for files that reach end, in Unix minutes (0 for
+	// none), which the update records with its entry in the reminder index
+	// (docs/internals.md, Reminder index). Without the hook the manifest keeps its
+	// own.
+	BeforeUpdate func(ctx context.Context, end uint64) (nextReminder int64, err error)
 }
 
-// setWake sets m's wake time from the Wake hook, if there is one, for files
-// that reach end.
-func (hk Hooks) setWake(ctx context.Context, m *Manifest, end uint64) error {
-	if hk.Wake == nil {
+// reminder calls the BeforeUpdate hook, if there is one, for files that reach end,
+// and records its answer in next with the entry that comes first.
+func (h *Handle) reminder(ctx context.Context, hk Hooks, end uint64, next *Manifest) error {
+	if hk.BeforeUpdate == nil {
 		return nil
 	}
-	w, err := hk.Wake(ctx, end)
+	reminder, err := hk.BeforeUpdate(ctx, end)
 	if err != nil {
-		return fmt.Errorf("wake time: %w", err)
+		return fmt.Errorf("before the manifest update: %w", err)
 	}
-	m.Wake = w
-	return nil
+	return h.setReminder(ctx, next, reminder)
 }
 
 // Policy says when a snapshot is written, and when it is a rebase and not a delta.
@@ -269,6 +271,16 @@ func (h *Handle) putTail(ctx context.Context, tail []capture.TailFile, hooks Hoo
 	}
 	defer delta.Close()
 	file := File{r, h.F.Blob.Epoch()}
+	// The reminder and its entry come before the file, so a failed entry leaves no
+	// file behind that a retry with a new handle (an adoption's) would find.
+	next := h.Manifest.clone()
+	next.Files = append(next.Files, file.String())
+	if edit != nil {
+		edit(next)
+	}
+	if err := h.reminder(ctx, hooks, r.Max, next); err != nil {
+		return err
+	}
 	if err := h.putFile(ctx, file, delta.Reader()); err != nil {
 		return err
 	}
@@ -276,14 +288,6 @@ func (h *Handle) putTail(ctx context.Context, tail []capture.TailFile, hooks Hoo
 		if err := hooks.AfterFileWrite(); err != nil {
 			return err
 		}
-	}
-	next := h.Manifest.clone()
-	next.Files = append(next.Files, file.String())
-	if err := hooks.setWake(ctx, next, r.Max); err != nil {
-		return err
-	}
-	if edit != nil {
-		edit(next)
 	}
 	if err := h.update(ctx, "delta", next); err != nil {
 		return err
@@ -376,6 +380,11 @@ func (h *Handle) Rebase(ctx context.Context, sh *capture.Shard, hooks Hooks) (bo
 	if len(files) == 1 && files[0].Max == position {
 		return false, nil // already one file that covers it
 	}
+	next := h.Manifest.clone()
+	next.Files = []string{base.String()}
+	if err := h.reminder(ctx, hooks, position, next); err != nil {
+		return false, err
+	}
 	if err := h.putFile(ctx, base, snap.Reader()); err != nil {
 		return false, err
 	}
@@ -383,11 +392,6 @@ func (h *Handle) Rebase(ctx context.Context, sh *capture.Shard, hooks Hooks) (bo
 		if err := hooks.AfterFileWrite(); err != nil {
 			return false, err
 		}
-	}
-	next := h.Manifest.clone()
-	next.Files = []string{base.String()}
-	if err := hooks.setWake(ctx, next, position); err != nil {
-		return false, err
 	}
 	if err := h.update(ctx, "rebase", next); err != nil {
 		return false, err

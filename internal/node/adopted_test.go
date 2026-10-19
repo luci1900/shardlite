@@ -37,7 +37,7 @@ func TestRestartAfterAnotherNodeAdoptedIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rep, err := files2.AdoptJournal(ctx, "n1", dead.JournalFrom, dead.JournalNext, func(context.Context, string) error { return nil }, nil)
+	rep, err := files2.AdoptJournal(ctx, "n1", dead.JournalFrom, dead.JournalNext, nil)
 	if err != nil || rep.Deltas != 1 {
 		t.Fatalf("adoption by n2: %+v %v", rep, err)
 	}

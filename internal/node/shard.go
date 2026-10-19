@@ -5,14 +5,18 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/luci1900/shardlite/internal/capture"
+	"github.com/luci1900/shardlite/internal/kind"
 	"github.com/luci1900/shardlite/internal/notify"
 	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/service"
 	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/system"
 )
 
 // LifecycleOptions configure each shard's lifecycle loop: its idle and delta
@@ -27,7 +31,7 @@ type LifecycleOptions struct {
 	MaxFiles      int           // files a manifest may list before the next snapshot rebases the shard, shardfile.DefaultMaxFiles if zero
 	SnapshotEvery time.Duration // how often each active shard looks whether it needs a snapshot (a delta or a rebase), and the tail alert is checked, 2 s if zero
 	HoldOff       time.Duration // how long to leave a shard alone after it couldn't be deactivated, 5 s if zero
-	IdleRecheck   time.Duration // the first wait before an idle shard that its messages keep active is looked at again (it doubles up to 10 s), 1 s if zero
+	IdleRecheck   time.Duration // the first wait before an idle shard that its reminders keep active is looked at again (it doubles up to 10 s), 1 s if zero
 }
 
 // shardDeps is what the shards' loops use, shared by every shard: the parts of
@@ -36,19 +40,24 @@ type LifecycleOptions struct {
 type shardDeps struct {
 	opts    LifecycleOptions
 	kinds   *Kinds
+	call    func(*http.Request) (*http.Response, error) // the node's calls to system shards (routing)
 	clock   Clock
 	log     *slog.Logger
 	stats   *Stats
 	tab     *table
 	cache   *cache
 	flush   *Flusher
-	msgs    *messenger
-	hints   hintStore
+	rem     *reminders
 	files   *shardfile.Files
 	writer  *segment.Writer
 	scratch string // capture's disposable working files
 	tempDir string // the node's temporary files (Config.TempDir)
 	spool   int    // Config.SpoolLimit
+
+	// deletedKinds holds the kinds that have had a shard deleted for holding
+	// nothing since this process started, so only the first of each is logged at
+	// info. Written once per kind (LoadOrStore), by whichever loop gets there first.
+	deletedKinds sync.Map
 
 	// base is the context everything the shards do runs on: it ends only once
 	// the Catalog has let go of them (or abandoned them).
@@ -63,17 +72,17 @@ type shardDeps struct {
 func (d *shardDeps) now() time.Time { return d.clock.Now() }
 
 // shard is the actor of one shard on this node (docs/concurrency.md, The tree):
-// the table runs its Serve, the lifecycle loop, which runs the shard's messages
-// owner while the shard is captured. The loop does one
+// the table runs its Serve, the lifecycle loop, which runs the shard's reminders
+// loop while the shard is captured. The loop does one
 // operation at a time: activation (its first job), a delta or rebase when its
 // delta timer says so, deactivation once its idle timer finds it unused for its
-// kind's timeout, and the releases and deletes that other goroutines ask for
-// (do). Everything it does runs on the shards' base context, not on the context
+// kind's timeout, and the deactivations, evictions and deletes that other
+// goroutines ask for (do). Everything it does runs on the shards' base context, not on the context
 // the table gives it, so stopping the shards doesn't cut off a release.
 //
 // References are not the loop's: requests take them in the shard's entry. The
 // shard's state is in plain parts, each with the methods that change it: its
-// capture, its idle timer's bookkeeping, its messages owner, its share of the
+// capture, its idle timer's bookkeeping, its reminders loop, its share of the
 // tail and the counters tests wait on.
 type shard struct {
 	d *shardDeps
@@ -84,7 +93,10 @@ type shard struct {
 	h              *shardfile.Handle
 	read           *shardfile.Handle // the manifest Acquire read before adding the entry, nil if it read none; activation starts from it
 
-	ctx   context.Context // the table's context for the loop, which the messages owner runs on (set as the loop starts)
+	sys *kind.Kind   // the shard's system kind, nil for an app kind's shard (whose settings are looked up as they are used, since a reload may change them)
+	app http.Handler // its system app, built for this activation
+
+	ctx   context.Context // the table's context for the loop, which the reminders loop runs on (set as the loop starts)
 	ops   chan func()     // requests for the lifecycle loop (do)
 	ready chan struct{}   // closed once the shard is activated
 	ended chan struct{}   // closed once the lifecycle loop has ended
@@ -92,14 +104,16 @@ type shard struct {
 
 	cap   captureState
 	idle  idleState
-	msgs  ownerSlot
+	loop  loopSlot
 	tail  tailState
 	looks shardLooks
 }
 
 func newShard(d *shardDeps, e *entry, kind, id string) *shard {
 	a := &shard{d: d, e: e, Name: e.name, Kind: kind, ID: id, ops: make(chan func()), ready: make(chan struct{}), ended: make(chan struct{})}
-	a.msgs.kept = newKept()
+	if a.sys = d.kinds.sys[kind]; a.sys != nil {
+		a.app = a.sys.Handler(&system.System{Name: a.Name, Tx: a.tx, Call: a.call, Sync: func(ctx context.Context) error { return a.gate(ctx, true) }})
+	}
 	return a
 }
 
@@ -185,7 +199,7 @@ func (c *captureState) hasNewFrames() bool {
 
 // idleState is the idle timer's bookkeeping: when a shard that was held off is
 // looked at again, whether the app held the file at the last deactivation, and
-// how long the shard's messages have kept it. Only the lifecycle loop changes
+// how long the shard's reminders have kept it. Only the lifecycle loop changes
 // it (tests read nextLook).
 type idleState struct {
 	nextLook  atomic.Int64  // when an idle shard that was held off is looked at again (Unix ns, 0 until it first is)
@@ -220,19 +234,17 @@ func (s *idleState) keptBy(live bool, now time.Time, recheck time.Duration) (hel
 	return true, 0
 }
 
-// ownerSlot is the shard's messages owner: the one running (the last one stays
-// once it is removed), the group it runs in and what the shard's messages keep
-// across owners. Only the lifecycle loop changes it. Others load the owner, or
-// use kept under its lock.
-type ownerSlot struct {
-	cur   atomic.Pointer[msgOwner]
+// loopSlot is the shard's reminders loop: the one running (the last one stays
+// once it is removed) and the group it runs in. Only the lifecycle loop changes
+// it. Others load the loop.
+type loopSlot struct {
+	cur   atomic.Pointer[reminderLoop]
 	run   *service.Group
 	on    bool
-	quiet bool  // stopped for the shards' shutdown: no owner starts any more
-	kept  *kept // handed to each owner
+	quiet bool // stopped for the shards' shutdown: no loop starts any more
 }
 
-func (s *ownerSlot) load() *msgOwner { return s.cur.Load() }
+func (s *loopSlot) load() *reminderLoop { return s.cur.Load() }
 
 // tailState is the shard's share of Stats.TailBytes (the loop's) and when the
 // watchdog last raised the tail alert for it (the watchdog's).
@@ -271,14 +283,14 @@ func (a *shard) Serve(ctx context.Context) {
 		d.tab.remove(a.e, err)
 		return
 	}
-	a.addOwner()
+	a.addLoop()
 	d.stats.Activations.Add(1)
 	close(a.ready)
 	a.e.activated(d.now())
 	defer func() {
-		// The deliveries end and are joined before the name is free again.
-		if err := a.removeOwner(); err != nil && ctx.Err() == nil {
-			d.log.Error("could not stop a shard's messages", "shard", a.Name, "err", err)
+		// A wake in progress ends before the name is free again.
+		if err := a.removeLoop(); err != nil && ctx.Err() == nil {
+			d.log.Error("could not stop a shard's reminders", "shard", a.Name, "err", err)
 		}
 		a.tail.count(d.stats, 0)
 		if a.gone {
@@ -295,7 +307,7 @@ func (a *shard) Serve(ctx context.Context) {
 
 	var idle <-chan time.Time
 	stopIdle := func() bool { return false }
-	if !d.opts.NoIdle {
+	if !d.opts.NoIdle && a.sys == nil { // a system shard's fixed id never goes idle
 		idle, stopIdle = d.clock.NewTimer(a.idleTimeout())
 	}
 	defer func() { stopIdle() }()
@@ -328,7 +340,7 @@ func (a *shard) idleTimeout() time.Duration {
 }
 
 // lookIdle is what the idle timer does: a shard nobody has used for its kind's
-// idle timeout is let go of, unless its messages keep it or it can't be. It
+// idle timeout is let go of, unless its reminders keep it or it can't be. It
 // returns when to look again.
 func (a *shard) lookIdle(ctx context.Context) time.Duration {
 	d := a.d
@@ -341,7 +353,7 @@ func (a *shard) lookIdle(ctx context.Context) time.Duration {
 		return left
 	}
 	if a.holds(ctx) {
-		return a.idle.holdOff(d.now(), a.idle.wait) // undelivered messages keep the shard active
+		return a.idle.holdOff(d.now(), a.idle.wait) // due reminders keep the shard active
 	}
 	ok, err := a.deactivate(ctx)
 	switch {
@@ -380,60 +392,62 @@ func (a *shard) snapshot(ctx context.Context) {
 		}
 		defer func() { <-d.rebases }()
 	}
-	if _, err := a.h.MaybeSnapshot(ctx, sh, d.opts.DeltaAge, policy, shardfile.Hooks{Wake: a.wakeAtDelta}); err != nil && ctx.Err() == nil {
+	hooks := shardfile.Hooks{BeforeUpdate: a.reminderAtDelta}
+	if _, err := a.h.MaybeSnapshot(ctx, sh, d.opts.DeltaAge, policy, hooks); err != nil && ctx.Err() == nil {
 		d.log.Warn("snapshot failed", "shard", a.Name, "err", err)
 	}
 }
 
-// addOwner starts a messages owner: once the shard is captured, and again when
+// addLoop starts the reminders loop: once the shard is captured, and again when
 // capture resumes after a release that didn't go through. Only the shard's loop
 // calls it, and it runs on the loop's context, so it ends with the loop's too.
-func (a *shard) addOwner() {
-	s := &a.msgs
+func (a *shard) addLoop() {
+	s := &a.loop
 	if s.on || s.quiet {
 		return
 	}
-	o := newMsgOwner(a.d.msgs, a, a.useDB, readGate{a.d.flush, &a.cap}, s.kept)
+	o := newReminderLoop(a.d.rem, a, a.useDB, readGate{a.d.flush, &a.cap})
 	s.cur.Store(o)
 	s.run = service.New(a.ctx, a.d.log)
 	s.run.Add(o)
 	s.on = true
 }
 
-// removeOwner removes the messages owner and waits for it and its deliveries
-// to end. Only the shard's loop calls it.
-func (a *shard) removeOwner() error {
-	s := &a.msgs
+// removeLoop removes the reminders loop and waits for it (and a wake in
+// progress) to end. Only the shard's lifecycle loop calls it.
+func (a *shard) removeLoop() error {
+	s := &a.loop
 	if !s.on {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), stopTimeout)
 	defer cancel()
 	if err := s.run.Stop(ctx); err != nil {
-		return fmt.Errorf("stopping the shard's messages: %w", err) // still on: no second owner starts beside it
+		return fmt.Errorf("stopping the shard's reminders: %w", err) // still on: no second loop starts beside it
 	}
 	s.on = false
 	return nil
 }
 
-// quiet stops the shard's messages owner for the shards' shutdown, through its
-// loop, and no owner starts again: its deliveries are joined when it returns.
+// quiet stops the shard's reminders loop for the shards' shutdown, through its
+// lifecycle loop, and no reminders loop starts again: a wake in progress has ended when it returns.
 func (a *shard) quiet(ctx context.Context) error {
 	err, lerr := do(ctx, a.ops, a.ended, func() error {
-		a.msgs.quiet = true
-		return a.removeOwner()
+		a.loop.quiet = true
+		return a.removeLoop()
 	})
 	if errors.Is(lerr, errLoopEnded) {
-		return nil // its owner was stopped as the loop ended
+		return nil // its reminders loop was stopped as the lifecycle loop ended
 	}
 	return errors.Join(lerr, err)
 }
 
-// release lets go of the shard through its loop, as an idle deactivation does
-// but whether or not it has been idle, and returns once its loop has ended and
-// its name is free. It reports false if the shard is in use or the app has it
-// open. A shard that was let go of meanwhile, or never activated, is released.
-func (a *shard) release(ctx context.Context) (bool, error) {
+// deactivateNow lets go of the shard through its loop, as an idle deactivation
+// does but whether or not it has been idle, and returns once its loop has ended
+// and its name is free. The node keeps owning it, cached. It reports false if
+// the shard is in use or the app has it open. A shard that was let go of
+// meanwhile, or never activated, counts as let go of.
+func (a *shard) deactivateNow(ctx context.Context) (bool, error) {
 	type result struct {
 		ok  bool
 		err error
@@ -464,8 +478,49 @@ func (a *shard) release(ctx context.Context) (bool, error) {
 	return r.ok, r.err
 }
 
+// evict lets go of the shard through its loop, as deactivateNow does, and
+// gives up its ownership too: once it is deactivated it is dropped as the cache
+// drops an evicted shard (its manifest released by compare-and-swap, then its
+// files), before its name is free, so the next node to need it claims it. It
+// returns once the loop has ended. A shard in use is not evicted (ErrBusy), nor
+// one the app has open (ErrAppHolds). done is false if the shard was let go of
+// meanwhile (or never activated): the caller looks again.
+func (a *shard) evict(ctx context.Context) (done bool, err error) {
+	err, lerr := do(ctx, a.ops, a.ended, func() error {
+		if a.gone {
+			return errLoopEnded
+		}
+		ok, err := a.deactivate(ctx)
+		switch {
+		case err != nil:
+			return err
+		case !ok && a.idle.held:
+			return fmt.Errorf("%w: %s", ErrAppHolds, a.Name)
+		case !ok:
+			return fmt.Errorf("%w: %s", ErrBusy, a.Name)
+		}
+		// Cached now, or deleted for holding nothing. If the drop fails the shard
+		// stays cached here.
+		row, ok, err := a.d.cache.idx.get(a.Name)
+		if err == nil && ok && row.State == stateCached {
+			err = a.d.cache.drop(ctx, row)
+		}
+		return err
+	})
+	if lerr != nil {
+		err = lerr
+	}
+	switch {
+	case errors.Is(err, errLoopEnded):
+		return false, nil
+	case err != nil:
+		return true, err
+	}
+	return true, a.waitEnded(ctx)
+}
+
 // waitEnded waits for the lifecycle loop of a shard that was let go of to end:
-// its deliveries are joined and its entry is removed by then.
+// its reminders loop has ended and its entry is removed by then.
 func (a *shard) waitEnded(ctx context.Context) error {
 	select {
 	case <-a.ended:

@@ -71,7 +71,7 @@ func (n *Node) Err() error {
 }
 
 // Start takes the node's lease with a new epoch and recovers from whatever the
-// previous process left (docs/internals.md, Restarting): it fences its own journal from
+// previous process left (docs/internals.md, Takeover: Restart): it fences its own journal from
 // the range recorded in the lease, writes a delta for every shard with a tail
 // there and records the adoption with the new range. A restart is treated as a
 // crash, so this is the one recovery path. If the previous life released its
@@ -104,12 +104,11 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 	switch prev := lease.Previous; {
 	case prev != nil && prev.Adopted < prev.Epoch:
 		var rep shardfile.AdoptReport
-		rep, lease, err = n.adoptOwn(ctx, lease)
+		rep, lease, start, err = n.adoptOwn(ctx, lease)
 		n.Adopted = rep
 		if err != nil {
 			return nil, err
 		}
-		start = rep.Fence + 1
 		if lease, err = reg.FinishAdoption(ctx, lease, prev.Epoch, rep.Fence); err != nil {
 			return nil, fmt.Errorf("record the adoption of the journal: %w", err)
 		}
@@ -143,15 +142,21 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 	return n, nil
 }
 
-// adoptOwn adopts the journal the node's previous life left (Start). It writes
-// a delta for every shard with a tail there, which can take longer than the
-// lease's TTL, so a keeper of its own renews the lease meanwhile: other nodes
-// would otherwise take the node for dead and adopt it themselves. The keeper
+// adoptOwn adopts the journal the node's previous life left (Start), as a peer
+// adopts a dead node's (docs/internals.md, Takeover: Restart). It writes a delta
+// for every shard with a tail there, which can take longer than the lease's
+// TTL, so a keeper of its own renews the lease meanwhile: other nodes would
+// otherwise take the node for dead and adopt it themselves. The keeper
 // publishes the lease as Acquire wrote it, with the previous life's journal
 // range, so a crash before the adoption finishes leaves that range for the next
-// life. The adoption stops if the lease is lost. It returns the lease as the
-// keeper last renewed it, for FinishAdoption.
-func (n *Node) adoptOwn(ctx context.Context, lease coord.NodeLease) (shardfile.AdoptReport, coord.NodeLease, error) {
+// life.
+//
+// Each delta is written after an entry due now for the shard is in the reminder
+// index, as a peer's adoption does. The node's own writer starts just after the
+// fence, once the adoption is done. The adoption stops if the lease is lost. It
+// returns the lease as the keeper last renewed it, for FinishAdoption, and where
+// the node's writer starts.
+func (n *Node) adoptOwn(ctx context.Context, lease coord.NodeLease) (shardfile.AdoptReport, coord.NodeLease, uint64, error) {
 	kopts := n.Config.Keeper
 	kopts.Info = nil // the lease's own
 	kopts.Logger = n.Logger
@@ -162,15 +167,12 @@ func (n *Node) adoptOwn(ctx context.Context, lease coord.NodeLease) (shardfile.A
 		k.Serve(actx)
 		return k.Check() // nil unless the lease was lost or ran out
 	})
-	rep, err := n.Files.AdoptJournal(actx, n.Name, lease.JournalFrom, lease.JournalNext, func(ctx context.Context, shard string) error {
-		_, err := hintStore{n.Store}.writeWake(ctx, shard, time.Now())
-		return err
-	}, n.Logger)
+	rep, err := n.Files.AdoptJournal(actx, n.Name, lease.JournalFrom, lease.JournalNext, n.Logger)
 	stop()
 	if kerr := g.Wait(); kerr != nil {
-		return rep, lease, fmt.Errorf("adopting the journal: %w", kerr)
+		return rep, lease, 0, fmt.Errorf("adopting the journal: %w", kerr)
 	}
-	return rep, k.Lease(), err
+	return rep, k.Lease(), rep.Fence + 1, err
 }
 
 // Tails is where the lease's shard count and journal range come from: whatever

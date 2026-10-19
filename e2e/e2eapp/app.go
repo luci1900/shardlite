@@ -10,11 +10,15 @@
 package e2eapp
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -25,6 +29,8 @@ import (
 
 	"google.golang.org/grpc"
 	_ "modernc.org/sqlite"
+
+	"github.com/luci1900/shardlite/internal/migrate"
 )
 
 // Options configure an App.
@@ -75,6 +81,7 @@ func (a *App) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok\n") })
 	mux.HandleFunc("POST /login", a.login)
+	mux.HandleFunc("POST /create", a.shard(a.create))
 	mux.HandleFunc("POST /add", a.shard(a.add))
 	mux.HandleFunc("GET /count", a.shard(a.count))
 	mux.HandleFunc("GET /tokens", a.shard(a.tokens))
@@ -82,9 +89,9 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /ws", a.shard(a.ws))
 	mux.HandleFunc("POST /transfer", a.shard(a.transfer))
 	mux.HandleFunc("POST /notify", a.shard(a.notify))
-	mux.HandleFunc("POST /inbox", a.shard(a.inbox))
+	mux.HandleFunc("POST /receive", a.shard(a.receive))
 	mux.HandleFunc("POST /remind", a.shard(a.remind))
-	mux.HandleFunc("POST /fired", a.shard(a.fired))
+	mux.HandleFunc("POST /_shardlite/reminders", a.shard(a.reminders))
 	mux.HandleFunc("POST /credit", a.shard(a.credit))
 	mux.HandleFunc("GET /me", a.shard(a.me))
 	mux.HandleFunc("GET /debug", a.serveDebug)
@@ -133,13 +140,17 @@ func (a *App) shard(h func(w http.ResponseWriter, r *http.Request, s *shardReq))
 	}
 }
 
-// Schema. Migrations happen on the first write, not on open: a request that
-// only reads a shard that was never written leaves nothing behind.
-const (
-	schemaVersion = 1
-	applicationID = 0x5348_4c45 // "SHLE"
-	migrateSQL    = `CREATE TABLE IF NOT EXISTS rows (id INTEGER PRIMARY KEY AUTOINCREMENT, token TEXT NOT NULL, payload BLOB)`
-)
+// Schema. Migrations happen in create and on the first write, not on open: a
+// request that only reads a shard that was never written leaves nothing behind.
+//
+//go:embed migrations/*.sql
+var embedded embed.FS
+
+var migrations, _ = fs.Sub(embedded, "migrations") // a fixed, valid name never fails
+
+// seenAge is how long the receiver of a durable send remembers it: the node's
+// MaxAge for reminders, after which the sender has stopped trying.
+const seenAge = 24 * 60 * 60
 
 // insert adds a row, migrating first if the shard is new, and returns its id and the row count.
 func (s *shardReq) insert(ctx context.Context, token string) (id, count int64, err error) {
@@ -153,22 +164,8 @@ func (s *shardReq) insertWith(ctx context.Context, token string, more func(tx *s
 		return 0, 0, err
 	}
 	defer tx.Rollback()
-	var version int
-	if err := tx.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
+	if err := s.migrate(ctx, tx); err != nil {
 		return 0, 0, err
-	}
-	if version == 0 {
-		if _, err := tx.ExecContext(ctx, migrateSQL); err != nil {
-			return 0, 0, err
-		}
-		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`PRAGMA application_id = %d`, applicationID)); err != nil {
-			return 0, 0, err
-		}
-		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion)); err != nil {
-			return 0, 0, err
-		}
-	} else if version > schemaVersion {
-		return 0, 0, fmt.Errorf("shard %s is at schema version %d, newer than this app reads (%d)", s.name, version, schemaVersion)
 	}
 	res, err := tx.ExecContext(ctx, `INSERT INTO rows (token, payload) VALUES (?, zeroblob(64))`, token)
 	if err != nil {
@@ -184,6 +181,36 @@ func (s *shardReq) insertWith(ctx context.Context, token string, more func(tx *s
 		}
 	}
 	return id, count, tx.Commit()
+}
+
+// migrate brings the shard's schema up to date in tx, and refuses a shard newer
+// than this app reads.
+func (s *shardReq) migrate(ctx context.Context, tx *sql.Tx) error {
+	if err := migrate.Migrate(ctx, tx, migrations, migrate.Latest); err != nil {
+		return fmt.Errorf("shard %s: %w", s.name, err)
+	}
+	return nil
+}
+
+// create sets up a new shard: it migrates, so the shard holds something and is
+// kept. Clients can only reach shards that exist, so the app creates one by
+// calling create before sending a client to it (docs/guide.md, Creating shards).
+func (a *App) create(w http.ResponseWriter, r *http.Request, s *shardReq) {
+	tx, err := s.db.sql.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+	if err := s.migrate(r.Context(), tx); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // tokensOf lists the tokens in a shard (none if it was never written).
@@ -260,8 +287,8 @@ func (a *App) events(w http.ResponseWriter, r *http.Request, s *shardReq) {
 	}
 }
 
-// login is shardless: it works out which shard the user's data lives in and
-// answers with a URL that names it (docs/guide.md, Routing requests to shards).
+// login is shardless: it works out which shard the user's data lives in, creates
+// it and answers with a URL that names it (docs/guide.md, Routing requests to shards).
 func (a *App) login(w http.ResponseWriter, r *http.Request) {
 	b, _ := io.ReadAll(io.LimitReader(r.Body, 1<<10))
 	name := strings.TrimSpace(string(b))
@@ -270,6 +297,20 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	shard := "users/" + name
+	// The client can only reach a shard that exists, so create it first.
+	q, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, "http://"+a.opts.Control+"/create", nil)
+	q.Header.Set("Shardlite-Target", shard)
+	q.Header.Set("Shardlite-Caller", "app")
+	resp, err := a.http.Do(q)
+	if err != nil {
+		http.Error(w, "creating the user's shard: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		http.Error(w, "creating the user's shard: "+resp.Status, http.StatusBadGateway)
+		return
+	}
 	writeJSON(w, map[string]string{"shard": shard, "url": "/me?shardlite-target=" + url.QueryEscape(shard)})
 }
 
@@ -318,19 +359,23 @@ func (a *App) credit(w http.ResponseWriter, r *http.Request, s *shardReq) {
 	io.WriteString(w, "ok\n")
 }
 
-// notify records a row and a message to another shard in one transaction:
-// ?to=wallet/b&token=t. The node delivers the message once the transaction is
-// durable, as a POST to /inbox on the target. The hops the app was called with
-// go into the row.
+// notify is a durable send (docs/guide.md, Durable send). It records a row, the
+// call to another shard and a reminder due now under one key, in one
+// transaction: ?to=wallet/b&token=t. The node wakes this shard's reminders
+// handler once the transaction is durable, and the handler makes the call to
+// /receive on the target.
 func (a *App) notify(w http.ResponseWriter, r *http.Request, s *shardReq) {
 	to, token := r.URL.Query().Get("to"), r.URL.Query().Get("token")
 	if to == "" || token == "" {
 		http.Error(w, "to and token are required", http.StatusBadRequest)
 		return
 	}
-	hops, _ := strconv.Atoi(r.Header.Get("Shardlite-Hops"))
+	key := "send:" + token
 	_, _, err := s.insertWith(r.Context(), "sent:"+token, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(r.Context(), `INSERT INTO _shardlite_outbox (target, path, content_type, body, hops) VALUES (?, '/inbox', 'text/plain', ?, ?)`, to, token, hops)
+		if _, err := tx.ExecContext(r.Context(), `INSERT INTO sends (key, target, path, body) VALUES (?, ?, '/receive', ?)`, key, to, token); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(r.Context(), `INSERT INTO _shardlite_reminders (key, due) VALUES (?, unixepoch())`, key)
 		return err
 	})
 	if err != nil {
@@ -340,29 +385,42 @@ func (a *App) notify(w http.ResponseWriter, r *http.Request, s *shardReq) {
 	io.WriteString(w, "ok\n")
 }
 
-// inbox is internal: it records a message from another shard once per token
-// (a message can arrive twice), and consumes its inbox row in the same transaction.
-func (a *App) inbox(w http.ResponseWriter, r *http.Request, s *shardReq) {
-	id, err := strconv.ParseInt(r.Header.Get("Shardlite-Inbox-Id"), 10, 64)
-	if r.Header.Get("Shardlite-Caller") == "" || err != nil {
+var errSeen = errors.New("seen before")
+
+// receive is internal: it records a send from another shard once per sender and
+// key (the sender can call twice), in the same transaction as the work.
+func (a *App) receive(w http.ResponseWriter, r *http.Request, s *shardReq) {
+	caller, key := r.Header.Get("Shardlite-Caller"), r.Header.Get("Idempotency-Key")
+	if caller == "" {
 		http.Error(w, "internal", http.StatusForbidden)
 		return
 	}
+	if key == "" {
+		http.Error(w, "an Idempotency-Key is required", http.StatusBadRequest)
+		return
+	}
 	b, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-	_, _, err = s.insertWith(r.Context(), "msg:"+string(b), func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(r.Context(), `DELETE FROM _shardlite_inbox WHERE id = ?`, id)
+	_, _, err := s.insertWith(r.Context(), "msg:"+string(b), func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(r.Context(), `INSERT INTO seen (caller, key, at) VALUES (?, ?, unixepoch()) ON CONFLICT DO NOTHING`, caller, key)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return errSeen // roll back: the work was done by the first call
+		}
+		_, err = tx.ExecContext(r.Context(), `DELETE FROM seen WHERE at < unixepoch() - ?`, seenAge)
 		return err
 	})
-	if err != nil {
+	if err != nil && !errors.Is(err, errSeen) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	io.WriteString(w, "ok\n")
 }
 
-// remind records a row and an inbox row for the shard itself in one
-// transaction: ?key=k&in=2 (seconds). The node calls /fired on the same shard
-// once the transaction is durable and the time has come.
+// remind records a row and a reminder for the shard itself in one transaction:
+// ?key=k&in=2 (seconds). The node wakes the reminders handler once the
+// transaction is durable and the time has come.
 func (a *App) remind(w http.ResponseWriter, r *http.Request, s *shardReq) {
 	key, in := r.URL.Query().Get("key"), r.URL.Query().Get("in")
 	secs, err := strconv.Atoi(in)
@@ -371,7 +429,7 @@ func (a *App) remind(w http.ResponseWriter, r *http.Request, s *shardReq) {
 		return
 	}
 	_, _, err = s.insertWith(r.Context(), "set:"+key, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(r.Context(), `INSERT INTO _shardlite_inbox (key, path, body, due) VALUES (?, '/fired', ?, unixepoch() + ?) ON CONFLICT (key) DO UPDATE SET due = excluded.due`, key, key, secs)
+		_, err := tx.ExecContext(r.Context(), `INSERT INTO _shardlite_reminders (key, due) VALUES (?, unixepoch() + ?) ON CONFLICT (key) DO UPDATE SET due = excluded.due`, "timer:"+key, secs)
 		return err
 	})
 	if err != nil {
@@ -381,24 +439,104 @@ func (a *App) remind(w http.ResponseWriter, r *http.Request, s *shardReq) {
 	io.WriteString(w, "ok\n")
 }
 
-// fired is internal: an inbox row of the shard's own came due. It does its work
-// and consumes the row in one transaction, as a handler should.
-func (a *App) fired(w http.ResponseWriter, r *http.Request, s *shardReq) {
-	id, err := strconv.ParseInt(r.Header.Get("Shardlite-Inbox-Id"), 10, 64)
-	if r.Header.Get("Shardlite-Caller") != s.name || err != nil {
+// reminders is the node's wake for the shard's reminders. It handles each due
+// reminder in a transaction of its own: a timer does its work and deletes its
+// reminder together, a send is called with its key as Idempotency-Key and both
+// rows are deleted once the call answered 2xx. It answers 503 if a send failed,
+// so the node wakes it again with backoff.
+func (a *App) reminders(w http.ResponseWriter, r *http.Request, s *shardReq) {
+	if r.Header.Get("Shardlite-Caller") != s.name {
 		http.Error(w, "internal", http.StatusForbidden)
 		return
 	}
-	name, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-	_, _, err = s.insertWith(r.Context(), "fired:"+string(name), func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(r.Context(), `DELETE FROM _shardlite_inbox WHERE id = ?`, id)
-		return err
-	})
+	keys, err := s.dueReminders(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	failed := false
+	for _, key := range keys {
+		if name, ok := strings.CutPrefix(key, "timer:"); ok {
+			_, _, err = s.insertWith(r.Context(), "fired:"+name, func(tx *sql.Tx) error {
+				_, err := tx.ExecContext(r.Context(), `DELETE FROM _shardlite_reminders WHERE key = ?`, key)
+				return err
+			})
+		} else {
+			var sent bool
+			if sent, err = a.send(r.Context(), s, key); err == nil && !sent {
+				failed = true
+			}
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	if failed {
+		http.Error(w, "a send failed", http.StatusServiceUnavailable)
+		return
+	}
 	io.WriteString(w, "ok\n")
+}
+
+// send makes the call recorded under key and, if it answered 2xx, deletes the
+// row and its reminder in one transaction. It reports whether the call
+// succeeded. A reminder with no row is deleted.
+func (a *App) send(ctx context.Context, s *shardReq, key string) (sent bool, err error) {
+	var target, path string
+	var body []byte
+	err = s.db.sql.QueryRowContext(ctx, `SELECT target, path, body FROM sends WHERE key = ?`, key).Scan(&target, &path, &body)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	if err == nil {
+		q, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+a.opts.Control+path, bytes.NewReader(body))
+		if err != nil {
+			return false, err
+		}
+		q.Header.Set("Shardlite-Target", target)
+		q.Header.Set("Shardlite-Caller", s.name)
+		q.Header.Set("Idempotency-Key", key)
+		resp, err := a.http.Do(q)
+		if err != nil {
+			return false, nil // try again at the next wake
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode/100 != 2 {
+			return false, nil
+		}
+	}
+	tx, err := s.db.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sends WHERE key = ?`, key); err != nil {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM _shardlite_reminders WHERE key = ?`, key); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+// dueReminders lists the keys of the reminders that are due.
+func (s *shardReq) dueReminders(ctx context.Context) ([]string, error) {
+	rs, err := s.db.sql.QueryContext(ctx, `SELECT key FROM _shardlite_reminders WHERE due <= unixepoch() ORDER BY due, key`)
+	if err != nil {
+		return nil, err
+	}
+	defer rs.Close()
+	var keys []string
+	for rs.Next() {
+		var k string
+		if err := rs.Scan(&k); err != nil {
+			return nil, err
+		}
+		keys = append(keys, k)
+	}
+	return keys, rs.Err()
 }
 
 // pool keeps each shard's database open between requests and closes it when it

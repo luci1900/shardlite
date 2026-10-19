@@ -86,7 +86,7 @@ func TestHookOutcomes(t *testing.T) {
 	rc, _ = h.GetRange(ctx, "after", 0, 1)
 	rc.Close()
 	h.Head(ctx, "after")
-	for range h.List(ctx, "af") {
+	for range h.List(ctx, "af", "") {
 	}
 	h.Delete(ctx, "after", "")
 	if len(seen) != 5 || seen[OpList] != "af" || seen[OpDelete] != "after" {
@@ -99,7 +99,7 @@ func TestHookOutcomes(t *testing.T) {
 		}
 		return nil
 	})
-	for _, err := range h.List(ctx, "") {
+	for _, err := range h.List(ctx, "", "") {
 		if !errors.Is(err, ErrUnknown) {
 			t.Fatalf("list: %v, want ErrUnknown", err)
 		}
@@ -139,24 +139,24 @@ func TestWithPrefix(t *testing.T) {
 	m := NewMemory()
 	b := WithPrefix(m, "staging/")
 	ctx := context.Background()
-	if _, err := b.Create(ctx, "state/nodes/n1", strings.NewReader("x"), WriteID{}); err != nil {
+	if _, err := b.Create(ctx, "state/leases/n1", strings.NewReader("x"), WriteID{}); err != nil {
 		t.Fatal(err)
 	}
 	// It is stored under the prefix, and invisible without it.
-	if _, err := m.Head(ctx, "staging/state/nodes/n1"); err != nil {
+	if _, err := m.Head(ctx, "staging/state/leases/n1"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.Head(ctx, "state/nodes/n1"); !errors.Is(err, ErrNotFound) {
+	if _, err := m.Head(ctx, "state/leases/n1"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("head without the prefix: %v", err)
 	}
 	var keys []string
-	for info, err := range b.List(ctx, "state/nodes/") {
+	for info, err := range b.List(ctx, "state/leases/", "") {
 		if err != nil {
 			t.Fatal(err)
 		}
 		keys = append(keys, info.Key)
 	}
-	if len(keys) != 1 || keys[0] != "state/nodes/n1" {
+	if len(keys) != 1 || keys[0] != "state/leases/n1" {
 		t.Fatalf("listing: %v", keys)
 	}
 }
@@ -234,7 +234,7 @@ func TestMemoryClockAndMissingKeys(t *testing.T) {
 	if !info.LastModified.Equal(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)) || later.LastModified.Sub(info.LastModified) != time.Hour {
 		t.Fatalf("modified %v and %v", info.LastModified, later.LastModified)
 	}
-	for li, err := range m.List(ctx, "k") {
+	for li, err := range m.List(ctx, "k", "") {
 		if err != nil || !li.LastModified.Equal(info.LastModified) || li.ETag != e {
 			t.Fatalf("list: %+v %v", li, err)
 		}

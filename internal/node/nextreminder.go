@@ -1,0 +1,87 @@
+package node
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+
+	"github.com/luci1900/shardlite/internal/capture"
+	"github.com/luci1900/shardlite/internal/remindex"
+)
+
+// A shard's next_reminder: when it next needs waking, read from its own tables at
+// its manifest writes and recorded in the manifest, with its entry in the
+// reminder index (docs/internals.md, Manifest and Reminder index).
+
+// nextReminder is when the shard next needs waking, as of one snapshot of its
+// tables: now if it has the delete marker, otherwise the due time of its earliest
+// reminder that isn't stale (never before now, since a reminder due now keeps the
+// shard active), and 0 if there is none. Unix seconds.
+//
+// at is the captured position the snapshot is exactly, or 0 if it can't tell
+// (capture.Shard.UseAt). A snapshot that holds commits that aren't captured yet
+// would make the time late for files that end before them, if one of them
+// removed work.
+func (a *shard) nextReminder(ctx context.Context) (w int64, at uint64, err error) {
+	now := a.d.now().Unix()
+	sh := a.cap.load()
+	if sh == nil {
+		return 0, 0, capture.ErrClosed
+	}
+	at, err = sh.UseAt(ctx, func(db *sql.DB) error {
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		w, err = nextReminderOf(ctx, tx, a.d.rem.since(a.d.now()), now, true)
+		return err
+	})
+	if err != nil {
+		return 0, 0, fmt.Errorf("reading the next reminder: %w", err)
+	}
+	return w, at, nil
+}
+
+// nextReminderOf is nextReminder's snapshot. marker says whether the delete marker
+// counts: not at a deactivation, which deletes a marked shard.
+func nextReminderOf(ctx context.Context, tx *sql.Tx, since, now int64, marker bool) (int64, error) {
+	if marker {
+		var marked bool
+		if err := tx.QueryRowContext(ctx, capture.MarkedQuery).Scan(&marked); err != nil || marked {
+			return now, err
+		}
+	}
+	due, ok, err := earliest(ctx, tx, since)
+	if !ok {
+		return 0, err
+	}
+	return max(due, now), err
+}
+
+// recordedFor is the next_reminder to record for files that reach end (Unix
+// minutes, 0 for none), given what nextReminder read (w, in seconds, at the
+// position at): exact if its snapshot was at end, and now otherwise, since the
+// shard's state at end is then unknown and now is never late. It rounds down to
+// the minute, which the index is in.
+func (a *shard) recordedFor(w int64, at, end uint64) int64 {
+	switch {
+	case a.sys != nil:
+		return 0 // the claimer brings a system shard back, never an entry
+	case at != end:
+		return remindex.MinuteOf(a.d.now().Unix())
+	}
+	return remindex.MinuteOf(w)
+}
+
+// reminderAtDelta is what a background delta or rebase does before its manifest
+// update: it reads the next reminder once the tail is taken, and records it if the
+// read was exactly the state the files reach (and now otherwise). A failure fails
+// the delta, which the delta timer tries again.
+func (a *shard) reminderAtDelta(ctx context.Context, end uint64) (int64, error) {
+	w, at, err := a.nextReminder(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return a.recordedFor(w, at, end), nil
+}

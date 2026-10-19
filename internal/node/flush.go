@@ -168,19 +168,40 @@ func (f *Flusher) Serve(ctx context.Context) error {
 // (each blocking cgo call holds one). GOMAXPROCS follows container CPU limits.
 func syncLimit() int { return runtime.GOMAXPROCS(0) }
 
+// syncTarget is one capture a cycle syncs: an active shard's, or the node
+// database's.
+type syncTarget struct {
+	name    string
+	cap     *captureState
+	closing func() bool // it is being let go of meanwhile, so a failure is no news
+	kick    func()      // after a capture: its new rows can be read, and are durable
+}
+
 type pendingSync struct {
-	a   *shard
+	t   syncTarget
 	h   capture.Header
 	ok  bool
 	err error // the sync's result
 }
 
+// targets are what a cycle syncs: the active shards (shards being let go of are
+// left to their final sync).
+func (f *Flusher) targets() []syncTarget {
+	var out []syncTarget
+	f.tab.shards(func(a *shard) {
+		out = append(out, syncTarget{name: a.Name, cap: &a.cap,
+			closing: func() bool { return !a.e.is(entryActive) },
+			kick: func() {
+				if o := a.loop.load(); o != nil {
+					o.kick()
+				}
+			}})
+	}, entryActive)
+	return out
+}
+
 func (f *Flusher) cycle(ctx context.Context) {
 	f.started.Add(1)
-
-	// Shards being let go of are left to their final sync.
-	var durable []*shard
-	f.tab.shards(func(a *shard) { durable = append(durable, a) }, entryActive)
 
 	// 1. Sync what changed, and 2. when every sync has queued what it captured
 	// (however many files that is), write them all as one segment. The writer is
@@ -189,16 +210,16 @@ func (f *Flusher) cycle(ctx context.Context) {
 	var ops []*pendingSync
 	var sg errgroup.Group
 	sg.SetLimit(syncLimit())
-	for _, a := range durable {
-		sh := a.cap.load()
+	for _, t := range f.targets() {
+		sh := t.cap.load()
 		if sh == nil {
 			continue
 		}
-		h, ok, changed := a.cap.changed()
+		h, ok, changed := t.cap.changed()
 		if !changed {
 			continue
 		}
-		p := &pendingSync{a: a, h: h, ok: ok}
+		p := &pendingSync{t: t, h: h, ok: ok}
 		ops = append(ops, p)
 		sg.Go(func() error {
 			p.err = sh.Capture(ctx) // each shard's own result: one failing must not cancel the rest
@@ -226,19 +247,16 @@ func (f *Flusher) cycle(ctx context.Context) {
 		if err == nil {
 			err = flushErr // queued, but never written
 		}
-		closing := !p.a.e.is(entryActive)
 		if err != nil {
-			p.a.cap.synced(err)
-			if ctx.Err() == nil && !closing {
-				f.log.Error("capturing a shard failed", "shard", p.a.Name, "err", err)
+			p.t.cap.synced(err)
+			if ctx.Err() == nil && !p.t.closing() {
+				f.log.Error("capturing a shard failed", "shard", p.t.name, "err", err)
 			}
 			continue
 		}
-		p.a.cap.synced(nil)
-		p.a.cap.captured(p.h, p.ok)
-		if o := p.a.msgs.load(); o != nil {
-			o.kick() // its new rows can be read, and are durable
-		}
+		p.t.cap.synced(nil)
+		p.t.cap.captured(p.h, p.ok)
+		p.t.kick()
 	}
 	f.done.Inc()
 }
@@ -306,19 +324,27 @@ func (m *Catalog) Barrier(ctx context.Context) error { return m.flush.Wait(ctx, 
 //
 // Call it once the chunk has been read from the app. sync is the kind's
 // setting or a Shardlite-Sync override.
-func (m *Catalog) Gate(ctx context.Context, r *Ref, sync bool) error {
-	if err := m.n.Keeper.Check(); err != nil {
+func (m *Catalog) Gate(ctx context.Context, r *Ref, sync bool) error { return r.a.gate(ctx, sync) }
+
+// gate is Gate for the shard's own output, and System.Sync with sync on.
+func (a *shard) gate(ctx context.Context, sync bool) error { return a.d.flush.gate(ctx, &a.cap, sync) }
+
+// gate holds what depends on c's commits until they are durable, as Gate does
+// for a shard: the lease must be good, and with sync on a cycle that began after
+// the call must have completed, unless c has nothing new.
+func (f *Flusher) gate(ctx context.Context, c *captureState, sync bool) error {
+	if err := f.keeper.Check(); err != nil {
 		return err
 	}
 	if !sync {
 		return nil
 	}
-	mark := m.flush.Mark()
-	if !r.a.cap.hasNewFrames() {
+	mark := f.Mark()
+	if !c.hasNewFrames() {
 		return nil
 	}
-	if err := m.flush.Wait(ctx, mark); err != nil {
+	if err := f.Wait(ctx, mark); err != nil {
 		return err
 	}
-	return r.a.cap.err()
+	return c.err()
 }

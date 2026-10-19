@@ -221,6 +221,17 @@ func (s *stack) request(method, path, target, body string) (int, string, error) 
 	return doRequest(http.DefaultClient, method, "http://"+s.pub+path, target, body)
 }
 
+// create creates shards as the app does, with a call to its create route:
+// clients can only reach shards that exist.
+func (s *stack) create(t testing.TB, shards ...string) {
+	t.Helper()
+	for _, shard := range shards {
+		if st, body, err := s.control("POST", "/create", shard, ""); err != nil || st != 204 {
+			t.Fatalf("creating %s: %d %q %v", shard, st, body, err)
+		}
+	}
+}
+
 func (s *stack) control(method, path, target, body string) (int, string, error) {
 	return doRequest(http.DefaultClient, method, "http://"+s.ctl+path, target, body)
 }
@@ -298,7 +309,8 @@ func (v *verifier) tokens(shard string) (toks map[string]bool, ok bool, err erro
 	return toks, true, rs.Err()
 }
 
-// shards lists every shard that has a manifest.
+// shards lists every app shard that has a manifest. System shards (their
+// kinds start with _) hold the node's own tables, not the app's.
 func (v *verifier) shards() []string {
 	v.t.Helper()
 	var out []string
@@ -307,6 +319,9 @@ func (v *verifier) shards() []string {
 			v.t.Fatal(err)
 		}
 		shard := strings.TrimPrefix(info.Key, shardfile.ManifestPrefix)
+		if strings.HasPrefix(shard, "_") {
+			continue
+		}
 		if _, _, err := v.files.GetManifest(context.Background(), shard); errors.Is(err, blob.ErrNotFound) {
 			continue
 		}

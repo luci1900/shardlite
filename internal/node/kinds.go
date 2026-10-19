@@ -14,19 +14,13 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/luci1900/shardlite/internal/kind"
 )
 
 // DefaultIdleTimeout is how long a shard stays active without requests when
 // neither the kinds file nor the environment says otherwise.
 const DefaultIdleTimeout = 10 * time.Minute
-
-// Kind is a category of shards with shared settings (docs/guide.md, Shard kinds).
-type Kind struct {
-	Name        string
-	Sync        bool          // durability gates hold responses until the writes before them are in blob storage ("sync": "on", the default)
-	IdleTimeout time.Duration // how long an unused shard stays active
-	Public      bool          // clients may name it; otherwise only calls from the app reach it
-}
 
 var (
 	// ErrUnknownKind: the kind isn't declared in the kinds file.
@@ -38,7 +32,10 @@ var (
 	ErrBadTarget = errors.New("bad shard name")
 )
 
-var kindName = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,31}$`)
+var (
+	kindName   = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,31}$`)   // a kind of the kinds file
+	targetKind = regexp.MustCompile(`^_?[a-z][a-z0-9_-]{0,31}$`) // and a system kind's, which starts with _
+)
 
 const maxIDLen = 128
 
@@ -53,7 +50,7 @@ func ParseTarget(target string) (kind, id string, err error) {
 	if !ok {
 		return "", "", fmt.Errorf("%w: %q is not kind/id", ErrBadTarget, target)
 	}
-	if !kindName.MatchString(kind) {
+	if !targetKind.MatchString(kind) {
 		return "", "", fmt.Errorf("%w: %q has no valid kind", ErrBadTarget, target)
 	}
 	if !idName.MatchString(id) {
@@ -72,9 +69,9 @@ type kindsJSON struct {
 	Kinds map[string]kindJSON `json:"kinds"`
 }
 
-// ParseKinds parses a kinds file. defaultIdle is used for kinds without an
-// idle_timeout of their own: a kind's own setting wins.
-func ParseKinds(data []byte, defaultIdle time.Duration) (map[string]Kind, error) {
+// ParseKinds parses a kinds file (docs/guide.md, Kinds file). defaultIdle is
+// used for kinds without an idle_timeout of their own: a kind's own setting wins.
+func ParseKinds(data []byte, defaultIdle time.Duration) (map[string]kind.Kind, error) {
 	var f kindsJSON
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
@@ -84,7 +81,7 @@ func ParseKinds(data []byte, defaultIdle time.Duration) (map[string]Kind, error)
 	if f.Kinds == nil {
 		return nil, errors.New(`kinds file: no "kinds" object`)
 	}
-	out := make(map[string]Kind, len(f.Kinds))
+	out := make(map[string]kind.Kind, len(f.Kinds))
 	for name, k := range f.Kinds {
 		if !kindName.MatchString(name) {
 			return nil, fmt.Errorf("kinds file: %q is not a valid kind name (lowercase letters, digits, - and _, starting with a letter)", name)
@@ -97,27 +94,28 @@ func ParseKinds(data []byte, defaultIdle time.Duration) (map[string]Kind, error)
 			}
 			idle = d
 		}
-		var sync bool
+		var sync kind.Sync
 		switch k.Sync {
 		case "", "on":
-			sync = true
 		case "off":
+			sync = kind.SyncOff
 		default:
 			return nil, fmt.Errorf(`kinds file: %s: sync is "on" or "off", not %q`, name, k.Sync)
 		}
-		out[name] = Kind{Name: name, Sync: sync, IdleTimeout: idle, Public: k.Public}
+		out[name] = kind.Kind{Name: name, Sync: sync, IdleTimeout: idle, Public: k.Public}
 	}
 	return out, nil
 }
 
-// Kinds is the node's view of the kinds file. A reload that fails keeps the
-// kinds that were loaded and marks the node not ready (Valid is false) until a
-// reload succeeds.
+// Kinds is the node's view of the kinds file, and of the system kinds. A
+// reload that fails keeps the kinds that were loaded and marks the node not
+// ready (Valid is false) until a reload succeeds.
 type Kinds struct {
 	path        string
 	defaultIdle time.Duration
-	cur         atomic.Pointer[map[string]Kind]
+	cur         atomic.Pointer[map[string]kind.Kind]
 	valid       atomic.Bool
+	sys         systemKinds // set as the catalog is built (setSystem), before anything reads it
 }
 
 // LoadKinds reads the kinds file. The first load must succeed.
@@ -136,7 +134,7 @@ func LoadKinds(path string, defaultIdle time.Duration) (*Kinds, error) {
 // result.
 func (k *Kinds) Reload() error {
 	data, err := os.ReadFile(k.path)
-	var m map[string]Kind
+	var m map[string]kind.Kind
 	if err == nil {
 		m, err = ParseKinds(data, k.defaultIdle)
 	}
@@ -153,14 +151,29 @@ func (k *Kinds) Reload() error {
 // while it is true.
 func (k *Kinds) Valid() bool { return k.valid.Load() }
 
-// Lookup returns the settings of a kind: ErrUnknownKind if it isn't declared.
-func (k *Kinds) Lookup(name string) (Kind, error) {
-	m := *k.cur.Load()
-	kind, ok := m[name]
-	if !ok {
-		return Kind{}, fmt.Errorf("%w: %q", ErrUnknownKind, name)
+// setSystem adds the system kinds, which a reload never changes, with the
+// node's idle timeout for those that leave theirs at zero.
+func (k *Kinds) setSystem(sys systemKinds) {
+	for _, s := range sys {
+		if s.IdleTimeout == 0 {
+			s.IdleTimeout = k.defaultIdle
+		}
 	}
-	return kind, nil
+	k.sys = sys
+}
+
+// Lookup returns a kind as it was declared, in the kinds file or by its system
+// kind's package: ErrUnknownKind if it is neither.
+func (k *Kinds) Lookup(name string) (kind.Kind, error) {
+	if s := k.sys[name]; s != nil {
+		return *s, nil
+	}
+	m := *k.cur.Load()
+	c, ok := m[name]
+	if !ok {
+		return kind.Kind{}, fmt.Errorf("%w: %q", ErrUnknownKind, name)
+	}
+	return c, nil
 }
 
 // CheckPublic is for a target a client named: a kind that isn't public gets
@@ -171,7 +184,7 @@ func (k *Kinds) CheckPublic(target string) error {
 	if err != nil {
 		return err
 	}
-	if c, ok := (*k.cur.Load())[kind]; ok && !c.Public {
+	if c, err := k.Lookup(kind); err == nil && !c.Public {
 		return fmt.Errorf("%w: %q", ErrNotPublic, kind)
 	}
 	return nil

@@ -30,6 +30,8 @@
 // Variants (constants below) switch a rule to a rejected alternative, to show its counterexample. Each has an
 // instance at the end of the file.
 //
+// Restarts. A restarting node adopts its own journal and starts its writer when the adoption finishes.
+//
 // The lifecycle of one node's shard (activation steps, the durability gate itself, the app holding the file
 // open) is shard.qnt. Here a node is active, cached or idle, and the gate is a guard on `respond`. Also left
 // out: the interior of the database, deletion, messages (messages.qnt), forwarding, rebasing, renewals and
@@ -97,6 +99,7 @@ module cluster {
 
   type Segment = {
     inc: int,           // the incarnation that wrote it, -1 for a fence
+    has: bool,          // it holds the shard (a fence doesn't)
     content: List[int]  // the shard's commits as of the flush
   }
 
@@ -185,7 +188,7 @@ module cluster {
   // The latest segment in a node's journal, below `upto`, that `p` accepts. List() if none.
   def latestWhere(st: State, x: int, upto: int, p: int => bool): List[int] = {
     val segs = segsOf(st, x)
-    val j = segs.indices().filter(k => k < upto and p(segs[k].inc)).fold(-1, (acc, k) => if (k > acc) k else acc)
+    val j = segs.indices().filter(k => k < upto and segs[k].has and p(segs[k].inc)).fold(-1, (acc, k) => if (k > acc) k else acc)
     if (j < 0) List() else segs[j].content
   }
 
@@ -230,6 +233,7 @@ module cluster {
                           mseen: noManifest, hasUnk: false, unk: noManifest }
 
   def setManifest(st: State, m: Manifest): State = { ...st, manifest: m }
+  pure def max(a: int, b: int): int = if (a > b) a else b
   def room(st: State, x: int): bool = segsOf(st, x).length() < MAX_SEGS
 
   action init = {
@@ -327,7 +331,7 @@ module cluster {
       ns.next != s.journals.get(n).length() or room(s, n),
       if (ns.next == s.journals.get(n).length())
         s' = { ...withNode(s, n, { ...ns, next: ns.next + 1, pend: ns.local.length() }),
-               journals: s.journals.put(n, s.journals.get(n).append({ inc: inc, content: ns.local })) }
+               journals: s.journals.put(n, s.journals.get(n).append({ inc: inc, has: true, content: ns.local })) }
       else
         s' = { ...withNode(s, n, down), rejected: true }
     }
@@ -494,8 +498,8 @@ module cluster {
     all {
       ad.phase == 1,
       room(s, ad.target),
-      s' = withAdoption({ ...s, journals: s.journals.put(ad.target, j.append({ inc: -1, content: List() })),
-                          liveFenced: s.liveFenced or live }, m, { ...ad, phase: 2, fence: j.length() })
+      s' = withAdoption({ ...s, journals: s.journals.put(ad.target, j.append({ inc: -1, has: false, content: List() })),
+                         liveFenced: s.liveFenced or live }, m, { ...ad, phase: 2, fence: j.length() })
     }
   }
 

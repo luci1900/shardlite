@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"fmt"
 	"os"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -37,7 +38,7 @@ type Env struct {
 	Peer        string        // SHARDLITE_LISTEN_PEER: the listener for traffic from other nodes, :2281
 	Control     string        // SHARDLITE_LISTEN_CONTROL: the control API on localhost TCP, 127.0.0.1:2282
 	Socket      string        // SHARDLITE_LISTEN_CONTROL_SOCKET: the control API on a Unix socket, if set
-	MaxHops     int           // SHARDLITE_MAX_HOPS: calls and messages chained past this many hops are refused with 508 (given up on for messages), 32
+	MaxHops     int           // SHARDLITE_MAX_HOPS: calls chained past this many hops are refused with 508, 32
 	Pprof       string        // SHARDLITE_LISTEN_PPROF: address for Go's pprof handlers, for diagnosis (off if unset)
 }
 
@@ -48,6 +49,10 @@ const defaultScratch = "/dev/shm/shardlite/"
 var goos = runtime.GOOS // for tests
 
 // ParseEnv reads the configuration from getenv (os.Getenv in the binary).
+
+// nodeName is what a node's name may be. Host names fit.
+var nodeName = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
+
 func ParseEnv(getenv func(string) string) (Env, error) {
 	e := Env{
 		Name: getenv("SHARDLITE_NODE"), Advertise: getenv("SHARDLITE_ADVERTISE_PEER"), Blob: getenv("SHARDLITE_BLOB"), S3Endpoint: getenv("SHARDLITE_S3_ENDPOINT"),
@@ -63,6 +68,10 @@ func ParseEnv(getenv func(string) string) (Env, error) {
 			return e, fmt.Errorf("SHARDLITE_NODE is not set and the host name is unknown: %w", err)
 		}
 		e.Name = h
+	}
+	// The name goes into object keys as it is (docs/guide.md, the reference).
+	if !nodeName.MatchString(e.Name) {
+		return e, fmt.Errorf("SHARDLITE_NODE is %q: a node's name is 1 to 128 ASCII letters, digits, '.', '-' and '_'", e.Name)
 	}
 	e.HealthPath = cmp.Or(e.HealthPath, "/health")
 	e.Public = cmp.Or(e.Public, ":2280")

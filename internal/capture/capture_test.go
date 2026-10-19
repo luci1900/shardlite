@@ -19,6 +19,7 @@ import (
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/capture"
+	"github.com/luci1900/shardlite/internal/harness"
 	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/service"
 	"github.com/luci1900/shardlite/internal/shardfile"
@@ -72,7 +73,7 @@ func (e *env) replay(t *testing.T, shard, path string) shardfile.State {
 	}
 	entries, seqs := e.entriesFor(t, shard)
 	for i, en := range entries {
-		b, err := segment.ReadEntry(context.Background(), e.store, "n1", seqs[i], en)
+		b, err := harness.ReadEntry(context.Background(), e.store, "n1", seqs[i], en)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -436,7 +437,7 @@ func TestCommitsInOneWindowKeepOnlyTheLatestPages(t *testing.T) {
 	// but never one per commit.
 	var totalPages, totalBytes, dbPages int
 	for i := len(before); i < len(entries); i++ {
-		b, err := segment.ReadEntry(ctx, e.store, "n1", seqs[i], entries[i])
+		b, err := harness.ReadEntry(ctx, e.store, "n1", seqs[i], entries[i])
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -522,5 +523,46 @@ func TestUseAtReportsTheExactPosition(t *testing.T) {
 	})
 	if err != nil || at != 0 {
 		t.Fatalf("with a commit during fn: at %d, err %v", at, err)
+	}
+}
+
+// Release's read sees the final state: it reports the final position, or 0
+// when something was committed after the read (which the close then captured).
+func TestReleaseReadsTheFinalState(t *testing.T) {
+	t.Parallel()
+	for _, commitDuring := range []bool{false, true} {
+		e := newEnv(t)
+		path := filepath.Join(e.dir, "users-1.db")
+		if err := os.WriteFile(path, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		sh := newShard(t, e, path)
+		ctx := context.Background()
+		if err := sh.Capture(ctx); err != nil {
+			t.Fatal(err)
+		}
+		app, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(wal)")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := app.Exec(`CREATE TABLE t (x)`); err != nil {
+			t.Fatal(err)
+		}
+		released, f, err := sh.Release(ctx, func(db *sql.DB) error {
+			if commitDuring {
+				if _, err := app.Exec(`INSERT INTO t VALUES (1)`); err != nil {
+					return err
+				}
+			}
+			var n int
+			return db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_schema WHERE name = 't'`).Scan(&n)
+		})
+		app.Close()
+		if err != nil || !released {
+			t.Fatalf("commit during the read %v: released %v, err %v", commitDuring, released, err)
+		}
+		if want := sh.Position(); (commitDuring && f.At != 0) || (!commitDuring && (f.At == 0 || f.At != want)) {
+			t.Fatalf("commit during the read %v: at %d, final position %d", commitDuring, f.At, want)
+		}
 	}
 }

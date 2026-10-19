@@ -18,7 +18,7 @@ import (
 // app's process.
 //
 // Measured on Linux with 300 shards: 6.0 descriptors and 7.05 mappings each
-// (5.0 and 6.4 before stage 1o: the reserved messages table is created, read
+// (5.0 and 6.4 before stage 1o: the reserved reminders table is created, read
 // and written through a second connection in Litestream's pool, which stays
 // open). Earlier benchmarks (stages 0b and 1f) saw 6 to 7 descriptors and 6.3
 // to 6.8 mappings per shard at up to 10,000 shards.

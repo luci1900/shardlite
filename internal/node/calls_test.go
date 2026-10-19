@@ -161,56 +161,12 @@ func TestGateOnStreamingCallBody(t *testing.T) {
 	}
 }
 
-// What a calling shard sends over an upgraded connection is gated on the caller
-// for as long as the connection lasts.
-func TestGateOnUpgradedCall(t *testing.T) {
+// A call from a shard can't be upgraded, whatever its kind's sync setting: what
+// it sent would need gating for as long as the connection lasts. A call from the
+// app with no shard behind it can.
+func TestUpgradedCallFromAShardIsRefused(t *testing.T) {
 	t.Parallel()
-	r := newSRigWith(t, manualFlush)
-	seen := make(chan seenChunk, 16)
-	r.app_(func(w http.ResponseWriter, q *http.Request) {
-		if q.Header.Get("Shardlite-Caller") != "wallet/up1" {
-			return
-		}
-		conn, rw, err := w.(http.Hijacker).Hijack()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
-		rw.Flush()
-		sc := bufio.NewScanner(rw)
-		for sc.Scan() {
-			seen <- seenChunk{sc.Text(), r.rows("wallet/up1")}
-		}
-	})
-	r.commitTo("wallet/up1")
-	conn, err := net.Dial("tcp", strings.TrimPrefix(r.ctl, "http://"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	fmt.Fprintf(conn, "GET /ws HTTP/1.1\r\nHost: x\r\nShardlite-Target: slow/up\r\nShardlite-Caller: wallet/up1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
-	br := bufio.NewReader(conn)
-	type resp struct {
-		r   *http.Response
-		err error
-	}
-	got := make(chan resp, 1)
-	go func() { rs, err := http.ReadResponse(br, nil); got <- resp{rs, err} }()
-	if rs := cyclesUntil(r, got); rs.err != nil || rs.r.StatusCode != 101 {
-		t.Fatalf("%v %v", rs.r, rs.err)
-	}
-	commits := 1
-	for _, m := range []string{"m1", "m2", "m3"} {
-		r.commitTo("wallet/up1")
-		commits++
-		fmt.Fprintf(conn, "%s\n", m)
-		c := cyclesUntil(r, seen)
-		if c.data != m || c.rows != commits {
-			t.Fatalf("%q reached the callee with %d of the caller's %d rows in blob storage (saw %q)", m, c.rows, commits, c.data)
-		}
-	}
-	// A caller that is not gated (its kind has sync off) is not held by the upgrade.
+	r := newSRig(t)
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		conn, rw, err := w.(http.Hijacker).Hijack()
 		if err != nil {
@@ -219,32 +175,26 @@ func TestGateOnUpgradedCall(t *testing.T) {
 		defer conn.Close()
 		rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
 		rw.Flush()
-		line, _ := bufio.NewReader(rw).ReadString('\n')
-		seen <- seenChunk{strings.TrimSpace(line), 0}
 	})
-	r.commitTo("users/up2")
-	r.withoutCycle(func() {
-		conn2, err := net.Dial("tcp", strings.TrimPrefix(r.ctl, "http://"))
+	for _, tc := range []struct {
+		caller string
+		want   int
+	}{{"wallet/up1", http.StatusBadRequest}, {"users/up2", http.StatusBadRequest}, {"app", http.StatusSwitchingProtocols}, {"", http.StatusSwitchingProtocols}} {
+		conn, err := net.Dial("tcp", strings.TrimPrefix(r.ctl, "http://"))
 		if err != nil {
-			t.Error(err)
-			return
+			t.Fatal(err)
 		}
-		defer conn2.Close()
-		fmt.Fprintf(conn2, "GET /ws HTTP/1.1\r\nHost: x\r\nShardlite-Target: slow/up\r\nShardlite-Caller: users/up2\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
-		if rs, err := http.ReadResponse(bufio.NewReader(conn2), nil); err != nil || rs.StatusCode != 101 {
-			t.Errorf("%v %v", rs, err)
-			return
+		caller := ""
+		if tc.caller != "" {
+			caller = "Shardlite-Caller: " + tc.caller + "\r\n"
 		}
-		fmt.Fprintf(conn2, "hello\n")
-		select {
-		case c := <-seen:
-			if c.data != "hello" {
-				t.Errorf("saw %q", c.data)
-			}
-		case <-time.After(20 * time.Second):
-			t.Error("the callee never saw the message")
+		fmt.Fprintf(conn, "GET /ws HTTP/1.1\r\nHost: x\r\nShardlite-Target: slow/up\r\n%sUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n", caller)
+		rs, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		conn.Close()
+		if err != nil || rs.StatusCode != tc.want {
+			t.Fatalf("caller %q: %v %v, want %d", tc.caller, rs, err, tc.want)
 		}
-	})
+	}
 }
 
 // A caller whose kind has sync off, a call that says Shardlite-Sync: off, a
@@ -352,13 +302,15 @@ func TestCallerStaysActiveForTheCall(t *testing.T) {
 	advanceUntil(t, clk, 100*time.Millisecond, "the caller to deactivate once the call ended", r.inactive("wallet/ia1"))
 }
 
-// --- hops and deadlines ---
+// --- hops ---
 
-// A client's own Shardlite-Hops and Shardlite-Deadline never reach the app, and
-// neither header gets out in a response.
-func TestHopsAndDeadlineAreTheNodes(t *testing.T) {
+// A client's own Shardlite-Hops never reaches the app, and a Shardlite-Deadline
+// (which the node no longer reads) is stripped like any other Shardlite-* header,
+// from a client and from a call. Neither header gets out in a response.
+func TestHopsAreTheNodes(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
+	r.create("slow/dd1")
 	var last atomic.Pointer[http.Request]
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		last.Store(q.Clone(context.Background()))
@@ -390,13 +342,9 @@ func TestHopsAndDeadlineAreTheNodes(t *testing.T) {
 	if resp, _ := r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "slow/dd1", "Shardlite-Hops": "x"}, ""); resp.StatusCode != 400 {
 		t.Fatalf("bad hops: %d", resp.StatusCode)
 	}
-	if resp, _ := r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "slow/dd1", "Shardlite-Deadline": "soon"}, ""); resp.StatusCode != 400 {
-		t.Fatalf("bad deadline: %d", resp.StatusCode)
-	}
-	// A call's deadline reaches the app, smaller than it was.
-	r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "slow/dd1", "Shardlite-Deadline": "5000"}, "")
-	if ms, err := strconv.Atoi(last.Load().Header.Get("Shardlite-Deadline")); err != nil || ms <= 0 || ms > 5000 {
-		t.Fatalf("deadline %q", last.Load().Header.Get("Shardlite-Deadline"))
+	// A Shardlite-Deadline on a call is stripped, not read: a value that isn't a number is no error.
+	if resp, _ := r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "slow/dd1", "Shardlite-Deadline": "soon"}, ""); resp.StatusCode != 200 || last.Load().Header.Get("Shardlite-Deadline") != "" {
+		t.Fatalf("a call with a deadline: %d %q", resp.StatusCode, last.Load().Header.Get("Shardlite-Deadline"))
 	}
 }
 
@@ -404,6 +352,7 @@ func TestHopsAndDeadlineAreTheNodes(t *testing.T) {
 func TestCallLoopStopsAtTheHopLimit(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
+	r.create("slow/la")
 	var logs bytes.Buffer
 	var lmu sync.Mutex
 	r.srv.log = slog.New(slog.NewTextHandler(writerFunc(func(p []byte) (int, error) { lmu.Lock(); defer lmu.Unlock(); return logs.Write(p) }), nil))
@@ -511,58 +460,14 @@ func (r *srig) slowJournal(d time.Duration) {
 	})
 }
 
-// A call with a short deadline to a shard whose gate is held fails with 504, and
-// the app saw the time left. The flush never completes
-// (the journal upload is held), so only the deadline can end the call, and the
-// test doesn't depend on how fast the machine is: the shard is active before the
-// call, so the deadline can't run out during activation.
-func TestDeadlineStopsAHeldGate(t *testing.T) {
+// A gRPC client's grpc-timeout reaches the app as the client sent it: the client
+// enforces its own deadline.
+func TestGRPCTimeoutPassesThrough(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
-	ref, err := r.m.Acquire(context.Background(), "wallet/dl1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ref.Release()
-	r.holdJournal()
-	var got atomic.Value
+	r.create("slow/gt1")
+	var gt atomic.Value
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
-		got.Store(q.Header.Get("Shardlite-Deadline"))
-		r.commit(q.Header.Get("Shardlite-Path")) // the response now waits for a flush
-		io.WriteString(w, "ok")
-	})
-	resp, _ := r.req("POST", r.ctl, "/x", map[string]string{"Shardlite-Target": "wallet/dl1", "Shardlite-Deadline": "500"}, "")
-	if resp.StatusCode != 504 {
-		t.Fatalf("status %d, want 504", resp.StatusCode)
-	}
-	seen, _ := got.Load().(string)
-	// The time left, rounded up to a millisecond: never more than was sent (how much
-	// less depends on how long the node took, which the test doesn't control).
-	ms, err := strconv.Atoi(seen)
-	if err != nil || ms <= 0 || ms > 500 {
-		t.Fatalf("the app saw Shardlite-Deadline %q, want at most the 500 sent", seen)
-	}
-	// gRPC callers get DEADLINE_EXCEEDED.
-	resp, _ = r.req("POST", r.ctl, "/svc/M", map[string]string{"Shardlite-Target": "wallet/dl1", "Shardlite-Deadline": "300", "Content-Type": "application/grpc"}, "")
-	if resp.Header.Get("Grpc-Status") != "4" {
-		t.Fatalf("gRPC: %v", resp.Header)
-	}
-	// A deadline that has passed is refused before anything runs.
-	before := r.m.Stats.Activations.Load()
-	resp, _ = r.req("POST", r.ctl, "/x", map[string]string{"Shardlite-Target": "wallet/dl2", "Shardlite-Deadline": "0"}, "")
-	if resp.StatusCode != 504 || r.m.Stats.Activations.Load() != before {
-		t.Fatalf("expired deadline: %d, activations %d", resp.StatusCode, r.m.Stats.Activations.Load()-before)
-	}
-}
-
-// grpc-timeout on a gRPC client request becomes Shardlite-Deadline for the app
-// (and the app's grpc-timeout is the time left).
-func TestGRPCTimeoutBecomesTheDeadline(t *testing.T) {
-	t.Parallel()
-	r := newSRig(t)
-	var dl, gt atomic.Value
-	r.app_(func(w http.ResponseWriter, q *http.Request) {
-		dl.Store(q.Header.Get("Shardlite-Deadline"))
 		gt.Store(q.Header.Get("Grpc-Timeout"))
 		io.Copy(io.Discard, q.Body)
 		w.Header().Set("Content-Type", "application/grpc")
@@ -577,29 +482,7 @@ func TestGRPCTimeoutBecomesTheDeadline(t *testing.T) {
 	}
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
-	ms, err := strconv.Atoi(dl.Load().(string))
-	if err != nil || ms < 3000 || ms > 5000 {
-		t.Fatalf("Shardlite-Deadline %q for grpc-timeout 5S", dl.Load())
-	}
-	if g := gt.Load().(string); !strings.HasSuffix(g, "m") {
-		t.Fatalf("the app's grpc-timeout is %q, want the time left in milliseconds", g)
-	}
-	// Plain HTTP clients have no deadline.
-	r.req("GET", r.pub, "/x", map[string]string{"Shardlite-Target": "slow/gt1", "Grpc-Timeout": "5S"}, "")
-	if dl.Load().(string) != "" {
-		t.Fatalf("a non-gRPC request got a deadline: %q", dl.Load())
-	}
-	// A bad one is refused.
-	q, _ = http.NewRequest("POST", r.pub+"/svc/Method", strings.NewReader("x"))
-	q.Header.Set("Content-Type", "application/grpc")
-	q.Header.Set("Grpc-Timeout", "soon")
-	q.Header.Set("Shardlite-Target", "slow/gt1")
-	resp, err = r.h2c.Do(q)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.Header.Get("Grpc-Status") != "3" {
-		t.Fatalf("bad grpc-timeout: %v", resp.Header)
+	if gt.Load().(string) != "5S" {
+		t.Fatalf("the app saw grpc-timeout %q", gt.Load())
 	}
 }

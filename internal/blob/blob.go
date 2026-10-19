@@ -100,8 +100,9 @@ type Backend interface {
 	// the startup check showed it works. Whether deleting a missing key is
 	// ErrNotFound depends on the store: S3 answers success, so callers accept both.
 	Delete(ctx context.Context, key string, expected ETag) error
-	// List returns objects whose key starts with prefix, in key order. It may lag.
-	// A listing carries no metadata on S3, so the objects it returns have a
-	// zero WriteID (the memory backend does the same). Nothing relies on listed write ids.
-	List(ctx context.Context, prefix string) iter.Seq2[ObjectInfo, error]
+	// List returns objects whose key starts with prefix and comes after after
+	// (from the start if after is empty), in key order. It may lag. A listing
+	// carries no metadata on S3, so the objects it returns have a zero WriteID
+	// (the memory backend does the same). Nothing relies on listed write ids.
+	List(ctx context.Context, prefix, after string) iter.Seq2[ObjectInfo, error]
 }

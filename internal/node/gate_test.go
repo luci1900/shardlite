@@ -70,6 +70,7 @@ func (r *srig) withCycles(do func()) {
 func TestGateOnResponses(t *testing.T) {
 	t.Parallel()
 	r := newSRigWith(t, manualFlush)
+	r.create("wallet/g1", "users/g2", "users/g3")
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		r.commit(q.Header.Get("Shardlite-Path"))
 		if v := q.URL.Query().Get("sync"); v != "" {
@@ -124,6 +125,7 @@ func TestGateOnResponses(t *testing.T) {
 func TestGateOnStreams(t *testing.T) {
 	t.Parallel()
 	r := newSRigWith(t, slowFlush)
+	r.create("wallet/sse")
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		for i := 1; i <= 3; i++ {
@@ -156,6 +158,7 @@ func TestGateOnStreams(t *testing.T) {
 func TestGateOnUpgradedConnections(t *testing.T) {
 	t.Parallel()
 	r := newSRigWith(t, slowFlush)
+	r.create("wallet/ws")
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		path := q.Header.Get("Shardlite-Path")
 		conn, rw, err := w.(http.Hijacker).Hijack()
@@ -199,6 +202,7 @@ func TestGateOnUpgradedConnections(t *testing.T) {
 func TestGateOnCalls(t *testing.T) {
 	t.Parallel()
 	r := newSRigWith(t, manualFlush)
+	r.create("wallet/call", "users/call", "wallet/call2")
 	var seen atomic.Int64 // rows of the caller in blob storage when the callee got the call
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		switch q.URL.Path {
@@ -249,6 +253,7 @@ func TestGateOnCalls(t *testing.T) {
 func TestSyncEndpointAndLeaseLoss(t *testing.T) {
 	t.Parallel()
 	r := newSRigWith(t, slowFlush)
+	r.create("users/s1", "wallet/s2")
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		r.commit(q.Header.Get("Shardlite-Path"))
 	})
@@ -293,14 +298,14 @@ func TestCreationOverHTTP(t *testing.T) {
 		r.app.Must(t, "close", path) // as the app contract asks, so the shard can deactivate
 		io.WriteString(w, "ok")
 	})
-	// The shard exists from activation: a read finds it created.
-	if resp, _ := r.req("GET", r.pub, "/read", map[string]string{"Shardlite-Target": "users/read"}, ""); resp.StatusCode != 200 {
+	// A call creates the shard at activation: a read finds it created.
+	if resp, _ := r.req("GET", r.ctl, "/read", map[string]string{"Shardlite-Target": "users/read"}, ""); resp.StatusCode != 200 {
 		t.Fatal(resp.StatusCode)
 	}
 	if _, err := r.manifest("users/read"); err != nil {
 		t.Fatalf("no manifest for an active shard: %v", err)
 	}
-	if resp, _ := r.req("POST", r.pub, "/write", map[string]string{"Shardlite-Target": "users/write"}, ""); resp.StatusCode != 200 {
+	if resp, _ := r.req("POST", r.ctl, "/write", map[string]string{"Shardlite-Target": "users/write"}, ""); resp.StatusCode != 200 {
 		t.Fatal(resp.StatusCode)
 	}
 	// Once idle, the shard that was only read is deleted and the written one is kept.
@@ -319,6 +324,7 @@ func TestCreationOverHTTP(t *testing.T) {
 func TestGatesCheckTheLease(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
+	r.create("wallet/l1", "slow/l2", "slow/l3")
 	next := make(chan struct{})
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		io.WriteString(w, "data: 1\n\n")

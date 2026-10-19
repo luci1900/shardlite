@@ -153,7 +153,7 @@ func (s *shardSim) deactivate() {
 	if err := s.app.Exit(); err != nil {
 		s.rt.Fatal(err)
 	}
-	released, _, err := s.sh.Release(s.ctx)
+	released, _, err := s.sh.Release(s.ctx, nil)
 	if err != nil || !released {
 		s.rt.Fatalf("release: released=%v err=%v", released, err)
 	}

@@ -49,8 +49,7 @@ type srig struct {
 	omu    sync.Mutex
 	opened map[string]bool
 
-	hook      atomic.Pointer[intakeHook]  // wraps the intake, kept across restarts
-	inboxHook atomic.Pointer[inboxHookFn] // wraps the delivery of an inbox row
+	wakeHook atomic.Pointer[wakeHookFn] // wraps the wake of the app, kept across restarts
 }
 
 func newSRig(t *testing.T) *srig { return newSRigWith(t, nil) }
@@ -74,7 +73,7 @@ func newSRigWith(t *testing.T, mutate func(*CatalogOptions)) *srig {
 	r.fake.Config.Protocols = protos
 	r.fake.Start()
 	t.Cleanup(r.fake.Close)
-	r.newTransport = r.serverTransport
+	r.newRouting = r.serverRouting
 	r.startNode()
 	r.startShards(mutate)
 	r.startServer()
@@ -87,28 +86,18 @@ func newSRigWith(t *testing.T, mutate func(*CatalogOptions)) *srig {
 	return r
 }
 
-// serverTransport makes the server the shards are built with, and returns its
-// transport behind the hooks.
-func (r *srig) serverTransport(m *Catalog) *transport {
+// serverRouting makes the server the shards are built with, and returns its
+// routing, with its wake of the app behind the hook.
+func (r *srig) serverRouting(m *Catalog) routing {
 	u, _ := url.Parse(r.fake.URL)
 	r.srv = NewServer(m, m.opts.Kinds, m.n.Keeper, ServerOptions{App: u, HealthEvery: 20 * time.Millisecond, Grace: 500 * time.Millisecond})
-	tr := r.srv.transport()
-	intake, inbox := tr.intake, tr.inbox
-	tr.intake = func(ctx context.Context, sender *shard, target string, row *outRow) (int, error) {
-		h := r.hook.Load()
-		if h == nil {
-			return intake(ctx, sender, target, row)
+	wake := r.srv.wakeApp
+	return routing{call: r.srv.call, dispatch: r.srv.dispatch, wake: func(ctx context.Context, a *shard) (int, error) {
+		if h := r.wakeHook.Load(); h != nil && a.sys == nil { // a system shard's wake isn't the app's
+			return (*h)(ctx, func() (int, error) { return wake(ctx, a) })
 		}
-		i := int(h.n.Add(1))
-		return h.fn(i, sender, target, row, func() (int, error) { return intake(ctx, sender, target, row) })
-	}
-	tr.inbox = func(ctx context.Context, a *shard, row *inRow) (int, error) {
-		if h := r.inboxHook.Load(); h != nil {
-			return (*h)(ctx, func() (int, error) { return inbox(ctx, a, row) })
-		}
-		return inbox(ctx, a, row)
-	}
-	return tr
+		return wake(ctx, a)
+	}}
 }
 
 // startServer serves the server the shards were built with.
@@ -187,6 +176,7 @@ func (r *srig) req(method, base, path string, hdr map[string]string, body string
 func TestServerRouting(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
+	r.create("slow/h", "slow/r1", "slow/q")
 	var last atomic.Pointer[http.Request]
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		last.Store(q.Clone(context.Background()))
@@ -254,19 +244,23 @@ func TestServerRouting(t *testing.T) {
 	}
 
 	// Kinds.
-	if resp, _ := r.req("GET", r.pub, "/x", map[string]string{"Shardlite-Target": "typo/1"}, ""); resp.StatusCode != 400 {
+	if resp, _ := r.req("GET", r.pub, "/x", map[string]string{"Shardlite-Target": "typo/1"}, ""); resp.StatusCode != 404 {
 		t.Fatalf("undeclared kind: %d", resp.StatusCode)
 	}
 	if resp, _ := r.req("GET", r.pub, "/x", map[string]string{"Shardlite-Target": "users"}, ""); resp.StatusCode != 400 {
 		t.Fatalf("no id: %d", resp.StatusCode)
 	}
+	// The control API has no delete: a shard is deleted with its delete marker.
+	if resp, _ := r.req("DELETE", r.ctl, "/_shardlite/shards/users/x", nil, ""); resp.StatusCode != 404 {
+		t.Fatalf("delete on the control API: %d", resp.StatusCode)
+	}
 	// With gRPC the errors the node makes are gRPC statuses.
 	resp, _ = r.req("POST", r.pub, "/svc/Method", map[string]string{"Shardlite-Target": "typo/1", "Content-Type": "application/grpc"}, "")
-	if resp.StatusCode != 200 || resp.Header.Get("Grpc-Status") != "3" || resp.Header.Get("Grpc-Message") == "" {
+	if resp.StatusCode != 200 || resp.Header.Get("Grpc-Status") != "5" || resp.Header.Get("Grpc-Message") == "" {
 		t.Fatalf("grpc error: %d %v", resp.StatusCode, resp.Header)
 	}
 	resp, _ = r.req("POST", r.ctl, "/svc/Method", map[string]string{"Shardlite-Target": "typo/1", "Content-Type": "application/grpc+proto"}, "")
-	if resp.Header.Get("Grpc-Status") != "3" {
+	if resp.Header.Get("Grpc-Status") != "5" {
 		t.Fatalf("grpc error on the control API: %v", resp.Header)
 	}
 }
@@ -277,6 +271,7 @@ func TestServerRouting(t *testing.T) {
 func TestServerKeepsForwardedHeadersFromTheLoadBalancer(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
+	r.create("slow/x1")
 	var last atomic.Pointer[http.Request]
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		last.Store(q.Clone(context.Background()))
@@ -310,6 +305,7 @@ func TestServerKeepsForwardedHeadersFromTheLoadBalancer(t *testing.T) {
 func TestServerLeavesCompressionToTheClient(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
+	r.create("slow/z1")
 	var asked atomic.Value // the request's Accept-Encoding
 	var zipped bytes.Buffer
 	zw := gzip.NewWriter(&zipped)
@@ -343,6 +339,7 @@ func TestServerLeavesCompressionToTheClient(t *testing.T) {
 func TestServerStripsUnderscoreHeaders(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
+	r.create("slow/u1")
 	var last atomic.Pointer[http.Request]
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		last.Store(q.Clone(context.Background()))
@@ -442,38 +439,11 @@ func TestServerControlAPI(t *testing.T) {
 	resp2.Body.Close()
 }
 
-func TestServerDeleteEndpoint(t *testing.T) {
-	t.Parallel()
-	r := newSRig(t)
-	r.app_(func(w http.ResponseWriter, q *http.Request) {
-		r.commit(q.Header.Get("Shardlite-Path"))
-		w.Header().Set("Shardlite-Sync", "on")
-	})
-	r.req("POST", r.pub, "/w", map[string]string{"Shardlite-Target": "slow/del"}, "")
-	// The app still has the file open (its connection is kept).
-	if resp, _ := r.req("DELETE", r.ctl, "/_shardlite/shards/slow/del", nil, ""); resp.StatusCode != 409 {
-		t.Fatalf("delete of a shard the app has open: %d", resp.StatusCode)
-	}
-	r.omu.Lock()
-	for p := range r.opened {
-		r.app.Must(t, "close", p)
-	}
-	r.omu.Unlock()
-	if resp, _ := r.req("DELETE", r.ctl, "/_shardlite/shards/slow/del", nil, ""); resp.StatusCode != 204 {
-		t.Fatalf("delete: %d", resp.StatusCode)
-	}
-	if _, err := r.manifest("slow/del"); !errors.Is(err, blob.ErrNotFound) {
-		t.Fatalf("manifest: %v", err)
-	}
-	if resp, _ := r.req("DELETE", r.ctl, "/_shardlite/shards/typo/x", nil, ""); resp.StatusCode != 400 {
-		t.Fatalf("delete of an undeclared kind: %d", resp.StatusCode)
-	}
-}
-
 // Server-sent events leave the node chunk by chunk.
 func TestServerStreamsWithoutBuffering(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
+	r.create("slow/sse")
 	// The app holds back the second event until the test has the first. A proxy
 	// that buffers never delivers it, and the safety timer lets go.
 	gate := make(chan struct{})
@@ -525,6 +495,7 @@ func TestServerStreamsWithoutBuffering(t *testing.T) {
 func TestServerUpgrade(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
+	r.create("slow/ws")
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		if q.Header.Get("Upgrade") != "websocket" || q.Header.Get("Shardlite-Target") != "slow/ws" {
 			http.Error(w, "bad", 400)
@@ -575,6 +546,7 @@ func TestServerUpgrade(t *testing.T) {
 func TestServerDropsInformationalResponses(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
+	r.create("slow/e1")
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		w.Header().Set("Link", "</style.css>; rel=preload")
 		w.Header().Set("Shardlite-Secret", "x")
@@ -615,6 +587,7 @@ func TestServerDropsInformationalResponses(t *testing.T) {
 func TestServerShutdownEndsAndJoinsRequests(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
+	r.create("slow/ws")
 	var started, ended apptest.Log[string]
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		started.Add(q.URL.Path)
@@ -678,6 +651,7 @@ func TestServerShutdownEndsAndJoinsRequests(t *testing.T) {
 		}()
 		return ch
 	}
+	r.create("slow/finish")
 	slow := call(r.ctl, "/slow", "slow/call") // through the control server
 	finish := call(r.pub, "/finish", "slow/finish")
 	started.WaitFor(t, 10*time.Second, "the requests to reach the app", func(p []string) bool {
@@ -715,6 +689,7 @@ func TestServerShutdownEndsAndJoinsRequests(t *testing.T) {
 func TestServerGRPC(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
+	r.create("slow/rpc")
 	var proto atomic.Int32
 	// The app holds back its second frame until the test has the first. A node
 	// that buffers the response never delivers it, and the safety timer lets go.
@@ -782,7 +757,7 @@ func TestServerGRPC(t *testing.T) {
 	}
 	io.Copy(io.Discard, resp2.Body)
 	resp2.Body.Close()
-	if resp2.StatusCode != 200 || resp2.Header.Get("Grpc-Status") != "3" {
+	if resp2.StatusCode != 200 || resp2.Header.Get("Grpc-Status") != "5" {
 		t.Fatalf("%d %v %v", resp2.StatusCode, resp2.Header, resp2.Trailer)
 	}
 }
@@ -790,6 +765,7 @@ func TestServerGRPC(t *testing.T) {
 func TestServerAppDown(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
+	r.create("slow/d1")
 	r.fake.Close()
 	if resp, _ := r.req("GET", r.pub, "/x", map[string]string{"Shardlite-Target": "slow/d1"}, ""); resp.StatusCode != 502 {
 		t.Fatalf("app down: %d", resp.StatusCode)
@@ -857,6 +833,7 @@ func TestServerReadiness(t *testing.T) {
 func TestOnlyPublicKindsForClients(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
+	r.create("users/1")
 	if err := writeFile(r.kindsPath, `{"kinds": {"users": {"public": true, "sync": "off"}, "secret": {"sync": "off"}}}`); err != nil {
 		t.Fatal(err)
 	}

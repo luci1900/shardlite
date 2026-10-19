@@ -240,25 +240,9 @@ func classify(ctx context.Context, err error, k kind, wasSent bool) error {
 	return fmt.Errorf("blob: s3: %w", err)
 }
 
-// bodySize is the length of body, which a request sends from its start without
-// holding it in memory (the SDK rewinds it to hash and to send). The body is
-// left at its start.
-func bodySize(body io.ReadSeeker) (int64, error) {
-	n, err := body.Seek(0, io.SeekEnd)
-	if err != nil {
-		return 0, err
-	}
-	_, err = body.Seek(0, io.SeekStart)
-	return n, err
-}
-
 func (s *S3) put(ctx context.Context, k kind, key string, body io.ReadSeeker, id WriteID, in *s3.PutObjectInput) (ETag, error) {
-	n, err := bodySize(body)
-	if err != nil {
-		return "", fmt.Errorf("%w: sizing the body: %w", ErrNotApplied, err)
-	}
+	// The SDK seeks the body for its length, and rewinds it to hash and to send.
 	in.Bucket, in.Key, in.Body = aws.String(s.bucket), aws.String(key), body
-	in.ContentLength = aws.Int64(n)
 	if !id.IsZero() {
 		in.Metadata = map[string]string{writeMeta: encodeWriteID(id)}
 	}
@@ -336,11 +320,15 @@ func (s *S3) Delete(ctx context.Context, key string, expected ETag) error {
 	return nil
 }
 
-// List is ListObjectsV2 with pagination. Listings carry no metadata, so the
-// WriteID of the objects it returns is zero.
-func (s *S3) List(ctx context.Context, prefix string) iter.Seq2[ObjectInfo, error] {
+// List is ListObjectsV2 with pagination, from StartAfter. Listings carry no
+// metadata, so the WriteID of the objects it returns is zero.
+func (s *S3) List(ctx context.Context, prefix, after string) iter.Seq2[ObjectInfo, error] {
 	return func(yield func(ObjectInfo, error) bool) {
-		p := s3.NewListObjectsV2Paginator(s.c, &s3.ListObjectsV2Input{Bucket: aws.String(s.bucket), Prefix: aws.String(prefix)})
+		in := &s3.ListObjectsV2Input{Bucket: aws.String(s.bucket), Prefix: aws.String(prefix)}
+		if after != "" {
+			in.StartAfter = aws.String(after)
+		}
+		p := s3.NewListObjectsV2Paginator(s.c, in)
 		for p.HasMorePages() {
 			page, err := p.NextPage(ctx)
 			if err != nil {

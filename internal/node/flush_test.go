@@ -250,28 +250,6 @@ func TestBarrierIsReleasedByAnEarlyCycle(t *testing.T) {
 	r.app.Must(t, "close", "a")
 }
 
-// An intake waiting for its row to be durable is released by an early cycle: the
-// receiver acknowledges within a cycle, not up to an interval later. (The
-// sender's row is a write nobody waits for, so the tick reads it.)
-func TestIntakeIsReleasedByAnEarlyCycle(t *testing.T) {
-	t.Parallel()
-	r := newSRigWith(t, both(quick, func(o *CatalogOptions) { o.Flush.Interval, o.Flush.Coalesce = 2*time.Second, time.Millisecond }))
-	rec := &recorder{}
-	r.record(rec, "")
-	var took atomic.Int64
-	r.hookIntake(func(_ int, _ *shard, _ string, _ *outRow, call func() (int, error)) (int, error) {
-		start := time.Now()
-		status, err := call()
-		took.Store(int64(time.Since(start)))
-		return status, err
-	})
-	r.addMessage("users/i1", "users/i2", "/hi", "x")
-	eventually(t, "the delivery", func() bool { return rec.count() == 1 })
-	if d := time.Duration(took.Load()); d == 0 || d > time.Second {
-		t.Fatalf("the intake took %v to be acknowledged with an interval of 2s, want about one cycle", d)
-	}
-}
-
 // A shard let go of at idle timeout doesn't wait for the tick either.
 func TestDeactivationDoesNotWaitForTheInterval(t *testing.T) {
 	t.Parallel()

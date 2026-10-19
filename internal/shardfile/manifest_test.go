@@ -190,7 +190,11 @@ func TestDeleteShard(t *testing.T) {
 	if _, _, err := e.Files.GetManifest(ctx, "users/e1"); err != nil {
 		t.Fatalf("a lost delete removed the manifest: %v", err)
 	}
-	if err := e.Files.DeleteShard(ctx, "users/e1"); err != nil {
+	current, err := e.Files.Attach(ctx, "users/e1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := current.DeleteShard(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := e.Files.GetManifest(ctx, "users/e1"); !errors.Is(err, blob.ErrNotFound) {
@@ -199,7 +203,7 @@ func TestDeleteShard(t *testing.T) {
 	if _, err := e.Files.Blob.Head(ctx, key); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("the LTX file is left: %v", err)
 	}
-	if err := e.Files.DeleteShard(ctx, "users/never"); err != nil {
-		t.Fatalf("deleting a shard with no manifest: %v", err)
+	if _, err := e.Files.Attach(ctx, "users/never"); !errors.Is(err, blob.ErrNotFound) {
+		t.Fatalf("a shard with no manifest: %v", err)
 	}
 }

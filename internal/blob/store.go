@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"iter"
+	"math/rand/v2"
 	"sync/atomic"
 	"time"
 )
@@ -13,7 +14,7 @@ import (
 // Options tune a Store's retries.
 type Options struct {
 	Attempts int           // attempts per call, 4 if zero
-	Backoff  time.Duration // wait before the first retry, doubling each time; 25 ms if zero
+	Backoff  time.Duration // longest wait before the first retry, doubling each time up to maxBackoff; 25 ms if zero
 	// Settle bounds the read-back that tells whether a write of unknown outcome
 	// landed. It runs on a context detached from the caller's, so a caller that
 	// has given up still learns. 5 s if zero.
@@ -57,9 +58,18 @@ func (s *Store) NewWriteID() WriteID {
 	return WriteID{Node: s.node, Epoch: s.epoch, N: s.n.Add(1)}
 }
 
+// maxBackoff caps the longest wait between attempts.
+const maxBackoff = time.Second
+
+// wait waits before a retry for a random time up to the attempt's backoff (full
+// jitter, as AWS advises for SlowDown), so that callers that failed together
+// don't retry together.
 func (s *Store) wait(ctx context.Context, attempt int) error {
-	d := s.opts.Backoff << attempt
-	t := time.NewTimer(d)
+	d := maxBackoff
+	if attempt < 30 && s.opts.Backoff < maxBackoff>>attempt {
+		d = s.opts.Backoff << attempt
+	}
+	t := time.NewTimer(rand.N(d))
 	defer t.Stop()
 	select {
 	case <-t.C:
@@ -336,11 +346,17 @@ func (s *Store) Head(ctx context.Context, key string) (ObjectInfo, error) {
 // List returns objects by key prefix. A failure while listing is not retried
 // mid-way (the caller sees it); one before the first result is.
 func (s *Store) List(ctx context.Context, prefix string) iter.Seq2[ObjectInfo, error] {
+	return s.ListAfter(ctx, prefix, "")
+}
+
+// ListAfter is List from the first key after after: a listing that picks up
+// where an earlier one stopped.
+func (s *Store) ListAfter(ctx context.Context, prefix, after string) iter.Seq2[ObjectInfo, error] {
 	return func(yield func(ObjectInfo, error) bool) {
 		for attempt := 0; ; attempt++ {
 			started := false
 			failed := false
-			for info, err := range s.b.List(ctx, prefix) {
+			for info, err := range s.b.List(ctx, prefix, after) {
 				if err != nil && !started && Transient(err) && attempt+1 < s.opts.Attempts {
 					failed = true
 					break

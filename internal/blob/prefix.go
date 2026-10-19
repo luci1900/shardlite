@@ -42,9 +42,12 @@ func (x prefixed) Head(ctx context.Context, key string) (ObjectInfo, error) {
 func (x prefixed) Delete(ctx context.Context, key string, expected ETag) error {
 	return x.b.Delete(ctx, x.p+key, expected)
 }
-func (x prefixed) List(ctx context.Context, prefix string) iter.Seq2[ObjectInfo, error] {
+func (x prefixed) List(ctx context.Context, prefix, after string) iter.Seq2[ObjectInfo, error] {
+	if after != "" {
+		after = x.p + after
+	}
 	return func(yield func(ObjectInfo, error) bool) {
-		for info, err := range x.b.List(ctx, x.p+prefix) {
+		for info, err := range x.b.List(ctx, x.p+prefix, after) {
 			info.Key = strings.TrimPrefix(info.Key, x.p)
 			if !yield(info, err) {
 				return

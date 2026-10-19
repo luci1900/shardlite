@@ -61,59 +61,6 @@ func TestReadOnlyShardLeavesNothing(t *testing.T) {
 	}
 }
 
-// Deleting a shard leaves no manifest and none of its LTX files, and the next
-// request gets an empty shard with a new generation.
-func TestDeleteLeavesNothing(t *testing.T) {
-	t.Parallel()
-	r := newMRig(t)
-	ctx := context.Background()
-	ref := r.acquire("slow/e4")
-	r.write(ref, "a")
-	if err := r.m.Gate(ctx, ref, true); err != nil {
-		t.Fatal(err)
-	}
-	old, _ := r.manifest("slow/e4")
-	r.app.Must(t, "close", "a")
-	ref.Release()
-	if err := r.m.Delete(ctx, "slow/e4"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.rawManifest("slow/e4"); !errors.Is(err, blob.ErrNotFound) {
-		t.Fatalf("manifest: %v, want none", err)
-	}
-	for info := range r.n.Store.List(ctx, shardfile.ShardPrefix("slow/e4")) {
-		t.Fatalf("an LTX file is left: %v", info.Key)
-	}
-	ref = r.acquire("slow/e4")
-	defer ref.Release()
-	m, err := r.manifest("slow/e4")
-	if err != nil || m.Generation == old.Generation {
-		t.Fatalf("manifest %+v (%v), want a new generation (old %s)", m, err, old.Generation)
-	}
-	if dump := r.liveDump(ref.Path()); strings.Contains(dump, "kv: ") {
-		t.Fatalf("the new shard has the old shard's data:\n%s", dump)
-	}
-	r.write(ref, "b")
-	if err := r.m.Gate(ctx, ref, true); err != nil {
-		t.Fatal(err)
-	}
-	if got := strings.Count(r.dumpBlob("slow/e4"), "kv: "); got != 2 { // (write inserts two rows)
-		t.Fatalf("%d rows after one write", got)
-	}
-}
-
-// Deleting a shard that doesn't exist is done and leaves nothing.
-func TestDeleteOfAShardWithNoManifest(t *testing.T) {
-	t.Parallel()
-	r := newMRig(t)
-	if err := r.m.Delete(context.Background(), "slow/nothing"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.rawManifest("slow/nothing"); !errors.Is(err, blob.ErrNotFound) {
-		t.Fatalf("a manifest was created: %v", err)
-	}
-}
-
 // Another node creates the shard between this node finding no manifest and
 // creating it: one wins, the other claims the winner's shard.
 func TestCreateRace(t *testing.T) {
@@ -132,11 +79,11 @@ func TestCreateRace(t *testing.T) {
 	creates := r.m.Stats.Creates.Load()
 	ref := r.acquire("users/e5")
 	defer ref.Release()
-	if !raced || !strings.Contains(ref.Path(), ".other.db") {
-		t.Fatalf("raced %v, path %s", raced, ref.Path())
-	}
-	if m, err := r.manifest("users/e5"); err != nil || m.Owner != "n1" || m.Generation != "other" {
-		t.Fatalf("manifest %+v: %v", m, err)
+	// The winner's manifest has nothing to restore, so the shard starts over in a
+	// generation of its own.
+	m, err := r.manifest("users/e5")
+	if !raced || err != nil || m.Owner != "n1" || m.Generation == "other" || !strings.Contains(ref.Path(), "."+m.Generation+".db") {
+		t.Fatalf("raced %v, path %s, manifest %+v: %v", raced, ref.Path(), m, err)
 	}
 	if r.m.Stats.Creates.Load() != creates {
 		t.Fatal("counted as created")
@@ -174,7 +121,11 @@ func TestDeleteRacingWithAWrite(t *testing.T) {
 		}
 		return nil
 	})
-	err := r.n.Files.DeleteShard(ctx, "users/e6")
+	stale, err := r.n.Files.Attach(ctx, "users/e6")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = stale.DeleteShard(ctx)
 	if !errors.Is(err, blob.ErrConflict) {
 		t.Fatalf("delete with a stale ETag: %v, want a conflict", err)
 	}

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -64,10 +65,17 @@ func newStore(t *testing.T) testStore {
 	return testStore{blob.NewStore(l, "n1", 1, blob.Options{Backoff: time.Millisecond}), l}
 }
 
+// appendBytes queues one LTX file held in memory.
+func appendBytes(w *Writer, shard, generation string, position uint64, ltxBytes []byte) error {
+	f := spool.Bytes(ltxBytes)
+	defer f.Close()
+	return w.AppendFile(shard, generation, position, f)
+}
+
 // mustAppend queues one LTX file of shard (generation "g").
 func mustAppend(t testing.TB, w *Writer, shard string, position uint64, ltxBytes []byte) {
 	t.Helper()
-	if err := w.Append(shard, "g", position, ltxBytes); err != nil {
+	if err := appendBytes(w, shard, "g", position, ltxBytes); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -82,7 +90,7 @@ func TestManyGoroutinesOneSegment(t *testing.T) {
 	var wg errgroup.Group
 	for i := range n {
 		wg.Go(func() error {
-			return w.Append(fmt.Sprintf("users/%d", i), "g", uint64(i+1), testLTX(t, ltx.TXID(i+1), byte(i)))
+			return appendBytes(w, fmt.Sprintf("users/%d", i), "g", uint64(i+1), testLTX(t, ltx.TXID(i+1), byte(i)))
 		})
 	}
 	if err := wg.Wait(); err != nil {
@@ -100,7 +108,7 @@ func TestManyGoroutinesOneSegment(t *testing.T) {
 	}
 	// Round trip of every entry.
 	for _, e := range entries {
-		b, err := ReadEntry(ctx, store.Store, "n1", 1, e)
+		b, err := readRange(ctx, store.Store, Key("n1", 1), e.Offset, e.Length)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -223,7 +231,7 @@ func TestErrExistsFencesWriter(t *testing.T) {
 		t.Fatalf("flush got %v, want ErrFenced", err)
 	}
 	// Stopped for good: later appends fail at once and nothing is written.
-	if err := w.Append("users/1", "g", 1, testLTX(t, 2, 1)); !errors.Is(err, ErrFenced) {
+	if err := appendBytes(w, "users/1", "g", 1, testLTX(t, 2, 1)); !errors.Is(err, ErrFenced) {
 		t.Fatalf("got %v, want ErrFenced", err)
 	}
 	if _, err := store.Head(ctx, Key("n1", 2)); !errors.Is(err, blob.ErrNotFound) {
@@ -362,7 +370,7 @@ func TestCloseEndsAWaitingFlush(t *testing.T) {
 	if err := w.Flush(context.Background()); !errors.Is(err, ErrClosed) {
 		t.Fatalf("flush after Close got %v, want ErrClosed", err)
 	}
-	if err := w.Append("users/1", "g", 2, testLTX(t, 2, 1)); !errors.Is(err, ErrClosed) {
+	if err := appendBytes(w, "users/1", "g", 2, testLTX(t, 2, 1)); !errors.Is(err, ErrClosed) {
 		t.Fatalf("append after Close got %v, want ErrClosed", err)
 	}
 }
@@ -672,5 +680,98 @@ func TestLargeSegmentsGoThroughTemporaryFiles(t *testing.T) {
 	}
 	if left() != 0 {
 		t.Fatalf("%d temporary files after the writer was closed", left())
+	}
+}
+
+// Scan reads footers a window at a time and hands their entries over in order,
+// across windows, skipping fences and stopping at the first missing number (or
+// failing on it, when it reads through to a given number).
+func TestScanReadsWindowsInOrder(t *testing.T) {
+	t.Parallel()
+	store, ctx := newStore(t), context.Background()
+	w := NewWriter(store.Store, "n1", Options{})
+	serve(t, w)
+	const n = 2*scanWindow + 10
+	for i := uint64(1); i <= n; i++ {
+		mustAppend(t, w, "users/1", i, testLTX(t, ltx.TXID(i), byte(i)))
+		if err := w.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Two fences, one of them first in its window.
+	fences := map[uint64]bool{10: true, scanWindow + 1: true}
+	for seq := range fences {
+		if err := store.Delete(ctx, Key("n1", seq), ""); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.Create(ctx, Key("n1", seq), strings.NewReader("")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	scan := func(to uint64) ([]uint64, error) {
+		var seqs []uint64
+		err := Scan(ctx, store.Store, "n1", 1, to, func(seq uint64, e Entry) error {
+			if e.Position != seq {
+				return fmt.Errorf("segment %d holds position %d", seq, e.Position)
+			}
+			seqs = append(seqs, seq)
+			return nil
+		})
+		return seqs, err
+	}
+	want := func(last uint64) (seqs []uint64) {
+		for seq := uint64(1); seq <= last; seq++ {
+			if !fences[seq] {
+				seqs = append(seqs, seq)
+			}
+		}
+		return seqs
+	}
+	for _, to := range []uint64{0, n} {
+		if got, err := scan(to); err != nil || !slices.Equal(got, want(n)) {
+			t.Fatalf("to %d: %v %v", to, got, err)
+		}
+	}
+	// A number missing below the end.
+	if err := store.Delete(ctx, Key("n1", 100), ""); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := scan(0); err != nil || !slices.Equal(got, want(99)) {
+		t.Fatalf("to 0 with 100 missing: %v %v", got, err)
+	}
+	if _, err := scan(n); !errors.Is(err, ErrMissing) || !strings.Contains(err.Error(), Key("n1", 100)) {
+		t.Fatalf("through 100 missing: %v", err)
+	}
+}
+
+// ReadFooter reads a segment's end once, which holds the footer of all but the
+// largest segments, and a large footer with a second read.
+func TestFooterReadsTheEndOnce(t *testing.T) {
+	t.Parallel()
+	store, ctx := newStore(t), context.Background()
+	w := NewWriter(store.Store, "n1", Options{})
+	serve(t, w)
+	sizes := []int{1, 1000} // a thousand entries make a footer larger than footerRead
+	for _, entries := range sizes {
+		for i := range entries {
+			mustAppend(t, w, fmt.Sprintf("users/%d", i), 1, testLTX(t, 1, byte(i)))
+		}
+		if err := w.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var ranges atomic.Int32
+	store.L.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
+		if op == blob.OpGetRange && !after {
+			ranges.Add(1)
+		}
+		return nil
+	})
+	for i, entries := range sizes {
+		ranges.Store(0)
+		got, err := ReadFooter(ctx, store.Store, "n1", uint64(i+1))
+		if err != nil || len(got) != entries || int(ranges.Load()) != i+1 {
+			t.Fatalf("%d entries: read %d with %d range reads, want %d: %v", entries, len(got), ranges.Load(), i+1, err)
+		}
 	}
 }

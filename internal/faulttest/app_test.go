@@ -31,7 +31,7 @@ func replayDump(t *testing.T, e *harness.Env, name string) (dump string, entries
 		if en.Shard != name {
 			return nil
 		}
-		b, err := segment.ReadEntry(ctx, e.Store, e.Node, seq, en)
+		b, err := harness.ReadEntry(ctx, e.Store, e.Node, seq, en)
 		if err != nil {
 			return err
 		}

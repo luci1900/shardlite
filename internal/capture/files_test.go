@@ -12,7 +12,7 @@ import (
 
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/capture"
-	"github.com/luci1900/shardlite/internal/segment"
+	"github.com/luci1900/shardlite/internal/harness"
 )
 
 // logFiles prints every file the shard's client has passed to the writer, as
@@ -21,7 +21,7 @@ func logFiles(t *testing.T, e *env, label string) {
 	t.Helper()
 	entries, seqs := e.entriesFor(t, "users/1")
 	for i, en := range entries {
-		b, err := segment.ReadEntry(context.Background(), e.store, "n1", seqs[i], en)
+		b, err := harness.ReadEntry(context.Background(), e.store, "n1", seqs[i], en)
 		if err != nil {
 			t.Fatal(err)
 		}

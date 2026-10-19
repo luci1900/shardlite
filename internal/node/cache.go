@@ -137,10 +137,10 @@ func shardOfPath(data, path string) string {
 	return name
 }
 
-func (c *cache) String() string { return "cache eviction" }
+func (c *cache) String() string { return "cache loop" }
 
 // Serve trims the cache to its limit and deletes the files held from before a
-// restart once they are closed. It is the cache eviction's loop, as a service.
+// restart once they are closed. It is the cache's loop, as a service.
 func (c *cache) Serve(ctx context.Context) error {
 	tick, stop := c.clock.NewTicker(c.every)
 	defer stop()
@@ -234,11 +234,10 @@ func (c *cache) discard(row indexRow) error {
 	return c.idx.delete(row.Name)
 }
 
-// evict makes room: the shard's manifest is released by compare-and-swap (the
-// delta was written when it was deactivated), then its files are deleted. It
-// runs under an entry of its own for the shard, and leaves alone a shard that
-// has one already (active, or being activated or deleted). It reports whether
-// it evicted the shard.
+// evict drops a cached shard, to make room or because the Catalog was asked
+// to (Catalog.Evict). It runs under an entry of its own for the shard, and
+// leaves alone a shard that has one already (active, or being activated or
+// deleted). It reports whether it evicted the shard.
 func (c *cache) evict(ctx context.Context, row indexRow) (bool, error) {
 	e, ok := c.tab.claim(row.Name)
 	if !ok {
@@ -249,16 +248,27 @@ func (c *cache) evict(ctx context.Context, row indexRow) (bool, error) {
 	if err != nil || !ok || cur.State != stateCached {
 		return false, err
 	}
-	if held, err := capture.ProbeOnce(cur.Path); err != nil {
+	if err := c.drop(ctx, cur); err != nil {
 		return false, err
+	}
+	return true, nil
+}
+
+// drop evicts a cached shard: its manifest is released by compare-and-swap
+// (the delta was written when it was deactivated), then its files and its row
+// are deleted. The caller holds an entry for the shard. A shard the app has open is not dropped (ErrAppHolds), and on any other
+// error the files stay for a later try.
+func (c *cache) drop(ctx context.Context, cur indexRow) error {
+	if held, err := capture.ProbeOnce(cur.Path); err != nil {
+		return err
 	} else if held {
-		return false, fmt.Errorf("%w: %s", ErrAppHolds, cur.Name)
+		return fmt.Errorf("%w: %s", ErrAppHolds, cur.Name)
 	}
 	h, err := c.files.Attach(ctx, cur.Name)
 	switch {
 	case errors.Is(err, blob.ErrNotFound):
 	case err != nil:
-		return false, err
+		return err
 	case h.Manifest.Owner == c.node:
 		switch err := h.ReleaseOwnership(ctx); {
 		case errors.Is(err, blob.ErrUnknown):
@@ -266,13 +276,13 @@ func (c *cache) evict(ctx context.Context, row indexRow) (bool, error) {
 			// activation serve the shard with no request to blob storage, while the
 			// manifest names no journal, so it goes as if the release had landed: the
 			// next activation claims and restores.
-			c.log.Warn("the release of an evicted shard has an unknown outcome, dropping it as released", "shard", cur.Name, "err", err)
+			c.log.Warn("the release of a cached shard has an unknown outcome, dropping it as released", "shard", cur.Name, "err", err)
 		case err != nil && !errors.Is(err, blob.ErrConflict):
-			return false, err // storage trouble: nothing happened, keep the files and try again later
+			return err // storage trouble: nothing happened, keep the files and try again later
 		}
 	}
 	removeLocal(cur.Path)
-	return true, c.idx.delete(cur.Name)
+	return c.idx.delete(cur.Name)
 }
 
 // evictIfNeeded removes the least recently used cached shards while the cache
@@ -312,48 +322,21 @@ func (c *cache) evictIfNeeded(ctx context.Context) {
 	}
 }
 
-// deleteCached deletes a shard that isn't active, cached here or not. The
-// caller holds an entry for it.
-func (c *cache) deleteCached(ctx context.Context, target string) error {
-	var path string
-	if row, ok, err := c.idx.get(target); err != nil {
-		return err
-	} else if ok && row.Path != "" {
-		path = row.Path
-		if held, err := capture.ProbeOnce(path); err != nil || held {
-			if err == nil {
-				err = fmt.Errorf("%w: the app has %s open", ErrBusy, target)
-			}
-			return err
-		}
-	}
-	return c.deleteReleased(ctx, target, path, nil, nil)
-}
-
 // deleteReleased deletes a shard that nothing has open: its manifest by
-// conditional delete (at h's version if there is a handle, which an active shard
-// has), then its generation's LTX files, then the local files at path and the
-// cache index row. If the manifest is still there afterwards, nothing was
-// deleted and resume (if given) starts capture again.
+// conditional delete (at h's version), then its generation's LTX files, then
+// the local files at path and the cache index row. If the manifest is still
+// there afterwards, nothing was deleted and resume starts capture again.
 //
 // A crash after the manifest is deleted leaves LTX files that nothing refers to
 // in blob storage, and the local files, which the next start finds in the index
 // as left by an earlier process and discards. A crash before it leaves the shard
 // as it was.
 func (c *cache) deleteReleased(ctx context.Context, target, path string, h *shardfile.Handle, resume func() error) error {
-	var err error
-	if h != nil {
-		err = h.DeleteShard(ctx)
-	} else {
-		err = c.files.DeleteShard(ctx, target)
-	}
-	if err != nil {
+	if err := h.DeleteShard(ctx); err != nil {
 		// If the manifest is gone the shard is deleted, whatever else failed.
 		if _, _, gerr := c.files.GetManifest(ctx, target); !errors.Is(gerr, blob.ErrNotFound) {
-			if resume != nil {
-				if rerr := resume(); rerr != nil {
-					c.log.Error("could not resume capture after a failed delete", "shard", target, "err", rerr)
-				}
+			if rerr := resume(); rerr != nil {
+				c.log.Error("could not resume capture after a failed delete", "shard", target, "err", rerr)
 			}
 			return err
 		}

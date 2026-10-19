@@ -155,14 +155,14 @@ func (h *Hooked) Delete(ctx context.Context, key string, expected ETag) error {
 
 // List collects the whole listing before the after call, so a lost response
 // loses all of it.
-func (h *Hooked) List(ctx context.Context, prefix string) iter.Seq2[ObjectInfo, error] {
+func (h *Hooked) List(ctx context.Context, prefix, after string) iter.Seq2[ObjectInfo, error] {
 	return func(yield func(ObjectInfo, error) bool) {
 		if err := h.before(ctx, OpList, prefix); err != nil {
 			yield(ObjectInfo{}, err)
 			return
 		}
 		var infos []ObjectInfo
-		for info, err := range h.b.List(ctx, prefix) {
+		for info, err := range h.b.List(ctx, prefix, after) {
 			if err != nil {
 				yield(ObjectInfo{}, err)
 				return

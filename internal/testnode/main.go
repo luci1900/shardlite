@@ -352,7 +352,7 @@ func (n *testNode) do(f []string) (string, error) {
 		})
 		return "", err
 	case "release":
-		released, _, err := s.sh.Release(ctx)
+		released, _, err := s.sh.Release(ctx, nil)
 		if err != nil {
 			return "", err
 		}

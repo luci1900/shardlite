@@ -43,10 +43,9 @@ func rawHeaders(ctx context.Context) http.Header {
 
 // HoldRecord is what the last Hold call saw.
 type HoldRecord struct {
-	GRPCTimeout     string `json:"grpc_timeout"`       // the raw grpc-timeout header
-	ShardliteDeadln string `json:"shardlite_deadline"` // the raw Shardlite-Deadline (ms)
-	DeadlineMS      int64  `json:"deadline_ms"`        // time left on the handler's context when it started, -1 if none
-	Target          string `json:"target"`
+	GRPCTimeout string `json:"grpc_timeout"` // the raw grpc-timeout header
+	DeadlineMS  int64  `json:"deadline_ms"`  // time left on the handler's context when it started, -1 if none
+	Target      string `json:"target"`
 }
 
 // Debug is the app's counters, served at GET /debug on the app's own address.
@@ -165,7 +164,7 @@ func (a *App) rpcHold(ctx context.Context, _ *shardReq, in string) (string, erro
 		rec.Target = v[0]
 	}
 	if h := rawHeaders(ctx); h != nil {
-		rec.GRPCTimeout, rec.ShardliteDeadln = h.Get("Grpc-Timeout"), h.Get("Shardlite-Deadline")
+		rec.GRPCTimeout = h.Get("Grpc-Timeout")
 	}
 	if d, ok := ctx.Deadline(); ok {
 		rec.DeadlineMS = time.Until(d).Milliseconds()

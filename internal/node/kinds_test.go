@@ -2,11 +2,15 @@ package node
 
 import (
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/luci1900/shardlite/internal/kind"
+	"github.com/luci1900/shardlite/internal/system"
 )
 
 func TestParseTarget(t *testing.T) {
@@ -37,11 +41,11 @@ func TestParseKinds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m["users"].IdleTimeout != 10*time.Minute || m["users"].Sync || !m["users"].Public || !m["chat"].Sync || m["audit"].Public {
+	if m["users"].IdleTimeout != 10*time.Minute || m["users"].Sync != kind.SyncOff || !m["users"].Public || m["chat"].Sync != kind.SyncOn || m["audit"].Public {
 		t.Fatalf("%+v", m)
 	}
 	// Leaving settings out gives the safe ones: sync on, not public.
-	if w := m["wallet"]; !w.Sync || w.Public || w.IdleTimeout != 3*time.Minute {
+	if w := m["wallet"]; w.Sync != kind.SyncOn || w.Public || w.IdleTimeout != 3*time.Minute {
 		t.Fatalf("defaults: %+v", w)
 	}
 	// The environment's idle timeout is a default: a kind's own setting wins.
@@ -76,7 +80,7 @@ func TestKindsReload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := k.Lookup("users"); got.IdleTimeout != DefaultIdleTimeout || !got.Sync {
+	if got, _ := k.Lookup("users"); got.IdleTimeout != DefaultIdleTimeout || got.Sync != kind.SyncOn {
 		t.Fatalf("%+v", got)
 	}
 	if _, err := k.Lookup("wallet"); !errors.Is(err, ErrUnknownKind) {
@@ -95,10 +99,10 @@ func TestKindsReload(t *testing.T) {
 	if err := k.Reload(); err != nil || !k.Valid() {
 		t.Fatal(err)
 	}
-	if got, err := k.Lookup("wallet"); err != nil || !got.Sync == false && got.Name != "wallet" {
+	if got, err := k.Lookup("wallet"); err != nil || got.Sync != kind.SyncOn || got.Name != "wallet" {
 		t.Fatalf("%+v %v", got, err)
 	}
-	if got, _ := k.Lookup("users"); got.Sync {
+	if got, _ := k.Lookup("users"); got.Sync != kind.SyncOff {
 		t.Fatal("new setting not seen")
 	}
 	if _, err := LoadKinds(filepath.Join(t.TempDir(), "missing.json"), 0); err == nil {
@@ -135,5 +139,29 @@ func TestParseEnv(t *testing.T) {
 		if _, err := ParseEnv(func(x string) string { return bad[x] }); err == nil {
 			t.Errorf("%s=%q accepted", k, v)
 		}
+	}
+}
+
+// A system kind declared with no settings gets the safe ones, as a kind of the
+// kinds file does: sync on, not public and the node's idle timeout.
+func TestSystemKindDefaults(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "kinds.json")
+	os.WriteFile(path, []byte(`{"kinds": {"users": {}}}`), 0o644)
+	k, err := LoadKinds(path, 3*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sys, err := newSystemKinds([]kind.Kind{{Name: "_probe", IDs: []string{"_cluster"}, Handler: func(*system.System) http.Handler { return http.NotFoundHandler() }}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	k.setSystem(sys)
+	got, err := k.Lookup("_probe")
+	if err != nil || got.Sync != kind.SyncOn || got.Public || got.IdleTimeout != 3*time.Minute || got.Handler == nil {
+		t.Fatalf("%+v %v", got, err)
+	}
+	if app, _ := k.Lookup("users"); app.Handler != nil || app.Sync != kind.SyncOn || app.IdleTimeout != 3*time.Minute {
+		t.Fatalf("%+v", app)
 	}
 }

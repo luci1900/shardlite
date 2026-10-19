@@ -335,20 +335,29 @@ func (s *Shard) durable(ctx context.Context) error {
 // database looked like just after is read. The mapping is kept: Release
 // compares this header with one read after its -shm check. A mapping holds no
 // locks, so keeping it costs nothing there.
-func (s *Shard) closeForRelease(ctx context.Context) (c closed, err error) {
+func (s *Shard) closeForRelease(ctx context.Context, read func(*sql.DB) error) (c closed, err error) {
 	if s.db == nil {
 		return c, ErrClosed
 	}
-	// Whether the shard holds anything of the app's is read between two syncs.
-	// The first captures what was committed before the read, so if the final
-	// sync (Litestream's close) captures anything more, something was written
-	// after the read.
+	// Whether the shard holds anything of the app's, and the caller's read, are
+	// read between two syncs. The first captures what was committed before the
+	// reads, so if the final sync (Litestream's close) captures anything more,
+	// something was written after them.
 	serr := s.db.SyncAndWait(context.Background())
-	empty, eerr := s.holdsNothing(ctx)
+	empty, marked, eerr := s.holdsNothing(ctx)
+	rerr := errors.New("no read")
+	if read != nil {
+		rerr = s.use(read)
+	}
 	pos := s.client.position()
 	err = s.db.Close(context.WithoutCancel(ctx))
 	s.db = nil
-	c.empty = serr == nil && eerr == nil && empty && s.client.position() == pos
+	exact := serr == nil && s.client.position() == pos
+	c.Empty = exact && eerr == nil && empty
+	c.Marked = c.Empty && marked
+	if exact && rerr == nil {
+		c.At = pos
+	}
 	c.hdr, c.hdrErr = s.header()
 	return c, err
 }
@@ -356,9 +365,7 @@ func (s *Shard) closeForRelease(ctx context.Context) (c closed, err error) {
 // closed is what closeForRelease learned about the database just after
 // Litestream closed it.
 type closed struct {
-	// empty says the shard held nothing of the app's: the app never wrote to it,
-	// removed everything it wrote or marked it for deletion.
-	empty bool
+	Released
 	// hdr is the wal-index header, to tell whether the app committed after
 	// Litestream's final sync.
 	hdr    Header
@@ -374,42 +381,39 @@ const MarkedQuery = `SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE name = '_s
 // it), or it has no tables or indexes besides Litestream's own and shardlite's
 // (the _shardlite_ tables; an index counts as its table's, so the automatic one
 // of a reserved table's text key is ignored), user_version and application_id
-// are both 0, and _shardlite_outbox and _shardlite_inbox have no rows (a row the
-// node gave up on is the app's data too). It asks through Litestream's own
+// are both 0, and _shardlite_reminders has no rows (a reminder the node gave up
+// on is the app's data too). marked says which it was. It asks through Litestream's own
 // connection, so the node opens nothing of the shard's (see shm.go for why that
 // matters).
-func (s *Shard) holdsNothing(ctx context.Context) (bool, error) {
+func (s *Shard) holdsNothing(ctx context.Context) (empty, marked bool, err error) {
 	sqldb := s.db.SQLDB()
 	if sqldb == nil {
-		return false, errors.New("capture: litestream has not opened the database")
+		return false, false, errors.New("capture: litestream has not opened the database")
 	}
-	var marked bool
 	if err := sqldb.QueryRowContext(ctx, MarkedQuery).Scan(&marked); err != nil || marked {
-		return marked, err
+		return marked, marked, err
 	}
 	var objects, userVersion, applicationID int64
-	err := sqldb.QueryRowContext(ctx, `SELECT
+	err = sqldb.QueryRowContext(ctx, `SELECT
 		(SELECT count(*) FROM sqlite_schema WHERE name NOT IN ('_litestream_seq', '_litestream_lock', 'sqlite_sequence') AND tbl_name NOT LIKE '\_shardlite\_%' ESCAPE '\'),
 		(SELECT user_version FROM pragma_user_version),
 		(SELECT application_id FROM pragma_application_id)`).Scan(&objects, &userVersion, &applicationID)
 	if err != nil || objects != 0 || userVersion != 0 || applicationID != 0 {
-		return false, err
+		return false, false, err
 	}
-	// Rows in the reserved tables (dead or not) are the app's data.
-	for _, table := range []string{"_shardlite_outbox", "_shardlite_inbox"} {
-		var exists bool
-		if err := sqldb.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE name = ? AND type = 'table')`, table).Scan(&exists); err != nil {
-			return false, err
-		}
-		if !exists {
-			continue
-		}
-		var rows bool
-		if err := sqldb.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM `+table+`)`).Scan(&rows); err != nil || rows {
-			return false, err
-		}
+	// Reminders (dead or not) are the app's data.
+	var exists bool
+	if err := sqldb.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE name = '_shardlite_reminders' AND type = 'table')`).Scan(&exists); err != nil {
+		return false, false, err
 	}
-	return true, nil
+	if !exists {
+		return true, false, nil
+	}
+	var rows bool
+	if err := sqldb.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM _shardlite_reminders)`).Scan(&rows); err != nil || rows {
+		return false, false, err
+	}
+	return true, false, nil
 }
 
 // ErrClosed is what Capture, Use and Snapshot return for a shard whose
@@ -561,19 +565,18 @@ func (s *Shard) Abandon() {
 // Litestream's close or the reopen fails, the activation is over too, and
 // Release returns the error (Open says which).
 //
-// empty is meaningful when released: the shard held nothing of the app's (the
-// app never wrote to it, or removed everything it wrote), so it can be deleted
-// rather than kept.
-func (s *Shard) Release(ctx context.Context) (released, empty bool, err error) {
+// read, if not nil, reads the database at its final state, beside the check
+// for empty (see Released.At). An error from it only makes At 0.
+func (s *Shard) Release(ctx context.Context, read func(*sql.DB) error) (released bool, f Released, err error) {
 	var c closed
 	if err := s.do(ctx, func() error {
 		var err error
-		if c, err = s.closeForRelease(ctx); err != nil && !errors.Is(err, ErrClosed) {
+		if c, err = s.closeForRelease(ctx, read); err != nil && !errors.Is(err, ErrClosed) {
 			s.end() // Litestream is closed or half closed: capture stays closed
 		}
 		return err
 	}); err != nil {
-		return false, false, err
+		return false, f, err
 	}
 	// Without the lock: the flush cycle this waits for may be waiting for it to
 	// sync this shard, which finds the database closed and returns.
@@ -586,9 +589,24 @@ func (s *Shard) Release(ctx context.Context) (released, empty bool, err error) {
 		return err
 	})
 	if err != nil || !released {
-		return false, false, err
+		return false, f, err
 	}
-	return true, c.empty, os.RemoveAll(s.metaDir)
+	return true, c.Released, os.RemoveAll(s.metaDir)
+}
+
+// Released is what Release found about the shard's final state. It is
+// meaningful when the shard was released.
+type Released struct {
+	// Empty says the shard held nothing of the app's (the app never wrote to it,
+	// removed everything it wrote or marked it for deletion), so it can be
+	// deleted rather than kept.
+	Empty bool
+	// Marked says Empty is because the app marked the shard for deletion.
+	Marked bool
+	// At is the position Release's read saw exactly, which is the shard's final
+	// position, or 0 if the read failed or something was committed after it
+	// (Litestream's close captured more).
+	At uint64
 }
 
 // settle is the last step of Release, under the lock, with nothing of the node's

@@ -11,7 +11,7 @@ import (
 func tailAlertAge(deltaAge time.Duration) time.Duration { return 3 * deltaAge }
 
 // JournalExpiry is how long the node keeps its journal segments before its
-// sweeper deletes them: 24 hours, or four times the tail alert age if that is
+// journal expiry deletes them: 24 hours, or four times the tail alert age if that is
 // longer, so the alert comes in time to act.
 func JournalExpiry(deltaAge time.Duration) time.Duration {
 	return max(24*time.Hour, 4*tailAlertAge(deltaAge))

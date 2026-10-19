@@ -5,6 +5,9 @@ import (
 	"testing"
 )
 
+// all returns every row.
+func (x *index) all() ([]indexRow, error) { return x.rows(``) }
+
 // modernc ignores connection-string settings it doesn't know, so check the
 // ones the index asks for took effect on a connection.
 func TestIndexPragmasTakeEffect(t *testing.T) {

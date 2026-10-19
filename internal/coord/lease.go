@@ -92,7 +92,7 @@ func (l *NodeLease) adoptedByOther() bool {
 }
 
 // Prefix is the key prefix of the leases (state, one per node).
-const Prefix = "state/nodes/"
+const Prefix = "state/leases/"
 
 // Key is the object key of a node's lease.
 func Key(node string) string { return Prefix + node }
@@ -268,14 +268,14 @@ func (r *Registry) Release(ctx context.Context, lease NodeLease) error {
 	return err
 }
 
-// Listed is a lease as a listing of state/nodes/ shows it, without reading it.
+// Listed is a lease as a listing of state/leases/ shows it, without reading it.
 type Listed struct {
 	Name         string
 	ETag         blob.ETag
 	LastModified time.Time // the store's clock at the lease's last write: a hint of when to look, never a decision
 }
 
-// List lists every node's lease from state/nodes/, in key order, without reading them.
+// List lists every node's lease from state/leases/, in key order, without reading them.
 func (r *Registry) List(ctx context.Context) ([]Listed, error) {
 	var out []Listed
 	for info, err := range r.store.List(ctx, Prefix) {

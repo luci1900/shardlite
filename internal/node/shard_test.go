@@ -117,7 +117,7 @@ func TestAnActivationRacingARelease(t *testing.T) {
 	defer unblock()
 	released := make(chan error, 1)
 	go func() {
-		ok, err := old.release(ctx)
+		ok, err := old.deactivateNow(ctx)
 		if err == nil && !ok {
 			err = errors.New("not released")
 		}
@@ -298,7 +298,7 @@ func TestTheDeactivationLimitHolds(t *testing.T) {
 	var g errgroup.Group
 	for _, a := range shards {
 		g.Go(func() error {
-			ok, err := a.release(ctx)
+			ok, err := a.deactivateNow(ctx)
 			if err == nil && !ok {
 				err = errors.New(a.Name + " not released")
 			}
@@ -422,7 +422,7 @@ func shardGoroutines() []string {
 }
 
 // Once the shards are let go of, every goroutine they ran has ended: each
-// shard's loop and supervisor and its deliveries, even one still waiting for
+// shard's loop and supervisor and its wakes, even one still waiting for
 // the app's answer. Not parallel: it looks at every goroutine.
 func TestShardsGoroutinesAreJoinedWhenTheyAreLetGo(t *testing.T) {
 	before := shardGoroutines()
@@ -430,22 +430,22 @@ func TestShardsGoroutinesAreJoinedWhenTheyAreLetGo(t *testing.T) {
 	rec := &recorder{keep: true, hold: make(chan struct{})}
 	defer close(rec.hold)
 	r.record(rec, "")
-	// A delivery that takes a while to end once it is cancelled: only a join waits for it.
-	hook := inboxHookFn(func(ctx context.Context, call func() (int, error)) (int, error) {
+	// A wake that takes a while to end once it is cancelled: only a join waits for it.
+	hook := wakeHookFn(func(ctx context.Context, call func() (int, error)) (int, error) {
 		status, err := call()
 		if ctx.Err() != nil {
 			time.Sleep(200 * time.Millisecond)
 		}
 		return status, err
 	})
-	r.inboxHook.Store(&hook)
-	r.setRow("slow/gj1", "k", "/held", time.Now().Unix())
-	eventually(t, "the delivery to reach the app", func() bool {
+	r.wakeHook.Store(&hook)
+	r.remind("slow/gj1", "k", time.Now().Unix())
+	eventually(t, "the wake to reach the app", func() bool {
 		rec.mu.Lock()
 		defer rec.mu.Unlock()
 		return len(rec.got) > 0
 	})
-	r.acquire("users/gj2").Release() // and a shard with nothing to deliver
+	r.acquire("users/gj2").Release() // and a shard with nothing to wake for
 	r.closeInApp("slow/gj1")
 	if err := r.mrig.stop(); err != nil {
 		t.Fatal(err)

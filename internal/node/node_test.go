@@ -183,7 +183,8 @@ func TestRestartAdoptsItsOwnJournal(t *testing.T) {
 			if rep.Deltas != 2 || rep.Fence != lastSeg+1 || rep.Expired {
 				t.Fatalf("adoption: %+v (last segment %d)", rep, lastSeg)
 			}
-			if n2.Writer.NextSeq() != rep.Fence+1 {
+			// After the fence.
+			if n2.Writer.NextSeq() <= rep.Fence {
 				t.Fatalf("writer starts at %d, fence is %d", n2.Writer.NextSeq(), rep.Fence)
 			}
 			// The lease records the new range at once, not at the first renewal.

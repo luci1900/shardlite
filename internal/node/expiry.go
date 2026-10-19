@@ -10,10 +10,10 @@ import (
 	"github.com/luci1900/shardlite/internal/segment"
 )
 
-// maxSweepEvery is the longest wait between two sweeps.
-const maxSweepEvery = 10 * time.Minute
+// maxExpireEvery is the longest wait between two passes.
+const maxExpireEvery = 10 * time.Minute
 
-// sweeper is the node's own journal sweeper (docs/internals.md, Cleaning the
+// expiry is the node's own journal expiry (docs/internals.md, Cleaning the
 // journal): every tenth of age (at most every ten minutes) until ctx ends it
 // lists data/journal/{node}/ and deletes the non-empty segments last modified more
 // than age ago. Empty segments (fences) are never deleted, since a zombie
@@ -28,10 +28,10 @@ const maxSweepEvery = 10 * time.Minute
 // before any of them can expire. age must be positive. Run runs it as one of the
 // node's services.
 //
-// An adopter sweeps a dead node's journal with it too, once (sweepJournal), with
+// An adopter sweeps a dead node's journal with it too, once (expire), with
 // an age of zero (every non-empty segment) and below set to its fence: segments from the fence on may be
 // the node's next life's, written since the adoption finished.
-type sweeper struct {
+type expiry struct {
 	store *blob.Store
 	node  string
 	age   time.Duration
@@ -39,28 +39,28 @@ type sweeper struct {
 	log   *slog.Logger
 }
 
-func (*sweeper) String() string { return "journal sweeper" }
+func (*expiry) String() string { return "journal expiry" }
 
-func (s *sweeper) Serve(ctx context.Context) error {
+func (s *expiry) Serve(ctx context.Context) error {
 	defer serving(s.log, s.String())()
-	t := time.NewTicker(min(s.age/10, maxSweepEvery))
+	t := time.NewTicker(min(s.age/10, maxExpireEvery))
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-t.C:
-			if _, err := s.sweepJournal(ctx, time.Now()); err != nil && ctx.Err() == nil {
-				s.log.Warn("sweeping the node journal failed, trying again later", "err", err)
+			if _, err := s.expire(ctx, time.Now()); err != nil && ctx.Err() == nil {
+				s.log.Warn("expiring the node journal failed, trying again later", "err", err)
 			}
 		}
 	}
 }
 
-// sweepJournal deletes the node's non-empty segments that are older than the age at
+// expire deletes the node's non-empty segments that are older than the age at
 // now, and returns how many it deleted. It stops at the first failure: the next
-// sweep starts again.
-func (s *sweeper) sweepJournal(ctx context.Context, now time.Time) (deleted int, err error) {
+// pass starts again.
+func (s *expiry) expire(ctx context.Context, now time.Time) (deleted int, err error) {
 	var old []string
 	for info, err := range s.store.List(ctx, segment.Prefix(s.node)) {
 		if err != nil {

@@ -12,12 +12,13 @@ import (
 
 // addresses caches where nodes listen for forwards, from their leases
 // (docs/internals.md, Routing and forwarding). A lease is read again when the
-// cache has none for the node, when a forward to it could not connect (forget)
-// and when the lease scan's listing shows the node wrote its lease after the
-// cached one would have expired, which only a node that was gone and came back
-// does: a node that renews writes before its lease runs out, so comparing with
-// the last write alone would read again at every renewal. A node that restarted
-// within its TTL is found by its refused connection.
+// cache has none for the node, when a forward to it got no answer (the check of
+// the owner reads it, and set keeps that read) and when the lease scan's
+// listing shows the node wrote its lease after the cached one would have
+// expired, which only a node that was gone and came back does: a node that
+// renews writes before its lease runs out, so comparing with the last write
+// alone would read again at every renewal. A node that restarted within its TTL
+// is found by its refused connection.
 type addresses struct {
 	get   func(ctx context.Context, node string) (*coord.NodeLease, error)
 	nodes func() *NodeList // the lease scan's last listing
@@ -60,9 +61,17 @@ func (a *addresses) stale(l *coord.NodeLease) bool {
 	return ok && list.Nodes[i].LastModified.After(l.ExpiresAt())
 }
 
-// forget drops the node's address: a forward could not connect to it.
-func (a *addresses) forget(node string) {
+// set replaces the node's lease with one read elsewhere (the check of an owner
+// that doesn't answer), and forgets the node if l is nil or has no address.
+func (a *addresses) set(node string, l *coord.NodeLease) {
 	a.mu.Lock()
-	delete(a.leases, node)
-	a.mu.Unlock()
+	defer a.mu.Unlock()
+	if l == nil || l.Address == "" {
+		delete(a.leases, node)
+		return
+	}
+	if a.leases == nil {
+		a.leases = map[string]*coord.NodeLease{}
+	}
+	a.leases[node] = l
 }

@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/superfly/ltx"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/notify"
@@ -36,6 +37,11 @@ const (
 	trailerSize   = 16
 	seqKeyDigits  = 20
 	maxFooterSize = 1 << 30
+	// footerRead is how much of a segment's end ReadFooter reads at once: the
+	// trailer and, for all but the largest segments, the footer with it.
+	footerRead = 64 << 10
+	// scanWindow is how many footers Scan reads at once.
+	scanWindow = 64
 )
 
 var (
@@ -151,16 +157,10 @@ func (w *Writer) NextSeq() uint64 {
 	return w.seq
 }
 
-// Append queues one LTX file. It fails with ErrFenced or ErrClosed if the
-// writer has stopped. Flush waits until the segment holding it is written.
-func (w *Writer) Append(shard, generation string, position uint64, ltxBytes []byte) error {
-	f := spool.Bytes(ltxBytes)
-	defer f.Close()
-	return w.AppendFile(shard, generation, position, f)
-}
-
-// AppendFile is Append for a file that may be in a temporary file. The writer
-// takes a reference of its own, so the caller still closes its own.
+// AppendFile queues one LTX file, which may be in a temporary file. The writer
+// takes a reference of its own, so the caller still closes its own. It fails
+// with ErrFenced or ErrClosed if the writer has stopped. Flush waits until the
+// segment holding it is written.
 func (w *Writer) AppendFile(shard, generation string, position uint64, ltxFile *spool.File) error {
 	hdr, _, err := ltx.PeekHeader(ltxFile.Reader())
 	if err != nil {
@@ -401,10 +401,13 @@ func ReadFooter(ctx context.Context, store *blob.Store, node string, seq uint64)
 	if info.Size < trailerSize {
 		return nil, fmt.Errorf("%w: %s is %d bytes", ErrCorrupt, key, info.Size)
 	}
-	tr, err := readRange(ctx, store, key, info.Size-trailerSize, trailerSize)
+	// The end of the segment, which usually holds the whole footer too.
+	end := min(info.Size, footerRead)
+	b, err := readRange(ctx, store, key, info.Size-end, end)
 	if err != nil {
 		return nil, err
 	}
+	tr := b[len(b)-trailerSize:]
 	if string(tr[8:]) != magic {
 		return nil, fmt.Errorf("%w: %s has bad magic", ErrCorrupt, key)
 	}
@@ -412,8 +415,10 @@ func ReadFooter(ctx context.Context, store *blob.Store, node string, seq uint64)
 	if n > maxFooterSize || int64(n) > info.Size-trailerSize {
 		return nil, fmt.Errorf("%w: %s footer length %d", ErrCorrupt, key, n)
 	}
-	fb, err := readRange(ctx, store, key, info.Size-trailerSize-int64(n), int64(n))
-	if err != nil {
+	var fb []byte
+	if int64(n)+trailerSize <= end {
+		fb = b[len(b)-trailerSize-int(n) : len(b)-trailerSize]
+	} else if fb, err = readRange(ctx, store, key, info.Size-trailerSize-int64(n), int64(n)); err != nil {
 		return nil, err
 	}
 	var entries []Entry
@@ -423,14 +428,8 @@ func ReadFooter(ctx context.Context, store *blob.Store, node string, seq uint64)
 	return entries, nil
 }
 
-// ReadEntry returns the LTX file bytes of one entry.
-func ReadEntry(ctx context.Context, store *blob.Store, node string, seq uint64, e Entry) ([]byte, error) {
-	return readRange(ctx, store, Key(node, seq), e.Offset, e.Length)
-}
-
-// ReadEntryFile is ReadEntry for an entry of any size: it is read into memory
-// up to limit bytes, and into a temporary file in dir beyond that. The caller
-// closes the file.
+// ReadEntryFile reads the LTX file of one entry, into memory up to limit bytes
+// and into a temporary file in dir beyond that. The caller closes the file.
 func ReadEntryFile(ctx context.Context, store *blob.Store, node string, seq uint64, e Entry, dir string, limit int) (*spool.File, error) {
 	rc, err := store.GetRange(ctx, Key(node, seq), e.Offset, e.Length)
 	if err != nil {
@@ -475,22 +474,41 @@ var ErrMissing = errors.New("segment: missing")
 // so a number below the fence that is missing has expired or been lost, and the
 // segments after it must not be silently ignored. It returns ErrMissing
 // (wrapped, with the number) for the first one.
+//
+// Footers are read scanWindow at a time, in parallel, and handed to fn in
+// order. With to zero, a window may read past the end, which costs a few
+// requests that find nothing.
 func Scan(ctx context.Context, store *blob.Store, node string, from, to uint64, fn func(seq uint64, e Entry) error) error {
-	for seq := from; to == 0 || seq <= to; seq++ {
-		entries, err := ReadFooter(ctx, store, node, seq)
-		if errors.Is(err, blob.ErrNotFound) {
-			if to == 0 {
-				return nil
-			}
-			return fmt.Errorf("%w: %s", ErrMissing, Key(node, seq))
-		} else if errors.Is(err, ErrFence) {
-			continue
-		} else if err != nil {
-			return err
+	for start := from; to == 0 || start <= to; start += scanWindow {
+		n := uint64(scanWindow)
+		if to != 0 {
+			n = min(n, to-start+1)
 		}
-		for _, e := range entries {
-			if err := fn(seq, e); err != nil {
+		footers, errs := make([][]Entry, n), make([]error, n)
+		var g errgroup.Group
+		for i := range footers {
+			g.Go(func() error {
+				footers[i], errs[i] = ReadFooter(ctx, store, node, start+uint64(i))
+				return nil
+			})
+		}
+		g.Wait()
+		for i, entries := range footers {
+			seq := start + uint64(i)
+			if err := errs[i]; errors.Is(err, blob.ErrNotFound) {
+				if to == 0 {
+					return nil
+				}
+				return fmt.Errorf("%w: %s", ErrMissing, Key(node, seq))
+			} else if errors.Is(err, ErrFence) {
+				continue
+			} else if err != nil {
 				return err
+			}
+			for _, e := range entries {
+				if err := fn(seq, e); err != nil {
+					return err
+				}
 			}
 		}
 	}

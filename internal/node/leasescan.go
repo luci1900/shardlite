@@ -17,7 +17,7 @@ import (
 
 // LeaseScanOptions configure the lease scan.
 type LeaseScanOptions struct {
-	// Every is how often the cluster as a whole lists state/nodes/: each node lists
+	// Every is how often the cluster as a whole lists state/leases/: each node lists
 	// every N × Every on average, N being the nodes in its last listing. 2 s if zero.
 	Every time.Duration
 	// TTL is the lease TTL the cluster runs with, coord.DefaultTTL if zero. A
@@ -41,7 +41,7 @@ type NodeList struct {
 	Nodes []NodeView
 }
 
-// leaseScan is the part of the Catalog that lists state/nodes/, finds dead nodes and
+// leaseScan is the part of the Catalog that lists state/leases/, finds dead nodes and
 // adopts them (docs/internals.md, Takeover). A
 // lease whose last write (the store's clock) is older than the TTL by the scan's
 // clock may have expired: the scan reads it, notes its ETag and looks again once
@@ -51,10 +51,12 @@ type NodeList struct {
 // which in a large cluster is far apart.
 //
 // A dead node is adopted at once, on the loop, one at a time: mark, the
-// journal's adoption (fence, deltas, wake hints), finish and the sweep of its
-// segments below the fence. Every step is safe to redo, so an adoption cut short
-// (an error, the scan stopping, this node dying) is simply made again, by this
-// node or another.
+// journal's adoption (fence, read, and for each tail an entry due now in the
+// reminder index before its delta), finish and the sweep of its segments below the
+// fence. A node that stopped (its lease released) has nothing to adopt: its shards
+// are covered by their entries. Every step is safe to redo, so an adoption cut
+// short (an error, the scan stopping, this node dying) is simply made again, by
+// this node or another.
 //
 // Its loop owns the watches. What others read is the published NodeList.
 type leaseScan struct {
@@ -68,6 +70,8 @@ type leaseScan struct {
 	log     *slog.Logger
 	scans   *notify.Counter // listings made, for tests
 	adopted *notify.Counter // adoptions finished, for tests
+	// died, if set, is told each node a listing first shows dead (Catalog.died).
+	died func(node string)
 
 	view    atomic.Pointer[NodeList]
 	watches map[string]*leaseWatch // by node, the loop's own
@@ -124,7 +128,7 @@ func (s *leaseScan) Serve(ctx context.Context) error {
 	}
 }
 
-// scan lists state/nodes/, starts or ends watches and publishes the listing. It
+// scan lists state/leases/, starts or ends watches and publishes the listing. It
 // returns how many nodes it listed.
 func (s *leaseScan) scan(ctx context.Context, now time.Time) int {
 	listed, err := s.reg.List(ctx)
@@ -156,8 +160,23 @@ func (s *leaseScan) scan(ctx context.Context, now time.Time) int {
 			delete(s.watches, name)
 		}
 	}
-	s.view.Store(out)
+	s.publish(out)
 	return len(listed)
+}
+
+// publish makes out the last listing, and tells died about each node it shows
+// dead that the listing before it didn't.
+func (s *leaseScan) publish(out *NodeList) {
+	was := map[string]bool{}
+	for _, v := range s.Nodes().nodes() {
+		was[v.Name] = v.Dead
+	}
+	s.view.Store(out)
+	for _, v := range out.Nodes {
+		if v.Dead && !was[v.Name] && s.died != nil {
+			s.died(v.Name)
+		}
+	}
 }
 
 // watch reads a lease that may have expired and starts its watch. A released
@@ -212,7 +231,7 @@ func (s *leaseScan) publishDead(node string) {
 			out.Nodes[i].Dead = true
 		}
 	}
-	s.view.Store(out)
+	s.publish(out)
 }
 
 // adoptDead adopts every dead node not adopted yet, one after the other, in
@@ -239,7 +258,11 @@ func (s *leaseScan) adoptDead(ctx context.Context) {
 // listing looks at the node afresh.
 func (s *leaseScan) adopt(ctx context.Context, x string, w *leaseWatch) {
 	l, me := w.lease, s.self()
-	if x == me.Node || l.Released || l.Adopted >= l.Epoch {
+	if x == me.Node {
+		w.done = true
+		return
+	}
+	if l.Released || l.Adopted >= l.Epoch { // a release also marks the lease adopted: there is no tail
 		w.done = true
 		return
 	}
@@ -261,10 +284,7 @@ func (s *leaseScan) adopt(ctx context.Context, x string, w *leaseWatch) {
 		return
 	}
 	s.log.Info("adopting a dead node", "node", x, "epoch", l.Epoch, "readopted", l.AdoptedBy != nil)
-	rep, err := s.files.AdoptJournal(ctx, x, l.JournalFrom, l.JournalNext, func(ctx context.Context, shard string) error {
-		_, err := hintStore{s.store}.writeWake(ctx, shard, s.clock.Now())
-		return err
-	}, s.log)
+	rep, err := s.files.AdoptJournal(ctx, x, l.JournalFrom, l.JournalNext, s.log)
 	if err != nil {
 		if ctx.Err() == nil {
 			s.log.Error("adopting a dead node failed, it will be adopted again", "node", x, "epoch", l.Epoch, "err", err)
@@ -283,8 +303,8 @@ func (s *leaseScan) adopt(ctx context.Context, x string, w *leaseWatch) {
 		return
 	}
 	// Segments from the fence on may be the node's next life's by now.
-	sw := &sweeper{store: s.store, node: x, below: rep.Fence, log: s.log}
-	if _, err := sw.sweepJournal(ctx, s.clock.Now()); err != nil && ctx.Err() == nil {
+	sw := &expiry{store: s.store, node: x, below: rep.Fence, log: s.log}
+	if _, err := sw.expire(ctx, s.clock.Now()); err != nil && ctx.Err() == nil {
 		s.log.Warn("could not sweep a dead node's journal", "node", x, "err", err)
 	}
 	s.log.Info("adopted a dead node", "node", x, "epoch", l.Epoch, "deltas", rep.Deltas, "lost", rep.Lost, "fence", rep.Fence)

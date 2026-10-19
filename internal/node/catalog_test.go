@@ -3,10 +3,12 @@ package node
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -53,9 +55,9 @@ type mrig struct {
 	m           *Catalog
 	stopM       func() error // stops the shards' Serve and returns what it returned
 
-	// newTransport makes the shards' transport (the server's, for the rigs that
-	// have one). The default reaches nobody.
-	newTransport func(*Catalog) *transport
+	// newRouting makes the shards' wake of the app and calls (the server's,
+	// for the rigs that have one). The default reaches nobody.
+	newRouting func(*Catalog) routing
 
 	cmu    sync.Mutex
 	counts map[string]int
@@ -132,16 +134,17 @@ func (r *mrig) startShards(mutate func(*CatalogOptions)) {
 	if mutate != nil {
 		mutate(&o)
 	}
-	newTransport := r.newTransport
-	if newTransport == nil {
-		newTransport = func(*Catalog) *transport {
+	newRouting := r.newRouting
+	if newRouting == nil {
+		newRouting = func(*Catalog) routing {
 			unserved := errors.New("the node is not serving")
-			return &transport{maxHops: DefaultMaxHops,
-				intake: func(context.Context, *shard, string, *outRow) (int, error) { return 0, unserved },
-				inbox:  func(context.Context, *shard, *inRow) (int, error) { return 0, unserved }}
+			return routing{
+				wake: func(context.Context, *shard) (int, error) { return 0, unserved },
+				call: func(*http.Request) (*http.Response, error) { return nil, unserved },
+			}
 		}
 	}
-	m, err := NewCatalog(r.n, o, newTransport)
+	m, err := NewCatalog(r.n, o, newRouting)
 	if err != nil {
 		r.t.Fatal(err)
 	}
@@ -190,6 +193,15 @@ func (r *mrig) calls(op, prefix string) int {
 		}
 	}
 	return n
+}
+
+// create creates shards as an app's call would: clients can only reach shards
+// that exist.
+func (r *mrig) create(targets ...string) {
+	r.t.Helper()
+	for _, target := range targets {
+		r.acquire(target).Release()
+	}
 }
 
 func (r *mrig) acquire(target string) *Ref {
@@ -419,11 +431,11 @@ func TestCreateRaceClaimsTheOther(t *testing.T) {
 	})
 	ref := r.acquire("users/2")
 	defer ref.Release()
-	if !raced || !strings.Contains(ref.Path(), ".other.db") {
-		t.Fatalf("raced %v, path %s", raced, ref.Path())
-	}
-	if m, err := r.manifest("users/2"); err != nil || m.Owner != "n1" || m.Generation != "other" {
-		t.Fatalf("manifest %+v: %v", m, err)
+	// The winner's manifest has nothing to restore, so the shard starts over in a
+	// generation of its own.
+	m, err := r.manifest("users/2")
+	if !raced || err != nil || m.Owner != "n1" || m.Generation == "other" || !strings.Contains(ref.Path(), "."+m.Generation+".db") {
+		t.Fatalf("raced %v, path %s, manifest %+v: %v", raced, ref.Path(), m, err)
 	}
 	if r.m.Stats.Creates.Load() != 0 {
 		t.Fatal("counted as created")
@@ -938,85 +950,6 @@ func TestEvictsLeastRecentlyUsed(t *testing.T) {
 	}
 }
 
-func TestDelete(t *testing.T) {
-	t.Parallel()
-	r := newMRig(t)
-	ctx := context.Background()
-	ref := r.acquire("slow/del")
-	r.write(ref, "a")
-	if err := r.m.Gate(ctx, ref, true); err != nil {
-		t.Fatal(err)
-	}
-	m1, _ := r.manifest("slow/del")
-	path := ref.Path()
-
-	// In use: refused.
-	if err := r.m.Delete(ctx, "slow/del"); !errors.Is(err, ErrBusy) {
-		t.Fatalf("delete of a shard in use: %v", err)
-	}
-	ref.Release()
-	// The app still has the file open: refused.
-	if err := r.m.Delete(ctx, "slow/del"); !errors.Is(err, ErrBusy) {
-		t.Fatalf("delete of a shard the app has open: %v", err)
-	}
-	if !r.m.IsActive("slow/del") {
-		t.Fatal("a refused delete deactivated the shard")
-	}
-	r.app.Must(t, "close", "a")
-	if err := r.m.Delete(ctx, "slow/del"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.manifest("slow/del"); !errors.Is(err, blob.ErrNotFound) {
-		t.Fatalf("manifest: %v", err)
-	}
-	for info, err := range r.n.Store.List(ctx, shardfile.ShardPrefix("slow/del")) {
-		t.Fatalf("LTX file left: %v %v", info.Key, err)
-	}
-	if _, err := os.Stat(path); err == nil {
-		t.Fatal("local file left")
-	}
-	if r.m.IsActive("slow/del") {
-		t.Fatal("still active")
-	}
-	// Deleting what isn't there is done. A later write makes a new, empty shard.
-	if err := r.m.Delete(ctx, "slow/del"); err != nil {
-		t.Fatal(err)
-	}
-	ref = r.acquire("slow/del")
-	defer ref.Release()
-	r.write(ref, "b")
-	if err := r.m.Gate(ctx, ref, true); err != nil {
-		t.Fatal(err)
-	}
-	m2, err := r.manifest("slow/del")
-	if err != nil || m2.Generation == m1.Generation || ref.Path() == path {
-		t.Fatalf("recreated shard reuses the old generation: %+v %v", m2, err)
-	}
-}
-
-func TestDeleteOfACachedShard(t *testing.T) {
-	t.Parallel()
-	r := newMRig(t)
-	ctx := context.Background()
-	ref := r.acquire("users/10")
-	r.write(ref, "a")
-	if err := r.m.Gate(ctx, ref, true); err != nil {
-		t.Fatal(err)
-	}
-	r.app.Must(t, "close", "a")
-	ref.Release()
-	eventually(t, "deactivation", func() bool { return r.cached("users/10") })
-	if err := r.m.Delete(ctx, "users/10"); err != nil {
-		t.Fatal(err)
-	}
-	if r.cached("users/10") {
-		t.Fatal("still cached")
-	}
-	if _, err := r.manifest("users/10"); !errors.Is(err, blob.ErrNotFound) {
-		t.Fatalf("manifest: %v", err)
-	}
-}
-
 func TestBackgroundDeltasAndRebases(t *testing.T) {
 	t.Parallel()
 	r := newMRig(t)
@@ -1231,7 +1164,7 @@ func TestReleasesShareSegments(t *testing.T) {
 		r.app.Must(t, "close", fmt.Sprint(i)) // the app lets go of the file, or the node keeps the shard
 		ref.Release()
 		g.Go(func() error {
-			ok, err := ref.a.release(ctx)
+			ok, err := ref.a.deactivateNow(ctx)
 			if err == nil && !ok {
 				err = errors.New("not deactivated")
 			}
@@ -1304,24 +1237,15 @@ func TestBackgroundSnapshotsAreNotRebasedByAge(t *testing.T) {
 	}
 }
 
-// The catalog stops in order: once the shards are being let go of, the wake scan no
-// longer activates anything (a hint that comes due during a release wakes
-// nothing), and the flusher still runs (a gate during a release goes through,
-// and so does each release's own final sync, which no longer has a fallback).
+// The catalog stops in order: the flusher still runs once the shards are being let
+// go of (a gate during a release goes through, and so does each release's own final
+// sync, which no longer has a fallback).
 func TestShardsStopInOrder(t *testing.T) {
 	t.Parallel()
-	r := newMRigWith(t, func(o *CatalogOptions) { o.Wakes.Every = 20 * time.Millisecond })
+	r := newMRig(t)
 	ctx := context.Background()
-	// A cached shard, which a hint would wake.
-	ref := r.acquire("users/so1")
-	r.write(ref, "so1")
-	ref.Release()
-	r.app.Must(t, "close", "so1")
-	if ok, err := r.shard("users/so1").release(ctx); err != nil || !ok {
-		t.Fatalf("release: %v %v", ok, err)
-	}
 	// An active shard whose release is held in its delta.
-	ref = r.acquire("wallet/so2")
+	ref := r.acquire("wallet/so2")
 	r.write(ref, "so2")
 	if err := r.m.Gate(ctx, ref, true); err != nil {
 		t.Fatal(err)
@@ -1330,22 +1254,14 @@ func TestShardsStopInOrder(t *testing.T) {
 	r.app.Must(t, "close", "so2")
 	entered, _, unblock := r.blockCreates(shardfile.ShardPrefix("wallet/so2"))
 	defer unblock()
-	activations := r.m.Stats.Activations.Load()
 	stopped := make(chan error, 1)
 	go func() { stopped <- r.stop() }()
 	<-entered // letting go of wallet/so2, past its final sync
 
-	if _, err := r.n.Store.Create(ctx, wakeKey(r.m.now(), "users/so1"), strings.NewReader("")); err != nil {
-		t.Fatal(err)
-	}
 	quick, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if err := r.m.Barrier(quick); err != nil {
 		t.Fatalf("a gate during the release: %v", err)
-	}
-	time.Sleep(100 * time.Millisecond) // five periods of the wake scan
-	if n := r.m.Stats.Activations.Load(); n != activations || r.m.IsActive("users/so1") {
-		t.Fatalf("a hint woke a shard while the shards were let go of (%d activations)", n-activations)
 	}
 	unblock()
 	if err := <-stopped; err != nil {
@@ -1353,5 +1269,70 @@ func TestShardsStopInOrder(t *testing.T) {
 	}
 	if r.m.IsActive("wallet/so2") {
 		t.Fatal("wallet/so2 was not let go of")
+	}
+}
+
+// An activation that fails after its first sync leaves its commits in the
+// journal, and the next one starts the shard over from position 1. It does so
+// in a new generation, so adopting the journal never mixes the two
+// activations' commits.
+func TestActivationAfterAFailedOneStartsANewGeneration(t *testing.T) {
+	t.Parallel()
+	r := newMRig(t)
+	ctx := context.Background()
+	// An active shard keeps the lease's journal range from moving past the failed
+	// activation's segment.
+	other := r.acquire("slow/other")
+	r.write(other, "o")
+
+	// What the failed activation leaves: a manifest with no files, and commits in
+	// the journal. The extra table stands for anything it committed that the next
+	// activation doesn't.
+	h, created, err := r.n.Files.Open(ctx, "slow/f")
+	if err != nil || !created {
+		t.Fatalf("create: %v %v", created, err)
+	}
+	failed := h.Manifest.Generation
+	path := r.m.cache.pathFor("slow", "f", failed)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sh, err := capture.New(capture.Config{Name: "slow/f", Path: path, Generation: failed, MetaRoot: r.meta, Writer: r.n.Writer, TempDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sh.Capture(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := sh.Use(ctx, func(db *sql.DB) error { _, err := db.ExecContext(ctx, `CREATE TABLE stray (x)`); return err }); err != nil {
+		t.Fatal(err)
+	}
+	if err := sh.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	sh.Close(ctx)
+	sh.Discard()
+
+	ref := r.acquire("slow/f")
+	if r.shard("slow/f").h.Manifest.Generation == failed {
+		t.Fatal("the shard started over in the failed activation's generation")
+	}
+	r.write(ref, "f")
+	if err := r.m.Gate(ctx, ref, true); err != nil {
+		t.Fatal(err)
+	}
+	want := r.liveDump(ref.Path())
+	r.app.Must(t, "close", "f")
+	r.app.Must(t, "close", "o")
+	r.crash() // the shard's commits are only in journal segments
+	r.startNode()
+	if r.n.Adopted.Deltas == 0 {
+		t.Fatalf("nothing was adopted: %+v", r.n.Adopted)
+	}
+	if got := r.dumpBlob("slow/f"); got != want {
+		t.Fatalf("restored after adoption:\n%s\nwant:\n%s", got, want)
 	}
 }

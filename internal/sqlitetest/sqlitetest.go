@@ -1,13 +1,18 @@
-// Package sqlitetest compares SQLite files in tests.
+// Package sqlitetest compares SQLite files in tests, and checks migrations.
 package sqlitetest
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
+	"io/fs"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	_ "modernc.org/sqlite"
+
+	"github.com/luci1900/shardlite/internal/migrate"
 )
 
 // Dump returns every row of every table except Litestream's own, plus the
@@ -82,4 +87,45 @@ func TryDump(path string) (string, error) {
 		}
 	}
 	return sb.String(), nil
+}
+
+// Migrations checks a release's migrations (see package migrate): they pass
+// migrate.Check, and on a new file migrating up, down to nothing and up again
+// leaves the same tables and rows as the first time.
+func Migrations(tb testing.TB, fsys fs.FS) {
+	tb.Helper()
+	if err := migrate.Check(fsys); err != nil {
+		tb.Fatal(err)
+	}
+	path := filepath.Join(tb.TempDir(), "migrations.db")
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	to := func(v int) {
+		tb.Helper()
+		tx, err := db.Begin()
+		if err != nil {
+			tb.Fatal(err)
+		}
+		defer tx.Rollback()
+		if err := migrate.Migrate(context.Background(), tx, fsys, v); err != nil {
+			tb.Fatalf("to %d: %v", v, err)
+		}
+		if err := tx.Commit(); err != nil {
+			tb.Fatal(err)
+		}
+	}
+	to(migrate.Latest)
+	first := Dump(tb, path)
+	to(0)
+	if empty := Dump(tb, path); empty != "" {
+		tb.Fatalf("down to 0 leaves:\n%s", empty)
+	}
+	to(migrate.Latest)
+	if again := Dump(tb, path); again != first {
+		tb.Fatalf("up again gives:\n%s\nthe first time:\n%s", again, first)
+	}
 }

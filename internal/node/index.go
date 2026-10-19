@@ -2,6 +2,7 @@ package node
 
 import (
 	"database/sql"
+	_ "embed"
 	"fmt"
 	"time"
 
@@ -31,6 +32,11 @@ type indexRow struct {
 	ETag       string
 }
 
+// indexSchema is the cache index's schema.
+//
+//go:embed index.sql
+var indexSchema string
+
 // index is the on-disk record of the node's shard files (a SQLite file), so a
 // million cached shards don't cost memory.
 type index struct{ db *sql.DB }
@@ -41,11 +47,7 @@ func openIndex(path string) (*index, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(4)
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS shards (
-		name TEXT PRIMARY KEY, path TEXT NOT NULL, generation TEXT NOT NULL, position INTEGER NOT NULL,
-		state TEXT NOT NULL, last_used INTEGER NOT NULL, bytes INTEGER NOT NULL,
-		size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, wal_size INTEGER NOT NULL, wal_mtime_ns INTEGER NOT NULL, manifest TEXT NOT NULL, etag TEXT NOT NULL);
-		CREATE INDEX IF NOT EXISTS shards_lru ON shards (state, last_used)`)
+	_, err = db.Exec(indexSchema)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("cache index: %w", err)
@@ -105,9 +107,6 @@ func (x *index) rows(where string, args ...any) ([]indexRow, error) {
 	}
 	return out, rs.Err()
 }
-
-// all returns every row.
-func (x *index) all() ([]indexRow, error) { return x.rows(``) }
 
 // cachedBytes is the disk used by deactivated shards.
 func (x *index) cachedBytes() (n int64, err error) {

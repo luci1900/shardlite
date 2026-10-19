@@ -44,7 +44,7 @@ func letGo(t *testing.T, e *harness.Env, app *apptest.App, sh *capture.Shard) {
 	t.Helper()
 	app.Must(t, "close", "a")
 	app.Exit()
-	released, _, err := sh.Release(context.Background())
+	released, _, err := sh.Release(context.Background(), nil)
 	if err != nil || !released {
 		t.Fatalf("release: released=%v err=%v", released, err)
 	}
@@ -134,7 +134,7 @@ func restoreAndCapture(t *testing.T, e *harness.Env, v variant) {
 		}
 		// Nothing but the three commits was uploaded: no entry holds more than a fraction of the database's pages.
 		for _, en := range all {
-			b, err := segment.ReadEntry(ctx, e.Store, e.Node, entrySeq(t, e, en), en)
+			b, err := harness.ReadEntry(ctx, e.Store, e.Node, entrySeq(t, e, en), en)
 			if err != nil {
 				t.Fatal(err)
 			}

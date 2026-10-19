@@ -16,7 +16,7 @@ func TestShardIsUsableAfterAReleaseThatDidNotGoThrough(t *testing.T) {
 	ref.Release()
 	a := r.shard("slow/g1")
 	for i := range 3 {
-		if ok, err := a.release(context.Background()); ok || err != nil {
+		if ok, err := a.deactivateNow(context.Background()); ok || err != nil {
 			t.Fatalf("deactivate %d: %v %v", i, ok, err)
 		}
 		if err := a.useDB(context.Background(), func(db *sql.DB) error { return db.PingContext(context.Background()) }); err != nil {

@@ -19,6 +19,16 @@ import (
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
+// ReadEntry returns the LTX file bytes of one journal entry.
+func ReadEntry(ctx context.Context, store *blob.Store, node string, seq uint64, e segment.Entry) ([]byte, error) {
+	f, err := segment.ReadEntryFile(ctx, store, node, seq, e, "", int(e.Length))
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return f.Bytes()
+}
+
 // Env is one node's worth of storage.
 type Env struct {
 	T     testing.TB

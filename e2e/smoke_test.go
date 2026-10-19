@@ -36,6 +36,8 @@ func TestProtocolsThroughTheNode(t *testing.T) {
 		}
 	}
 
+	s.create(t, "users/u1", "wallet/w1", "wallet/w2", "wallet/w3", "wallet/w4", "wallet/w5", "wallet/w7", "wallet/w9")
+
 	// Plain HTTP.
 	st, body, err := s.request("POST", "/add", "users/u1", "t1")
 	if err != nil || st != 200 || jsonField(t, body, "count") != float64(1) {
@@ -48,15 +50,14 @@ func TestProtocolsThroughTheNode(t *testing.T) {
 		t.Fatalf("tokens via the query parameter: %d %q", st, body)
 	}
 
-	// A shard that is only read is created on activation and deleted when it
-	// goes idle, so it leaves nothing durable behind.
-	if st, body, _ := s.request("GET", "/count", "users/fresh", ""); st != 200 || jsonField(t, body, "count") != float64(0) {
-		t.Fatalf("count of a new shard: %d %q", st, body)
+	// A client can't create a shard: one that doesn't exist gets 404 and leaves
+	// nothing behind.
+	if st, body, _ := s.request("GET", "/count", "users/fresh", ""); st != 404 {
+		t.Fatalf("count of a shard that doesn't exist: %d %q", st, body)
 	}
-	eventually(t, "the shard that was only read to be deleted", func() bool {
-		_, _, err := v.files.GetManifest(t.Context(), "users/fresh")
-		return isNotFound(err)
-	})
+	if _, _, err := v.files.GetManifest(t.Context(), "users/fresh"); !isNotFound(err) {
+		t.Fatalf("a client's request created users/fresh: %v", err)
+	}
 
 	// Sync on: the response comes after the write is in blob storage.
 	if st, _, _ := s.request("POST", "/add", "wallet/w1", "pay-1"); st != 200 {
@@ -125,16 +126,16 @@ func TestProtocolsThroughTheNode(t *testing.T) {
 	}
 	// Errors the node makes are gRPC statuses.
 	_, err = unary(withMD(ctx, "shardlite-target", "typo/1"), cc, "Add", "x")
-	if status.Code(err) != codes.InvalidArgument {
+	if status.Code(err) != codes.NotFound {
 		t.Fatalf("undeclared kind over gRPC: %v", err)
 	}
 	// A kind that isn't public gets what an undeclared kind gets.
 	_, err = unary(withMD(ctx, "shardlite-target", "audit/1"), cc, "Add", "x")
-	if status.Code(err) != codes.InvalidArgument {
+	if status.Code(err) != codes.NotFound {
 		t.Fatalf("private kind over gRPC: %v", err)
 	}
 
-	// A shardless login answers with a URL naming the shard.
+	// A shardless login creates the user's shard and answers with a URL naming it.
 	st, body, _ = s.request("POST", "/login", "", "alice")
 	url, _ := jsonField(t, body, "url").(string)
 	if st != 200 || url != "/me?shardlite-target=users%2Falice" {
@@ -151,17 +152,17 @@ func TestProtocolsThroughTheNode(t *testing.T) {
 	}
 	mustHave("a transfer", "wallet/w5", "debit:x1")
 	mustHave("a transfer", "wallet/w6", "credit:x1")
-	// A message: the row and the message are one transaction on the sender; the
-	// node delivers it once that is durable, and the receiver's commit is durable
-	// before the node deletes the row.
+	// A durable send: the row, the call and its reminder are one transaction on
+	// the sender. The node wakes the sender's reminders handler once that is
+	// durable, and the handler calls the receiver, which does its work once.
 	if st, _, _ := s.request("POST", "/notify?to=wallet/w8&token=m1", "wallet/w7", ""); st != 200 {
 		t.Fatalf("notify: %d", st)
 	}
 	mustHave("a notify", "wallet/w7", "sent:m1")
-	eventually(t, "the message to reach its receiver", func() bool { return v.has("wallet/w8", "msg:m1") })
+	eventually(t, "the send to reach its receiver", func() bool { return v.has("wallet/w8", "msg:m1") })
 
-	// A reminder: set with a row in one transaction, fired by the node on the
-	// shard itself two seconds later, whose handler consumes it.
+	// A reminder: set with a row in one transaction, and the node wakes the
+	// shard's reminders handler two seconds later, which handles and deletes it.
 	if st, _, _ := s.request("POST", "/remind?key=r1&in=2", "wallet/w9", ""); st != 200 {
 		t.Fatalf("remind: %d", st)
 	}
@@ -174,11 +175,14 @@ func TestProtocolsThroughTheNode(t *testing.T) {
 	}
 
 	// Refusals.
-	if st, _, _ := s.request("GET", "/count", "audit/1", ""); st != 400 { // not public, like an undeclared kind
+	if st, _, _ := s.request("GET", "/count", "audit/1", ""); st != 404 { // not public, like an undeclared kind
 		t.Fatalf("private kind: %d", st)
 	}
-	if st, _, _ := s.request("GET", "/count", "typo/1", ""); st != 400 {
+	if st, _, _ := s.request("GET", "/count", "typo/1", ""); st != 404 {
 		t.Fatalf("undeclared kind: %d", st)
+	}
+	if st, _, _ := s.request("POST", "/_shardlite/reminders", "wallet/w6", ""); st != 404 {
+		t.Fatalf("the reminders wake from a client: %d", st)
 	}
 	if st, _, _ := s.request("POST", "/_shardlite/sync", "", ""); st != 404 {
 		t.Fatalf("node API from a client: %d", st)
@@ -192,7 +196,7 @@ func TestProtocolsThroughTheNode(t *testing.T) {
 	}
 
 	// Kinds are reloaded on SIGHUP.
-	if st, _, _ := s.request("POST", "/add", "extra/1", "e"); st != 400 {
+	if st, _, _ := s.request("POST", "/add", "extra/1", "e"); st != 404 {
 		t.Fatalf("a kind that isn't declared yet: %d", st)
 	}
 	kinds := strings.Replace(kindsJSON, `"audit"`, `"extra": {"public": true}, "audit"`, 1)
@@ -200,15 +204,9 @@ func TestProtocolsThroughTheNode(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.node.signal(syscall.SIGHUP)
-	eventually(t, "the new kind", func() bool { st, _, _ := s.request("POST", "/add", "extra/1", "e"); return st == 200 })
-
-	// Delete: refused while the app has the shard open, done once it has closed it.
-	eventually(t, "delete", func() bool {
-		st, _, _ := s.control("DELETE", "/_shardlite/shards/users/u1", "", "")
-		return st == 204
-	})
-	if _, _, err := v.files.GetManifest(t.Context(), "users/u1"); !isNotFound(err) {
-		t.Fatalf("manifest after delete: %v", err)
+	eventually(t, "the new kind", func() bool { st, _, _ := s.control("POST", "/create", "extra/1", ""); return st == 204 })
+	if st, _, _ := s.request("POST", "/add", "extra/1", "e"); st != 200 {
+		t.Fatalf("the new kind from a client: %d", st)
 	}
 
 	// Graceful stop: every shard is let go of (the app closes its handles when idle) and the lease is released.

@@ -6,6 +6,7 @@ Shardlite serves SQLite databases as actors, with blob storage as the system of 
 
 - [docs/overview.md](docs/overview.md) for the concepts and goals
 - [docs/internals.md](docs/internals.md) for how the node works
+- [docs/system-kinds.md](docs/system-kinds.md) for the node's own shards and cluster-wide jobs like `_dispatch`
 - [docs/concurrency.md](docs/concurrency.md) for goroutine ownership and shutdown rules (read it before touching any goroutine)
 - [docs/guide.md](docs/guide.md) for app-facing behaviour, headers, endpoints and settings
 - [docs/roadmap.md](docs/roadmap.md) for stages

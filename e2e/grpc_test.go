@@ -3,7 +3,6 @@ package e2e
 import (
 	"fmt"
 	"io"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +23,8 @@ func TestGRPCThroughTheNode(t *testing.T) {
 	pub, ctl := dialGRPC(t, s.pub), dialGRPC(t, s.ctl)
 	ctx, cancel := timeout(60 * time.Second)
 	defer cancel()
+
+	s.create(t, "wallet/g1", "wallet/g2", "wallet/g3", "wallet/g4", "wallet/g5", "wallet/g7", "wallet/g8", "wallet/r1")
 
 	t.Run("unary with headers and trailers", func(t *testing.T) {
 		var hdr, tr metadata.MD
@@ -125,10 +126,11 @@ func TestGRPCThroughTheNode(t *testing.T) {
 	t.Run("the node's own errors", func(t *testing.T) {
 		for _, c := range []struct {
 			name, shard string
-		}{{"undeclared kind", "typo/1"}, {"private kind", "audit/1"}, {"bad target", "nokind"}} {
+			code        codes.Code
+		}{{"undeclared kind", "typo/1", codes.NotFound}, {"private kind", "audit/1", codes.NotFound}, {"missing shard", "wallet/none", codes.NotFound}, {"bad target", "nokind", codes.InvalidArgument}} {
 			_, err := unary(withMD(ctx, "shardlite-target", c.shard), pub, "Add", "x")
-			if status.Code(err) != codes.InvalidArgument {
-				t.Errorf("%s: %v, want InvalidArgument", c.name, err)
+			if status.Code(err) != c.code {
+				t.Errorf("%s: %v, want %v", c.name, err, c.code)
 			}
 		}
 		// Shardlite-If-Active on a shard that isn't active: NotFound, and it stays inactive.
@@ -136,7 +138,7 @@ func TestGRPCThroughTheNode(t *testing.T) {
 		if status.Code(err) != codes.NotFound {
 			t.Errorf("inactive shard: %v, want NotFound", err)
 		}
-		if _, err := unary(withMD(ctx, "shardlite-target", "wallet/g6"), pub, "Add", "g6"); err != nil {
+		if _, err := unary(withMD(ctx, "shardlite-target", "wallet/g6"), ctl, "Add", "g6"); err != nil { // a call creates it
 			t.Fatal(err)
 		}
 		if _, err := unary(withMD(ctx, "shardlite-target", "wallet/g6", "shardlite-if-active", "true"), ctl, "Who", ""); err != nil {
@@ -155,7 +157,7 @@ func TestGRPCThroughTheNode(t *testing.T) {
 		if err == nil {
 			_, err = recv(st)
 		}
-		if status.Code(err) != codes.InvalidArgument {
+		if status.Code(err) != codes.NotFound {
 			t.Errorf("stream to an undeclared kind: %v", err)
 		}
 	})
@@ -170,13 +172,11 @@ func TestGRPCThroughTheNode(t *testing.T) {
 			hold <- err
 		}()
 		eventually(t, "the call to reach the app", func() bool { return s.appDebug().HoldStarted > before.HoldStarted })
+		// The client's grpc-timeout passes through as it sent it (the client enforces
+		// its own deadline).
 		rec := s.appDebug().LastHold
-		gt := strings.TrimSuffix(rec.GRPCTimeout, "m")
-		if ms, err := strconv.Atoi(gt); err != nil || !strings.HasSuffix(rec.GRPCTimeout, "m") || ms <= 0 || ms > 2000 {
-			t.Errorf("grpc-timeout at the app: %q", rec.GRPCTimeout)
-		}
-		if ms, err := strconv.Atoi(rec.ShardliteDeadln); err != nil || ms <= 0 || ms > 2000 {
-			t.Errorf("Shardlite-Deadline at the app: %q", rec.ShardliteDeadln)
+		if rec.GRPCTimeout == "" {
+			t.Errorf("the app saw no grpc-timeout")
 		}
 		if rec.Target != "wallet/g7" || rec.DeadlineMS <= 0 || rec.DeadlineMS > 2000 {
 			t.Errorf("handler context: %+v", rec)
@@ -185,20 +185,6 @@ func TestGRPCThroughTheNode(t *testing.T) {
 			t.Errorf("the call ended with %v, want DeadlineExceeded", err)
 		}
 		eventually(t, "the app's handler to see the deadline", func() bool { return s.appDebug().HoldCancel > before.HoldCancel })
-	})
-
-	t.Run("a deadline the node enforces", func(t *testing.T) {
-		// Through the control API a call may carry a Shardlite-Deadline of its own, which
-		// the node enforces and the app sees.
-		before := s.appDebug()
-		_, err := unary(withMD(ctx, "shardlite-target", "wallet/g7", "shardlite-deadline", "300"), ctl, "Hold", "")
-		if status.Code(err) != codes.DeadlineExceeded {
-			t.Fatalf("%v, want DeadlineExceeded", err)
-		}
-		if rec := s.appDebug().LastHold; rec.ShardliteDeadln == "" || rec.ShardliteDeadln == "0" {
-			t.Errorf("the app saw %+v", rec)
-		}
-		eventually(t, "the app's handler to be cancelled", func() bool { return s.appDebug().HoldCancel > before.HoldCancel })
 	})
 
 	t.Run("cancelling a call cancels the handler", func(t *testing.T) {

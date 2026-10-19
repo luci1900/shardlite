@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -27,6 +28,7 @@ import (
 type cluster struct {
 	t     *testing.T
 	mem   *blob.Memory
+	vars  map[string]string // environment variables every node gets, over the defaults
 	nodes []*clusterNode
 }
 
@@ -55,7 +57,13 @@ func newCluster(t *testing.T, n int) *cluster { return newClusterWith(t, n, nil)
 // newClusterWith is newCluster with the shards' options changed by tune.
 func newClusterWith(t *testing.T, n int, tune func(*CatalogOptions)) *cluster {
 	t.Helper()
-	c := &cluster{t: t, mem: blob.NewMemory()}
+	return newClusterEnv(t, n, nil, tune)
+}
+
+// newClusterEnv is newClusterWith with environment variables set on every node.
+func newClusterEnv(t *testing.T, n int, vars map[string]string, tune func(*CatalogOptions)) *cluster {
+	t.Helper()
+	c := &cluster{t: t, mem: blob.NewMemory(), vars: vars}
 	for i := range n {
 		nd := c.newNode(fmt.Sprintf("n%d", i))
 		nd.tune = tune
@@ -92,6 +100,7 @@ func (c *cluster) newNode(name string) *clusterNode {
 		"SHARDLITE_LISTEN_PUBLIC": "127.0.0.1:0", "SHARDLITE_LISTEN_CONTROL": "127.0.0.1:0", "SHARDLITE_LISTEN_PEER": "127.0.0.1:0",
 		"SHARDLITE_FLUSH": "50ms",
 	}
+	maps.Copy(vars, c.vars)
 	env, err := ParseEnv(func(k string) string { return vars[k] })
 	if err != nil {
 		t.Fatal(err)
@@ -107,6 +116,17 @@ const clusterKinds = `{"kinds": {
 	"audit":  {"idle_timeout": "1h"},
 	"brief":  {"public": true, "sync": "off", "idle_timeout": "100ms"}
 }}`
+
+// create creates a shard on the node, as an app's call would, without asking the
+// app: clients can only reach shards that exist.
+func (n *clusterNode) create(target string) {
+	n.t.Helper()
+	ref, err := n.m.Load().Acquire(context.Background(), target)
+	if err != nil {
+		n.t.Fatalf("creating %s: %v", target, err)
+	}
+	ref.Release()
+}
 
 // serve makes h the node's app (but for its health endpoint).
 func (n *clusterNode) serve(h http.HandlerFunc) { n.app.Store(&h) }
@@ -176,13 +196,15 @@ func (n *clusterNode) Stop() {
 	}
 }
 
-// Kill cancels the node with the store cut off from it, so nothing can be let
-// go of and the lease is not released: to the others it is a node that went
-// quiet. Meant for nodes with no active shards, whose release would otherwise
-// be retried until its deadline.
+// Kill cancels the node with the store cut off from it, and its shards stop as
+// in a crash, so nothing is let go of and the lease is not released: to the
+// others it is a node that went quiet.
 func (n *clusterNode) Kill() {
 	n.t.Helper()
 	close(n.killed)
+	if m := n.m.Load(); m != nil {
+		m.abandon.Store(true)
+	}
 	n.Stop()
 }
 

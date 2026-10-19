@@ -16,7 +16,10 @@ import (
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/coord"
+	"github.com/luci1900/shardlite/internal/kind"
 	"github.com/luci1900/shardlite/internal/service"
+	"github.com/luci1900/shardlite/internal/system/dispatch"
+	"github.com/luci1900/shardlite/internal/system/sweep"
 )
 
 // RunOption changes how Run is assembled. Tests use them to swap parts the
@@ -120,7 +123,7 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 	// The catalog empties it of what a crash left (clearCache), once adoption is done.
 	tempDir := filepath.Join(env.Data, tempDirName)
 
-	expiry := JournalExpiry(env.DeltaAge)
+	expireAge := JournalExpiry(env.DeltaAge)
 	n, err := Start(ctx, Config{
 		Name: env.Name, Address: address, Backend: backend,
 		Lease:   coord.RegistryOptions{TTL: env.LeaseTTL},
@@ -192,13 +195,19 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 		Flush:     FlushOptions{Interval: env.Flush, Min: env.FlushMin},
 		Lifecycle: LifecycleOptions{DeltaAge: env.DeltaAge, DeltaSize: env.DeltaSize},
 		Leases:    LeaseScanOptions{TTL: env.LeaseTTL},
+		Dispatch:  &dispatch.Options{},
+		// The system kinds (docs/internals.md, System kinds), with what each is given
+		// of the node's.
+		System: []kind.Kind{
+			sweep.New(n.Store, n.Keeper.Check, time.Now, log, sweep.Options{Age: expireAge}),
+		},
 	}
 	if ro.shards != nil {
 		ro.shards(&so, nil)
 	}
-	m, err := NewCatalog(n, so, func(m *Catalog) *transport {
+	m, err := NewCatalog(n, so, func(m *Catalog) routing {
 		srv = NewServer(m, kinds, n.Keeper, ServerOptions{App: app, HealthPath: env.HealthPath, MaxHops: env.MaxHops, Grace: ro.grace, Logger: log})
-		return srv.transport()
+		return routing{wake: srv.wakeApp, dispatch: srv.dispatch, call: srv.call}
 	})
 	if err != nil {
 		return fail(err)
@@ -215,22 +224,21 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 	// what depends on it:
 	//
 	//	front   the public server and the services that depend on nothing
-	//	drain   not a service: Run delivers the live messages
 	//	callers the control server (the app's handlers can still make calls
-	//	        while the drain runs and until the shards are let go of) and
-	//	        the peer server (other nodes' requests)
+	//	        until the shards are let go of) and the peer server (other
+	//	        nodes' requests)
 	//	shards  every request has been joined once both servers have ended
 	//	journal the writer and the keeper, last
 	//
 	// A service that fails (its stage's Done), a lost lease or a fenced writer
 	// ends the wait below, and Run then runs the same stops as for a shutdown.
-	// Each stage has a limit on how long its stop waits; the drain and the
-	// shards have their own.
+	// Each stage has a limit on how long its stop waits; the shards have their
+	// own.
 	shardsClosed := make(chan error, 1)
 	front := service.New(context.Background(), log)
 	front.Add(srv.publicServer(public))
 	front.Add(srv.health)
-	front.Add(&sweeper{store: n.Store, node: n.Name, age: expiry, log: log})
+	front.Add(&expiry{store: n.Store, node: n.Name, age: expireAge, log: log})
 	front.Add(&kindsReload{kinds, log})
 	if pprof != nil {
 		front.Add(&httpServer{name: "pprof", log: log, lns: []net.Listener{pprof}, handler: http.DefaultServeMux, grace: ro.grace})
@@ -268,11 +276,6 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 	if err := stopStage(log, "the public server and the services that depend on nothing", front); cause == nil {
 		cause = err
 	}
-	// Messages that are still live get a few seconds to go out before the shards
-	// are let go of (the rest get a wake hint as each shard is).
-	log.Debug("service started", "service", "drain")
-	m.Drain(context.Background()) // bounded by ShardsOptions.Drain
-	log.Debug("service stopped", "service", "drain")
 	if err := stopStage(log, "the control and peer servers", callers); cause == nil {
 		cause = err
 	}

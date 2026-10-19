@@ -6,16 +6,18 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"time"
 
 	"golang.org/x/sync/errgroup"
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/capture"
+	"github.com/luci1900/shardlite/internal/remindex"
 	"github.com/luci1900/shardlite/internal/segment"
 )
 
-// AdoptReport says what AdoptJournal did.
+// AdoptReport says what AdoptJournal (or an Adoption) did.
 type AdoptReport struct {
 	Fence   uint64 // the number of the fence the adoption wrote: the journal's writer continues after it
 	From    uint64 // the first segment read (later than asked if the segments before it had expired)
@@ -37,7 +39,7 @@ type AdoptReport struct {
 const adoptWorkers = 64
 
 // AdoptJournal is what a node does with a journal that may hold commits no file has:
-// its own, left by the process it replaces (docs/internals.md, Restarting), or a dead
+// its own, left by the process it replaces (docs/internals.md, Takeover: Restart), or a dead
 // node's.
 //
 //  1. It fences the journal: an empty segment at the first free number from next,
@@ -46,31 +48,45 @@ const adoptWorkers = 64
 //  2. It reads the journal's footers from from, the oldest segment the lease says
 //     is still needed.
 //  3. For every shard with entries the manifest's files don't cover, it writes
-//     one delta and adds it to the manifest, clearing the manifest's journal.
-//     A wake hint for the current minute is written (by wake, which writes the
-//     hint and counts an existing one as success) before the delta: the shard
-//     may hold messages that were never delivered, and the scan for hints is what
-//     wakes it. The delta sets the manifest's wake time to now to match.
+//     one delta and adds it to the manifest, clearing the manifest's journal. The
+//     delta records a reminder due now, with its entry in the reminder index
+//     created first (Handle.setReminder): the shard may hold reminders that were
+//     never delivered and the adopter can't read them (docs/internals.md,
+//     Takeover). A failed entry leaves the delta unwritten.
 //
-// A tail with a hole in it is reported in Lost, not as a failure, only if the
-// journal's first segments had expired: refusing to start would not bring those
-// commits back. A hole anywhere else means the range in the lease was wrong or
-// the journal is damaged, and fails the adoption so the bug is seen.
-//
-// Every shard is tried, so one bad shard doesn't leave the others' tails in
-// the journal. If any failed the error says so (and Problems lists them): the
-// journal's range must not be moved on, since the tails are still there.
-func (f *Files) AdoptJournal(ctx context.Context, node string, from, next uint64, wake func(ctx context.Context, shard string) error, logger *slog.Logger) (AdoptReport, error) {
+// It is ReadJournal (steps 1 and 2) and Adopt (step 3).
+func (f *Files) AdoptJournal(ctx context.Context, node string, from, next uint64, logger *slog.Logger) (AdoptReport, error) {
+	a, err := f.ReadJournal(ctx, node, from, next, logger)
+	if err != nil {
+		return a.Report, err
+	}
+	err = a.Adopt(ctx)
+	return a.Report, err
+}
+
+// Adoption is a journal being adopted: fenced and read (ReadJournal), with its
+// deltas still to write (Adopt).
+type Adoption struct {
+	f      *Files
+	node   string
+	idx    *JournalIndex
+	log    *slog.Logger
+	Report AdoptReport
+}
+
+// ReadJournal fences the journal and reads its footers: steps 1 and 2 of
+// AdoptJournal. On an error the Adoption still has the Report so far.
+func (f *Files) ReadJournal(ctx context.Context, node string, from, next uint64, logger *slog.Logger) (*Adoption, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	a := &Adoption{f: f, node: node, log: logger}
 	from, next = max(from, 1), max(next, 1)
-	rep := AdoptReport{}
 	fence, err := segment.Fence(ctx, f.Blob, node, next)
 	if err != nil {
-		return rep, fmt.Errorf("adopt %s: fence: %w", node, err)
+		return a, fmt.Errorf("adopt %s: fence: %w", node, err)
 	}
-	rep.Fence = fence
+	a.Report.Fence = fence
 
 	// Segments expire. A lease that has been idle for longer than they live can
 	// name ones that are gone, and the journal then starts where the listing says.
@@ -78,27 +94,41 @@ func (f *Files) AdoptJournal(ctx context.Context, node string, from, next uint64
 		if _, err := segment.ReadFooter(ctx, f.Blob, node, from); errors.Is(err, blob.ErrNotFound) {
 			low, _, err := segment.Bounds(ctx, f.Blob, node)
 			if err != nil {
-				return rep, fmt.Errorf("adopt %s: %w", node, err)
+				return a, fmt.Errorf("adopt %s: %w", node, err)
 			}
 			logger.Warn("the journal's first segments have expired", "node", node, "lease_from", from, "first_present", low)
-			rep.Expired = true
+			a.Report.Expired = true
 			from = max(low, from)
 		}
 	}
-	rep.From = from
+	a.Report.From = from
 
 	// Every number from the start of the range to the fence must be there. A
 	// missing one in the middle would hide the segments after it from a plain
 	// scan, and with them commits an acknowledgement was given for.
 	idx, err := f.LoadJournal(ctx, node, from, fence)
 	if err != nil {
-		return rep, fmt.Errorf("adopt %s: reading the journal: %w", node, err)
+		return a, fmt.Errorf("adopt %s: reading the journal: %w", node, err)
 	}
-	rep.Shards = len(idx.byShard)
+	a.idx = idx
+	a.Report.Shards = len(idx.byShard)
+	return a, nil
+}
 
-	// Each worker fills its own slot, and they are folded after Wait.
-	names := make([]string, 0, len(idx.byShard))
-	for name := range idx.byShard {
+// Adopt writes the deltas of step 3 for the shards with entries in the journal,
+// adding to Report.
+//
+// A tail with a hole in it is reported in Lost, not as a failure, only if the
+// journal's first segments had expired: refusing to start would not bring those
+// commits back. A hole anywhere else means the range in the lease was wrong or
+// the journal is damaged, and fails the adoption so the bug is seen.
+//
+// Every shard is tried, so one bad one doesn't leave the others' tails in
+// the journal. If any failed the error says so (and Problems lists them): the
+// journal's range must not be moved on, since the tails are still there.
+func (a *Adoption) Adopt(ctx context.Context) error {
+	names := make([]string, 0, len(a.idx.byShard))
+	for name := range a.idx.byShard {
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -111,15 +141,17 @@ func (f *Files) AdoptJournal(ctx context.Context, node string, from, next uint64
 	g.SetLimit(adoptWorkers)
 	for i, name := range names {
 		g.Go(func() error {
-			results[i].wrote, results[i].err = f.adoptShard(ctx, node, name, idx, wake)
+			results[i].wrote, results[i].err = a.f.adoptShard(ctx, a.node, name, a.idx)
 			return nil // each shard's problem is collected below, the others carry on
 		})
 	}
 	g.Wait()
+	rep := &a.Report
+	failed := 0
 	for i, name := range names {
 		r := results[i]
 		if _, gap := errors.AsType[*gapError](r.err); gap && rep.Expired {
-			logger.Error("a shard's tail has a hole, commits after it are lost", "node", node, "shard", name, "err", r.err)
+			a.log.Error("a shard's tail has a hole, commits after it are lost", "node", a.node, "shard", name, "err", r.err)
 			rep.Lost = append(rep.Lost, name)
 		} else if r.err != nil {
 			err := r.err
@@ -127,15 +159,16 @@ func (f *Files) AdoptJournal(ctx context.Context, node string, from, next uint64
 				err = fmt.Errorf("%w (the journal's range was not expired, so this is a bug)", err)
 			}
 			rep.Problems = append(rep.Problems, fmt.Errorf("%s: %w", name, err))
+			failed++
 		} else if r.wrote {
 			rep.Deltas++
 		}
 	}
 	sort.Slice(rep.Problems, func(i, j int) bool { return rep.Problems[i].Error() < rep.Problems[j].Error() })
-	if len(rep.Problems) > 0 {
-		return rep, fmt.Errorf("adopt %s: %d of %d shards failed: %w", node, len(rep.Problems), rep.Shards, errors.Join(rep.Problems...))
+	if failed > 0 {
+		return fmt.Errorf("adopt %s: %d of %d shards failed: %w", a.node, failed, len(names), errors.Join(rep.Problems...))
 	}
-	return rep, nil
+	return nil
 }
 
 type gapError struct{ from, to uint64 }
@@ -145,7 +178,7 @@ func (g *gapError) Error() string {
 }
 
 // adoptShard writes the delta for one shard's uncovered entries, if it has any.
-func (f *Files) adoptShard(ctx context.Context, node, name string, idx *JournalIndex, wake func(ctx context.Context, shard string) error) (bool, error) {
+func (f *Files) adoptShard(ctx context.Context, node, name string, idx *JournalIndex) (bool, error) {
 	for range 5 {
 		h, err := f.Attach(ctx, name)
 		if errors.Is(err, blob.ErrNotFound) {
@@ -164,19 +197,19 @@ func (f *Files) adoptShard(ctx context.Context, node, name string, idx *JournalI
 		if len(tail) == 0 {
 			return false, nil
 		}
-		// The hint comes first: if this node dies before the delta, a repeated
-		// adoption finds the tail in the journal and writes the hint again (an
-		// existing one counts as success). A hint that is found before the delta only
-		// means "look": a wake that fails while the shard isn't released leaves it, and
-		// the next scan gets it.
-		if err := wake(ctx, name); err != nil {
-			capture.CloseTail(tail)
-			return false, fmt.Errorf("writing the wake hint: %w", err)
+		// The entry comes first: journal expiry checks no lease, so once the delta
+		// covers the tail a zombie of the dead node may delete the segments holding
+		// it, and then nothing but the entry says the shard may have a reminder. If
+		// this node dies before the delta, a repeated adoption finds the tail and
+		// creates an entry again. The delta records a reminder due now, since the
+		// shard may hold reminders that were never delivered and the adopter can't
+		// read them. A system shard has none: the claimer brings it back.
+		var hooks Hooks
+		if !isSystem(name) {
+			now := remindex.MinuteAt(f.now())
+			hooks.BeforeUpdate = func(context.Context, uint64) (int64, error) { return now, nil }
 		}
-		err = h.putTail(ctx, tail, Hooks{}, func(n *Manifest) {
-			n.Journal = ""
-			n.Wake = time.Now().Unix() // it can't read the shard's rows, so the shard is woken to look
-		})
+		err = h.putTail(ctx, tail, hooks, func(n *Manifest) { n.Journal = "" })
 		capture.CloseTail(tail)
 		if errors.Is(err, blob.ErrConflict) {
 			continue // somebody changed the manifest: look again
@@ -185,3 +218,7 @@ func (f *Files) adoptShard(ctx context.Context, node, name string, idx *JournalI
 	}
 	return false, errors.New("the manifest keeps changing")
 }
+
+// isSystem reports whether the shard is a system shard (a kind that starts with
+// "_"), which has no reminder in the index: the claimer brings it back.
+func isSystem(name string) bool { return strings.HasPrefix(name, "_") }

@@ -3,10 +3,10 @@ package node
 import "time"
 
 // Clock is the time the shards use for reminders (their timers and due times),
-// wake hints (the minute of a key, which keys are due), the age of rows, the
-// retry backoff of messages, each shard's idle and delta timers with the times
+// their next_reminder and the index entries (which are due), the age of reminders, the
+// retry backoff of reminders, each shard's idle and delta timers with the times
 // they compare (a shard's last use and hold-off), and the periods of the cache
-// loop, the watchdog and the wake scan. Tests move it. Flush cycles, the ages of
+// loop, the watchdog and the lease scan. Tests move it. Flush cycles, the ages of
 // tails (which decide whether a delta is due, and the tail alert), the short
 // pauses between a commit's writes, and shutdown use real time.
 type Clock interface {

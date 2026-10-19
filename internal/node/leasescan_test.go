@@ -17,6 +17,7 @@ import (
 )
 
 // runScan serves a lease scan for node "w" (epoch 1) on b until the test ends.
+// These tests give it no tails to adopt.
 func runScan(t *testing.T, b blob.Backend, opts LeaseScanOptions) *leaseScan {
 	t.Helper()
 	reg := coord.NewRegistry(b, "w", coord.RegistryOptions{})

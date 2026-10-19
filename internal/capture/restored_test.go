@@ -208,7 +208,7 @@ func replayInto(t *testing.T, e *harness.Env, path string) {
 		if en.Shard != name || en.Last() <= last {
 			return nil
 		}
-		b, err := segment.ReadEntry(ctx, e.Store, e.Node, seq, en)
+		b, err := harness.ReadEntry(ctx, e.Store, e.Node, seq, en)
 		if err != nil {
 			return err
 		}
@@ -321,7 +321,7 @@ func TestRestoredShardNeverWritten(t *testing.T) {
 	if err := sh.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
-	released, empty, err := sh.Release(ctx)
+	released, f, err := sh.Release(ctx, nil)
 	if err != nil || !released {
 		t.Fatalf("release: %v, %v", released, err)
 	}
@@ -331,7 +331,7 @@ func TestRestoredShardNeverWritten(t *testing.T) {
 	if got := sh.Position(); got != res.State.Position {
 		t.Fatalf("position moved from %d to %d", res.State.Position, got)
 	}
-	if empty {
+	if f.Empty {
 		t.Fatal("a shard with data in it counts as empty")
 	}
 }
@@ -353,7 +353,7 @@ func TestReactivationFoldsTheWALItLeft(t *testing.T) {
 		}
 	}
 	app.Must(t, "close", "a")
-	released, _, err := sh.Release(ctx)
+	released, _, err := sh.Release(ctx, nil)
 	if err != nil || !released {
 		t.Fatalf("release: %v, %v", released, err)
 	}
@@ -613,7 +613,7 @@ func TestRefusedReleaseAfterTheTailWasDropped(t *testing.T) {
 		if n, _ := sh.TailInfo(); n != 0 {
 			t.Fatalf("%d files in the tail after a delta", n)
 		}
-		released, _, err := sh.Release(ctx)
+		released, _, err := sh.Release(ctx, nil)
 		if err != nil || released {
 			t.Fatalf("release with the app holding the shard: %v, %v", released, err)
 		}

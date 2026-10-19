@@ -3,7 +3,6 @@ package node
 import (
 	"context"
 	"errors"
-	"net/http"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -38,6 +37,7 @@ func ask(t *testing.T, nd *clusterNode, target string) {
 func TestMissForAShardOwnedElsewhereReadsOneManifest(t *testing.T) {
 	c := newCluster(t, 2)
 	n0, n1 := c.nodes[0], c.nodes[1]
+	n0.create("users/o")
 	ask(t, n0, "users/o")
 	reads := n1.countReads(shardfile.ManifestPrefix)
 
@@ -46,7 +46,13 @@ func TestMissForAShardOwnedElsewhereReadsOneManifest(t *testing.T) {
 		t.Fatalf("the miss read %d manifests", got)
 	}
 	m := n1.m.Load()
-	if len(m.Active()) != 0 || m.tab.load("users/o") != nil {
+	// (A system shard may be active here: the claimer races the other node's for it.)
+	for _, name := range m.Active() {
+		if !strings.HasPrefix(name, "_") {
+			t.Fatalf("the miss started an activation: %v", m.Active())
+		}
+	}
+	if m.tab.load("users/o") != nil {
 		t.Fatalf("the miss started an activation: %v", m.Active())
 	}
 	if owner, ok := m.owners.Get("users/o"); !ok || owner != "n0" {
@@ -64,7 +70,9 @@ func TestMissForAShardOwnedElsewhereReadsOneManifest(t *testing.T) {
 func TestOwnerCacheOfOne(t *testing.T) {
 	c := newClusterWith(t, 2, func(o *CatalogOptions) { o.OwnerCache = 1 })
 	n0, n1 := c.nodes[0], c.nodes[1]
+	n0.create("users/a")
 	ask(t, n0, "users/a")
+	n0.create("users/b")
 	ask(t, n0, "users/b")
 	reads := n1.countReads(shardfile.ManifestPrefix)
 	for _, target := range []string{"users/a", "users/b", "users/a", "users/b"} {
@@ -93,27 +101,25 @@ func TestClaimingForgetsTheOwner(t *testing.T) {
 	}
 }
 
-// A forward that can't connect makes the node read the owner's address again,
-// at the next request, and not before.
-func TestForwardThatCannotConnectForgetsTheAddress(t *testing.T) {
-	c := newCluster(t, 2)
+// An owner that stops releases its lease. Once the lease scan sees it, the node
+// forgets every owner cache entry naming it, so the next request for one of its
+// shards claims the shard here, with no answer from the stopped node first.
+func TestStoppedOwnersEntriesAreForgotten(t *testing.T) {
+	c := newClusterWith(t, 2, func(o *CatalogOptions) { o.Leases.Every = 50 * time.Millisecond })
 	n0, n1 := c.nodes[0], c.nodes[1]
-	ask(t, n0, "users/g")
-	leases := n1.countReads(coord.Key("n0"))
-	ask(t, n1, "users/g") // reads n0's lease for the claim and for the address
-	ask(t, n1, "users/g")
-	if got := leases.Load(); got != 2 {
-		t.Fatalf("%d lease reads for a miss and a hit", got)
+	n1.echoes()
+	for _, shard := range []string{"users/g", "users/h"} {
+		n0.create(shard)
+		ask(t, n0, shard)
+		ask(t, n1, shard) // cached as n0's on n1
 	}
-	n0.Stop() // its listeners are gone, and n1 still believes it owns the shard
-	for range 2 {
-		resp, _ := send(t, "GET", "http://"+n1.Public+"/", map[string]string{"Shardlite-Target": "users/g"}, "")
-		if resp.StatusCode != http.StatusBadGateway {
-			t.Fatalf("a forward to a stopped node: %d", resp.StatusCode)
+	n0.Stop()
+	eventually(t, "n1 to forget n0's shards", func() bool { return n1.m.Load().owners.Len() == 0 })
+	for _, shard := range []string{"users/g", "users/h"} {
+		n1.create(shard) // n0's held nothing, so they were deleted when it stopped
+		if resp, body := post(t, n1, shard, ""); resp.StatusCode != 200 || resp.Header.Get("X-Served-By") != "n1" {
+			t.Fatalf("%s: %d %q", shard, resp.StatusCode, body)
 		}
-	}
-	if got := leases.Load(); got != 3 {
-		t.Fatalf("%d lease reads after two refused forwards, want 3 (the first used the cached address, the second read it again)", got)
 	}
 }
 
@@ -152,9 +158,12 @@ func TestAddressCache(t *testing.T) {
 	list.Store(&NodeList{Nodes: []NodeView{{Listed: coord.Listed{Name: "n1", LastModified: now.Add(30 * time.Second)}}}})
 	want("b:2", 2)
 	address = "c:3"
-	a.forget("n1")
+	a.set("n1", nil)
 	list.Store(nil)
 	want("c:3", 3)
+	// A lease read by the owner check replaces the cached one.
+	a.set("n1", &coord.NodeLease{NodeInfo: coord.NodeInfo{Name: "n1", Address: "d:4"}, Renewed: now, TTL: 10 * time.Second})
+	want("d:4", 3)
 	if _, err := a.address(ctx, "gone"); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("a node with no lease: %v", err)
 	}

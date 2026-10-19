@@ -9,21 +9,30 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/coord"
+	"github.com/luci1900/shardlite/internal/remindex"
 	"github.com/luci1900/shardlite/internal/spool"
 )
 
 // Manifest is the per-shard record in blob storage (see docs/internals.md,
 // Manifest). Last owner and pin come with the cluster and pinning.
 type Manifest struct {
-	Generation string   `json:"generation"`     // random, set at creation, part of the shard's object paths
-	Owner      string   `json:"owner"`          // the node allowed to write the shard, "" if released
-	NodeEpoch  uint64   `json:"node_epoch"`     // the owner's lease epoch when it claimed the shard
-	Files      []string `json:"files"`          // base and deltas, "min-max.epoch" (min-max in the shard's own positions), in order
-	Journal    string   `json:"journal"`        // the node journal holding commits after the last file, "" if there are none
-	Wake       int64    `json:"wake,omitempty"` // when the shard next needs waking as of its files, a Unix time in seconds, 0 if never
+	Generation string   `json:"generation"` // random, set at creation, part of the shard's object paths
+	Owner      string   `json:"owner"`      // the node allowed to write the shard, "" if released
+	NodeEpoch  uint64   `json:"node_epoch"` // the owner's lease epoch when it claimed the shard
+	Files      []string `json:"files"`      // base and deltas, "min-max.epoch" (min-max in the shard's own positions), in order
+	Journal    string   `json:"journal"`    // the node journal holding commits after the last file, "" if there are none
+	// NextReminder is when the shard next needs waking, Unix minutes, omitted when
+	// there is none (docs/internals.md, Manifest). The owner's deltas, rebases and
+	// deactivations set it, with its entry in the reminder index created before the
+	// write. Claims and releases keep it.
+	NextReminder int64 `json:"next_reminder,omitempty"`
+	// Rev counts the manifest's writes, so no two versions have the same bytes and
+	// ETag. The reminder index's pruning rule relies on a changed version staying changed.
+	Rev uint64 `json:"rev,omitempty"`
 }
 
 // Range is a range of the shard's own positions covered by one LTX file.
@@ -89,17 +98,18 @@ func (m *Manifest) clone() *Manifest {
 	return &c
 }
 
-// ManifestPrefix is the key prefix of the manifests (state, one per shard).
-const ManifestPrefix = "state/shards/"
-
-// FilesPrefix is the key prefix of all shards' LTX files (data).
-const FilesPrefix = "data/shards/"
+// A shard's manifest and files each have a prefix, under the state and data roles
+// (docs/internals.md, Data and state).
+const (
+	ManifestPrefix = "state/shards/" // the shards' manifests (state, one per shard)
+	FilesPrefix    = "data/shards/"  // all shards' LTX files (data)
+)
 
 // ManifestKey is the object key of a shard's manifest.
-func ManifestKey(shard string) string { return ManifestPrefix + shard }
+func ManifestKey(name string) string { return ManifestPrefix + name }
 
 // ShardPrefix is the key prefix of all of a shard's LTX files.
-func ShardPrefix(shard string) string { return FilesPrefix + shard + "/" }
+func ShardPrefix(name string) string { return FilesPrefix + name + "/" }
 
 // GenerationPrefix is the key prefix of the LTX files of one generation of a shard.
 func GenerationPrefix(shard, generation string) string { return ShardPrefix(shard) + generation + "/" }
@@ -177,6 +187,15 @@ type Files struct {
 	// SpoolLimit is how large a delta gets before it is built in a temporary file,
 	// spool.DefaultLimit if zero.
 	SpoolLimit int
+	// Now is the time adoption records its reminders at, time.Now if nil.
+	Now func() time.Time
+}
+
+func (f *Files) now() time.Time {
+	if f.Now != nil {
+		return f.Now()
+	}
+	return time.Now()
 }
 
 func (f *Files) spoolLimit() int {
@@ -259,6 +278,42 @@ func (f *Files) Create(ctx context.Context, shard string) (h *Handle, created bo
 	return h, false, err
 }
 
+// setReminder records next_reminder in a manifest about to be written by update
+// (0 for none). The write's entry in the reminder index comes first, keyed by the
+// version the write CASes against, and a failure fails the write. A reminder in
+// the minute the manifest already has (Unix minutes) needs no new entry: the entry that backs
+// the old one backs it too, since an entry is never deleted while it is backed.
+func (h *Handle) setReminder(ctx context.Context, next *Manifest, reminder int64) error {
+	if reminder > 0 && reminder != h.Manifest.NextReminder {
+		e := remindex.Entry{Minute: reminder, Shard: h.Name, Base: remindex.BaseOf(h.ETag)}
+		if err := remindex.New(h.F.Blob).Create(ctx, e); err != nil {
+			return err
+		}
+	}
+	next.NextReminder = reminder
+	return nil
+}
+
+// SetReminder writes next_reminder alone (Unix minutes, 0 for none), with its
+// entry in the reminder index created first. It is for a deactivation with no
+// tail, which has no delta to carry the shard's next reminder: a reminder that went
+// stale, or an adoption's, would otherwise leave the manifest naming a time
+// the shard has nothing due at, and the dispatcher waking it for nothing. It
+// writes nothing if the manifest has that already.
+func (h *Handle) SetReminder(ctx context.Context, reminder int64) error {
+	if err := h.settle(ctx); err != nil {
+		return err
+	}
+	if h.Manifest.NextReminder == reminder {
+		return nil
+	}
+	next := h.Manifest.clone()
+	if err := h.setReminder(ctx, next, reminder); err != nil {
+		return err
+	}
+	return h.update(ctx, "reminder", next)
+}
+
 // update writes next with compare-and-swap and adopts it. A conflict is
 // somebody else's change: blob.Store has already ruled out an earlier attempt
 // of this writer whose response was lost. op names the operation for errors.
@@ -268,6 +323,7 @@ func (f *Files) Create(ctx context.Context, shard string) (h *Handle, created bo
 // it looks before its next operation (settle), so it never keeps writing from a
 // version that is gone, which would conflict for good.
 func (h *Handle) update(ctx context.Context, op string, next *Manifest) error {
+	next.Rev = h.Manifest.Rev + 1
 	etag, err := h.F.manifests().Put(ctx, h.Name, next, &h.ETag)
 	if err != nil {
 		if errors.Is(err, blob.ErrUnknown) {
@@ -355,6 +411,17 @@ func (h *Handle) Claim(ctx context.Context) error {
 	return h.update(ctx, "claim", next)
 }
 
+// StartOver gives a shard with nothing to restore a new generation, for an
+// activation that starts it empty. Its positions start again at 1, and an
+// earlier activation that failed after its first sync may have left commits at
+// those positions in the journal: in a new generation they are never read.
+func (h *Handle) StartOver(ctx context.Context) error {
+	next := h.Manifest.clone()
+	next.Generation = NewGeneration()
+	next.NextReminder = 0
+	return h.update(ctx, "new generation", next)
+}
+
 // CheckClaimable returns what Claim would return for a shard it can't claim
 // (ErrOwnedElsewhere or ErrOwnerNotAdopted, or a failed read), without writing
 // anything. It lets a node find out that another node owns a shard before it
@@ -403,40 +470,13 @@ func (h *Handle) ReleaseOwnership(ctx context.Context) error {
 	return h.update(ctx, "release", next)
 }
 
-// SetWake sets the manifest's wake time with one compare-and-swap, for a shard
-// that has no tail to write a delta for. Nothing is written if it is unchanged.
-func (h *Handle) SetWake(ctx context.Context, wake int64) error {
-	if err := h.settle(ctx); err != nil {
-		return err
-	}
-	if h.Manifest.Wake == wake {
-		return nil
-	}
-	next := h.Manifest.clone()
-	next.Wake = wake
-	return h.update(ctx, "wake", next)
-}
-
-// DeleteShard removes a shard: its manifest is deleted by conditional delete (a
-// conflict, if somebody changed it, leaves everything as it is), then the LTX
-// files of its generation. A crash in between leaves files nobody refers to. The
-// next request creates a new shard with a new generation, so it never reads the
-// old one's data. Any tail left in the node journal is never read again (its
-// generation no longer matches any manifest). Deleting a shard that doesn't exist
-// is done.
-func (f *Files) DeleteShard(ctx context.Context, shard string) error {
-	h, err := f.Attach(ctx, shard)
-	if errors.Is(err, blob.ErrNotFound) {
-		return nil
-	} else if err != nil {
-		return err
-	}
-	return h.DeleteShard(ctx)
-}
-
-// DeleteShard is Files.DeleteShard for a shard the caller holds a handle on: the
-// manifest is deleted at the handle's version, so a change by anybody else
-// (blob.ErrConflict) leaves everything as it is.
+// DeleteShard removes a shard the caller holds a handle on: its manifest is
+// deleted by conditional delete at the handle's version (a conflict, if somebody
+// changed it, leaves everything as it is), then the LTX files of its generation.
+// A crash in between leaves files nobody refers to. The next request creates a
+// new shard with a new generation, so it never reads the old one's data. Any
+// tail left in the node journal is never read again (its generation no longer
+// matches any manifest).
 func (h *Handle) DeleteShard(ctx context.Context) error {
 	f := h.F
 	if err := h.settle(ctx); err != nil {

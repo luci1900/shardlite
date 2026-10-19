@@ -185,12 +185,12 @@ func (m *Memory) Delete(ctx context.Context, key string, expected ETag) error {
 	return nil
 }
 
-func (m *Memory) List(ctx context.Context, prefix string) iter.Seq2[ObjectInfo, error] {
+func (m *Memory) List(ctx context.Context, prefix, after string) iter.Seq2[ObjectInfo, error] {
 	return func(yield func(ObjectInfo, error) bool) {
 		m.mu.Lock()
 		var infos []ObjectInfo
 		for k, o := range m.objects {
-			if strings.HasPrefix(k, prefix) {
+			if strings.HasPrefix(k, prefix) && k > after {
 				infos = append(infos, ObjectInfo{Key: k, Size: int64(len(o.data)), ETag: o.etag, LastModified: o.modified})
 			}
 		}

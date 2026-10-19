@@ -6,12 +6,17 @@
 // receiver's handler consumes the inbox row in the same transaction as its work.
 //
 // Assumptions taken from cluster.qnt, which is not modelled here: one node owns a shard at a time, and
-// adoption of a crashed node writes a wake hint for exactly the shards it replayed a tail for. A shard is
-// simply active, or orphaned by a crash until it is adopted, or inactive. "Tailed" means its journal holds
-// commits beyond its last delta. A shard's manifest records when it next needs waking (its wake time), and
-// the node writes the hint for that time before every manifest write that records one, so the model has the
-// hint appear with the delta that ends a tail. Durability here is the same idea as in shard.qnt: the file is what the
+// adoption of a crashed node creates a reminder index entry for exactly the shards it replayed a tail for. A shard
+// is simply active, or orphaned by a crash until it is adopted, or inactive. "Tailed" means its journal holds
+// commits beyond its last delta. A shard's manifest records when it next needs waking (`next_reminder`), and the
+// node creates the entry for that time before every manifest write that records one, so the model has the entry
+// appear with the delta that ends a tail. Durability here is the same idea as in shard.qnt: the file is what the
 // node has, durable is what survives a crash.
+//
+// Where it differs from dispatch.qnt, which is the model of the index: entries carry no base and no minute here. The
+// entry and its manifest write are one step, so the race the base guards (a dispatcher pruning between a writer's
+// create and its CAS) doesn't arise, and the dispatcher's pruning rule is `pruneEntry`, which checks only that the
+// manifest doesn't back the entry.
 //
 // Left out: hop limits, retries and giving up, keyed rows, the receiver's own app calls, ordering, and
 // everything about which node a shard is on.
@@ -47,7 +52,7 @@ module messages {
 
   type State = {
     shards: int -> Shard,
-    hints: Set[int],            // shards with a wake hint
+    entries: Set[int],          // shards with a reminder entry
     inflight: int -> int,       // intake requests on the network, by message
     waiting: Set[int],          // messages the sender's node has an attempt out for (its memory)
     pendingRows: Set[int],      // rows the receiver's node will answer for once durable (its memory)
@@ -74,7 +79,7 @@ module messages {
 
   action init = s' = {
     shards: SHARDS.mapBy(i => { active: true, orphan: false, tailed: false, file: empty, durable: empty }),
-    hints: Set(),
+    entries: Set(),
     inflight: 1.to(MAX_MSGS).mapBy(m => 0),
     waiting: Set(),
     pendingRows: Set(),
@@ -204,7 +209,7 @@ module messages {
 
   // -- Shipping and life cycle
 
-  // The flush makes the commits durable and extends the tail. The messages owner writes no hint: while a
+  // The flush makes the commits durable and extends the tail. The messages owner writes no entry: while a
   // commit is in the tail, adoption covers it after a crash.
   action flush(i) = all {
     val sh = s.shards.get(i)
@@ -215,20 +220,20 @@ module messages {
     }
   }
 
-  // A delta turns the tail into files and records the shard's wake time in the same manifest write, with its
-  // hint written first. The shard has a wake time when it has work of any kind (rows to send, rows due now or
-  // rows due later), so from here a crash leaves a hint whatever the tail held. (Rows given up on are not
-  // modelled. The code leaves them without a wake time.) The wake time is read through the shard's connection,
+  // A delta turns the tail into files and records the shard's next_reminder in the same manifest write, with its
+  // entry created first. The shard has a next_reminder when it has work of any kind (rows to send, rows due now or
+  // rows due later), so from here a crash leaves an entry whatever the tail held. (Rows given up on are not
+  // modelled. The code leaves them without a next_reminder.) The next_reminder is read through the shard's connection,
   // which can be ahead of the files: a commit that consumes a row but isn't captured yet would hide the row. So
-  // the read counts only if nothing is uncaptured (here: the file is all durable), and otherwise the wake time is
-  // now, with its hint.
+  // the read counts only if nothing is uncaptured (here: the file is all durable), and otherwise the next_reminder is
+  // now, with its entry.
   action delta(i) = all {
     val sh = s.shards.get(i)
     all {
       sh.active,
       sh.tailed,
       s' = { ...withShard(s, i, { ...sh, tailed: false }),
-             hints: if (sh.file != sh.durable or hasWork(sh.durable)) s.hints.union(Set(i)) else s.hints }
+             entries: if (sh.file != sh.durable or hasWork(sh.durable)) s.entries.union(Set(i)) else s.entries }
     }
   }
 
@@ -242,8 +247,8 @@ module messages {
   }
 
   // Idle deactivation: everything is durable, and rows to send or due now keep the shard active. The final
-  // delta records the wake time, with its hint written first if the shard has rows due later. The release
-  // deletes no hints, so the existing one stays, and the scan deletes it when it is stale.
+  // delta records the next_reminder, with its entry written first if the shard has rows due later. The release
+  // deletes no entries, so the existing one stays, and the dispatcher prunes it when it is stale.
   action deactivate(i) = all {
     val sh = s.shards.get(i)
     all {
@@ -252,35 +257,37 @@ module messages {
       sh.file.outbox.size() == 0,
       sh.file.inbox.size() == 0,
       s' = { ...forgotten(withShard(s, i, { ...sh, active: false, tailed: false }), i),
-             hints: if (hasWork(sh.file)) s.hints.union(Set(i)) else s.hints }
+             entries: if (hasWork(sh.file)) s.entries.union(Set(i)) else s.entries }
     }
   }
 
   // A node scaling down delivers for a few seconds, then lets each shard go with a final delta that records the
-  // wake time, with its hint written first if the shard still has work.
+  // next_reminder, with its entry written first if the shard still has work.
   action drain(i) = all {
     val sh = s.shards.get(i)
     all {
       sh.active,
       sh.file == sh.durable,
       s' = { ...forgotten(withShard(s, i, { ...sh, active: false, tailed: false }), i),
-             hints: if (hasWork(sh.file)) s.hints.union(Set(i)) else s.hints }
+             entries: if (hasWork(sh.file)) s.entries.union(Set(i)) else s.entries }
     }
   }
 
-  // The wake scan is the only thing that deletes hints. For a shard that is active it waits until the shard has
-  // nothing live. For one at rest it reads the manifest (the durable content here) and deletes the hint if the
-  // wake time is absent or later than the hint. The model keeps any hint while there is work of any kind, which
-  // is stricter than the code, since it doesn't tell the hints of rows due later from the hints for now. A shard
-  // that crashed and is not adopted yet belongs to a dead node, so its hint stays.
-  action dropHint(i) = all {
+  // The dispatcher is the only thing that deletes entries, and it checks them against the state only. It reads
+  // the manifest and deletes the entry if `next_reminder` is absent or later than the entry, whether or not the shard
+  // is active, and never reads the shard's tables. The manifest describes the shard's files. Without a tail they
+  // hold all of the durable content. With one (an active shard that has committed since its last delta) the model
+  // doesn't track what the files alone hold, so it lets the dispatcher drop the entry whatever they hold: the work is in
+  // the tail, which adoption covers after a crash, and the next delta records it. (The model keeps an entry while
+  // there is work of any kind, without telling rows due later from rows due now.) A shard that crashed and is not
+  // adopted yet belongs to a dead node, so its entry stays.
+  action pruneEntry(i) = all {
     val sh = s.shards.get(i)
     all {
-      s.hints.contains(i),
+      s.entries.contains(i),
       not(sh.orphan),
-      not(hasWork(sh.file)),
-      not(hasWork(sh.durable)),
-      s' = { ...s, hints: s.hints.exclude(Set(i)) }
+      not(hasWork(sh.durable)) or (sh.active and sh.tailed),
+      s' = { ...s, entries: s.entries.exclude(Set(i)) }
     }
   }
 
@@ -296,13 +303,13 @@ module messages {
     }
   }
 
-  // The adopter writes a delta for every shard it replayed a tail for, and a wake hint for it.
+  // The adopter writes a delta for every shard it replayed a tail for, and a reminder entry for it.
   action adopt(i) = all {
     val sh = s.shards.get(i)
     all {
       sh.orphan,
       s' = { ...withShard(s, i, { ...sh, orphan: false, tailed: false }),
-             hints: if (sh.tailed) s.hints.union(Set(i)) else s.hints }
+             entries: if (sh.tailed) s.entries.union(Set(i)) else s.entries }
     }
   }
 
@@ -327,7 +334,7 @@ module messages {
       activate(i),
       deactivate(i),
       drain(i),
-      dropHint(i),
+      pruneEntry(i),
       crash(i),
       adopt(i)
     }
@@ -370,12 +377,12 @@ module messages {
   })
 
   // The promise about waking: a shard that is not active and not waiting for an adopter, with rows to send, rows
-  // due now or rows due later, has a wake hint, so it is woken when they are due. This holds for outbox rows and
-  // due inbox rows that were still failing when a tail became a delta, since the delta's hint covers them.
+  // due now or rows due later, has a reminder entry, so it is woken when they are due. This holds for outbox rows and
+  // due inbox rows that were still failing when a tail became a delta, since the delta's entry covers them.
   // (It subsumes the earlier check for outbox and due inbox rows alone.)
   val notStranded = SHARDS.forall(i => {
     val sh = s.shards.get(i)
-    (not(sh.active) and not(sh.orphan) and hasWork(sh.durable)) implies s.hints.contains(i)
+    (not(sh.active) and not(sh.orphan) and hasWork(sh.durable)) implies s.entries.contains(i)
   })
 
   // The delivery properties on their own.
@@ -388,5 +395,5 @@ module messages {
   val neverResent = s.sends <= s.nextMsg - 1
   val neverDuplicated = not(1.to(MAX_ROWS).exists(r => 1.to(MAX_ROWS).exists(q =>
     r != q and s.rowMsg.get(r) != 0 and s.rowMsg.get(r) == s.rowMsg.get(q))))
-  val neverHinted = s.hints.size() == 0
+  val neverEntered = s.entries.size() == 0
 }

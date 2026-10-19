@@ -15,6 +15,8 @@ This is the Orleans / Durable Objects model, with SQLite as the state and with t
 - Apps can be written in any language or framework, even Unreal dedicated servers.
 - Clients can connect directly to the process holding a shard over UDP or WebRTC, not only through an HTTP proxy.
 
+As virtual actors, any shard id can be called and the first call creates the shard, with no create step. The app creates shards and clients reach the ones that exist, so a random id from a client finds nothing and creates nothing.
+
 Shardlite keeps Orleans' operational trade-offs. Blob storage (S3 or compatible) is the system of record, run by someone else. Nodes keep shards on local disk only as a cache, so they are disposable. Durability comes from shipping changes to blob storage, and the storage is the final check against duplicate owners (as Orleans' storage ETags are). Shardlite is a router and a cache in front of blob storage, not a database to operate.
 
 An actor's state is always its SQLite file, never objects in memory. That makes activation and deactivation almost free:
@@ -25,7 +27,9 @@ An actor's state is always its SQLite file, never objects in memory. That makes 
 
 The trade-off is that reads go through SQLite (microseconds from cache) rather than plain objects, and anything the app keeps in memory outside SQLite is lost on deactivation.
 
-The same goes for shardlite's own state about a shard: it lives in the shard, and anything global only points into it. Messages and timers are rows in the shard's own tables, written in the app's transactions, the way an intrusive list keeps its links inside the elements. Where something global is needed, such as the wake hints in blob storage, it holds no payload, just which shard to look at when. So nothing global has to stay consistent with the shards, deleting a shard takes its state with it, and the node's memory is a cache it can lose at any time.
+The same goes for shardlite's own state about a shard: it lives in the shard, and anything global only points into it. Reminders are rows in the shard's own table, written in the app's transactions, the way an intrusive list keeps its links inside the elements. Where something outside the shard is needed, such as the reminder index, it holds no payload, just which shard to look at when. So nothing global has to stay consistent with the shards, deleting a shard takes its state with it, and the node's memory is a cache it can lose at any time.
+
+A shardlite app should be no more exposed to abuse than any web app. Clients can name shards directly, which a plain web app never lets them do, so the node makes sure that naming one costs no more than a request for a row that doesn't exist (or that the caller may not see) would cost a web app. What remains is what every web app already handles with the defences it already has: floods, which rate limiting at the load balancer stops, and abuse by authenticated users, which the app limits. A design that lets unauthenticated input cause blob storage writes, restores or state left behind is a gap shardlite opened, and the node closes it. One gap is still open: a guessed id of a shard that exists costs a restore before the app can refuse the request, so kinds clients can name should use unguessable ids (see [Kinds clients can name](guide.md#kinds-clients-can-name)).
 
 ## Non-goals
 
@@ -95,11 +99,11 @@ The node does all of the distributed work: leases, ownership, routing, shipping 
 - SlateDB: an LSM tree on object storage. Its fencing of WAL writers by conditional creates is the model for node journals.
 - mvsqlite: SQLite pages stored in a key-value store.
 - ActorDB: a SQLite database per actor, with a schema per actor type, Raft replication and transactions across actors, queried as a database server rather than opened locally.
-- Durable Objects: SQLite storage with output gates. Its alarms are durable timers too, kept in the object's storage and retried with backoff, but one per object, where a shard's inbox holds any number.
+- Durable Objects: SQLite storage with output gates. Its alarms are what a shard's reminders follow: durable timers kept in the object's storage and retried with backoff, but one per object, where a shard's table holds any number.
 - [Durable Actors](https://github.com/TerseAI/durable-actors) (Terse, 2026): an open-source take on Durable Objects. Actors are written in its TypeScript or Python SDK and run inside its runtime, with a Postgres control plane and an LTX chain per actor in object storage. Its `terse-ltx` and `terse-litestream` crates come from it.
-- Pat Helland, "Life beyond Distributed Transactions": entities that change atomically only within themselves and talk through at-least-once messages, remembering what each partner has sent. Shardlite's model, almost exactly.
-- SQL Server Service Broker: queues as tables inside the database, sent and received in the same transactions as the data, delivered exactly once and in order between databases.
-- Akka Persistence's at-least-once delivery: an actor keeps the messages it has sent but not had confirmed in its own persisted state, and sends them again until they are, as a shard keeps its outbox.
-- Orleans reminders (and Dapr's and Service Fabric's): durable timers for actors, kept in a table the whole cluster shares rather than in the actor's state. A shard's timers are rows in its own inbox, and the only global part is a wake hint with no payload.
+- Pat Helland, "Life beyond Distributed Transactions": entities that change atomically only within themselves and talk through at-least-once messages, remembering what each partner has sent. Shardlite's model, almost exactly, and what the guide's durable send follows.
+- SQL Server Service Broker: queues as tables inside the database, sent and received in the same transactions as the data, delivered exactly once and in order between databases. The guide's durable send is the same idea with the app's own tables, and gives at-least-once delivery with no order.
+- Akka Persistence's at-least-once delivery: an actor keeps the messages it has sent but not had confirmed in its own persisted state, and sends them again until they are, as a shard keeps its sends table.
+- Orleans reminders (and Dapr's and Service Fabric's): durable timers for actors, kept in a table the whole cluster shares rather than in the actor's state. A shard's reminders are rows in its own table, and the only part outside it is an empty entry in the reminder index, which says which shard to look at when.
 - Restate: virtual objects with durable state, timers and messages between services, journaled in Restate's own log rather than in each object's database.
 - Spanner: commit wait, which holds acknowledgements until TrueTime uncertainty has passed.

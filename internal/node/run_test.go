@@ -121,14 +121,15 @@ func TestRunLeavesNoGoroutines(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	addr := make(chan string, 1)
+	addr := make(chan [2]string, 1)
 	ran := make(chan error, 1)
 	go func() {
-		ran <- Run(ctx, env, slog.New(slog.DiscardHandler), func(public, control, peer string) { addr <- public }, WithBackend(blob.NewMemory()))
+		ran <- Run(ctx, env, slog.New(slog.DiscardHandler), func(public, control, peer string) { addr <- [2]string{public, control} }, WithBackend(blob.NewMemory()))
 	}()
-	var public string
+	var public, control string
 	select {
-	case public = <-addr:
+	case a := <-addr:
+		public, control = a[0], a[1]
 	case err := <-ran:
 		t.Fatalf("Run ended early: %v", err)
 	case <-time.After(20 * time.Second):
@@ -142,10 +143,10 @@ func TestRunLeavesNoGoroutines(t *testing.T) {
 		resp.Body.Close()
 		return resp.StatusCode == 200
 	})
-	// Shards of both kinds with writes: lazy creation, capture, syncs, gated responses.
+	// Shards of both kinds with writes, created by calls: lazy creation, capture, syncs, gated responses.
 	for i := range 5 {
 		for _, kind := range []string{"users", "wallet"} {
-			q, _ := http.NewRequest("POST", "http://"+public+"/write", nil)
+			q, _ := http.NewRequest("POST", "http://"+control+"/write", nil)
 			q.Header.Set("Shardlite-Target", fmt.Sprintf("%s/%d", kind, i))
 			resp, err := http.DefaultClient.Do(q)
 			if err != nil {
@@ -305,6 +306,14 @@ func TestRunJoinsRequestsBeforeLettingGo(t *testing.T) {
 		t.Fatal("the node did not come up")
 	}
 
+	// A call creates the shard the client connects to.
+	q, _ := http.NewRequest("GET", "http://"+a.control+"/", nil)
+	q.Header.Set("Shardlite-Target", "users/ws")
+	if resp, err := http.DefaultClient.Do(q); err != nil || resp.StatusCode != 200 {
+		t.Fatalf("creating users/ws: %v %v", resp, err)
+	} else {
+		resp.Body.Close()
+	}
 	conn, err := net.Dial("tcp", a.public)
 	if err != nil {
 		t.Fatal(err)
@@ -356,15 +365,16 @@ func TestRunJoinsRequestsBeforeLettingGo(t *testing.T) {
 // runRig is Run on the in-memory store in front of a fake app that answers
 // everything with 200.
 type runRig struct {
-	t      *testing.T
-	env    Env
-	mem    *blob.Memory
-	hooked *blob.Hooked // mem, as Run sees it
-	log    runLog
-	cancel context.CancelFunc
-	ran    chan error
-	public string
-	peer   string
+	t       *testing.T
+	env     Env
+	mem     *blob.Memory
+	hooked  *blob.Hooked // mem, as Run sees it
+	log     runLog
+	cancel  context.CancelFunc
+	ran     chan error
+	public  string
+	control string
+	peer    string
 }
 
 func startRun(t *testing.T, name string, vars map[string]string, opts ...RunOption) *runRig {
@@ -393,10 +403,10 @@ func startRun(t *testing.T, name string, vars map[string]string, opts ...RunOpti
 	r.hooked = blob.WithHook(r.mem)
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
-	up := make(chan [2]string, 1)
+	up := make(chan [3]string, 1)
 	opts = append([]RunOption{WithBackend(r.hooked), withGrace(200 * time.Millisecond)}, opts...)
 	go func() {
-		r.ran <- Run(ctx, env, slog.New(&r.log), func(public, control, peer string) { up <- [2]string{public, peer} }, opts...)
+		r.ran <- Run(ctx, env, slog.New(&r.log), func(public, control, peer string) { up <- [3]string{public, control, peer} }, opts...)
 	}()
 	t.Cleanup(func() {
 		cancel()
@@ -408,7 +418,7 @@ func startRun(t *testing.T, name string, vars map[string]string, opts ...RunOpti
 	})
 	select {
 	case a := <-up:
-		r.public, r.peer = a[0], a[1]
+		r.public, r.control, r.peer = a[0], a[1], a[2]
 	case err := <-r.ran:
 		r.ran <- err
 		t.Fatalf("Run ended early: %v", err)
@@ -458,19 +468,19 @@ func (r *runRig) in(groups ...[]string) {
 	}
 }
 
-// stopOrder is the order of Run's shutdown: the public server, the drain, the
-// control and peer servers and the shards. The journal (the writer and the keeper) stops
+// stopOrder is the order of Run's shutdown: the public server, the control and
+// peer servers and the shards. The journal (the writer and the keeper) stops
 // last, and has no line of its own.
-var stopOrder = [][]string{{"stop public server"}, {"stop drain"}, {"stop control server", "stop peer server"}, {"stop catalog"}}
+var stopOrder = [][]string{{"stop public server"}, {"stop control server", "stop peer server"}, {"stop catalog"}}
 
 // Run starts every service at once, with everything built before, and stops
 // them one supervisor at a time: the services that depend on nothing (the health poll,
-// the journal sweeper, the kinds reload and pprof) stop with the public server,
+// the journal expiry, the kinds reload and pprof) stop with the public server,
 // first. A shard being let go of holds up the shards' stop.
 func TestRunStartsAndStopsInOrder(t *testing.T) {
 	t.Parallel()
 	r := startRun(t, "run-order-test", map[string]string{"SHARDLITE_LISTEN_PPROF": "127.0.0.1:0"})
-	all := []string{"public server", "control server", "peer server", "health poll", "catalog", "journal sweeper", "kinds reload", "pprof"}
+	all := []string{"public server", "control server", "peer server", "health poll", "catalog", "journal expiry", "kinds reload", "pprof"}
 	r.log.events.WaitFor(t, 5*time.Second, "every service to start", func(e []string) bool {
 		for _, p := range all {
 			if !slices.Contains(e, "start "+p) {
@@ -479,7 +489,7 @@ func TestRunStartsAndStopsInOrder(t *testing.T) {
 		}
 		return true
 	})
-	resp, err := http.Get("http://" + r.public + "/x?shardlite-target=users/o1")
+	resp, err := http.Get("http://" + r.control + "/x?shardlite-target=users/o1") // a call, which creates the shard
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -495,7 +505,7 @@ func TestRunStartsAndStopsInOrder(t *testing.T) {
 		}
 		return nil
 	})
-	independent := []string{"stop health poll", "stop journal sweeper", "stop kinds reload", "stop pprof"}
+	independent := []string{"stop health poll", "stop journal expiry", "stop kinds reload", "stop pprof"}
 
 	r.cancel()
 	r.log.events.WaitFor(t, 10*time.Second, "the services that depend on nothing to stop", func(e []string) bool {
@@ -519,7 +529,7 @@ func TestRunStartsAndStopsInOrder(t *testing.T) {
 
 // A lost lease stops the node at once: Run returns the lease error and the
 // lease is left as it is. The supervisors still stop in order (no shard is let go of
-// with a server still running), and nothing is drained or let go of.
+// with a server still running), and nothing is let go of.
 func TestRunStopsAtOnceWhenTheLeaseIsLost(t *testing.T) {
 	t.Parallel()
 	r := startRun(t, "run-lost-test", map[string]string{"SHARDLITE_LEASE_TTL": "1500ms"})
@@ -544,7 +554,7 @@ func TestRunStopsAtOnceWhenTheLeaseIsLost(t *testing.T) {
 func TestRunFatalErrorDuringShutdown(t *testing.T) {
 	t.Parallel()
 	r := startRun(t, "run-fatal-stop-test", map[string]string{"SHARDLITE_LEASE_TTL": "1500ms"})
-	resp, err := http.Get("http://" + r.public + "/x?shardlite-target=users/fs1")
+	resp, err := http.Get("http://" + r.control + "/x?shardlite-target=users/fs1") // a call, which creates the shard
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -676,6 +686,18 @@ func TestPeerListenerSaysWhoTheNodeIs(t *testing.T) {
 		if resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("%s answered %d, want 404", path, resp.StatusCode)
 		}
+	}
+	// Not even a delete a node forwards: there is no such request.
+	req, err := http.NewRequest(http.MethodDelete, "http://"+r.peer+"/_shardlite/shards/users/x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Shardlite-Origin", "delete")
+	req.Header.Set("Shardlite-Target", "users/x")
+	if resp, err := client.Do(req); err != nil || resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("a delete on the peer listener: %v, %v", resp, err)
+	} else {
+		resp.Body.Close()
 	}
 }
 

@@ -208,7 +208,7 @@ func TestCheckpointsNeverLoseFrames(t *testing.T) {
 				if en.Shard != name {
 					return nil
 				}
-				b, err := segment.ReadEntry(ctx, e.Store, e.Node, seq, en)
+				b, err := harness.ReadEntry(ctx, e.Store, e.Node, seq, en)
 				if err != nil {
 					return err
 				}
@@ -250,7 +250,7 @@ func TestReleaseChecksShm(t *testing.T) {
 	obs := apptest.Start(t) // a third process, to see who holds the shard
 
 	// The app has the shard open: the node doesn't let go, and capture carries on where it was.
-	if released, _, err := sh.Release(ctx); err != nil || released {
+	if released, _, err := sh.Release(ctx, nil); err != nil || released {
 		t.Fatalf("app open: released=%v err=%v", released, err)
 	}
 	pos := sh.Position()
@@ -263,7 +263,7 @@ func TestReleaseChecksShm(t *testing.T) {
 	}
 	// Doing it again and again changes nothing.
 	for range 5 {
-		if released, _, err := sh.Release(ctx); err != nil || released {
+		if released, _, err := sh.Release(ctx, nil); err != nil || released {
 			t.Fatalf("app open: released=%v err=%v", released, err)
 		}
 	}
@@ -273,7 +273,7 @@ func TestReleaseChecksShm(t *testing.T) {
 
 	// The app closes its connection: now the node can let go.
 	app.Must(t, "close", "a")
-	if released, _, err := sh.Release(ctx); err != nil || !released {
+	if released, _, err := sh.Release(ctx, nil); err != nil || !released {
 		t.Fatalf("app closed: released=%v err=%v", released, err)
 	}
 	if _, err := os.Stat(capture.MetaDir(e.Meta, name, h.Manifest.Generation)); !os.IsNotExist(err) {
@@ -423,7 +423,7 @@ func TestReleaseSeesACommitAfterTheFinalSync(t *testing.T) {
 	pos := sh.Position()
 
 	late = true
-	if released, _, err := sh.Release(ctx); err != nil || released {
+	if released, _, err := sh.Release(ctx, nil); err != nil || released {
 		t.Fatalf("commit after the final sync: released=%v err=%v", released, err)
 	}
 	if err := sh.Sync(ctx); err != nil {
@@ -433,7 +433,7 @@ func TestReleaseSeesACommitAfterTheFinalSync(t *testing.T) {
 		t.Fatal("the late commit was not captured after capture resumed")
 	}
 	// With nothing new, the node lets go.
-	if released, _, err := sh.Release(ctx); err != nil || !released {
+	if released, _, err := sh.Release(ctx, nil); err != nil || !released {
 		t.Fatalf("nothing new: released=%v err=%v", released, err)
 	}
 }
@@ -465,7 +465,7 @@ func TestReleaseWhoseWaitFailsReopensCapture(t *testing.T) {
 		t.Fatal(err)
 	}
 	app.Must(t, "close", "a")
-	if released, _, err := sh.Release(ctx); !errors.Is(err, errStorage) || released {
+	if released, _, err := sh.Release(ctx, nil); !errors.Is(err, errStorage) || released {
 		t.Fatalf("release whose wait failed: released=%v err=%v", released, err)
 	}
 	if !sh.Open() {
@@ -481,7 +481,7 @@ func TestReleaseWhoseWaitFailsReopensCapture(t *testing.T) {
 	if sh.Position() <= pos {
 		t.Fatal("a commit after the failed release was not captured")
 	}
-	if released, _, err := sh.Release(ctx); err != nil || !released {
+	if released, _, err := sh.Release(ctx, nil); err != nil || !released {
 		t.Fatalf("second release: released=%v err=%v", released, err)
 	}
 	if sh.Open() {

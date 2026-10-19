@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/capture"
+	"github.com/luci1900/shardlite/internal/migrate"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
@@ -28,7 +30,7 @@ import (
 //     it is claimed like any other shard.
 func (a *shard) activate(ctx context.Context) error {
 	d := a.d
-	target, kind, id := a.Name, a.Kind, a.ID
+	target, kind := a.Name, a.Kind
 	if _, err := d.kinds.Lookup(kind); err != nil {
 		return err
 	}
@@ -53,11 +55,7 @@ func (a *shard) activate(ctx context.Context) error {
 			return err
 		}
 	}
-	a.Gen, a.Path = h.Manifest.Generation, d.cache.pathFor(kind, id, h.Manifest.Generation)
-	if err := d.cache.clearLocal(a.Path); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(a.Path), 0o755); err != nil {
+	if err := a.setPath(h); err != nil {
 		return err
 	}
 	a.h = h
@@ -74,7 +72,14 @@ func (a *shard) activate(ctx context.Context) error {
 		switch {
 		case errors.Is(err, shardfile.ErrNothingToRestore):
 			// A manifest with nothing durable behind it (its node died before the
-			// first flush): the shard starts empty, as a new one does.
+			// first flush, or an activation here failed): the shard starts empty, as
+			// a new one does, in a new generation.
+			if err := h.StartOver(ctx); err != nil {
+				return err
+			}
+			if err := a.setPath(h); err != nil {
+				return err
+			}
 		case err != nil:
 			return err
 		default:
@@ -87,7 +92,27 @@ func (a *shard) activate(ctx context.Context) error {
 	if err := d.cache.put(a, stateActive, 0); err != nil {
 		return err
 	}
-	return a.startCapture(ctx, restored)
+	err := a.startCapture(ctx, restored)
+	if errors.Is(err, migrate.ErrNewer) {
+		// A newer node migrated this system shard. It is given up, so that a node
+		// that can read it claims it instead of finding it owned here. Nothing was
+		// committed (the migration rolled back) and the files are all of it, so
+		// there is no tail to write first.
+		if rerr := a.h.ReleaseOwnership(ctx); rerr != nil {
+			err = errors.Join(err, rerr)
+		}
+	}
+	return err
+}
+
+// setPath points the shard at its local file for h's generation, removing
+// whatever an earlier activation left there.
+func (a *shard) setPath(h *shardfile.Handle) error {
+	a.Gen, a.Path = h.Manifest.Generation, a.d.cache.pathFor(a.Kind, a.ID, h.Manifest.Generation)
+	if err := a.d.cache.clearLocal(a.Path); err != nil {
+		return err
+	}
+	return os.MkdirAll(filepath.Dir(a.Path), 0o755)
 }
 
 // activateCached reuses a cached file. done is false when the file had to be
@@ -162,8 +187,9 @@ func (a *shard) startCapture(ctx context.Context, restored *capture.Restored) er
 		sh.Discard()
 		return err
 	}
-	// The reserved table goes in after the first sync, before the app has the shard.
-	if err := ensureMessages(ctx, sh); err != nil {
+	// The reserved table (and a system kind's schema and seed) go in after the
+	// first sync, before the app has the shard.
+	if err := ensureTables(ctx, sh, a.sys, d.now().Unix(), d.rem.since(d.now())); err != nil {
 		a.cap.uncounted(sh)
 		sh.Close(ctx)
 		sh.Discard()
@@ -219,28 +245,31 @@ func (a *shard) deactivate(ctx context.Context) (bool, error) {
 	}
 	defer func() {
 		if !a.gone {
-			a.addOwner() // capture resumed, or never stopped
+			a.addLoop() // capture resumed, or never stopped
 			a.e.reopen()
 		}
 	}()
 
-	// The messages owner stops first, so nothing of the node's changes the rows
-	// meanwhile and nothing uses the capture during the final sync. Then the wake
-	// time, read now since the final sync closes the connection, and its hint. If
-	// the hint can't be written the shard stays active and a new owner starts. A
-	// marked shard is deleted by this release, so the marker needs no hint.
-	if err := a.removeOwner(); err != nil {
+	// The reminders loop stops first, so nothing of the node's changes the rows
+	// meanwhile and nothing uses the capture during the final sync.
+	if err := a.removeLoop(); err != nil {
 		return false, err
 	}
-	wake, at, err := a.wake(ctx, false)
-	if err != nil {
-		return false, err
-	}
-	if err := a.hint(ctx, wake); err != nil {
-		return false, err
+	// The next reminder is read inside the release, at the shard's final state. A
+	// marked shard is deleted by this release, so the marker doesn't count.
+	now := d.now()
+	var next int64
+	read := func(db *sql.DB) error {
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		next, err = nextReminderOf(ctx, tx, d.rem.since(now), now.Unix(), false)
+		return err
 	}
 	sh := a.cap.load()
-	released, empty, err := sh.Release(ctx)
+	released, final, err := sh.Release(ctx, read)
 	if err != nil {
 		a.resumeIfClosed(ctx, sh)
 		return false, err
@@ -253,7 +282,7 @@ func (a *shard) deactivate(ctx context.Context) (bool, error) {
 	// The tail is only in the journal until the delta (or the deletion) is done, so
 	// the lease's range covers it until then. A resumed capture is counted instead.
 	defer a.cap.uncounted(sh)
-	if empty {
+	if final.Empty {
 		// The shard leaves nothing behind, and no final delta: the tail goes with the
 		// journal. If the manifest can't be deleted (somebody else changed it),
 		// capture resumes and the shard stays active.
@@ -262,32 +291,32 @@ func (a *shard) deactivate(ctx context.Context) (bool, error) {
 		if err := d.cache.deleteReleased(ctx, a.Name, a.Path, a.h, resume); err != nil {
 			return false, err
 		}
+		d.logDeleted(a, final.Marked)
 		d.stats.Deletes.Add(1) // before the shard stops being active, so whoever sees it gone sees the count
 		a.gone = true
 		return true, nil
 	}
 	// A tail is a delta by the time the shard is cached, so the lease's journal range
-	// never has to cover a shard that isn't active.
-	// The app may have committed between the read and the final sync: then the
-	// delta records now, with a hint of its own.
-	hooks := shardfile.Hooks{Wake: func(ctx context.Context, end uint64) (int64, error) {
-		if w := a.wakeFor(wake, at, end); w != wake {
-			return w, a.hint(ctx, w)
-		}
-		return wake, nil
-	}}
-	if err := a.h.WriteDelta(ctx, sh, hooks); err != nil {
+	// never has to cover a shard that isn't active. The delta's manifest update
+	// records the next reminder (exact if the read saw the final state, now
+	// otherwise), with its entry in the reminder index created first. With no tail
+	// there is no delta, and the next reminder is written alone if it differs from
+	// the manifest's (a reminder that went stale, or an adoption's). If either fails,
+	// capture resumes and the shard stays active.
+	recorded := false
+	record := func(_ context.Context, end uint64) (int64, error) {
+		recorded = true
+		return a.recordedFor(next, final.At, end), nil
+	}
+	err = a.h.WriteDelta(ctx, sh, shardfile.Hooks{BeforeUpdate: record})
+	if err == nil && !recorded {
+		err = a.h.SetReminder(ctx, a.recordedFor(next, final.At, sh.Position()))
+	}
+	if err != nil {
 		if rerr := a.resume(ctx, sh); rerr != nil {
 			d.log.Error("could not resume capture after a failed delta", "shard", a.Name, "err", rerr)
 		}
 		return false, err
-	}
-	// With no tail there was no delta to record it. Nothing was committed after the
-	// last delta then, so the read was exact. Without commits the wake time only
-	// moves later (a row given up on), so a manifest left as it was only wakes the
-	// shard early.
-	if err := a.h.SetWake(ctx, wake); err != nil {
-		d.log.Warn("could not update a shard's wake time", "shard", a.Name, "err", err)
 	}
 	if err := d.cache.put(a, stateCached, a.h.Manifest.LastPosition()); err != nil {
 		return false, err
@@ -296,39 +325,21 @@ func (a *shard) deactivate(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-// deleteActive deletes an active shard.
-func (a *shard) deleteActive(ctx context.Context) error {
-	if a.gone {
-		return errLoopEnded // let go of already: the caller looks again
+// logDeleted says a shard was deleted at deactivation because it held nothing.
+// One the app marked for deletion is deliberate, so it is only a debug line. For
+// an empty one the first of each kind on this node is logged at info, with the
+// rule, since a new app with no migrations yet meets it as clients getting 404
+// for a shard its call created. Later ones are debug, since lookups from app code
+// can delete many.
+func (d *shardDeps) logDeleted(a *shard, marked bool) {
+	if marked {
+		d.log.Debug("deleted at deactivation: the app marked it for deletion", "shard", a.Name)
+		return
 	}
-	if !a.e.close() {
-		return fmt.Errorf("%w: %s has requests or connections", ErrBusy, a.Name)
+	msg := "deleted at deactivation: it held nothing of the app's (no tables, user_version or reminders), and a call creates it again"
+	if _, seen := d.deletedKinds.LoadOrStore(a.Kind, struct{}{}); seen {
+		d.log.Debug(msg, "shard", a.Name)
+		return
 	}
-	defer func() {
-		if !a.gone {
-			a.addOwner()
-			a.e.reopen()
-		}
-	}()
-	if err := a.removeOwner(); err != nil {
-		return err
-	}
-	sh := a.cap.load()
-	released, _, err := sh.Release(ctx)
-	if err != nil || !released {
-		if err == nil {
-			err = fmt.Errorf("%w: the app has %s open", ErrBusy, a.Name)
-		}
-		a.resumeIfClosed(ctx, sh)
-		return err
-	}
-	// Counted until the deletion is done: the manifest points at the tail until then.
-	defer a.cap.uncounted(sh)
-	defer sh.Discard() // the shard is deleted, or resumed with the tail handed on
-	resume := func() error { return a.resume(ctx, sh) }
-	if err := a.d.cache.deleteReleased(ctx, a.Name, a.Path, a.h, resume); err != nil {
-		return err
-	}
-	a.gone = true
-	return nil
+	d.log.Info(msg, "shard", a.Name)
 }

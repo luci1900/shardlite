@@ -19,6 +19,7 @@ import (
 func TestClientDisconnectWhileHeldAtTheGate(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
+	r.create("wallet/cx1")
 	r.slowJournal(5 * time.Second) // every flush takes 5 s
 	var appCancelled, appAnswered atomic.Bool
 	r.app_(func(w http.ResponseWriter, q *http.Request) {

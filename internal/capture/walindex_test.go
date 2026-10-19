@@ -225,7 +225,7 @@ func TestWalIndexAcrossHeldRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.Close()
-	released, _, err := sh.Release(ctx)
+	released, _, err := sh.Release(ctx, nil)
 	if err != nil || released {
 		t.Fatalf("release: %v %v", released, err)
 	}
@@ -244,7 +244,7 @@ func TestWalIndexAcrossHeldRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	app.Must(t, "close", "a")
-	if released, _, err = sh.Release(ctx); err != nil || !released {
+	if released, _, err = sh.Release(ctx, nil); err != nil || !released {
 		t.Fatalf("final release: %v %v", released, err)
 	}
 }
@@ -265,7 +265,7 @@ func TestHeldReleaseKeepsTheWALForTheNextRelease(t *testing.T) {
 	if err := sh.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if released, _, err := sh.Release(ctx); err != nil || released {
+	if released, _, err := sh.Release(ctx, nil); err != nil || released {
 		t.Fatalf("release with the app holding the shard: %v %v", released, err)
 	}
 	before, _ := e.entriesFor(t, "users/1")
@@ -273,7 +273,7 @@ func TestHeldReleaseKeepsTheWALForTheNextRelease(t *testing.T) {
 	if err := sh.Sync(ctx); err != nil { // the next flush cycle, or the messages owner's first read
 		t.Fatal(err)
 	}
-	if released, _, err := sh.Release(ctx); err != nil || !released {
+	if released, _, err := sh.Release(ctx, nil); err != nil || !released {
 		t.Fatalf("release once the app closed it: %v %v", released, err)
 	}
 	if after, _ := e.entriesFor(t, "users/1"); len(after) != len(before) {

@@ -244,7 +244,7 @@ func conformance(t *testing.T, mk backendFactory) {
 	})
 
 	run("ListByPrefix", func(t *testing.T, b Backend, s *Store) {
-		for _, k := range []string{"data/journal/n1/2", "data/journal/n1/1", "data/journal/n2/1", "state/nodes/n1", "data/journal/n10/1"} {
+		for _, k := range []string{"data/journal/n1/2", "data/journal/n1/1", "data/journal/n2/1", "state/leases/n1", "data/journal/n10/1"} {
 			s.Create(ctx, k, strings.NewReader(k))
 		}
 		list := func(prefix string) string {
@@ -294,6 +294,20 @@ func conformance(t *testing.T, mk backendFactory) {
 		}
 		if count != n {
 			t.Fatalf("listed %d of %d", count, n)
+		}
+		// From after a key, across the page boundary: the next key is the first.
+		after, count := "many/00099", 0
+		for info, err := range s.ListAfter(ctx, "many/", after) {
+			if err != nil {
+				t.Fatal(err)
+			}
+			if count == 0 && info.Key != "many/00100" {
+				t.Fatalf("listing after %q began at %q", after, info.Key)
+			}
+			count++
+		}
+		if count != n-100 {
+			t.Fatalf("listed %d after %q, want %d", count, after, n-100)
 		}
 	})
 
@@ -348,23 +362,23 @@ func conformance(t *testing.T, mk backendFactory) {
 
 	run("WithPrefixesAreSeparate", func(t *testing.T, b Backend, s *Store) {
 		x, y := storeOf(WithPrefix(b, "x/")), storeOf(WithPrefix(b, "y/"))
-		if _, err := x.Create(ctx, "state/nodes/n1", strings.NewReader("x")); err != nil {
+		if _, err := x.Create(ctx, "state/leases/n1", strings.NewReader("x")); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := y.Create(ctx, "state/nodes/n1", strings.NewReader("y")); err != nil {
+		if _, err := y.Create(ctx, "state/leases/n1", strings.NewReader("y")); err != nil {
 			t.Fatal(err)
 		}
 		var keys []string
-		for info, err := range x.List(ctx, "state/nodes/") {
+		for info, err := range x.List(ctx, "state/leases/") {
 			if err != nil {
 				t.Fatal(err)
 			}
 			keys = append(keys, info.Key)
 		}
-		if len(keys) != 1 || keys[0] != "state/nodes/n1" {
+		if len(keys) != 1 || keys[0] != "state/leases/n1" {
 			t.Fatalf("listing: %v", keys)
 		}
-		if _, err := s.Head(ctx, "state/nodes/n1"); !errors.Is(err, ErrNotFound) {
+		if _, err := s.Head(ctx, "state/leases/n1"); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("head without the prefix: %v", err)
 		}
 	})

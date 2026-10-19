@@ -16,8 +16,8 @@ import (
 var errShardsStopped = errors.New("node: the shards have stopped")
 
 // table maps each shard's name to its entry (docs/concurrency.md, The tree), and
-// runs the shards' loops until it stops. Each loop runs its shard's messages
-// owner. Nothing locks the whole table: an activation adds its entry with LoadOrStore,
+// runs the shards' loops until it stops. Each loop runs its shard's reminders
+// loop. Nothing locks the whole table: an activation adds its entry with LoadOrStore,
 // and whoever finds one already there waits for it; removal marks the entry
 // gone under the entry's own mutex, then deletes it with CompareAndDelete, so it
 // can only remove the entry it means to. A request that found an entry just

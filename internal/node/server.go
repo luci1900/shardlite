@@ -33,10 +33,9 @@ const (
 	hdrCaller   = "Shardlite-Caller"
 	hdrSync     = "Shardlite-Sync"
 	hdrIfActive = "Shardlite-If-Active"
+	hdrIfExists = "Shardlite-If-Exists"
 	hdrHops     = "Shardlite-Hops"
-	hdrDeadline = "Shardlite-Deadline"
-	hdrInboxID  = "Shardlite-Inbox-Id"
-	hdrOrigin   = "Shardlite-Origin" // on a forward: "client" or "call"
+	hdrOrigin   = "Shardlite-Origin" // on a forward: "client", "call" or "node"
 	hdrOwner    = "Shardlite-Owner"  // on a 421: the owner the node found
 	queryTarget = "shardlite-target"
 	apiPrefix   = "/_shardlite/"
@@ -52,12 +51,15 @@ type ServerOptions struct {
 	HealthEvery time.Duration // 1 s if zero
 	// MaxHops is the longest chain of hops allowed, DefaultMaxHops if zero.
 	MaxHops int
-	// MessageTimeout is how long one intake or one call to a handler for an inbox row may take, 30 s if zero.
-	MessageTimeout time.Duration
+	// ReminderTimeout is how long one wake of the app for a shard's reminders may take, 30 s if zero.
+	ReminderTimeout time.Duration
 	// Grace is how long stopping a server waits for requests in flight before it
 	// ends them, 10 s if zero.
-	Grace  time.Duration
-	Logger *slog.Logger
+	Grace time.Duration
+	// AnswerTimeout is how long a forward waits for the owner's node to
+	// acknowledge it before the owner counts as unreachable, 1 s if zero.
+	AnswerTimeout time.Duration
+	Logger        *slog.Logger
 }
 
 // The timeouts of the node's HTTP transports and servers.
@@ -76,7 +78,7 @@ const (
 	serverIdleTimeout = 2 * time.Minute
 )
 
-// DefaultMaxHops is how many hops a chain of calls and messages may have (Dapr limits calls the same way).
+// DefaultMaxHops is how many hops a chain of calls may have (Dapr limits calls the same way).
 const DefaultMaxHops = 32
 
 // Server is the node's HTTP side: a public handler for clients (behind the
@@ -95,7 +97,8 @@ type Server struct {
 	// listeners: over h2c, one multiplexed connection per pair of nodes, but an
 	// upgrade over HTTP/1.1 on a connection of its own.
 	forwarder *httputil.ReverseProxy
-	health    *health // a service of Run's
+	peers     *http.Client // the node's own requests to other nodes (dispatches)
+	health    *health      // a service of Run's
 }
 
 // NewServer makes the node's servers. The app counts as unhealthy until its
@@ -107,8 +110,9 @@ func NewServer(m *Catalog, kinds *Kinds, keeper *coord.Keeper, opts ServerOption
 	opts.HealthPath = cmp.Or(opts.HealthPath, "/health")
 	orDefault(&opts.HealthEvery, time.Second)
 	orDefault(&opts.MaxHops, DefaultMaxHops)
-	orDefault(&opts.MessageTimeout, 30*time.Second)
+	orDefault(&opts.ReminderTimeout, 30*time.Second)
 	orDefault(&opts.Grace, 10*time.Second)
+	orDefault(&opts.AnswerTimeout, time.Second)
 	u := *opts.App
 	u.Path = strings.TrimRight(u.Path, "/") + opts.HealthPath
 	s := &Server{m: m, kinds: kinds, keeper: keeper, opts: opts, log: opts.Logger}
@@ -146,6 +150,7 @@ func NewServer(m *Catalog, kinds *Kinds, keeper *coord.Keeper, opts ServerOption
 		ErrorHandler:   s.forwardError,
 		FlushInterval:  -1,
 	}
+	s.peers = &http.Client{Transport: splitTransport{h1: h1, h2c: h2c, peer: true}}
 	return s
 }
 
@@ -342,20 +347,31 @@ func (s *Server) PeerHandler(name string) http.Handler {
 			json.NewEncoder(w).Encode(NodeInfoReply{Name: name, Epoch: s.keeper.Lease().Epoch})
 			return
 		}
+		if r.URL.Path == dispatchPath && r.Method == http.MethodPost {
+			s.serveDispatch(w, r)
+			return
+		}
 		o := origin{forwarded: true}
 		switch r.Header.Get(hdrOrigin) {
 		case originClient:
 			o.kind = fromClient
 		case originCall:
 			o.kind = fromCall
+		case originNode:
+			o.kind = fromNode
 		default:
 			writeError(w, r, true, http.StatusNotFound, "not found")
 			return
 		}
-		if isAPIPath(r.URL.Path) {
+		// Only the node's own requests use paths under /_shardlite/ (a system app's
+		// that only the node may send), and only another node forwards them here.
+		if isAPIPath(r.URL.Path) && o.kind != fromNode {
 			writeError(w, r, true, http.StatusNotFound, "not found")
 			return
 		}
+		// The forward has reached this node: the forwarding node can tell a slow app
+		// from a node that doesn't answer.
+		w.WriteHeader(http.StatusProcessing)
 		s.route(w, r, o)
 	})
 }
@@ -364,6 +380,7 @@ func (s *Server) PeerHandler(name string) http.Handler {
 const (
 	originClient = "client"
 	originCall   = "call"
+	originNode   = "node"
 )
 
 // NodeInfoReply is the answer of GET /_shardlite/node.
@@ -402,13 +419,6 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
-	case strings.HasPrefix(r.URL.Path, apiPrefix+"shards/") && r.Method == http.MethodDelete:
-		target := strings.TrimPrefix(r.URL.Path, apiPrefix+"shards/")
-		if err := s.m.Delete(r.Context(), target); err != nil {
-			s.fail(w, r, false, err)
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
 	default:
 		writeError(w, r, false, http.StatusNotFound, "no such endpoint")
 	}
@@ -421,7 +431,8 @@ type reqInfo struct {
 	caller string // "" on a client request
 	ref    *Ref
 	public bool
-	own    bool // the node's own request (an intake or a delivery), answered in process
+	own    bool // the node's own request (a delivery), answered in process
+	node   bool // the node's request for a system shard (fromNode)
 	// forwarded is a request another node forwarded here. owner is the node that
 	// owns the target when that isn't this one, and peer the address it is
 	// forwarded to.
@@ -431,13 +442,13 @@ type reqInfo struct {
 	// its own), and movedTo is the owner it named: empty if it named none.
 	moved   bool
 	movedTo string
+	// answer is what the forward in progress has heard from the owner's node
+	// (answerAwaited, answerHeard or answerLate), and unreachable is set when it
+	// failed before the owner's node answered.
+	answer      atomic.Int32
+	unreachable bool
 
-	hops     int       // sent to the app as Shardlite-Hops
-	deadline time.Time // zero if the request has none
-	inboxID  int64     // the inbox row a handler is called for, 0 if none
-	// callerGate gates what the calling shard sends for the whole call (the
-	// request body and, after an upgrade, what it writes), nil if the call isn't gated.
-	callerGate *gate
+	hops int // sent to the app as Shardlite-Hops
 	// gates counts the request's gates in progress (see route), and held is
 	// what the request holds until it ends.
 	gates inFlight
@@ -459,7 +470,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, o origin) {
 			target = q
 		}
 	}
-	info := &reqInfo{target: target, public: !o.control(), own: o.internal(), forwarded: o.forwarded}
+	info := &reqInfo{target: target, public: !o.control(), own: o.internal(), node: o.kind == fromNode, forwarded: o.forwarded}
 	// The proxy can leave goroutines behind that are still reading through a gate
 	// when the handler returns: the second copier of an upgraded connection, or
 	// the transport writing a request body. Their gates end with the request's
@@ -473,18 +484,9 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, o origin) {
 			ref.Release()
 		}
 	}()
-	// The one place that decides a request is an intake. Between nodes it will be
-	// the header, which only a node may set: whatever an app or a client sent is
-	// removed here, so nothing else can ask for it.
-	r.Header.Del(hdrInbox)
 	if err := s.parseCall(r, o, info); err != nil {
 		s.answer(w, r, o.internal(), err)
 		return
-	}
-	if !info.deadline.IsZero() {
-		ctx, cancel := context.WithDeadline(r.Context(), info.deadline)
-		defer cancel()
-		r = r.WithContext(ctx)
 	}
 	if target != "" {
 		if err := s.checkTarget(r, o, info); err != nil {
@@ -495,13 +497,14 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, o origin) {
 			s.answer(w, r, o.internal(), err)
 			return
 		}
-		if info.owner != "" && !s.forwardOrRetry(w, r, o, info) {
+		if info.owner != "" {
+			s.forward(w, r, info)
 			return
 		}
-	}
-	if o.kind == fromIntake {
-		s.serveIntake(w, r, info) // answered by the node, not the app
-		return
+		if info.ref.a.sys != nil {
+			s.serveSystem(w, r, info)
+			return
+		}
 	}
 	s.proxy.ServeHTTP(noInformational{w}, r.WithContext(context.WithValue(r.Context(), ctxKey{}, info)))
 }
@@ -520,11 +523,16 @@ func (s *Server) answer(w http.ResponseWriter, r *http.Request, own bool, err er
 		writeError(w, r, own, se.status, se.msg)
 		return
 	}
+	if ue, ok := errors.AsType[*unavailable](err); ok {
+		w.Header().Set("Retry-After", strconv.Itoa(int((ue.retry+time.Second-1)/time.Second)))
+		writeError(w, r, own, http.StatusServiceUnavailable, ue.msg)
+		return
+	}
 	s.fail(w, r, own, err)
 }
 
-// parseCall reads what a call says about itself into info: its caller, its hops
-// and its deadline.
+// parseCall reads what a call says about itself into info: its caller and its
+// hops.
 func (s *Server) parseCall(r *http.Request, o origin, info *reqInfo) error {
 	if o.control() {
 		if info.target == "" {
@@ -535,6 +543,12 @@ func (s *Server) parseCall(r *http.Request, o origin, info *reqInfo) error {
 			info.caller = callerApp
 		} else if _, _, err := ParseTarget(info.caller); err != nil && info.caller != callerApp {
 			return &statusError{http.StatusBadRequest, "bad Shardlite-Caller"}
+		}
+		// What a calling shard sends is gated on its commits, and an upgraded
+		// connection would need every write gated for as long as it lasts. Streams
+		// carry the same traffic, gated as any call's body is.
+		if info.caller != callerApp && r.Header.Get("Upgrade") != "" {
+			return &statusError{http.StatusBadRequest, "a call from a shard can't be upgraded: use a streaming request (server-sent events or a gRPC stream)"}
 		}
 	}
 	// Hops: the call is one more than the one the app says it is serving
@@ -555,41 +569,6 @@ func (s *Server) parseCall(r *http.Request, o origin, info *reqInfo) error {
 			}
 		}
 	}
-
-	// Deadline: from a call's or a forward's header, or from grpc-timeout on a
-	// gRPC request (the smaller if both). Clients can't send Shardlite-Deadline.
-	var left time.Duration
-	hasDeadline := false
-	if o.control() || o.forwarded {
-		if v := r.Header.Get(hdrDeadline); v != "" {
-			ms, err := strconv.ParseInt(v, 10, 64)
-			if err != nil || ms < 0 {
-				return &statusError{http.StatusBadRequest, "bad Shardlite-Deadline"}
-			}
-			left, hasDeadline = time.Duration(ms)*time.Millisecond, true
-		}
-	}
-	if isGRPC(r) {
-		if v := r.Header.Get("Grpc-Timeout"); v != "" {
-			d, err := parseGRPCTimeout(v)
-			if err != nil {
-				return &statusError{http.StatusBadRequest, "bad grpc-timeout"}
-			}
-			if !hasDeadline || d < left {
-				left, hasDeadline = d, true
-			}
-		}
-	}
-	if hasDeadline {
-		info.deadline = time.Now().Add(left)
-		if left <= 0 {
-			return context.DeadlineExceeded
-		}
-	}
-	if o.kind == fromDelivery {
-		// The handler sees the row's own hops, not one more.
-		info.hops, info.inboxID = o.hops, o.inboxID
-	}
 	return nil
 }
 
@@ -606,7 +585,7 @@ func (s *Server) checkTarget(r *http.Request, o origin, info *reqInfo) error {
 			return err
 		}
 	}
-	if wantsActive(r, o) && !s.m.IsActive(info.target) {
+	if o.control() && strings.EqualFold(r.Header.Get(hdrIfActive), "true") && !s.m.IsActive(info.target) {
 		// Not activated for a call that only wants shards that are already running.
 		if _, _, err := ParseTarget(info.target); err != nil {
 			return err
@@ -623,17 +602,9 @@ func (s *Server) checkTarget(r *http.Request, o origin, info *reqInfo) error {
 			info.owner = m.Owner
 			return nil
 		}
-		return errNotActive
+		return &statusError{http.StatusNotFound, "shard is not active"}
 	}
 	return nil
-}
-
-var errNotActive = &statusError{http.StatusNotFound, "shard is not active"}
-
-// wantsActive reports whether the request is a call that wants only shards that
-// are active already (Shardlite-If-Active).
-func wantsActive(r *http.Request, o origin) bool {
-	return o.control() && strings.EqualFold(r.Header.Get(hdrIfActive), "true")
 }
 
 // holdShards gates the caller and acquires the target, unless another node owns
@@ -652,7 +623,6 @@ func (s *Server) holdShards(r *http.Request, o origin, info *reqInfo) error {
 		}
 		if cg != nil {
 			info.held = append(info.held, cg.ref)
-			info.callerGate = cg
 			if r.Body != nil && r.Body != http.NoBody {
 				r.Body = gatedBody{r.Body, cg}
 			}
@@ -665,16 +635,31 @@ func (s *Server) holdShards(r *http.Request, o origin, info *reqInfo) error {
 		info.owner = owner
 		return nil
 	}
-	return s.acquire(r, o, info)
-}
-
-// acquire activates the target on this node and holds it, unless another node
-// owns it (info.owner).
-func (s *Server) acquire(r *http.Request, o origin, info *reqInfo) error {
-	ref, err := s.m.Acquire(r.Context(), info.target)
-	if oe, ok := errors.AsType[*shardfile.OwnedElsewhereError](err); ok && !o.internal() {
+	// Clients never create a shard, and a call can ask not to (Shardlite-If-Exists).
+	// Shardlite-If-Active is the same ask, made before the table is looked at.
+	existing := o.kind == fromClient || (o.control() && strings.EqualFold(r.Header.Get(hdrIfExists), "true"))
+	var ref *Ref
+	var err error
+	if existing {
+		ref, err = s.m.acquireExisting(r.Context(), info.target)
+	} else {
+		ref, err = s.m.Acquire(r.Context(), info.target)
+	}
+	if errors.Is(err, blob.ErrNotFound) {
+		// The same answer as a kind the client may not name, so it says nothing of
+		// kinds or ids. A flood of misses must not be a flood of log lines.
+		s.log.Debug("no shard to reach: it does not exist, and this request may not create it", "target", info.target)
+		kind, _, _ := strings.Cut(info.target, "/")
+		return fmt.Errorf("%w: %q", ErrUnknownKind, kind)
+	}
+	if oe, ok := errors.AsType[*shardfile.OwnedElsewhereError](err); ok && o.kind != fromWake {
 		info.owner = oe.Owner
 		return nil
+	}
+	if errors.Is(err, shardfile.ErrOwnerNotAdopted) {
+		// The owner's lease has expired, or it restarted, so there is nothing to
+		// wait for but the adoption.
+		return &unavailable{err.Error(), time.Second}
 	}
 	if err != nil {
 		return err
@@ -687,10 +672,10 @@ func (s *Server) acquire(r *http.Request, o origin, info *reqInfo) error {
 
 // cachedOwner is the node the owner cache names for target, if it names one
 // that forwards should go to. A forwarded request is for the node that
-// received it to decide, so it never looks, and the node's own requests (which
-// are not forwarded) don't either.
+// received it to decide, so it never looks, and a delivery (which is for the
+// node that owns the shard and is never forwarded) doesn't either.
 func (s *Server) cachedOwner(o origin, target string) (string, bool) {
-	if o.forwarded || o.internal() {
+	if o.forwarded || o.kind == fromWake {
 		return "", false
 	}
 	return s.m.owners.Get(target)
@@ -775,28 +760,20 @@ func (s *Server) rewrite(pr *httputil.ProxyRequest) {
 	pr.Out.Header.Set(hdrHops, strconv.Itoa(info.hops))
 	if info.peer != "" {
 		origin := originCall
-		if info.public {
+		switch {
+		case info.public:
 			origin = originClient
-		} else {
-			for _, h := range []string{hdrIfActive, hdrSync} {
+		case info.node:
+			origin = originNode
+			fallthrough
+		default:
+			for _, h := range []string{hdrIfActive, hdrIfExists, hdrSync} {
 				if v := pr.In.Header.Get(h); v != "" {
 					pr.Out.Header.Set(h, v)
 				}
 			}
 		}
 		pr.Out.Header.Set(hdrOrigin, origin)
-	}
-	if info.inboxID != 0 {
-		pr.Out.Header.Set(hdrInboxID, strconv.FormatInt(info.inboxID, 10))
-	}
-	if !info.deadline.IsZero() {
-		// The time still left, so the app (and its own calls) stop when the node would.
-		left := max(time.Until(info.deadline), time.Millisecond)
-		ms := strconv.FormatInt((left + time.Millisecond - 1).Milliseconds(), 10) // rounded up
-		pr.Out.Header.Set(hdrDeadline, ms)
-		if pr.Out.Header.Get("Grpc-Timeout") != "" {
-			pr.Out.Header.Set("Grpc-Timeout", ms+"m")
-		}
 	}
 	if info.target != "" {
 		pr.Out.Header.Set(hdrTarget, info.target)
@@ -836,7 +813,6 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 	info, _ := resp.Request.Context().Value(ctxKey{}).(*reqInfo)
 	override := resp.Header.Get(hdrSync)
 	stripShardliteHeaders(resp.Header)
-	defer endAtDeadline(resp, info)
 	if info == nil || info.ref == nil {
 		return nil // shardless: a plain reverse proxy
 	}
@@ -848,7 +824,7 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 	}
 	g := &gate{m: s.m, ref: info.ref, sync: sync, ctx: ctx, resp: resp, calls: &info.gates}
 	if rwc, ok := resp.Body.(io.ReadWriteCloser); ok && resp.StatusCode == http.StatusSwitchingProtocols {
-		resp.Body = gatedConn{rwc, g, info.callerGate, &info.gates}
+		resp.Body = gatedConn{rwc, g, &info.gates}
 	} else {
 		resp.Body = gatedBody{resp.Body, g}
 	}
@@ -872,161 +848,6 @@ func (w noInformational) WriteHeader(code int) {
 
 func (w noInformational) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
-// endAtDeadline makes a gRPC response that the node's deadline cuts short end
-// with a status. The app (or the owner's node) is told the time left, so it
-// usually answers at about the moment the node's own deadline passes. If that
-// cuts the body short after the headers went out, the client gets a gRPC
-// status, not a reset stream.
-func endAtDeadline(resp *http.Response, info *reqInfo) {
-	if info == nil || info.deadline.IsZero() || !isGRPC(resp.Request) {
-		return
-	}
-	if resp.Trailer == nil {
-		resp.Trailer = http.Header{}
-	}
-	resp.Body = deadlineBody{resp.Body, resp, resp.Request.Context()}
-}
-
-// forwardOrRetry forwards the request to the owner it found, and corrects the
-// owner cache if the owner answers 421 (docs/internals.md, Routing and
-// forwarding). It retries once, here, never at the owner that answered: at the
-// node the 421 names, or through Acquire if it names this node or none. A second
-// 421, a body that can't be sent again and a deadline that has passed are
-// answered here. It reports whether the request is now to be served on this
-// node (the retry found the shard here), and has answered it otherwise.
-func (s *Server) forwardOrRetry(w http.ResponseWriter, r *http.Request, o origin, info *reqInfo) (local bool) {
-	var kept *replayBody
-	if !info.forwarded && r.Body != nil && r.Body != http.NoBody {
-		kept = newReplayBody(r.Body, replayLimit)
-		r.Body, r.GetBody = kept.view(), func() (io.ReadCloser, error) { return kept.view(), nil }
-	}
-	if !s.forward(w, r, info) {
-		return false
-	}
-	moved := fmt.Errorf("%w: %s is not owned by %s", errMoved, info.target, info.owner)
-	switch {
-	case context.Cause(r.Context()) != nil: // never started past the deadline
-		s.fail(w, r, false, context.Cause(r.Context()))
-		return false
-	case kept != nil && !kept.replayable():
-		s.fail(w, r, false, fmt.Errorf("%w, and its body is too large to send again", moved))
-		return false
-	}
-	if kept != nil {
-		r.Body = kept.view()
-	}
-	// The entry was wrong. The owner named is recorded, and a node that names
-	// none, or this one, is asked through Acquire as for a miss.
-	named := info.movedTo
-	s.m.owners.Remove(info.target)
-	info.owner, info.peer, info.moved, info.movedTo = "", "", false, ""
-	switch {
-	case named != "" && named != s.m.n.Name:
-		s.m.owners.Add(info.target, named)
-		info.owner = named
-	case wantsActive(r, o) && !s.m.IsActive(info.target):
-		s.answer(w, r, false, errNotActive) // a call that only wants shards already running activates none
-		return false
-	default:
-		if err := s.acquire(r, o, info); err != nil {
-			s.answer(w, r, o.internal(), err)
-			return false
-		}
-	}
-	if info.owner == "" {
-		return true
-	}
-	if s.forward(w, r, info) {
-		s.m.owners.Remove(info.target) // and the one it names is worth more than the one just tried
-		if info.movedTo != "" && info.movedTo != s.m.n.Name {
-			s.m.owners.Add(info.target, info.movedTo)
-		}
-		s.fail(w, r, false, fmt.Errorf("%w again: %s is not owned by %s either", errMoved, info.target, info.owner))
-	}
-	return false
-}
-
-// errMoved is a forward's answer from a node that found the shard isn't its own.
-var errMoved = errors.New("the shard has moved")
-
-// forward sends a request for a shard another node owns to that node's peer
-// listener, which serves it as this node would have (docs/internals.md, Routing
-// and forwarding). The caller's gate, if any, is on the request's body already.
-// A forward is never forwarded again: a node that finds a forward's shard isn't
-// its own answers 421, naming the owner it found if it found one. It reports
-// that the owner answered 421 (info.moved), in which case nothing has been
-// written.
-func (s *Server) forward(w http.ResponseWriter, r *http.Request, info *reqInfo) (moved bool) {
-	if info.forwarded {
-		w.Header().Set(hdrOwner, info.owner)
-		writeError(w, r, true, http.StatusMisdirectedRequest, fmt.Sprintf("%s is owned by %s", info.target, info.owner))
-		return false
-	}
-	address, err := s.m.addrs.address(r.Context(), info.owner)
-	if err == nil {
-		err = context.Cause(r.Context()) // never started past the deadline
-	}
-	if err != nil {
-		s.fail(w, r, false, fmt.Errorf("forwarding to %s, the owner of %s: %w", info.owner, info.target, err))
-		return false
-	}
-	info.peer = address
-	s.forwarder.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, info)))
-	return info.moved
-}
-
-// forwardError is proxyError for a forward. A connection that is refused or
-// can't be dialled makes the node forget the owner's address: it may have
-// restarted somewhere else.
-func (s *Server) forwardError(w http.ResponseWriter, r *http.Request, err error) {
-	if info, _ := r.Context().Value(ctxKey{}).(*reqInfo); info != nil {
-		if oe, ok := errors.AsType[*net.OpError](err); ok && oe.Op == "dial" {
-			s.m.addrs.forget(info.owner)
-		}
-	}
-	if errors.Is(err, errMoved) {
-		return // forward reports it, and forwardOrRetry answers
-	}
-	s.proxyError(w, r, err)
-}
-
-// forwardedResponse is the owner's answer to a forward. It passes through as it
-// is (the owner gated it), except a 421 from the owner's node. What a calling
-// shard sends over an upgraded connection is gated here, on the caller.
-func (s *Server) forwardedResponse(resp *http.Response) error {
-	info, _ := resp.Request.Context().Value(ctxKey{}).(*reqInfo)
-	// Only a node sets Shardlite-Owner (an owner strips the app's), though it may
-	// be empty: the node that answered didn't find the owner.
-	if owner, ok := resp.Header[hdrOwner]; ok && resp.StatusCode == http.StatusMisdirectedRequest {
-		info.moved, info.movedTo = true, strings.Join(owner, "")
-		return fmt.Errorf("%w: %s is not owned by %s but by %q", errMoved, info.target, info.owner, info.movedTo)
-	}
-	if rwc, ok := resp.Body.(io.ReadWriteCloser); ok && resp.StatusCode == http.StatusSwitchingProtocols {
-		resp.Body = gatedConn{rwc, nil, info.callerGate, &info.gates}
-		return nil
-	}
-	endAtDeadline(resp, info)
-	return nil
-}
-
-// deadlineBody ends a gRPC response whose read failed because the node's deadline
-// passed with DEADLINE_EXCEEDED in its trailers.
-type deadlineBody struct {
-	io.ReadCloser
-	resp *http.Response
-	ctx  context.Context
-}
-
-func (b deadlineBody) Read(p []byte) (int, error) {
-	n, err := b.ReadCloser.Read(p)
-	if err != nil && err != io.EOF && errors.Is(b.ctx.Err(), context.DeadlineExceeded) {
-		b.resp.Trailer.Set("Grpc-Status", strconv.Itoa(grpcCodes[http.StatusGatewayTimeout]))
-		b.resp.Trailer.Set("Grpc-Message", grpcMessage(context.DeadlineExceeded.Error()))
-		return n, io.EOF
-	}
-	return n, err
-}
-
 // stripShardliteHeaders removes every Shardlite-* header. A key is matched
 // without regard to case and with "_" read as "-", because Go keeps a header sent
 // as Shardlite_Caller under a key that isn't canonical, while CGI-style
@@ -1037,100 +858,6 @@ func stripShardliteHeaders(h http.Header) {
 			delete(h, k)
 		}
 	}
-}
-
-// gate holds back each chunk of a shard's output until the shard's earlier
-// commits are durable. A response is gated on the callee that produced it, and
-// what a calling shard sends (a request body, an upgraded connection's writes)
-// on the caller.
-type gate struct {
-	m    *Catalog
-	ref  *Ref
-	sync bool
-	ctx  context.Context
-	resp *http.Response // the response being gated, nil for a caller's gate
-	// calls are the request's gates in progress: once the request has ended, a
-	// gate fails without looking at the shard, whose reference is released.
-	calls *inFlight
-}
-
-// errRequestEnded is what a gate returns once its request has ended.
-var errRequestEnded = errors.New("the request has ended")
-
-// wait gates a chunk that was just read (n bytes, or the end of the body, whose
-// trailers are output too).
-func (g *gate) wait(n int, err error) error {
-	if n > 0 || errors.Is(err, io.EOF) {
-		if !g.calls.enter() {
-			return errRequestEnded
-		}
-		defer g.calls.leave()
-		return g.m.Gate(g.ctx, g.ref, g.sync)
-	}
-	return nil
-}
-
-func (g *gate) read(n int, err error) (int, error) {
-	if gerr := g.wait(n, err); gerr != nil {
-		return 0, gerr
-	}
-	if errors.Is(err, io.EOF) && g.resp != nil {
-		stripShardliteHeaders(g.resp.Trailer)
-	}
-	return n, err
-}
-
-// gatedBody is a body whose chunks are gated: a response's on the callee that
-// produced it, and a call's request body on the caller. Each chunk, and the end
-// of the body with its trailers, gets through only once what the shard
-// committed before it is durable.
-type gatedBody struct {
-	io.ReadCloser
-	g *gate
-}
-
-func (b gatedBody) Read(p []byte) (int, error) {
-	n, err := b.ReadCloser.Read(p)
-	return b.g.read(n, err)
-}
-
-// gatedConn is an upgraded connection (a WebSocket) to the app, or to the
-// owner's node for a forward: what the app sends is gated on its shard (g, nil
-// on a forward, which the owner gates). What the client sends is not, but what a
-// calling shard sends is, on the caller (cg): the proxy copies it to this
-// connection with Write. Each read and write counts as one of the request's
-// calls in progress, so once the request has ended none is and none starts: the
-// proxy's second copier outlives its handler only to return.
-type gatedConn struct {
-	io.ReadWriteCloser
-	g     *gate
-	cg    *gate // nil unless the upgrade is a gated call
-	calls *inFlight
-}
-
-func (c gatedConn) Read(p []byte) (int, error) {
-	if !c.calls.enter() {
-		return 0, errRequestEnded
-	}
-	defer c.calls.leave()
-	n, err := c.ReadWriteCloser.Read(p)
-	if c.g == nil {
-		return n, err
-	}
-	return c.g.read(n, err)
-}
-
-func (c gatedConn) Write(p []byte) (int, error) {
-	if !c.calls.enter() {
-		return 0, errRequestEnded
-	}
-	defer c.calls.leave()
-	if c.cg != nil {
-		if err := c.cg.wait(len(p), nil); err != nil {
-			return 0, err
-		}
-	}
-	return c.ReadWriteCloser.Write(p)
 }
 
 func (s *Server) proxyError(w http.ResponseWriter, r *http.Request, err error) {
@@ -1145,10 +872,10 @@ func (s *Server) proxyError(w http.ResponseWriter, r *http.Request, err error) {
 func (s *Server) fail(w http.ResponseWriter, r *http.Request, own bool, err error) {
 	status := http.StatusBadGateway
 	switch {
-	case errors.Is(err, ErrUnknownKind), errors.Is(err, ErrBadTarget):
+	case errors.Is(err, ErrUnknownKind):
+		status = http.StatusNotFound
+	case errors.Is(err, ErrBadTarget):
 		status = http.StatusBadRequest
-	case errors.Is(err, ErrBusy):
-		status = http.StatusConflict
 	case errors.Is(err, ErrAppHolds), errors.Is(err, errMoved),
 		errors.Is(err, coord.ErrLeaseLost), errors.Is(err, coord.ErrLeaseExpired):
 		status = http.StatusServiceUnavailable
@@ -1214,92 +941,4 @@ func grpcMessage(s string) string {
 		}
 	}
 	return b.String()
-}
-
-// Ready reports whether the node should get traffic: the app is healthy, the
-// kinds file is valid and the node's lease is good.
-func (s *Server) Ready() (bool, string) {
-	switch {
-	case !s.health.Healthy():
-		return false, "the app is not healthy"
-	case !s.kinds.Valid():
-		return false, "the kinds file is not valid"
-	case s.keeper.Check() != nil:
-		return false, "the node's lease is not valid"
-	}
-	return true, "ok"
-}
-
-func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
-	ok, why := s.Ready()
-	status := http.StatusOK
-	if !ok {
-		status = http.StatusServiceUnavailable
-	}
-	w.Header().Set("Content-Type", "text/plain")
-	w.WriteHeader(status)
-	if r.Method != http.MethodHead {
-		io.WriteString(w, why+"\n")
-	}
-}
-
-// health polls the app's health endpoint.
-type health struct {
-	url    string
-	every  time.Duration
-	client *http.Client
-	log    *slog.Logger
-	ok     atomic.Bool
-}
-
-func (*health) String() string { return "health poll" }
-
-// Healthy reports whether the last poll got a 2xx answer.
-func (h *health) Healthy() bool { return h.ok.Load() }
-
-func (h *health) Serve(ctx context.Context) error {
-	defer serving(h.log, h.String())()
-	check := func() {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.url, nil)
-		if err != nil {
-			h.ok.Store(false)
-			return
-		}
-		resp, err := h.client.Do(req)
-		if err != nil {
-			h.ok.Store(false)
-			return
-		}
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-		h.ok.Store(resp.StatusCode/100 == 2)
-	}
-	check()
-	t := time.NewTicker(h.every)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-t.C:
-			check()
-		}
-	}
-}
-
-// parseGRPCTimeout parses a grpc-timeout value: up to 8 digits and a unit
-// (H, M, S, m, u or n).
-func parseGRPCTimeout(v string) (time.Duration, error) {
-	if len(v) < 2 || len(v) > 9 {
-		return 0, fmt.Errorf("bad grpc-timeout %q", v)
-	}
-	n, err := strconv.ParseUint(v[:len(v)-1], 10, 32)
-	if err != nil {
-		return 0, fmt.Errorf("bad grpc-timeout %q", v)
-	}
-	unit := map[byte]time.Duration{'H': time.Hour, 'M': time.Minute, 'S': time.Second, 'm': time.Millisecond, 'u': time.Microsecond, 'n': time.Nanosecond}[v[len(v)-1]]
-	if unit == 0 {
-		return 0, fmt.Errorf("bad grpc-timeout %q", v)
-	}
-	return time.Duration(n) * unit, nil
 }

@@ -32,6 +32,8 @@ func TestWebSocketThroughTheNode(t *testing.T) {
 		return c
 	}
 
+	s.create(t, "wallet/s1", "wallet/s2", "wallet/s3", "wallet/s4", "wallet/s5", "arena/s7")
+
 	t.Run("text and binary both ways", func(t *testing.T) {
 		c := dial(t, "wallet/s1")
 		if echo, err := wsEcho(ctx, c, "hello"); err != nil || echo != "ok:hello" {
