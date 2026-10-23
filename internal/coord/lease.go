@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/cluster"
+	"github.com/luci1900/shardlite/internal/pos"
 )
 
 var (
@@ -34,27 +36,36 @@ const DefaultTTL = 10 * time.Second
 
 // NodeInfo is what a node publishes in its lease besides its epoch.
 type NodeInfo struct {
-	Name    string `json:"name"`
-	Address string `json:"address"`
-	Shards  int    `json:"shards"` // active shards
+	Name    cluster.Node `json:"name"`
+	Address string       `json:"address"`
+	Shards  int          `json:"shards"` // active shards
 	// JournalFrom is the oldest segment of the node's journal that may still hold a tail
 	// no delta covers, and JournalNext the next segment number the node would write
 	// when it published this. An adopter reads from JournalFrom, and fences by probing
 	// forward from JournalNext, so a JournalNext that is a little stale only costs probes.
-	JournalFrom uint64 `json:"journal_from"`
-	JournalNext uint64 `json:"journal_next"`
+	JournalFrom pos.Seg `json:"journal_from"`
+	JournalNext pos.Seg `json:"journal_next"`
+	// Mirrors are the nodes whose disks hold a copy of this node's journal:
+	// chosen once, at acquire, from the lease listing, least loaded first.
+	// The set is sticky: repair changes it, a renewal republishes it
+	// unchanged. Nothing depends on who the mirrors are, so the relation
+	// needs no symmetry and no coordination.
+	Mirrors []cluster.Node `json:"mirrors,omitempty"`
+	// Standby says this node can hold another node's journal: its local
+	// database is persistent. Selection picks standbys only.
+	Standby bool `json:"standby,omitempty"`
 }
 
 // Incarnation is one life of a node: its name and the epoch of its lease.
 type Incarnation struct {
-	Node  string `json:"node"`
-	Epoch uint64 `json:"epoch"`
+	Node  cluster.Node `json:"node"`
+	Epoch pos.Epoch    `json:"epoch"`
 }
 
 // NodeLease is a node's lease as of one write.
 type NodeLease struct {
 	NodeInfo
-	Epoch    uint64        `json:"epoch"` // +1 each time the node acquires its lease
+	Epoch    pos.Epoch     `json:"epoch"` // +1 each time the node acquires its lease
 	Renewed  time.Time     `json:"renewed"`
 	TTL      time.Duration `json:"ttl"`
 	Released bool          `json:"released,omitempty"` // a graceful shutdown: nothing is owned any more
@@ -64,7 +75,7 @@ type NodeLease struct {
 	// Adopted is the highest epoch up to which every epoch's journal has been
 	// adopted (or the node released its lease at it), 0 if none. A shard whose
 	// owner's epoch is at most Adopted has nothing left in that journal.
-	Adopted uint64 `json:"adopted,omitempty"`
+	Adopted pos.Epoch `json:"adopted,omitempty"`
 
 	ETag blob.ETag `json:"-"`
 	// Previous is the lease an Acquire replaced, nil if the node never had one.
@@ -95,7 +106,7 @@ func (l *NodeLease) adoptedByOther() bool {
 const Prefix = "state/leases/"
 
 // Key is the object key of a node's lease.
-func Key(node string) string { return Prefix + node }
+func Key(node cluster.Node) string { return Prefix + string(node) }
 
 // RegistryOptions tune a Registry.
 type RegistryOptions struct {
@@ -116,7 +127,7 @@ type Registry struct {
 // NewRegistry returns a registry for the node named node. Its writes go
 // through a blob.Store of their own with a random epoch in their write ids,
 // since the node's real epoch isn't known until Acquire has returned.
-func NewRegistry(b blob.Backend, node string, opts RegistryOptions) *Registry {
+func NewRegistry(b blob.Backend, node cluster.Node, opts RegistryOptions) *Registry {
 	if opts.TTL <= 0 {
 		opts.TTL = DefaultTTL
 	}
@@ -128,7 +139,7 @@ func NewRegistry(b blob.Backend, node string, opts RegistryOptions) *Registry {
 	}
 	var r [8]byte
 	_, _ = rand.Read(r[:])
-	return &Registry{store: blob.NewStore(b, node, binary.BigEndian.Uint64(r[:]), opts.Blob), opts: opts}
+	return &Registry{store: blob.NewStore(b, node, pos.Epoch(binary.BigEndian.Uint64(r[:])), opts.Blob), opts: opts}
 }
 
 func encodeLease(l *NodeLease) *bytes.Reader {
@@ -141,7 +152,7 @@ func encodeLease(l *NodeLease) *bytes.Reader {
 
 // Get returns a node's lease whether or not it is valid (check ValidAt).
 // blob.ErrNotFound if the node never had one.
-func (r *Registry) Get(ctx context.Context, node string) (*NodeLease, error) {
+func (r *Registry) Get(ctx context.Context, node cluster.Node) (*NodeLease, error) {
 	rc, etag, err := r.store.Get(ctx, Key(node))
 	if err != nil {
 		return nil, err
@@ -270,7 +281,7 @@ func (r *Registry) Release(ctx context.Context, lease NodeLease) error {
 
 // Listed is a lease as a listing of state/leases/ shows it, without reading it.
 type Listed struct {
-	Name         string
+	Name         cluster.Node
 	ETag         blob.ETag
 	LastModified time.Time // the store's clock at the lease's last write: a hint of when to look, never a decision
 }
@@ -282,7 +293,7 @@ func (r *Registry) List(ctx context.Context) ([]Listed, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, Listed{Name: strings.TrimPrefix(info.Key, Prefix), ETag: info.ETag, LastModified: info.LastModified})
+		out = append(out, Listed{Name: cluster.Node(strings.TrimPrefix(info.Key, Prefix)), ETag: info.ETag, LastModified: info.LastModified})
 	}
 	return out, nil
 }
@@ -321,7 +332,7 @@ func (r *Registry) Adopt(ctx context.Context, dead NodeLease, by Incarnation) (N
 // renews its lease meanwhile, and a write whose answer was lost leaves an old
 // ETag), and the finish is written over it. Otherwise ErrNotAdoptable: the node
 // restarted or another adopter took over, and this adoption is over.
-func (r *Registry) FinishAdoption(ctx context.Context, l NodeLease, epoch, fence uint64) (NodeLease, error) {
+func (r *Registry) FinishAdoption(ctx context.Context, l NodeLease, epoch pos.Epoch, fence pos.Seg) (NodeLease, error) {
 	finish := func(base NodeLease) (NodeLease, error) {
 		next := base
 		next.Previous = nil

@@ -15,6 +15,7 @@ import (
 	"github.com/luci1900/shardlite/internal/notify"
 	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/service"
+	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/system"
 )
@@ -34,12 +35,13 @@ type LifecycleOptions struct {
 	IdleRecheck   time.Duration // the first wait before an idle shard that its reminders keep active is looked at again (it doubles up to 10 s), 1 s if zero
 }
 
-// shardDeps is what the shards' loops use, shared by every shard: the parts of
+// actorDeps is what the shards' loops use, shared by every shard: the parts of
 // the Catalog and of the node that a shard calls, and the node-wide limits. The
 // Catalog makes it, and no shard reaches the Catalog itself.
-type shardDeps struct {
+type actorDeps struct {
 	opts    LifecycleOptions
 	kinds   *Kinds
+	sys     systemKinds                                 // the system kinds' registry: fixed ids, migrations and handlers
 	call    func(*http.Request) (*http.Response, error) // the node's calls to system shards (routing)
 	clock   Clock
 	log     *slog.Logger
@@ -50,7 +52,6 @@ type shardDeps struct {
 	rem     *reminders
 	files   *shardfile.Files
 	writer  *segment.Writer
-	scratch string // capture's disposable working files
 	tempDir string // the node's temporary files (Config.TempDir)
 	spool   int    // Config.SpoolLimit
 
@@ -69,29 +70,30 @@ type shardDeps struct {
 	rebases       chan struct{}
 }
 
-func (d *shardDeps) now() time.Time { return d.clock.Now() }
+func (d *actorDeps) now() time.Time { return d.clock.Now() }
 
-// shard is the actor of one shard on this node (docs/concurrency.md, The tree):
+// actor is one shard's actor on this node (docs/internals.md, Concurrency):
 // the table runs its Serve, the lifecycle loop, which runs the shard's reminders
-// loop while the shard is captured. The loop does one
-// operation at a time: activation (its first job), a delta or rebase when its
-// delta timer says so, deactivation once its idle timer finds it unused for its
-// kind's timeout, and the deactivations, evictions and deletes that other
-// goroutines ask for (do). Everything it does runs on the shards' base context, not on the context
-// the table gives it, so stopping the shards doesn't cut off a release.
+// loop while the shard is captured. The loop does one operation at a time:
+// activation (its first job), a delta or rebase when its delta timer says so,
+// deactivation once its idle timer finds it unused for its kind's timeout, and
+// the deactivations, evictions and deletes that other goroutines ask for (do).
+// Everything it does runs on the shards' base context, not on the context the
+// table gives it, so stopping the shards doesn't cut off a release.
 //
 // References are not the loop's: requests take them in the shard's entry. The
 // shard's state is in plain parts, each with the methods that change it: its
 // capture, its idle timer's bookkeeping, its reminders loop, its share of the
 // tail and the counters tests wait on.
-type shard struct {
-	d *shardDeps
+type actor struct {
+	d *actorDeps
 	e *entry
 
-	Name, Kind, ID string
-	Gen, Path      string
-	h              *shardfile.Handle
-	read           *shardfile.Handle // the manifest Acquire read before adding the entry, nil if it read none; activation starts from it
+	Name shard.Name
+	Gen  shard.Gen
+	Path string
+	h    *shardfile.Handle
+	read *shardfile.Handle // the manifest Acquire read before adding the entry, nil if it read none; activation starts from it
 
 	sys *kind.Kind   // the shard's system kind, nil for an app kind's shard (whose settings are looked up as they are used, since a reload may change them)
 	app http.Handler // its system app, built for this activation
@@ -106,13 +108,13 @@ type shard struct {
 	idle  idleState
 	loop  loopSlot
 	tail  tailState
-	looks shardLooks
+	looks actorLooks
 }
 
-func newShard(d *shardDeps, e *entry, kind, id string) *shard {
-	a := &shard{d: d, e: e, Name: e.name, Kind: kind, ID: id, ops: make(chan func()), ready: make(chan struct{}), ended: make(chan struct{})}
-	if a.sys = d.kinds.sys[kind]; a.sys != nil {
-		a.app = a.sys.Handler(&system.System{Name: a.Name, Tx: a.tx, Call: a.call, Sync: func(ctx context.Context) error { return a.gate(ctx, true) }})
+func newActor(d *actorDeps, e *entry) *actor {
+	a := &actor{d: d, e: e, Name: e.name, ops: make(chan func()), ready: make(chan struct{}), ended: make(chan struct{})}
+	if a.sys = d.sys[a.Name.Kind()]; a.sys != nil {
+		a.app = a.sys.Handler(&system.System{Name: a.Name, Tx: a.tx, Call: a.call, Sync: func(ctx context.Context) error { return a.gate(ctx, a.sys.Sync) }})
 	}
 	return a
 }
@@ -265,17 +267,17 @@ func (t *tailState) count(st *Stats, n int64) {
 	}
 }
 
-// shardLooks count the looks of the shard's timers, for tests.
-type shardLooks struct {
+// actorLooks count the looks of the shard's timers, for tests.
+type actorLooks struct {
 	idle notify.Counter // looks of the idle timer
 	snap notify.Counter // looks of the delta timer
 }
 
-func (a *shard) String() string { return a.Name }
+func (a *actor) String() string { return a.Name.String() }
 
 // Serve is the lifecycle loop. It runs until the shard is let go of, its
 // activation fails or ctx ends.
-func (a *shard) Serve(ctx context.Context) {
+func (a *actor) Serve(ctx context.Context) {
 	defer close(a.ended)
 	a.ctx = ctx
 	d := a.d
@@ -332,8 +334,8 @@ func (a *shard) Serve(ctx context.Context) {
 	}
 }
 
-func (a *shard) idleTimeout() time.Duration {
-	if k, err := a.d.kinds.Lookup(a.Kind); err == nil {
+func (a *actor) idleTimeout() time.Duration {
+	if k, err := a.d.kinds.Lookup(a.Name.Kind()); err == nil {
 		return k.IdleTimeout
 	}
 	return DefaultIdleTimeout
@@ -342,7 +344,7 @@ func (a *shard) idleTimeout() time.Duration {
 // lookIdle is what the idle timer does: a shard nobody has used for its kind's
 // idle timeout is let go of, unless its reminders keep it or it can't be. It
 // returns when to look again.
-func (a *shard) lookIdle(ctx context.Context) time.Duration {
+func (a *actor) lookIdle(ctx context.Context) time.Duration {
 	d := a.d
 	idle := a.idleTimeout()
 	refs, last := a.e.use()
@@ -371,7 +373,7 @@ func (a *shard) lookIdle(ctx context.Context) time.Duration {
 // snapshot is what the delta timer does: a delta for a tail that has aged, or a
 // rebase instead when the shard's base is old or it has many files
 // (docs/internals.md, Node journals and snapshots), under the node's limits.
-func (a *shard) snapshot(ctx context.Context) {
+func (a *actor) snapshot(ctx context.Context) {
 	d := a.d
 	sh := a.cap.load()
 	if sh == nil {
@@ -401,7 +403,7 @@ func (a *shard) snapshot(ctx context.Context) {
 // addLoop starts the reminders loop: once the shard is captured, and again when
 // capture resumes after a release that didn't go through. Only the shard's loop
 // calls it, and it runs on the loop's context, so it ends with the loop's too.
-func (a *shard) addLoop() {
+func (a *actor) addLoop() {
 	s := &a.loop
 	if s.on || s.quiet {
 		return
@@ -415,7 +417,7 @@ func (a *shard) addLoop() {
 
 // removeLoop removes the reminders loop and waits for it (and a wake in
 // progress) to end. Only the shard's lifecycle loop calls it.
-func (a *shard) removeLoop() error {
+func (a *actor) removeLoop() error {
 	s := &a.loop
 	if !s.on {
 		return nil
@@ -431,7 +433,7 @@ func (a *shard) removeLoop() error {
 
 // quiet stops the shard's reminders loop for the shards' shutdown, through its
 // lifecycle loop, and no reminders loop starts again: a wake in progress has ended when it returns.
-func (a *shard) quiet(ctx context.Context) error {
+func (a *actor) quiet(ctx context.Context) error {
 	err, lerr := do(ctx, a.ops, a.ended, func() error {
 		a.loop.quiet = true
 		return a.removeLoop()
@@ -447,7 +449,7 @@ func (a *shard) quiet(ctx context.Context) error {
 // and its name is free. The node keeps owning it, cached. It reports false if
 // the shard is in use or the app has it open. A shard that was let go of
 // meanwhile, or never activated, counts as let go of.
-func (a *shard) deactivateNow(ctx context.Context) (bool, error) {
+func (a *actor) deactivateNow(ctx context.Context) (bool, error) {
 	type result struct {
 		ok  bool
 		err error
@@ -485,7 +487,7 @@ func (a *shard) deactivateNow(ctx context.Context) (bool, error) {
 // returns once the loop has ended. A shard in use is not evicted (ErrBusy), nor
 // one the app has open (ErrAppHolds). done is false if the shard was let go of
 // meanwhile (or never activated): the caller looks again.
-func (a *shard) evict(ctx context.Context) (done bool, err error) {
+func (a *actor) evict(ctx context.Context) (done bool, err error) {
 	err, lerr := do(ctx, a.ops, a.ended, func() error {
 		if a.gone {
 			return errLoopEnded
@@ -521,7 +523,7 @@ func (a *shard) evict(ctx context.Context) (done bool, err error) {
 
 // waitEnded waits for the lifecycle loop of a shard that was let go of to end:
 // its reminders loop has ended and its entry is removed by then.
-func (a *shard) waitEnded(ctx context.Context) error {
+func (a *actor) waitEnded(ctx context.Context) error {
 	select {
 	case <-a.ended:
 		return nil

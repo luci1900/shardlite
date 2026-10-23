@@ -53,6 +53,36 @@ type App struct {
 	in  io.WriteCloser
 	out *bufio.Reader
 	mu  sync.Mutex
+	err *stderr
+}
+
+// stderr keeps what a process wrote to its standard error, so a test can look
+// at it, and passes it on to the test's own standard error.
+type stderr struct {
+	mu  sync.Mutex
+	buf []byte
+	max int
+	out io.Writer
+}
+
+// maxStderr is how much of a process's standard error is kept.
+const maxStderr = 64 << 10
+
+func (w *stderr) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	w.buf = append(w.buf, p...)
+	if len(w.buf) > w.max {
+		w.buf = append(w.buf[:0], w.buf[len(w.buf)-w.max:]...)
+	}
+	w.mu.Unlock()
+	return w.out.Write(p)
+}
+
+// String is what the process wrote to its standard error.
+func (w *stderr) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return string(w.buf)
 }
 
 // Start launches a testapp process.
@@ -69,7 +99,8 @@ func Start(tb testing.TB) *App {
 // StartAt launches a binary that speaks the same line protocol as testapp.
 func StartAt(path string, args ...string) (*App, error) {
 	cmd := exec.Command(path, args...)
-	cmd.Stderr = os.Stderr
+	errs := &stderr{max: maxStderr, out: os.Stderr}
+	cmd.Stderr = errs
 	in, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -81,8 +112,11 @@ func StartAt(path string, args ...string) (*App, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	return &App{cmd: cmd, in: in, out: bufio.NewReaderSize(out, 1<<16)}, nil
+	return &App{cmd: cmd, in: in, out: bufio.NewReaderSize(out, 1<<16), err: errs}, nil
 }
+
+// Stderr is what the process wrote to its standard error.
+func (a *App) Stderr() string { return a.err.String() }
 
 // Do sends one command and returns its reply value.
 func (a *App) Do(fields ...string) (string, error) {
@@ -136,10 +170,10 @@ func (a *App) Exit() error {
 	return err
 }
 
-// Dump returns a dump of a database that this process (or its Litestream)
+// Dump returns a dump of a database that this process (or its capture)
 // has open, read by a process of its own. Reading the file here would open
 // and close a descriptor on it, and closing any descriptor drops all of the
-// process's fcntl locks on the file, Litestream's among them.
+// process's fcntl locks on the file, capture's among them.
 func Dump(tb testing.TB, path string) string {
 	tb.Helper()
 	a, err := StartAt(Binary(tb))

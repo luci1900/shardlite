@@ -11,12 +11,13 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/coord"
 )
 
-func newLocal(t *testing.T) *blob.Hooked {
+func newLocal(t *testing.T) *blobtest.Hooked {
 	t.Helper()
-	return blob.WithHook(blob.NewMemory())
+	return blobtest.WithHook(blob.NewMemory())
 }
 
 // serve serves k, as the node's tree does, and returns the func that stops it
@@ -95,8 +96,8 @@ func TestRenewSurvivesALostResponse(t *testing.T) {
 	}
 	// The write lands but the answer is lost, twice: blob.Store reads the write id back.
 	var lost atomic.Int32
-	l.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpUpdate && after && lost.Add(1) <= 2 {
+	l.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if op == blobtest.OpUpdate && after && lost.Add(1) <= 2 {
 			return errors.New("response lost")
 		}
 		return nil
@@ -174,7 +175,7 @@ func TestKeeperExpiresEarlyAndForGood(t *testing.T) {
 		// Storage goes away.
 		var down atomic.Bool
 		down.Store(true)
-		l.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
+		l.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
 			if down.Load() {
 				return errors.New("storage down")
 			}
@@ -220,7 +221,7 @@ func TestKeeperSurvivesBriefTroubleAndStopsWhenReplaced(t *testing.T) {
 
 		// Four seconds of failures are within the margin; renewals resume after.
 		var down atomic.Bool
-		l.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
+		l.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
 			if down.Load() {
 				return errors.New("storage down")
 			}

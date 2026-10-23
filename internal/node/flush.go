@@ -12,11 +12,14 @@ import (
 
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/coord"
+	"github.com/luci1900/shardlite/internal/kind"
 	"github.com/luci1900/shardlite/internal/notify"
 	"github.com/luci1900/shardlite/internal/segment"
+	"github.com/luci1900/shardlite/internal/shard"
 )
 
-// Defaults of the flush timing, chosen from the measurements in plans/stage-1.2-report.md.
+// Defaults of the flush timing, chosen from the measurements in
+// measure_flush_test.go.
 const (
 	// DefaultFlushMin is the shortest time between the starts of two cycles
 	// (SHARDLITE_FLUSH_MIN): it caps the segment PUT rate when gated writes
@@ -38,11 +41,13 @@ const (
 //     at a time;
 //  2. once all of those have queued their commits in the segment writer, the
 //     writer is flushed: one segment for the whole node;
-//  3. the cycle completes: shards whose sync and flush succeeded are marked
+//  3. the cycle completes: shards whose capture and flush succeeded are marked
 //     captured if the lease is still good, and the counter advances.
 //
 // The counters are what the durability gates use: a chunk of output read from
-// the app is held until a cycle that began after it was read has completed.
+// the app is held until a cycle that began after it was read has completed,
+// and the cycle's capture has queued the commits before it. Which store the
+// chunk waits for is the kind's tier (docs/guide.md, Durability).
 type Flusher struct {
 	tab      *table          // the shards it syncs
 	writer   *segment.Writer // the node's journal, flushed once per cycle
@@ -57,10 +62,20 @@ type Flusher struct {
 	waiting   atomic.Int64  // waiters in Wait that have not returned
 	wantAfter atomic.Uint64 // the highest mark a waiter has asked for a cycle after
 
-	started atomic.Uint64
-	done    notify.Counter // cycles completed
+	started  atomic.Uint64
+	captured notify.Counter // cycles whose capture has queued its commits
+	queued   atomic.Pointer[queuedCount]
+	done     notify.Counter // cycles completed
 
 	exited chan struct{} // closed when the loop has ended (the shards are stopping)
+}
+
+// queuedCount is what a cycle's capture queued: the number of entries the
+// writer holds, which the stores have to have written for the output that was
+// read before the cycle may leave.
+type queuedCount struct {
+	cycle uint64
+	count uint64
 }
 
 // FlushOptions configure the flush loop.
@@ -163,15 +178,15 @@ func (f *Flusher) Serve(ctx context.Context) error {
 }
 
 // syncLimit is how many shards a cycle syncs at once. A sync is CPU work
-// (reading frames, encoding and checksumming LTX) and short syscalls, with
-// Litestream's metadata on tmpfs, so more syncs than cores only adds OS threads
-// (each blocking cgo call holds one). GOMAXPROCS follows container CPU limits.
+// (reading frames, encoding and checksumming LTX) and short syscalls, so more
+// syncs than cores only adds OS threads (each blocking cgo call holds one).
+// GOMAXPROCS follows container CPU limits.
 func syncLimit() int { return runtime.GOMAXPROCS(0) }
 
 // syncTarget is one capture a cycle syncs: an active shard's, or the node
 // database's.
 type syncTarget struct {
-	name    string
+	name    shard.Name
 	cap     *captureState
 	closing func() bool // it is being let go of meanwhile, so a failure is no news
 	kick    func()      // after a capture: its new rows can be read, and are durable
@@ -188,7 +203,7 @@ type pendingSync struct {
 // left to their final sync).
 func (f *Flusher) targets() []syncTarget {
 	var out []syncTarget
-	f.tab.shards(func(a *shard) {
+	f.tab.shards(func(a *actor) {
 		out = append(out, syncTarget{name: a.Name, cap: &a.cap,
 			closing: func() bool { return !a.e.is(entryActive) },
 			kick: func() {
@@ -201,7 +216,7 @@ func (f *Flusher) targets() []syncTarget {
 }
 
 func (f *Flusher) cycle(ctx context.Context) {
-	f.started.Add(1)
+	n := f.started.Add(1)
 
 	// 1. Sync what changed, and 2. when every sync has queued what it captured
 	// (however many files that is), write them all as one segment. The writer is
@@ -230,6 +245,11 @@ func (f *Flusher) cycle(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
+	// What the capture queued is published: a gate that waits for a store
+	// waits for that many entries to be written there. The publication comes
+	// before the counter, so a waiter that sees the counter sees this too.
+	f.queued.Store(&queuedCount{cycle: n, count: f.writer.Queued()})
+	f.captured.Inc()
 	flushErr := f.writer.Flush(ctx)
 	if flushErr != nil && ctx.Err() == nil {
 		f.log.Error("flushing the node journal failed", "err", flushErr)
@@ -315,36 +335,96 @@ func (m *Catalog) Barrier(ctx context.Context) error { return m.flush.Wait(ctx, 
 // Gate holds a chunk of a shard's output until what the shard committed before
 // it is durable (docs/internals.md, Durability gates):
 //
-//   - whatever the setting, the node's lease must be good: a node whose lease
+//   - whatever the tier, the node's lease must be good: a node whose lease
 //     has run out may have lost the shard to another node, and answers nothing;
-//   - with sync off the chunk then goes straight out;
-//   - with sync on it waits for a flush cycle that began after the chunk was
-//     read, unless the shard has had no new frames since its last capture (a
-//     shard whose header can't be read counts as having them).
+//   - the chunk then waits for the store its tier names: the record (blob
+//     storage) or the node's own disk, unless the shard has had no new frames
+//     since its last capture (a shard whose header can't be read counts as
+//     having them).
 //
-// Call it once the chunk has been read from the app. sync is the kind's
-// setting or a Shardlite-Sync override.
-func (m *Catalog) Gate(ctx context.Context, r *Ref, sync bool) error { return r.a.gate(ctx, sync) }
+// Call it once the chunk has been read from the app. sync is the kind's tier
+// or a Shardlite-Sync override.
+func (m *Catalog) Gate(ctx context.Context, h *Hold, sync kind.Sync) error {
+	return h.a.gate(ctx, sync)
+}
 
-// gate is Gate for the shard's own output, and System.Sync with sync on.
-func (a *shard) gate(ctx context.Context, sync bool) error { return a.d.flush.gate(ctx, &a.cap, sync) }
+// gate is Gate for the shard's own output, and System.Sync with the kind's
+// tier.
+func (a *actor) gate(ctx context.Context, sync kind.Sync) error {
+	return a.d.flush.gate(ctx, &a.cap, sync)
+}
 
 // gate holds what depends on c's commits until they are durable, as Gate does
-// for a shard: the lease must be good, and with sync on a cycle that began after
-// the call must have completed, unless c has nothing new.
-func (f *Flusher) gate(ctx context.Context, c *captureState, sync bool) error {
+// for a shard: the lease must be good, and a cycle that began after the call
+// must have captured the commits and written them to the store the tier names,
+// unless c has nothing new.
+func (f *Flusher) gate(ctx context.Context, c *captureState, sync kind.Sync) error {
 	if err := f.keeper.Check(); err != nil {
 		return err
-	}
-	if !sync {
-		return nil
 	}
 	mark := f.Mark()
 	if !c.hasNewFrames() {
 		return nil
 	}
-	if err := f.Wait(ctx, mark); err != nil {
-		return err
+	switch sync {
+	case kind.SyncLocal:
+		if err := f.waitLocal(ctx, mark); err != nil {
+			return err
+		}
+	case kind.SyncStorage:
+		if err := f.Wait(ctx, mark); err != nil {
+			return err
+		}
 	}
 	return c.err()
+}
+
+// waitLocal waits until what was committed before the mark is durable in the
+// node's own disk. The record is the fallback: the local tier's promise is the
+// weaker one, and the gate waits for the record when the local store is slow
+// or has given up.
+func (f *Flusher) waitLocal(ctx context.Context, mark uint64) error {
+	keeper := f.keeper
+	f.waiting.Add(1)
+	defer f.waiting.Add(-1)
+	if f.done.Load() <= mark && f.started.Load() <= mark {
+		// No cycle has begun since the mark: ask for one.
+		f.request(mark)
+	}
+	target, err := f.queuedAfter(ctx, mark)
+	if err != nil {
+		return err
+	}
+	select {
+	case <-f.writer.Reached(segment.StoreLocal, target):
+		return keeper.Check()
+	case <-f.writer.Reached(segment.StoreRecord, target):
+		return keeper.Check() // the fallback: the record is the truth
+	case <-f.exited:
+		return errFlusherStopped
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	case <-keeper.Lost():
+		return keeper.Check()
+	}
+}
+
+// queuedAfter waits for a capture that began after the mark and returns how
+// many entries it queued. That capture holds the commits the chunk was read
+// after, so the store has to have written that many entries before the chunk
+// may leave.
+func (f *Flusher) queuedAfter(ctx context.Context, mark uint64) (uint64, error) {
+	for {
+		pub := f.queued.Load()
+		if pub != nil && pub.cycle > mark {
+			return pub.count, nil
+		}
+		select {
+		case <-f.captured.Reached(mark + 1):
+		case <-f.exited:
+			return 0, errFlusherStopped
+		case <-ctx.Done():
+			return 0, context.Cause(ctx)
+		}
+	}
 }

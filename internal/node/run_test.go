@@ -22,6 +22,7 @@ import (
 
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/coord"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
@@ -43,7 +44,7 @@ func nodeGoroutines() []string {
 		if i == 0 || strings.Contains(g, "_test.go") {
 			continue // the calling goroutine, and the test's helpers
 		}
-		for _, pkg := range []string{"internal/node.", "internal/capture.", "internal/segment.", "internal/coord.", "internal/shardfile.", "internal/blob."} {
+		for _, pkg := range []string{"internal/node.", "internal/capture.", "internal/journal.", "internal/segment.", "internal/coord.", "internal/shardfile.", "internal/blob."} {
 			if strings.Contains(g, "luci1900/shardlite/"+pkg) {
 				out = append(out, g)
 				break
@@ -79,15 +80,21 @@ func startedSince(before, now []string) []string {
 	return out
 }
 
+// runKinds is what the test's app declares: long idle timeouts, so the shards
+// the test activates stay active while it counts goroutines, and sync off for
+// users, so a flush is not what the writes wait for.
+const runKinds = `{"app": "test", "kinds": {"users": {"public": true, "sync": "local", "idle_timeout": "1h"}, "wallet": {"public": true, "idle_timeout": "1h"}}}`
+
 // Run returns only after every goroutine it started has ended: the loops, the
-// servers, the health poll, the flush cycle's syncs, the segment writer and
+// servers, the ready poll, the flush cycle's syncs, the segment writer and
 // the lease keeper.
 func TestRunLeavesNoGoroutines(t *testing.T) {
 	app := apptest.Start(t)
 	var mu sync.Mutex
 	opened := map[string]bool{}
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
-		if q.URL.Path == "/health" {
+		if q.URL.Path == appReadyPath {
+			io.WriteString(w, runKinds)
 			return
 		}
 		path := q.Header.Get("Shardlite-Path")
@@ -103,14 +110,10 @@ func TestRunLeavesNoGoroutines(t *testing.T) {
 	defer fake.Close()
 
 	dir := t.TempDir()
-	kinds := filepath.Join(dir, "kinds.json")
-	if err := os.WriteFile(kinds, []byte(`{"kinds": {"users": {"public": true, "sync": "off", "idle_timeout": "1h"}, "wallet": {"public": true, "idle_timeout": "1h"}}}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
 	vars := map[string]string{
-		"SHARDLITE_NODE": "run-test", "SHARDLITE_BLOB": "s3://unused", "SHARDLITE_KINDS": kinds,
-		"SHARDLITE_DATA": filepath.Join(dir, "data"), "SHARDLITE_SCRATCH_DIR": filepath.Join(dir, "meta"),
-		"SHARDLITE_APP": fake.URL, "SHARDLITE_LISTEN_PUBLIC": "127.0.0.1:0", "SHARDLITE_LISTEN_CONTROL": "127.0.0.1:0", "SHARDLITE_LISTEN_PEER": "127.0.0.1:0",
+		"SHARDLITE_NODE": "run-test", "SHARDLITE_BLOB": "s3://unused",
+		"SHARDLITE_DATA": filepath.Join(dir, "data"),
+		"SHARDLITE_APP":  fake.URL, "SHARDLITE_LISTEN_PUBLIC": "127.0.0.1:0", "SHARDLITE_LISTEN_CONTROL": "127.0.0.1:0", "SHARDLITE_LISTEN_PEER": "127.0.0.1:0",
 		"SHARDLITE_FLUSH": "50ms", "SHARDLITE_LISTEN_PPROF": "127.0.0.1:0",
 	}
 	env, err := ParseEnv(func(k string) string { return vars[k] })
@@ -145,7 +148,7 @@ func TestRunLeavesNoGoroutines(t *testing.T) {
 	})
 	// Shards of both kinds with writes, created by calls: lazy creation, capture, syncs, gated responses.
 	for i := range 5 {
-		for _, kind := range []string{"users", "wallet"} {
+		for _, kind := range []string{"test.users", "test.wallet"} {
 			q, _ := http.NewRequest("POST", "http://"+control+"/write", nil)
 			q.Header.Set("Shardlite-Target", fmt.Sprintf("%s/%d", kind, i))
 			resp, err := http.DefaultClient.Do(q)
@@ -190,14 +193,10 @@ func TestRunFailsWhenAListenerCannotBeBound(t *testing.T) {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
-	kinds := filepath.Join(dir, "kinds.json")
-	if err := os.WriteFile(kinds, []byte(`{"kinds": {"users": {}}}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
 	vars := map[string]string{
-		"SHARDLITE_NODE": "bind-test", "SHARDLITE_BLOB": "s3://unused", "SHARDLITE_KINDS": kinds,
-		"SHARDLITE_DATA": filepath.Join(dir, "data"), "SHARDLITE_SCRATCH_DIR": filepath.Join(dir, "meta"),
-		"SHARDLITE_APP": "http://127.0.0.1:1", "SHARDLITE_LISTEN_PUBLIC": "127.0.0.1:0", "SHARDLITE_LISTEN_CONTROL": taken.Addr().String(), "SHARDLITE_LISTEN_PEER": "127.0.0.1:0",
+		"SHARDLITE_NODE": "bind-test", "SHARDLITE_BLOB": "s3://unused",
+		"SHARDLITE_DATA": filepath.Join(dir, "data"),
+		"SHARDLITE_APP":  "http://127.0.0.1:1", "SHARDLITE_LISTEN_PUBLIC": "127.0.0.1:0", "SHARDLITE_LISTEN_CONTROL": taken.Addr().String(), "SHARDLITE_LISTEN_PEER": "127.0.0.1:0",
 	}
 	env, err := ParseEnv(func(k string) string { return vars[k] })
 	if err != nil {
@@ -254,6 +253,10 @@ func TestRunJoinsRequestsBeforeLettingGo(t *testing.T) {
 	t.Parallel()
 	var started apptest.Log[string]
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		if q.URL.Path == appReadyPath {
+			io.WriteString(w, `{"app": "test", "kinds": {"users": {"public": true, "sync": "local", "idle_timeout": "1h"}}}`)
+			return
+		}
 		switch q.URL.Path {
 		case "/ws":
 			conn, rw, err := w.(http.Hijacker).Hijack()
@@ -272,14 +275,10 @@ func TestRunJoinsRequestsBeforeLettingGo(t *testing.T) {
 	}))
 	defer fake.Close()
 	dir := t.TempDir()
-	kinds := filepath.Join(dir, "kinds.json")
-	if err := os.WriteFile(kinds, []byte(`{"kinds": {"users": {"public": true, "sync": "off", "idle_timeout": "1h"}}}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
 	vars := map[string]string{
-		"SHARDLITE_NODE": "run-join-test", "SHARDLITE_BLOB": "s3://unused", "SHARDLITE_KINDS": kinds,
-		"SHARDLITE_DATA": filepath.Join(dir, "data"), "SHARDLITE_SCRATCH_DIR": filepath.Join(dir, "meta"),
-		"SHARDLITE_APP": fake.URL, "SHARDLITE_LISTEN_PUBLIC": "127.0.0.1:0", "SHARDLITE_LISTEN_CONTROL": "127.0.0.1:0", "SHARDLITE_LISTEN_PEER": "127.0.0.1:0",
+		"SHARDLITE_NODE": "run-join-test", "SHARDLITE_BLOB": "s3://unused",
+		"SHARDLITE_DATA": filepath.Join(dir, "data"),
+		"SHARDLITE_APP":  fake.URL, "SHARDLITE_LISTEN_PUBLIC": "127.0.0.1:0", "SHARDLITE_LISTEN_CONTROL": "127.0.0.1:0", "SHARDLITE_LISTEN_PEER": "127.0.0.1:0",
 		"SHARDLITE_FLUSH": "50ms",
 	}
 	env, err := ParseEnv(func(k string) string { return vars[k] })
@@ -305,10 +304,19 @@ func TestRunJoinsRequestsBeforeLettingGo(t *testing.T) {
 	case <-time.After(20 * time.Second):
 		t.Fatal("the node did not come up")
 	}
+	// The first requests wait for the poll to land the declaration.
+	eventually(t, "the app's declaration", func() bool {
+		resp, err := http.Get("http://" + a.public + readyPath)
+		if err != nil {
+			return false
+		}
+		resp.Body.Close()
+		return resp.StatusCode == 200
+	})
 
 	// A call creates the shard the client connects to.
 	q, _ := http.NewRequest("GET", "http://"+a.control+"/", nil)
-	q.Header.Set("Shardlite-Target", "users/ws")
+	q.Header.Set("Shardlite-Target", "test.users/ws")
 	if resp, err := http.DefaultClient.Do(q); err != nil || resp.StatusCode != 200 {
 		t.Fatalf("creating users/ws: %v %v", resp, err)
 	} else {
@@ -319,7 +327,7 @@ func TestRunJoinsRequestsBeforeLettingGo(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	fmt.Fprintf(conn, "GET /ws?shardlite-target=users/ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+	fmt.Fprintf(conn, "GET /ws?shardlite-target=test.users/ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
 	br := bufio.NewReader(conn)
 	if resp, err := http.ReadResponse(br, nil); err != nil || resp.StatusCode != 101 {
 		t.Fatalf("upgrade: %v %v", resp, err)
@@ -327,7 +335,7 @@ func TestRunJoinsRequestsBeforeLettingGo(t *testing.T) {
 	slow := make(chan error, 1)
 	go func() {
 		q, _ := http.NewRequest("GET", "http://"+a.control+"/slow", nil)
-		q.Header.Set("Shardlite-Target", "users/call")
+		q.Header.Set("Shardlite-Target", "test.users/call")
 		resp, err := http.DefaultClient.Do(q)
 		if err == nil {
 			_, err = io.ReadAll(resp.Body)
@@ -368,7 +376,7 @@ type runRig struct {
 	t       *testing.T
 	env     Env
 	mem     *blob.Memory
-	hooked  *blob.Hooked // mem, as Run sees it
+	hooked  *blobtest.Hooked // mem, as Run sees it
 	log     runLog
 	cancel  context.CancelFunc
 	ran     chan error
@@ -379,17 +387,17 @@ type runRig struct {
 
 func startRun(t *testing.T, name string, vars map[string]string, opts ...RunOption) *runRig {
 	t.Helper()
-	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {}))
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		if q.URL.Path == appReadyPath {
+			io.WriteString(w, runKinds)
+		}
+	}))
 	t.Cleanup(fake.Close)
 	dir := t.TempDir()
-	kinds := filepath.Join(dir, "kinds.json")
-	if err := os.WriteFile(kinds, []byte(`{"kinds": {"users": {"public": true, "sync": "off", "idle_timeout": "1h"}}}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
 	all := map[string]string{
-		"SHARDLITE_NODE": name, "SHARDLITE_BLOB": "s3://unused", "SHARDLITE_KINDS": kinds,
-		"SHARDLITE_DATA": filepath.Join(dir, "data"), "SHARDLITE_SCRATCH_DIR": filepath.Join(dir, "meta"),
-		"SHARDLITE_APP": fake.URL, "SHARDLITE_LISTEN_PUBLIC": "127.0.0.1:0", "SHARDLITE_LISTEN_CONTROL": "127.0.0.1:0", "SHARDLITE_LISTEN_PEER": "127.0.0.1:0",
+		"SHARDLITE_NODE": name, "SHARDLITE_BLOB": "s3://unused",
+		"SHARDLITE_DATA": filepath.Join(dir, "data"),
+		"SHARDLITE_APP":  fake.URL, "SHARDLITE_LISTEN_PUBLIC": "127.0.0.1:0", "SHARDLITE_LISTEN_CONTROL": "127.0.0.1:0", "SHARDLITE_LISTEN_PEER": "127.0.0.1:0",
 		"SHARDLITE_FLUSH": "50ms",
 	}
 	for k, v := range vars {
@@ -400,7 +408,7 @@ func startRun(t *testing.T, name string, vars map[string]string, opts ...RunOpti
 		t.Fatal(err)
 	}
 	r := &runRig{t: t, env: env, mem: blob.NewMemory(), ran: make(chan error, 1)}
-	r.hooked = blob.WithHook(r.mem)
+	r.hooked = blobtest.WithHook(r.mem)
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
 	up := make(chan [3]string, 1)
@@ -425,6 +433,16 @@ func startRun(t *testing.T, name string, vars map[string]string, opts ...RunOpti
 	case <-time.After(20 * time.Second):
 		t.Fatal("the node did not come up")
 	}
+	// The kinds come from the app's declaration now, not a file read at
+	// startup: the first requests wait for the poll to land.
+	eventually(t, "the app's declaration", func() bool {
+		resp, err := http.Get("http://" + r.public + readyPath)
+		if err != nil {
+			return false
+		}
+		resp.Body.Close()
+		return resp.StatusCode == 200
+	})
 	return r
 }
 
@@ -474,13 +492,13 @@ func (r *runRig) in(groups ...[]string) {
 var stopOrder = [][]string{{"stop public server"}, {"stop control server", "stop peer server"}, {"stop catalog"}}
 
 // Run starts every service at once, with everything built before, and stops
-// them one supervisor at a time: the services that depend on nothing (the health poll,
-// the journal expiry, the kinds reload and pprof) stop with the public server,
+// them one supervisor at a time: the services that depend on nothing (the ready poll,
+// the journal expiry and pprof) stop with the public server,
 // first. A shard being let go of holds up the shards' stop.
 func TestRunStartsAndStopsInOrder(t *testing.T) {
 	t.Parallel()
 	r := startRun(t, "run-order-test", map[string]string{"SHARDLITE_LISTEN_PPROF": "127.0.0.1:0"})
-	all := []string{"public server", "control server", "peer server", "health poll", "catalog", "journal expiry", "kinds reload", "pprof"}
+	all := []string{"public server", "control server", "peer server", "ready poll", "catalog", "journal expiry", "pprof"}
 	r.log.events.WaitFor(t, 5*time.Second, "every service to start", func(e []string) bool {
 		for _, p := range all {
 			if !slices.Contains(e, "start "+p) {
@@ -489,14 +507,14 @@ func TestRunStartsAndStopsInOrder(t *testing.T) {
 		}
 		return true
 	})
-	resp, err := http.Get("http://" + r.control + "/x?shardlite-target=users/o1") // a call, which creates the shard
+	resp, err := http.Get("http://" + r.control + "/x?shardlite-target=test.users/o1") // a call, which creates the shard
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
 	release := make(chan struct{})
-	r.hooked.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if after || op == blob.OpGet || op == blob.OpList || !strings.HasSuffix(key, shardfile.ManifestKey("users/o1")) {
+	r.hooked.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if after || op == blobtest.OpGet || op == blobtest.OpList || !strings.HasSuffix(key, shardfile.ManifestKey(shardName("test.users/o1"))) {
 			return nil
 		}
 		select {
@@ -505,7 +523,7 @@ func TestRunStartsAndStopsInOrder(t *testing.T) {
 		}
 		return nil
 	})
-	independent := []string{"stop health poll", "stop journal expiry", "stop kinds reload", "stop pprof"}
+	independent := []string{"stop ready poll", "stop journal expiry", "stop pprof"}
 
 	r.cancel()
 	r.log.events.WaitFor(t, 10*time.Second, "the services that depend on nothing to stop", func(e []string) bool {
@@ -554,15 +572,15 @@ func TestRunStopsAtOnceWhenTheLeaseIsLost(t *testing.T) {
 func TestRunFatalErrorDuringShutdown(t *testing.T) {
 	t.Parallel()
 	r := startRun(t, "run-fatal-stop-test", map[string]string{"SHARDLITE_LEASE_TTL": "1500ms"})
-	resp, err := http.Get("http://" + r.control + "/x?shardlite-target=users/fs1") // a call, which creates the shard
+	resp, err := http.Get("http://" + r.control + "/x?shardlite-target=test.users/fs1") // a call, which creates the shard
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
 	entered, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
-	r.hooked.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if after || op == blob.OpGet || op == blob.OpList || !strings.HasSuffix(key, shardfile.ManifestKey("users/fs1")) {
+	r.hooked.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if after || op == blobtest.OpGet || op == blobtest.OpList || !strings.HasSuffix(key, shardfile.ManifestKey(shardName("test.users/fs1"))) {
 			return nil
 		}
 		once.Do(func() { close(entered) })
@@ -677,7 +695,7 @@ func TestPeerListenerSaysWhoTheNodeIs(t *testing.T) {
 	if resp.ProtoMajor != 2 || got.Name != "peer-test" || got.Epoch != r.lease().Epoch {
 		t.Fatalf("proto %d, reply %+v, lease %+v", resp.ProtoMajor, got, r.lease())
 	}
-	for _, path := range []string{"/", "/_shardlite/ready", "/x?shardlite-target=users/o1"} {
+	for _, path := range []string{"/", "/_shardlite/ready", "/x?shardlite-target=test.users/o1"} {
 		resp, err := client.Get("http://" + r.peer + path)
 		if err != nil {
 			t.Fatal(err)
@@ -693,7 +711,7 @@ func TestPeerListenerSaysWhoTheNodeIs(t *testing.T) {
 		t.Fatal(err)
 	}
 	req.Header.Set("Shardlite-Origin", "delete")
-	req.Header.Set("Shardlite-Target", "users/x")
+	req.Header.Set("Shardlite-Target", "test.users/x")
 	if resp, err := client.Do(req); err != nil || resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("a delete on the peer listener: %v, %v", resp, err)
 	} else {

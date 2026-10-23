@@ -1,8 +1,8 @@
 // Package dispatch is the _dispatch system kind (docs/internals.md, System kinds):
-// one shard, _dispatch/_cluster, that lists the reminder index up to the current
-// minute and sends each due shard a dispatch, a call that makes the shard active
-// on its owner or claims it on a node picked for load. It holds no state of its
-// own beyond its reminder, so a move loses nothing.
+// one shard, _system.dispatch/_cluster, that lists the reminder index up to the
+// current minute and sends each due shard a dispatch, a call that makes the shard
+// active on its owner or claims it on a node picked for load. It holds no state
+// of its own beyond its reminder, so a move loses nothing.
 package dispatch
 
 import (
@@ -21,19 +21,53 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/cluster"
 	"github.com/luci1900/shardlite/internal/kind"
 	"github.com/luci1900/shardlite/internal/remindex"
+	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/system"
 )
 
-// Answer is what a node says to a dispatch it could carry out.
+// Answer is what a node says to a dispatch it could carry out. The zero value
+// is Unknown, which is no answer at all: Valid() is false for it, so a caller
+// that lost the answer cannot mistake it for one the node gave
+// (docs/internals.md, Failing loudly, the zero-value policy).
 type Answer int
 
 const (
-	Active    Answer = iota // the shard was active on the node already
-	Activated               // the dispatch made it active
+	// Unknown is no answer: a dispatch that failed or was never answered.
+	Unknown Answer = iota
+	// Active means the shard was active on the node already.
+	Active
+	// Activated means the dispatch made it active.
+	Activated
 )
+
+// String names an answer, for the logs and the errors.
+func (a Answer) String() string {
+	switch a {
+	case Unknown:
+		return "unknown"
+	case Active:
+		return "active"
+	case Activated:
+		return "activated"
+	}
+	return "unknown"
+}
+
+// Valid reports whether a is one of the answers a node gives. Unknown, the
+// zero, is not one of them.
+func (a Answer) Valid() bool {
+	switch a {
+	case Unknown:
+		return false
+	case Active, Activated:
+		return true
+	}
+	return false
+}
 
 // ErrNotFound is the answer for a shard that has no manifest.
 var ErrNotFound = errors.New("dispatch: the shard doesn't exist")
@@ -65,10 +99,10 @@ type Options struct {
 type Deps struct {
 	Store *blob.Store
 	// Live names the nodes the lease scan's last listing counts as alive.
-	Live func() []string
+	Live func() []cluster.Node
 	// Dispatch sends the dispatch for shard to node, in process when node is this
 	// one. It returns ErrNotFound for a shard with no manifest.
-	Dispatch func(ctx context.Context, node, shard string) (Answer, error)
+	Dispatch func(ctx context.Context, node cluster.Node, name shard.Name) (Answer, error)
 	Now      func() time.Time
 	Log      *slog.Logger
 }
@@ -76,10 +110,11 @@ type Deps struct {
 // migrations: the kind has no tables of its own.
 var migrations embed.FS
 
-// New returns the _dispatch kind. Sync is off: nothing acts on its answers.
+// New returns the _dispatch kind. Its tier is the node's own disk: nothing
+// acts on its answers, so it waits for the cheapest tier there is.
 func New(d Deps, opts Options) kind.Kind {
 	p := newDispatcher(d, opts)
-	return kind.Kind{Name: "_dispatch", Sync: kind.SyncOff, IDs: []string{"_cluster"}, Migrations: migrations, Handler: p.handler}
+	return kind.Kind{Name: kind.SystemKind("dispatch"), Sync: kind.SyncLocal, IDs: []shard.ID{"_cluster"}, Migrations: migrations, Handler: p.handler}
 }
 
 func newDispatcher(d Deps, opts Options) *dispatcher {
@@ -98,7 +133,7 @@ func newDispatcher(d Deps, opts Options) *dispatcher {
 	if opts.Pace <= 0 {
 		opts.Pace = time.Second
 	}
-	return &dispatcher{Deps: d, opts: opts, index: remindex.New(d.Store), manifests: shardfile.NewManifestStore(d.Store), load: map[string]int{}}
+	return &dispatcher{Deps: d, opts: opts, index: remindex.New(d.Store), manifests: shardfile.NewManifestStore(d.Store), load: map[cluster.Node]int{}}
 }
 
 type dispatcher struct {
@@ -108,8 +143,8 @@ type dispatcher struct {
 	manifests shardfile.ManifestStore
 
 	mu   sync.Mutex
-	load map[string]int // this dispatcher's dispatches in flight, by node
-	slot time.Time      // when the next dispatch may go
+	load map[cluster.Node]int // this dispatcher's dispatches in flight, by node
+	slot time.Time            // when the next dispatch may go
 
 	Passes, Dispatched, Failed atomic.Int64
 }
@@ -184,7 +219,7 @@ func (p *dispatcher) handle(ctx context.Context, e remindex.Entry, now time.Time
 		p.fail(ctx, e, "could not read a manifest", err)
 		return
 	}
-	var next int64
+	var next remindex.Minute
 	if exists {
 		next = m.NextReminder
 	}
@@ -201,11 +236,19 @@ func (p *dispatcher) handle(ctx context.Context, e remindex.Entry, now time.Time
 	step := backoff(e.N)
 	answer, err := p.send(ctx, e.Shard, m)
 	switch {
-	case err == nil && answer == Active:
-		step = maxBackoff // its reminders loop covers it
 	case err == nil:
+		switch answer {
+		case Active:
+			step = maxBackoff // its reminders loop covers it
+		case Activated:
+		case Unknown:
+			// A dispatch that answers nothing is one that failed: back off
+			// and try again.
+			p.Failed.Add(1)
+			p.Log.Warn("a dispatch answered nothing, backing off", "shard", e.Shard, "moved", e.N)
+		}
 	case ctx.Err() != nil:
-		return
+		return // the pass's budget ended: the entry stays due for the next one
 	default:
 		p.Failed.Add(1)
 		p.Log.Warn("could not dispatch a shard, backing off", "shard", e.Shard, "moved", e.N, "err", err)
@@ -216,7 +259,7 @@ func (p *dispatcher) handle(ctx context.Context, e remindex.Entry, now time.Time
 func backoff(n int) int { return min(1<<min(n, 5), maxBackoff) }
 
 func (p *dispatcher) move(ctx context.Context, e remindex.Entry, now time.Time, minutes int) {
-	if err := p.index.Move(ctx, e, remindex.MinuteAt(now)+int64(minutes)); err != nil && ctx.Err() == nil {
+	if err := p.index.Move(ctx, e, remindex.MinuteAt(now)+remindex.Minute(minutes)); err != nil && ctx.Err() == nil {
 		p.Log.Warn("could not move a reminder entry, trying again", "shard", e.Shard, "err", err)
 	}
 }
@@ -231,25 +274,25 @@ func (p *dispatcher) fail(ctx context.Context, e remindex.Entry, msg string, err
 // the owner doesn't take it (a node that stopped is still listed as alive until its
 // lease is a TTL old) it goes once to a node picked for load, which claims the
 // shard if the owner's lease allows it and answers that the owner has it if not.
-func (p *dispatcher) send(ctx context.Context, shard string, m *shardfile.Manifest) (Answer, error) {
+func (p *dispatcher) send(ctx context.Context, name shard.Name, m *shardfile.Manifest) (Answer, error) {
 	if err := p.pace(ctx); err != nil {
-		return 0, err
+		return Unknown, err
 	}
-	owner := ""
+	owner := cluster.Node("")
 	for range 2 {
 		node, ok := p.place(m.Owner, owner)
 		if !ok {
-			return 0, errors.New("no live node to dispatch to")
+			return Unknown, errors.New("no live node to dispatch to")
 		}
 		p.Dispatched.Add(1)
-		answer, err := p.Dispatch(ctx, node, shard)
+		answer, err := p.Dispatch(ctx, node, name)
 		p.inflight(node, -1)
 		if err == nil || ctx.Err() != nil || node != m.Owner {
 			return answer, err
 		}
 		owner = node // the owner didn't take it: anyone else
 	}
-	return 0, errors.New("unreachable")
+	return Unknown, errors.New("unreachable")
 }
 
 // pace waits for the next slot at Rate dispatches a second.
@@ -279,11 +322,11 @@ func (p *dispatcher) pace(ctx context.Context) error {
 // nodes picked at random, the one with fewer of this dispatcher's dispatches in
 // flight. Lease counts are seconds old and would send a herd to one node, so
 // they aren't used, and the dispatcher's own node gets no preference.
-func (p *dispatcher) place(owner, not string) (string, bool) {
-	live := slices.DeleteFunc(slices.Clone(p.Live()), func(n string) bool { return n == not })
+func (p *dispatcher) place(owner, not cluster.Node) (cluster.Node, bool) {
+	live := slices.DeleteFunc(slices.Clone(p.Live()), func(n cluster.Node) bool { return n == not })
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	pick := ""
+	pick := cluster.Node("")
 	if owner != "" && slices.Contains(live, owner) {
 		pick = owner
 	}
@@ -308,7 +351,7 @@ func (p *dispatcher) place(owner, not string) (string, bool) {
 	return pick, true
 }
 
-func (p *dispatcher) inflight(node string, d int) {
+func (p *dispatcher) inflight(node cluster.Node, d int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.load[node] += d; p.load[node] <= 0 {

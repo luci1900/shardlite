@@ -1,7 +1,7 @@
 // Command bench measures the node in front of the e2e app: requests per
-// second and latency for active shards, with sync off (users) and sync on
-// (wallet). It starts its own node and app for each kind, activates the
-// shards, then drives closed-loop load. The numbers are relative: the load
+// second and latency for active shards, with sync local (users) and sync
+// storage (wallet). It starts its own node and app for each kind, activates
+// the shards, then drives closed-loop load. The numbers are relative: the load
 // generator, the node and the app share the machine.
 //
 // The node needs an S3 store: run RustFS (docker/compose.s3.yaml) and pass its
@@ -153,9 +153,9 @@ func main() {
 	fmt.Println("| kind | sync | operation | requests/s | p50 | p95 | p99 | max | errors | node CPU |")
 	fmt.Println("|---|---|---|---|---|---|---|---|---|---|")
 	for _, r := range results {
-		sync := "off"
+		sync := "local"
 		if r.kind == "wallet" {
-			sync = "on"
+			sync = "storage"
 		}
 		cpu := "n/a"
 		if r.cpu >= 0 {
@@ -191,17 +191,19 @@ func run(root, kind string) []result {
 	d := filepath.Join(root, kind)
 	os.RemoveAll(d)
 	os.MkdirAll(d, 0o755)
-	kf := filepath.Join(d, "kinds.json")
-	os.WriteFile(kf, []byte(`{"kinds": {"users": {"public": true, "sync": "off", "idle_timeout": "1h"}, "wallet": {"public": true, "idle_timeout": "1h"}}}`), 0o644)
+	// What the app declares at its ready route: the file is a stand-in for the
+	// app's own, checked into its repository.
+	df := filepath.Join(d, "declaration.json")
+	os.WriteFile(df, []byte(`{"app": "bench", "kinds": {"users": {"public": true, "sync": "local", "idle_timeout": "1h"}, "wallet": {"public": true, "idle_timeout": "1h"}}}`), 0o644)
 	pub, ctl := freeAddr(), freeAddr()
 	// The app keeps each shard's database open (its idle close is long) so the measurement is of serving, not of reopening.
-	app := start(*appBin, nil, "-listen", "127.0.0.1:0", "-control", ctl, "-idle-close", "10m")
+	app := start(*appBin, nil, "-listen", "127.0.0.1:0", "-control", ctl, "-idle-close", "10m", "-declare", df)
 	defer app.cmd.Process.Kill()
 	appAddr := app.waitFor(`listening (\S+)`, 20*time.Second)[1]
 	node := start(*nodeBin, []string{
 		"SHARDLITE_NODE=bench", "SHARDLITE_BLOB=s3://" + *s3Bucket, "SHARDLITE_S3_ENDPOINT=" + *s3URL, fmt.Sprintf("SHARDLITE_PREFIX=bench/%s/%d/", kind, time.Now().UnixNano()),
-		"AWS_ACCESS_KEY_ID=" + envOr("AWS_ACCESS_KEY_ID", "shardlite"), "AWS_SECRET_ACCESS_KEY=" + envOr("AWS_SECRET_ACCESS_KEY", "shardlite-secret"), "AWS_REGION=" + envOr("AWS_REGION", "us-east-1"), "SHARDLITE_KINDS=" + kf,
-		"SHARDLITE_DATA=" + filepath.Join(d, "data"), "SHARDLITE_SCRATCH_DIR=" + filepath.Join(d, "meta"),
+		"AWS_ACCESS_KEY_ID=" + envOr("AWS_ACCESS_KEY_ID", "shardlite"), "AWS_SECRET_ACCESS_KEY=" + envOr("AWS_SECRET_ACCESS_KEY", "shardlite-secret"), "AWS_REGION=" + envOr("AWS_REGION", "us-east-1"),
+		"SHARDLITE_DATA=" + filepath.Join(d, "data"),
 		"SHARDLITE_APP=http://" + appAddr, "SHARDLITE_LISTEN_PUBLIC=" + pub, "SHARDLITE_LISTEN_CONTROL=" + ctl, "SHARDLITE_LISTEN_PEER=127.0.0.1:0",
 		"SHARDLITE_FLUSH=" + flush.String(), "SHARDLITE_LISTEN_PPROF=127.0.0.1:6060",
 	})
@@ -246,7 +248,7 @@ func run(root, kind string) []result {
 				if i >= *nShards {
 					return nil
 				}
-				if err := do("POST", "/add", fmt.Sprintf("%s/s%d", kind, i), "warm"); err != nil {
+				if err := do("POST", "/add", fmt.Sprintf("bench.%s/s%d", kind, i), "warm"); err != nil {
 					log.Fatalf("activating %s/s%d: %v\n%s", kind, i, err, node.String())
 				}
 			}

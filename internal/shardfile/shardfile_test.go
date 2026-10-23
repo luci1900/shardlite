@@ -13,12 +13,17 @@ import (
 
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/harness"
+	shardpkg "github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
 )
 
-const shard = "users/42"
+const shard = "test.users/42"
+
+// shardName is a shard's name in the tests that need the parsed type.
+func shardName(s string) shardpkg.Name { return shardpkg.MustParse(s) }
 
 // write runs a few app commits and syncs them.
 func write(t *testing.T, _ *harness.Env, app mustDoer, sync func() error, i int) {
@@ -43,7 +48,7 @@ func removeLocal(t *testing.T, path string) {
 func restoreDump(t *testing.T, e *harness.Env, name string) string {
 	t.Helper()
 	dst := filepath.Join(t.TempDir(), name+".db")
-	if _, err := e.Files.Restore(context.Background(), shard, dst, shardfile.RestoreOptions{}); err != nil {
+	if _, err := e.Files.Restore(context.Background(), shardName(shard), dst, shardfile.RestoreOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	return sqlitetest.Dump(t, dst)
@@ -66,11 +71,11 @@ func TestDeltaEqualsReplayingTail(t *testing.T) {
 	if len(sh.Tail()) != 0 {
 		t.Fatal("tail not dropped")
 	}
-	if got := h.Manifest.Files; len(got) != 1 || got[0] != fmt.Sprintf("1-%d.%d", tail[len(tail)-1].Last(), h.F.Blob.Epoch()) {
+	if got := h.Manifest.Files; len(got) != 1 || got[0].String() != fmt.Sprintf("1-%d.%d", tail[len(tail)-1].Last(), h.F.Blob.Epoch()) {
 		t.Fatalf("manifest files %v", got)
 	}
 	// The manifest was stored.
-	m, _, err := e.Files.GetManifest(ctx, shard)
+	m, _, err := e.Files.GetManifest(ctx, shardName(shard))
 	if err != nil || len(m.Files) != 1 {
 		t.Fatalf("stored manifest %+v err=%v", m, err)
 	}
@@ -87,8 +92,8 @@ func TestDeltaEqualsReplayingTail(t *testing.T) {
 	if len(h.Manifest.Files) != 2 {
 		t.Fatalf("files %v", h.Manifest.Files)
 	}
-	first, _ := e.Store.Head(ctx, shardfile.FileKey(shard, h.Manifest.Generation, mustFile(t, h.Manifest.Files[0])))
-	second, _ := e.Store.Head(ctx, shardfile.FileKey(shard, h.Manifest.Generation, mustFile(t, h.Manifest.Files[1])))
+	first, _ := e.Store.Head(ctx, shardfile.FileKey(shardName(shard), h.Manifest.Generation, h.Manifest.Files[0]))
+	second, _ := e.Store.Head(ctx, shardfile.FileKey(shardName(shard), h.Manifest.Generation, h.Manifest.Files[1]))
 	t.Logf("base %d bytes, delta %d bytes", first.Size, second.Size)
 	if second.Size >= first.Size {
 		t.Fatalf("delta (%d) not smaller than base (%d)", second.Size, first.Size)
@@ -97,14 +102,6 @@ func TestDeltaEqualsReplayingTail(t *testing.T) {
 		t.Fatal("restored database differs after second delta")
 	}
 	sh.Close(ctx)
-}
-
-func mustFile(t *testing.T, s string) shardfile.File {
-	r, err := shardfile.ParseFile(s)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return r
 }
 
 func TestMaybeSnapshotByAge(t *testing.T) {
@@ -142,12 +139,12 @@ func TestCrashBetweenFileAndManifest(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 	// The orphan file exists, but the stored manifest is unchanged and valid.
-	m, _, err := e.Files.GetManifest(ctx, shard)
+	m, _, err := e.Files.GetManifest(ctx, shardName(shard))
 	if err != nil || len(m.Files) != 1 || m.Files[0] != before {
 		t.Fatalf("manifest %+v err=%v", m, err)
 	}
 	var keys int
-	for _, err := range e.Store.List(ctx, shardfile.ShardPrefix(shard)) {
+	for _, err := range e.Store.List(ctx, shardfile.ShardPrefix(shardName(shard))) {
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -181,8 +178,8 @@ func TestManifestUpdateFails(t *testing.T) {
 	app := e.StartApp(shard)
 	h, sh := e.NewShard(shard)
 	write(t, e, app, func() error { return sh.Sync(ctx) }, 0)
-	e.Blob.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpUpdate && !after {
+	e.Blob.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if op == blobtest.OpUpdate && !after {
 			return errors.New("storage down")
 		}
 		return nil
@@ -204,8 +201,8 @@ type mustDoer interface {
 	Must(testing.TB, ...string) string
 }
 
-// After a delta empties the tail, a failed upload must not make Litestream
-// start again from transaction 1 (whose local file the delta removed).
+// After a delta empties the tail, a failed upload must not put the next
+// commit in the journal twice (the segment is retried until storage answers).
 func TestUploadFailsAfterDelta(t *testing.T) {
 	t.Parallel()
 	e := harness.New(t)
@@ -217,8 +214,8 @@ func TestUploadFailsAfterDelta(t *testing.T) {
 	if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); err != nil {
 		t.Fatal(err)
 	}
-	e.Blob.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpCreate && !after {
+	e.Blob.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if op == blobtest.OpCreate && !after {
 			return errors.New("storage down")
 		}
 		return nil
@@ -249,9 +246,9 @@ func TestUploadFailsAfterDelta(t *testing.T) {
 func TestLostResponses(t *testing.T) {
 	t.Parallel()
 	// lose drops the response of the first successful op on a key with the given prefix.
-	lose := func(e *harness.Env, op blob.Op, prefix string) *atomic.Bool {
+	lose := func(e *harness.Env, op blobtest.Op, prefix string) *atomic.Bool {
 		var fired atomic.Bool
-		e.Blob.SetHook(func(ctx context.Context, o blob.Op, key string, after bool) error {
+		e.Blob.SetHook(func(ctx context.Context, o blobtest.Op, key string, after bool) error {
 			if o == op && after && strings.HasPrefix(key, prefix) && fired.CompareAndSwap(false, true) {
 				return errors.New("response lost")
 			}
@@ -263,8 +260,8 @@ func TestLostResponses(t *testing.T) {
 
 	t.Run("manifest create", func(t *testing.T) {
 		e := harness.New(t)
-		fired := lose(e, blob.OpCreate, shardfile.ManifestPrefix)
-		h, created, err := e.Files.Open(ctx, shard)
+		fired := lose(e, blobtest.OpCreate, shardfile.ManifestPrefix)
+		h, created, err := e.Files.Open(ctx, shardName(shard))
 		if err != nil || !created || !fired.Load() {
 			t.Fatalf("created=%v fired=%v err=%v", created, fired.Load(), err)
 		}
@@ -280,7 +277,7 @@ func TestLostResponses(t *testing.T) {
 		app := e.StartApp(shard)
 		h, sh := e.NewShard(shard)
 		write(t, e, app, func() error { return sh.Sync(ctx) }, 0)
-		fired := lose(e, blob.OpUpdate, shardfile.ManifestPrefix)
+		fired := lose(e, blobtest.OpUpdate, shardfile.ManifestPrefix)
 		if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); err != nil || !fired.Load() {
 			t.Fatalf("fired=%v err=%v", fired.Load(), err)
 		}
@@ -296,8 +293,8 @@ func TestLostResponses(t *testing.T) {
 
 	t.Run("conflict is not mistaken for our own write", func(t *testing.T) {
 		e := harness.New(t)
-		h, _, _ := e.Files.Open(ctx, shard)
-		other, _, _ := e.Files.Open(ctx, shard) // somebody else holding the same manifest
+		h, _, _ := e.Files.Open(ctx, shardName(shard))
+		other, _, _ := e.Files.Open(ctx, shardName(shard)) // somebody else holding the same manifest
 		if err := other.Touch(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -311,7 +308,7 @@ func TestLostResponses(t *testing.T) {
 		app := e.StartApp(shard)
 		h, sh := e.NewShard(shard)
 		write(t, e, app, func() error { return sh.Sync(ctx) }, 0)
-		fired := lose(e, blob.OpCreate, shardfile.FilesPrefix)
+		fired := lose(e, blobtest.OpCreate, shardfile.FilesPrefix)
 		if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); err != nil || !fired.Load() {
 			t.Fatalf("fired=%v err=%v", fired.Load(), err)
 		}
@@ -325,7 +322,7 @@ func TestLostResponses(t *testing.T) {
 		h, sh := e.NewShard(shard)
 		write(t, e, app, func() error { return sh.Sync(ctx) }, 0)
 		tail := sh.Tail()
-		key := shardfile.FileKey(shard, h.Manifest.Generation, shardfile.File{Range: shardfile.Range{Min: tail[0].Position, Max: tail[len(tail)-1].Last()}, Epoch: h.F.Blob.Epoch()})
+		key := shardfile.FileKey(shardName(shard), h.Manifest.Generation, shardfile.File{Range: shardfile.Range{Min: tail[0].Position, Max: tail[len(tail)-1].Last()}, Epoch: h.F.Blob.Epoch()})
 		e.Store.Create(ctx, key, strings.NewReader("someone else's bytes"))
 		if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); !errors.Is(err, blob.ErrExists) {
 			t.Fatalf("got %v, want blob.ErrExists", err)
@@ -343,13 +340,13 @@ func TestLostResponses(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		fired := lose(e, blob.OpDelete, shardfile.FilesPrefix)
+		fired := lose(e, blobtest.OpDelete, shardfile.FilesPrefix)
 		if _, err := h.Rebase(ctx, sh, shardfile.Hooks{}); err != nil || !fired.Load() {
 			t.Fatalf("fired=%v err=%v", fired.Load(), err)
 		}
 		e.Blob.SetHook(nil)
 		n := 0
-		for range e.Store.List(ctx, shardfile.ShardPrefix(shard)) {
+		for range e.Store.List(ctx, shardfile.ShardPrefix(shardName(shard))) {
 			n++
 		}
 		if n != 1 {
@@ -372,12 +369,12 @@ func TestManifestUpdateWithAnUnknownOutcomeDoesNotLeaveAStaleHandle(t *testing.T
 	write(t, e, app, func() error { return sh.Sync(ctx) }, 0)
 	var down atomic.Bool
 	down.Store(true)
-	e.Blob.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
+	e.Blob.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
 		if down.Load() && strings.HasPrefix(key, shardfile.ManifestPrefix) {
-			if op == blob.OpUpdate && after {
+			if op == blobtest.OpUpdate && after {
 				return errors.New("response lost") // it happened
 			}
-			if op == blob.OpHead || op == blob.OpGet {
+			if op == blobtest.OpHead || op == blobtest.OpGet {
 				return errors.New("storage slow") // and nothing can be read back
 			}
 		}
@@ -409,12 +406,12 @@ func TestManifestUpdateCancelledAfterLandingDoesNotLeaveAStaleHandle(t *testing.
 	h, sh := e.NewShard(shard)
 	write(t, e, app, func() error { return sh.Sync(context.Background()) }, 0)
 	ctx, cancel := context.WithCancel(context.Background())
-	e.Blob.SetHook(func(c context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpUpdate && after && strings.HasPrefix(key, shardfile.ManifestPrefix) {
+	e.Blob.SetHook(func(c context.Context, op blobtest.Op, key string, after bool) error {
+		if op == blobtest.OpUpdate && after && strings.HasPrefix(key, shardfile.ManifestPrefix) {
 			cancel() // the update has happened; the caller is told to stop
 			return context.Canceled
 		}
-		if ctx.Err() != nil && (op == blob.OpHead || op == blob.OpGet) {
+		if ctx.Err() != nil && (op == blobtest.OpHead || op == blobtest.OpGet) {
 			return ctx.Err() // and can't look
 		}
 		return nil

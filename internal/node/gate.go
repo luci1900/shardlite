@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"net/http"
+
+	"github.com/luci1900/shardlite/internal/kind"
 )
 
 // gate holds back each chunk of a shard's output until the shard's earlier
@@ -13,12 +15,12 @@ import (
 // on the caller.
 type gate struct {
 	m    *Catalog
-	ref  *Ref
-	sync bool
+	hold *Hold
+	sync kind.Sync
 	ctx  context.Context
 	resp *http.Response // the response being gated, nil for a caller's gate
 	// calls are the request's gates in progress: once the request has ended, a
-	// gate fails without looking at the shard, whose reference is released.
+	// gate fails without looking at the shard, whose hold is released.
 	calls *inFlight
 }
 
@@ -33,7 +35,7 @@ func (g *gate) wait(n int, err error) error {
 			return errRequestEnded
 		}
 		defer g.calls.leave()
-		return g.m.Gate(g.ctx, g.ref, g.sync)
+		return g.m.Gate(g.ctx, g.hold, g.sync)
 	}
 	return nil
 }

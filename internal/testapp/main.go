@@ -1,6 +1,6 @@
 // Command testapp is a stand-in for an application: it opens SQLite shard
-// files with the modernc driver (the one Litestream uses) in WAL mode with
-// default locking and writes to them on command, from its own process.
+// files with the modernc driver in WAL mode with default locking and writes
+// to them on command, from its own process.
 //
 // Protocol: one command per line on stdin, fields separated by tabs. Each
 // command gets one reply line on stdout: "ok [value]" or "err message".
@@ -89,7 +89,7 @@ func (a *app) do(f []string) (string, error) {
 	cmd, id := f[0], f[1]
 	if cmd == "probe" {
 		// The app has no sqlite handle on this file, or its own locks are ignored anyway.
-		held, err := capture.ProbeOnce(f[2])
+		held, err := capture.WALSidecarsOf(f[2]).Held()
 		if held {
 			return "held", err
 		}

@@ -32,14 +32,14 @@ func TestWebSocketThroughTheNode(t *testing.T) {
 		return c
 	}
 
-	s.create(t, "wallet/s1", "wallet/s2", "wallet/s3", "wallet/s4", "wallet/s5", "arena/s7")
+	s.create(t, "e2e.wallet/s1", "e2e.wallet/s2", "e2e.wallet/s3", "e2e.wallet/s4", "e2e.wallet/s5", "e2e.arena/s7")
 
 	t.Run("text and binary both ways", func(t *testing.T) {
-		c := dial(t, "wallet/s1")
+		c := dial(t, "e2e.wallet/s1")
 		if echo, err := wsEcho(ctx, c, "hello"); err != nil || echo != "ok:hello" {
 			t.Fatalf("%q %v", echo, err)
 		}
-		if !v.has("wallet/s1", "hello") {
+		if !v.has("e2e.wallet/s1", "hello") {
 			t.Fatal("the echo came before the commit was durable")
 		}
 		payload := []byte{0, 1, 2, 0xff, 0xfe, 'a'}
@@ -60,7 +60,7 @@ func TestWebSocketThroughTheNode(t *testing.T) {
 	})
 
 	t.Run("messages of several megabytes", func(t *testing.T) {
-		c := dial(t, "wallet/s2")
+		c := dial(t, "e2e.wallet/s2")
 		big := bytes.Repeat([]byte("0123456789abcdef"), 4<<20/16) // 4 MB
 		for i := range 3 {
 			big[i*1000] = byte(i + 1)
@@ -85,7 +85,7 @@ func TestWebSocketThroughTheNode(t *testing.T) {
 	})
 
 	t.Run("ping and pong", func(t *testing.T) {
-		c := dial(t, "wallet/s3")
+		c := dial(t, "e2e.wallet/s3")
 		// The client pings the app: Ping needs a reader running, and the app answers from its own read loop.
 		msgs := make(chan string, 8)
 		go func() {
@@ -122,13 +122,13 @@ func TestWebSocketThroughTheNode(t *testing.T) {
 		before := len(s.appDebug().WSClose)
 		closes := func() (codes []int, reasons []string) {
 			for _, rec := range s.appDebug().WSClose[before:] {
-				if rec.Shard == "wallet/s4" {
+				if rec.Shard == "e2e.wallet/s4" {
 					codes, reasons = append(codes, rec.Code), append(reasons, rec.Reason)
 				}
 			}
 			return
 		}
-		c := dial(t, "wallet/s4")
+		c := dial(t, "e2e.wallet/s4")
 		if err := c.Close(websocket.StatusCode(4001), "bye from the client"); err != nil {
 			t.Logf("close: %v", err) // the handshake may report the peer's reply
 		}
@@ -137,7 +137,7 @@ func TestWebSocketThroughTheNode(t *testing.T) {
 			t.Fatalf("the app saw %v %q", codes, reasons)
 		}
 
-		c = dial(t, "wallet/s4")
+		c = dial(t, "e2e.wallet/s4")
 		if err := c.Write(ctx, websocket.MessageText, []byte("close:4002:bye from the app")); err != nil {
 			t.Fatal(err)
 		}
@@ -147,7 +147,7 @@ func TestWebSocketThroughTheNode(t *testing.T) {
 			t.Fatalf("the client saw %v", err)
 		}
 
-		c = dial(t, "wallet/s4")
+		c = dial(t, "e2e.wallet/s4")
 		c.Close(websocket.StatusNormalClosure, "")
 		eventually(t, "the app to see a normal close", func() bool {
 			codes, _ := closes()
@@ -166,7 +166,7 @@ func TestWebSocketThroughTheNode(t *testing.T) {
 			mu.Unlock()
 			return c, err
 		}}}
-		c := dial(t, "wallet/s5", func(o *websocket.DialOptions) { o.HTTPClient = hc })
+		c := dial(t, "e2e.wallet/s5", func(o *websocket.DialOptions) { o.HTTPClient = hc })
 		if echo, err := wsEcho(ctx, c, "here"); err != nil || echo != "ok:here" {
 			t.Fatalf("%q %v", echo, err)
 		}
@@ -175,7 +175,7 @@ func TestWebSocketThroughTheNode(t *testing.T) {
 		mu.Unlock()
 		eventually(t, "the app to see the connection end", func() bool { return s.appDebug().WSEnded > before })
 		cl := s.appDebug().WSClose
-		if rec := cl[len(cl)-1]; rec.Shard != "wallet/s5" || rec.Code != -1 {
+		if rec := cl[len(cl)-1]; rec.Shard != "e2e.wallet/s5" || rec.Code != -1 {
 			t.Fatalf("the app saw %+v, want an end without a close frame", rec)
 		}
 	})
@@ -186,32 +186,32 @@ func TestWebSocketThroughTheNode(t *testing.T) {
 		// it is active, and blob storage tells whether it is without probing the
 		// node (which would reset the shard's idle timer).
 		active := func(shard string) bool {
-			_, _, err := v.files.GetManifest(ctx, shard)
+			_, _, err := v.files.GetManifest(ctx, shardName(shard))
 			if err != nil && !isNotFound(err) {
 				t.Fatal(err)
 			}
 			return err == nil
 		}
-		c := dial(t, "arena/s7")
+		c := dial(t, "e2e.arena/s7")
 		if echo, err := wsEcho(ctx, c, "kept"); err != nil || echo != "ok:kept" {
 			t.Fatalf("%q %v", echo, err)
 		}
 		if reply, err := wsEcho(ctx, c, "mark"); err != nil || reply != "marked" {
 			t.Fatalf("mark: %q %v", reply, err)
 		}
-		if !active("arena/s7") {
+		if !active("e2e.arena/s7") {
 			t.Fatal("no manifest for an active shard")
 		}
 		// 1.5 s is five idle timeouts, with a janitor pass in it after the shard
 		// had been idle for one, with the connection idle.
 		time.Sleep(1500 * time.Millisecond)
-		if !active("arena/s7") {
+		if !active("e2e.arena/s7") {
 			t.Fatal("the shard was deactivated under an open WebSocket")
 		}
 		if n, err := wsEcho(ctx, c, "count"); err != nil || n != "1" {
 			t.Fatalf("the shard lost its data: %q %v", n, err)
 		}
 		c.Close(websocket.StatusNormalClosure, "")
-		eventually(t, "the shard to deactivate after the WebSocket closed (its manifest goes)", func() bool { return !active("arena/s7") })
+		eventually(t, "the shard to deactivate after the WebSocket closed (its manifest goes)", func() bool { return !active("e2e.arena/s7") })
 	})
 }

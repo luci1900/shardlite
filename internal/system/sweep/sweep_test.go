@@ -18,8 +18,10 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/kind"
 	"github.com/luci1900/shardlite/internal/migrate"
+	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
 	"github.com/luci1900/shardlite/internal/system"
@@ -97,7 +99,7 @@ func (r *rig) handler() http.Handler {
 		return nil
 	}
 	k := New(r.store, check, r.clock, slog.New(slog.DiscardHandler), r.opts)
-	return k.Handler(&system.System{Name: "_sweep/_cluster", Tx: txOn(r.db)})
+	return k.Handler(&system.System{Name: shard.MustParse("_system.sweep/_cluster"), Tx: txOn(r.db)})
 }
 
 // wake sends the wake to a new handler and returns its status.
@@ -147,10 +149,18 @@ func (r *rig) put(key string) {
 	}
 }
 
-func (r *rig) manifest(shard, gen string, files ...string) {
+func (r *rig) manifest(name, gen string, files ...string) {
 	r.t.Helper()
-	m := &shardfile.Manifest{Generation: gen, Files: files}
-	if _, err := shardfile.NewManifestStore(r.store).Put(context.Background(), shard, m, nil); err != nil {
+	fs := make([]shardfile.File, len(files))
+	for i, s := range files {
+		f, err := shardfile.ParseFile(s)
+		if err != nil {
+			r.t.Fatal(err)
+		}
+		fs[i] = f
+	}
+	m := &shardfile.Manifest{Generation: shard.Gen(gen), Files: fs}
+	if _, err := shardfile.NewManifestStore(r.store).Put(context.Background(), shard.MustParse(name), m, nil); err != nil {
 		r.t.Fatal(err)
 	}
 }
@@ -167,8 +177,8 @@ func (r *rig) keys() []string {
 	return out
 }
 
-func file(shard, gen, name string) string {
-	return shardfile.GenerationPrefix(shard, gen) + name + ".ltx"
+func file(name, gen, file string) string {
+	return shardfile.GenerationPrefix(shard.MustParse(name), shard.Gen(gen)) + file + ".ltx"
 }
 
 // The sweeper deletes the files no manifest lists once they are past the age:
@@ -178,22 +188,22 @@ func file(shard, gen, name string) string {
 // journal.
 func TestSweepDeletesOnlyOldUnlistedFiles(t *testing.T) {
 	r := newRig(t, Options{Age: time.Hour, Batch: 3})
-	listed := []string{file("users/a", "g1", "1-5.1"), file("users/a", "g1", "6-9.1")}
-	oldUnlisted := file("users/a", "g1", "6-8.1")
-	oldGen := []string{file("users/a", "g0", "1-3.1"), file("users/a", "g0", "4-4.1")}
-	orphan := file("users/b", "g9", "1-2.3")
+	listed := []string{file("test.users/a", "g1", "1-5.1"), file("test.users/a", "g1", "6-9.1")}
+	oldUnlisted := file("test.users/a", "g1", "6-8.1")
+	oldGen := []string{file("test.users/a", "g0", "1-3.1"), file("test.users/a", "g0", "4-4.1")}
+	orphan := file("test.users/b", "g9", "1-2.3")
 	for _, k := range append(append(listed, oldUnlisted, orphan, "data/journal/n1/1"), oldGen...) {
 		r.put(k)
 	}
-	r.manifest("users/a", "g1", "1-5.1", "6-9.1")
+	r.manifest("test.users/a", "g1", "1-5.1", "6-9.1")
 	r.advance(2 * time.Hour)
-	youngUnlisted := file("users/a", "g1", "10-12.1")
-	youngGen := []string{file("users/c", "g2", "1-1.1"), file("users/c", "g3", "1-1.1")}
+	youngUnlisted := file("test.users/a", "g1", "10-12.1")
+	youngGen := []string{file("test.users/c", "g2", "1-1.1"), file("test.users/c", "g3", "1-1.1")}
 	r.put(youngUnlisted)
 	r.put(youngGen[0])
 	// users/c/g3 has an old file and a young one: the generation is kept whole.
 	r.advance(-2 * time.Hour)
-	r.put(file("users/c", "g3", "2-2.1"))
+	r.put(file("test.users/c", "g3", "2-2.1"))
 	r.advance(2 * time.Hour)
 	r.put(youngGen[1])
 
@@ -206,7 +216,7 @@ func TestSweepDeletesOnlyOldUnlistedFiles(t *testing.T) {
 			t.Errorf("%s was not deleted", k)
 		}
 	}
-	for _, k := range append(append(listed, youngUnlisted, "data/journal/n1/1", file("users/c", "g3", "2-2.1")), youngGen...) {
+	for _, k := range append(append(listed, youngUnlisted, "data/journal/n1/1", file("test.users/c", "g3", "2-2.1")), youngGen...) {
 		if !slices.Contains(got, k) {
 			t.Errorf("%s was deleted", k)
 		}
@@ -221,12 +231,12 @@ func TestSweepDeletesOnlyOldUnlistedFiles(t *testing.T) {
 func TestSweepLeavesOtherPrefixesAlone(t *testing.T) {
 	r := newRig(t, Options{Age: time.Hour, Batch: 2})
 	other := "data/nodes/n1/g1/2-3.1.ltx"
-	unlisted := file("users/a", "g", "2-3.1")
-	listed := file("users/a", "g", "1-1.1")
+	unlisted := file("test.users/a", "g", "2-3.1")
+	listed := file("test.users/a", "g", "1-1.1")
 	for _, k := range []string{other, unlisted, listed} {
 		r.put(k)
 	}
-	r.manifest("users/a", "g", "1-1.1")
+	r.manifest("test.users/a", "g", "1-1.1")
 	r.advance(2 * time.Hour)
 	r.pass()
 	got := r.keys()
@@ -245,7 +255,7 @@ func TestSweepLeavesOtherPrefixesAlone(t *testing.T) {
 // later. A batch never splits a shard.
 func TestSweepResumesFromItsCursor(t *testing.T) {
 	r := newRig(t, Options{Age: time.Hour, Batch: 2, Pace: 5 * time.Second})
-	for _, s := range []string{"users/a", "users/b", "users/c"} {
+	for _, s := range []string{"test.users/a", "test.users/b", "test.users/c"} {
 		r.put(file(s, "g", "1-1.1"))
 		r.put(file(s, "g", "2-2.1"))
 		r.put(file(s, "g", "3-3.1"))
@@ -254,7 +264,7 @@ func TestSweepResumesFromItsCursor(t *testing.T) {
 	if code := r.wake(); code != http.StatusNoContent {
 		t.Fatalf("answered %d", code)
 	}
-	if c := r.cursor(); c != file("users/a", "g", "3-3.1") {
+	if c := r.cursor(); c != file("test.users/a", "g", "3-3.1") {
 		t.Fatalf("cursor %q after the first batch, want the end of users/a", c)
 	}
 	if want := r.clock().Add(5 * time.Second).Unix(); r.due() != want {
@@ -273,7 +283,7 @@ func TestSweepResumesFromItsCursor(t *testing.T) {
 // which the reminders loop tries again.
 func TestSweepChecksTheLeaseBeforeDeleting(t *testing.T) {
 	r := newRig(t, Options{Age: time.Hour})
-	r.put(file("users/a", "g", "1-1.1"))
+	r.put(file("test.users/a", "g", "1-1.1"))
 	r.advance(2 * time.Hour)
 	r.lost.Store(true)
 	if code := r.wake(); code != http.StatusServiceUnavailable {
@@ -291,12 +301,12 @@ func TestSweepChecksTheLeaseBeforeDeleting(t *testing.T) {
 // a batch repeated after a move is harmless.
 func TestSweepToleratesAFileAlreadyGone(t *testing.T) {
 	r := newRig(t, Options{Age: time.Hour})
-	key := file("users/a", "g", "1-1.1")
+	key := file("test.users/a", "g", "1-1.1")
 	r.put(key)
 	r.advance(2 * time.Hour)
-	hooked := blob.WithHook(r.mem)
-	hooked.SetHook(func(ctx context.Context, op blob.Op, k string, after bool) error {
-		if op == blob.OpDelete && !after {
+	hooked := blobtest.WithHook(r.mem)
+	hooked.SetHook(func(ctx context.Context, op blobtest.Op, k string, after bool) error {
+		if op == blobtest.OpDelete && !after {
 			r.mem.Delete(ctx, k, "")
 		}
 		return nil
@@ -309,14 +319,30 @@ func TestSweepToleratesAFileAlreadyGone(t *testing.T) {
 
 // The sweeper's kind has sync off: a cursor lost with a host only repeats a
 // batch.
-func TestKindHasSyncOff(t *testing.T) {
+func TestKindHasTheLocalTier(t *testing.T) {
 	k := New(nil, nil, time.Now, slog.New(slog.DiscardHandler), Options{})
-	if k.Sync != kind.SyncOff {
-		t.Fatalf("sync %v, want off", k.Sync)
+	if k.Sync != kind.SyncLocal {
+		t.Fatalf("sync %v, want local", k.Sync)
 	}
 }
 
 func TestMigrations(t *testing.T) {
 	t.Parallel()
 	sqlitetest.Migrations(t, migrations)
+}
+
+// The state table is STRICT: a value of the wrong type is refused, where a lax
+// table would store it as whatever the column's affinity makes of it. A number
+// into the TEXT cursor still converts, so the refusals tested are the ones
+// there are.
+func TestSweepTableIsStrict(t *testing.T) {
+	db := openDB(t, "strict.db", migrations)
+	for _, q := range []string{
+		`UPDATE sweep SET deleted = 'none'`,
+		`UPDATE sweep SET cursor = x'00'`,
+	} {
+		if _, err := db.Exec(q); err == nil {
+			t.Errorf("%q was accepted", q)
+		}
+	}
 }

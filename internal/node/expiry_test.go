@@ -9,15 +9,19 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/blobtest"
+	"github.com/luci1900/shardlite/internal/cluster"
 	"github.com/luci1900/shardlite/internal/coord"
-	"github.com/luci1900/shardlite/internal/segment"
+	"github.com/luci1900/shardlite/internal/journal"
+	"github.com/luci1900/shardlite/internal/kind"
+	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
 // segments counts the non-empty and empty (fence) objects under the journal prefix.
 func (r *mrig) segments() (data, fences int) {
 	r.t.Helper()
-	for info, err := range r.local.List(context.Background(), segment.Root, "") {
+	for info, err := range r.local.List(context.Background(), journal.Root, "") {
 		if err != nil {
 			r.t.Fatal(err)
 		}
@@ -42,20 +46,20 @@ func TestTailOlderThanTheAlertAgeRaisesIt(t *testing.T) {
 	r.startExpiry(expiry)
 
 	ctx := context.Background()
-	ref := r.acquire("slow/tail")
+	ref := r.acquire("test.slow/tail")
 	defer ref.Release()
 	r.write(ref, "a")
-	if err := r.m.Gate(ctx, ref, true); err != nil {
+	if err := r.m.Gate(ctx, ref, kind.SyncStorage); err != nil {
 		t.Fatal(err)
 	}
-	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if (op == blob.OpUpdate || op == blob.OpCreate) && strings.HasPrefix(key, shardfile.ManifestPrefix) {
+	r.local.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if (op == blobtest.OpUpdate || op == blobtest.OpCreate) && strings.HasPrefix(key, shardfile.ManifestPrefix) {
 			return errors.New("storage refuses manifests")
 		}
 		return nil
 	})
 	r.app.Must(t, "insert", "a", "2", "100") // a tail whose delta can never be recorded
-	if err := r.m.Gate(ctx, ref, true); err != nil {
+	if err := r.m.Gate(ctx, ref, kind.SyncStorage); err != nil {
 		t.Fatal(err)
 	}
 	eventually(t, "the tail alert", func() bool { return r.m.Stats.TailAlerts.Load() > 0 })
@@ -73,20 +77,20 @@ func TestTailAlertWhenDeltasFail(t *testing.T) {
 	r.crash()
 	r.startShards(func(o *CatalogOptions) { o.Lifecycle.DeltaAge = 100 * time.Millisecond }) // the alert is at 300 ms
 	ctx := context.Background()
-	ref := r.acquire("slow/failing")
+	ref := r.acquire("test.slow/failing")
 	defer ref.Release()
 	r.write(ref, "a")
-	if err := r.m.Gate(ctx, ref, true); err != nil {
+	if err := r.m.Gate(ctx, ref, kind.SyncStorage); err != nil {
 		t.Fatal(err)
 	}
-	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if (op == blob.OpUpdate || op == blob.OpCreate) && strings.HasPrefix(key, shardfile.ManifestPrefix) {
+	r.local.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if (op == blobtest.OpUpdate || op == blobtest.OpCreate) && strings.HasPrefix(key, shardfile.ManifestPrefix) {
 			return errors.New("storage refuses manifests")
 		}
 		return nil
 	})
 	r.app.Must(t, "insert", "a", "2", "100") // a tail whose delta can never be recorded
-	if err := r.m.Gate(ctx, ref, true); err != nil {
+	if err := r.m.Gate(ctx, ref, kind.SyncStorage); err != nil {
 		t.Fatal(err)
 	}
 	eventually(t, "the tail alert", func() bool { return r.m.Stats.TailAlerts.Load() > 0 })
@@ -102,13 +106,13 @@ func TestRestartAfterSegmentsExpired(t *testing.T) {
 	ctx := context.Background()
 
 	want := map[string]string{}
-	for _, name := range []string{"wallet/1", "wallet/2", "users/3"} {
+	for _, name := range []string{"test.wallet/1", "test.wallet/2", "test.users/3"} {
 		ref := r.acquire(name)
 		r.write(ref, name)
 		for range 3 {
 			r.app.Must(t, "insert", name, "2", "100")
 		}
-		if err := r.m.Gate(ctx, ref, true); err != nil {
+		if err := r.m.Gate(ctx, ref, kind.SyncStorage); err != nil {
 			t.Fatal(err)
 		}
 		want[name] = r.liveDump(ref.Path())
@@ -123,7 +127,7 @@ func TestRestartAfterSegmentsExpired(t *testing.T) {
 		}
 		return true
 	})
-	r.afterSnapshotLooks(2, "wallet/1", "wallet/2", "users/3") // a few more looks of the delta timers
+	r.afterSnapshotLooks(2, "test.wallet/1", "test.wallet/2", "test.users/3") // a few more looks of the delta timers
 	dataBefore, _ := r.segments()
 	if dataBefore == 0 {
 		t.Fatal("no segments")
@@ -159,7 +163,7 @@ func TestRestartAfterSegmentsExpired(t *testing.T) {
 }
 
 func envWith(extra map[string]string) (Env, error) {
-	m := map[string]string{"SHARDLITE_NODE": "n", "SHARDLITE_BLOB": "s3://b", "SHARDLITE_KINDS": "k", "SHARDLITE_DATA": "d", "SHARDLITE_SCRATCH_DIR": "m"}
+	m := map[string]string{"SHARDLITE_NODE": "n", "SHARDLITE_BLOB": "s3://b", "SHARDLITE_DATA": "d"}
 	for k, v := range extra {
 		m[k] = v
 	}
@@ -216,10 +220,10 @@ func TestExpiryStartsAfterAdoption(t *testing.T) {
 	r := newMRig(t)
 	r.skew.Store(int64(24 * time.Hour)) // everything written from here on is a day old
 	ctx := context.Background()
-	ref := r.acquire("wallet/1")
+	ref := r.acquire("test.wallet/1")
 	r.write(ref, "a")
 	r.app.Must(t, "insert", "a", "2", "100")
-	if err := r.m.Gate(ctx, ref, true); err != nil {
+	if err := r.m.Gate(ctx, ref, kind.SyncStorage); err != nil {
 		t.Fatal(err)
 	}
 	want := r.liveDump(ref.Path())
@@ -236,16 +240,16 @@ func TestExpiryStartsAfterAdoption(t *testing.T) {
 	}
 	r.startExpiry(200 * time.Millisecond)
 	eventually(t, "the old segments to expire", func() bool { d, _ := r.segments(); return d == 0 })
-	if got := r.dumpBlob("wallet/1"); got != want {
+	if got := r.dumpBlob("test.wallet/1"); got != want {
 		t.Fatal("the shard restores differently")
 	}
 }
 
 // putSegment writes a stand-in for a journal segment (a node's journal is only
 // its writer's business, so a test can name any number).
-func (r *mrig) putSegment(node string, seq uint64, body string) string {
+func (r *mrig) putSegment(node cluster.Node, seq pos.Seg, body string) string {
 	r.t.Helper()
-	key := segment.Key(node, seq)
+	key := journal.Key(node, seq)
 	if _, err := r.n.Store.Create(context.Background(), key, strings.NewReader(body)); err != nil {
 		r.t.Fatal(err)
 	}
@@ -285,7 +289,7 @@ func TestExpiryDeletesOldSegmentsKeepsFencesAndRecent(t *testing.T) {
 	if err != nil || deleted != 3-1 {
 		t.Fatalf("deleted %d, %v, want the two non-empty segments", deleted, err)
 	}
-	if r.exists(old) || r.exists(segment.Key("n1", 1003)) {
+	if r.exists(old) || r.exists(journal.Key("n1", 1003)) {
 		t.Fatal("old segments are still there")
 	}
 	if !r.exists(fence) {
@@ -313,11 +317,13 @@ func TestExpiryUsesOnlyListAndDelete(t *testing.T) {
 	r.putSegment("n1", 2003, "")
 
 	var mu sync.Mutex
-	ops := map[blob.Op]int{}
-	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if !after && strings.HasPrefix(key, segment.Root) {
+	// Keyed by name because it counts what expiry made, rather than dispatching
+	// on it: an enum-keyed map literal must hold every member.
+	ops := map[string]int{}
+	r.local.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if !after && strings.HasPrefix(key, journal.Root) {
 			mu.Lock()
-			ops[op]++
+			ops[op.String()]++
 			mu.Unlock()
 		}
 		return nil
@@ -328,7 +334,7 @@ func TestExpiryUsesOnlyListAndDelete(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if ops[blob.OpList] == 0 || ops[blob.OpDelete] != 2 || len(ops) != 2 {
+	if ops[blobtest.OpList.String()] == 0 || ops[blobtest.OpDelete.String()] != 2 || len(ops) != 2 {
 		t.Fatalf("journal expiry made these calls: %v, want only list (once or more) and two deletes", ops)
 	}
 }

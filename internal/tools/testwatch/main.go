@@ -11,9 +11,6 @@
 // takes the testapp children with it). The binary's output and exit status
 // pass through, so go test behaves as usual. TESTWATCH_IDLE and
 // TESTWATCH_SAMPLE (Go durations) change the limits.
-//
-// "testwatch report [-n 20]" reads go test -json on stdin and prints the
-// output of failed tests, a line per package and the slowest tests.
 package main
 
 import (
@@ -35,11 +32,8 @@ const (
 )
 
 func main() {
-	if len(os.Args) >= 2 && os.Args[1] == "report" {
-		os.Exit(report(os.Args[2:], os.Stdin, os.Stdout))
-	}
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: testwatch binary [args...] (for go test -exec) or testwatch report [-n 20] < test.json")
+		fmt.Fprintln(os.Stderr, "usage: testwatch binary [args...] (for go test -exec)")
 		os.Exit(2)
 	}
 	os.Exit(run(os.Args[1], os.Args[2:], os.Stdout, os.Stderr, durationEnv("TESTWATCH_IDLE", defaultIdle), durationEnv("TESTWATCH_SAMPLE", defaultSample), quitGrace))

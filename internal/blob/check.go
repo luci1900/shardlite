@@ -10,9 +10,11 @@ import (
 	"io"
 	"strings"
 	"time"
+
+	"github.com/luci1900/shardlite/internal/cluster"
 )
 
-// CheckStore runs the startup check of a store (docs/internals.md, Coordination) on a
+// CheckStore runs the startup check of a store (docs/internals.md, The shape of a node) on a
 // scratch key, check/{node}/{random}, and deletes the key afterwards. It
 // refuses a store that misbehaves, naming the step that failed:
 //
@@ -27,12 +29,12 @@ import (
 // A store or proxy that silently ignored If-Match would otherwise break fencing
 // without any error. The check goes through a Store, as everything does, so it
 // tests the same write path.
-func CheckStore(ctx context.Context, b Backend, node string) error {
+func CheckStore(ctx context.Context, b Backend, node cluster.Node) error {
 	var r [8]byte
 	if _, err := rand.Read(r[:]); err != nil {
 		return err
 	}
-	key := "check/" + node + "/" + hex.EncodeToString(r[:])
+	key := "check/" + string(node) + "/" + hex.EncodeToString(r[:])
 	missing := key + "-missing"
 	s := NewStore(b, node, 0, Options{Attempts: 3})
 	fail := func(step, format string, args ...any) error {

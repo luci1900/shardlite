@@ -16,6 +16,7 @@ import (
 
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/cluster"
 	"github.com/luci1900/shardlite/internal/coord"
 )
 
@@ -24,23 +25,23 @@ import (
 func TestKilledOwnerFailsFast(t *testing.T) {
 	c := newClusterWith(t, 2, func(o *CatalogOptions) { o.OwnerCheck = time.Hour })
 	n0, n1 := c.nodes[0], c.nodes[1]
-	n0.create("users/k")
-	ask(t, n0, "users/k")
-	ask(t, n1, "users/k") // n1 has the owner and its address cached
+	n0.create("test.users/k")
+	ask(t, n0, "test.users/k")
+	ask(t, n1, "test.users/k") // n1 has the owner and its address cached
 	leases := n1.countReads(coord.Key("n0"))
 	n0.Kill()
 
 	var g sync.WaitGroup
 	for range 20 {
 		g.Go(func() {
-			resp, body := post(t, n1, "users/k", "hi")
+			resp, body := post(t, n1, "test.users/k", "hi")
 			if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") != "1" || !strings.Contains(body, "does not answer") {
 				t.Errorf("%d (Retry-After %q) %q", resp.StatusCode, resp.Header.Get("Retry-After"), body)
 			}
 		})
 	}
 	g.Wait()
-	resp := grpcRequest(t, "http://"+n1.Public+"/svc/M", "users/k", nil)
+	resp := grpcRequest(t, "http://"+n1.Public+"/svc/M", "test.users/k", nil)
 	resp.Body.Close()
 	if got := resp.Header.Get("Grpc-Status"); got != "14" {
 		t.Fatalf("gRPC: grpc-status %q, want 14 (UNAVAILABLE)", got)
@@ -95,14 +96,14 @@ func TestPausedOwnerFailsAfterTheAnswerTimeout(t *testing.T) {
 	c := newCluster(t, 2)
 	n0, n1 := c.nodes[0], c.nodes[1]
 	n0.echoes()
-	n0.create("users/q")
-	ask(t, n0, "users/q")
+	n0.create("test.users/q")
+	ask(t, n0, "test.users/q")
 	addr, accepted := silentPeer(t)
 	reg := coord.NewRegistry(blob.WithPrefix(c.mem, n1.env.Prefix), "sleepy", coord.RegistryOptions{TTL: time.Hour})
 	if _, err := reg.Acquire(context.Background(), coord.NodeInfo{Name: "sleepy", Address: addr}); err != nil {
 		t.Fatal(err)
 	}
-	n1.believe("users/p", "sleepy", addr)
+	n1.believe("test.users/p", "sleepy", addr)
 
 	type result struct {
 		status int
@@ -110,11 +111,11 @@ func TestPausedOwnerFailsAfterTheAnswerTimeout(t *testing.T) {
 	}
 	paused := make(chan result, 1)
 	go func() {
-		resp, _ := post(t, n1, "users/p", strings.Repeat("x", 256<<10))
+		resp, _ := post(t, n1, "test.users/p", strings.Repeat("x", 256<<10))
 		paused <- result{resp.StatusCode, resp.Header.Get("Retry-After")}
 	}()
 	<-accepted
-	if resp, body := post(t, n1, "users/q", "other"); resp.StatusCode != 200 || body != `n0 got "other"` {
+	if resp, body := post(t, n1, "test.users/q", "other"); resp.StatusCode != 200 || body != `n0 got "other"` {
 		t.Fatalf("another owner's shard: %d %q", resp.StatusCode, body)
 	}
 	select {
@@ -132,9 +133,9 @@ func TestPausedOwnerFailsAfterTheAnswerTimeout(t *testing.T) {
 func TestSlowAppIsNotUnreachable(t *testing.T) {
 	c := newCluster(t, 2)
 	n0, n1 := c.nodes[0], c.nodes[1]
-	n0.create("users/s")
-	ask(t, n0, "users/s")
-	ask(t, n1, "users/s")
+	n0.create("test.users/s")
+	ask(t, n0, "test.users/s")
+	ask(t, n1, "test.users/s")
 	release := make(chan struct{})
 	n0.serve(func(w http.ResponseWriter, q *http.Request) {
 		select {
@@ -146,7 +147,7 @@ func TestSlowAppIsNotUnreachable(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		if resp, body := post(t, n1, "users/s", ""); resp.StatusCode != 200 || body != "late" {
+		if resp, body := post(t, n1, "test.users/s", ""); resp.StatusCode != 200 || body != "late" {
 			t.Errorf("%d %q", resp.StatusCode, body)
 		}
 	}()
@@ -169,7 +170,7 @@ func testOwnerChecks(t *testing.T) {
 	unblock := make(chan struct{})
 	var logs bytes.Buffer
 	c := &ownerChecks{
-		get: func(context.Context, string) (*coord.NodeLease, error) {
+		get: func(context.Context, cluster.Node) (*coord.NodeLease, error) {
 			reads.Add(1)
 			<-unblock
 			if readErr != nil {
@@ -255,8 +256,8 @@ func TestAdoptedOwnersShardIsClaimed(t *testing.T) {
 	app := apptest.Start(t)
 	paths := make(chan string, 1)
 	n0.serve(func(w http.ResponseWriter, q *http.Request) { paths <- q.Header.Get("Shardlite-Path") })
-	n0.create("wallet/a")
-	ask(t, n0, "wallet/a")
+	n0.create("test.wallet/a")
+	ask(t, n0, "test.wallet/a")
 	path := <-paths
 	app.Must(t, "open", "a", path)
 	app.Must(t, "insert", "a", "5", "64")
@@ -264,14 +265,14 @@ func TestAdoptedOwnersShardIsClaimed(t *testing.T) {
 		t.Fatalf("sync: %d %q", resp.StatusCode, body)
 	}
 	n0.serve(func(http.ResponseWriter, *http.Request) {})
-	ask(t, n1, "wallet/a") // n1 has the owner and its address cached
+	ask(t, n1, "test.wallet/a") // n1 has the owner and its address cached
 	n0.Kill()
 
-	n1.create("users/none")
-	if resp, _ := post(t, n1, "users/none", ""); resp.StatusCode != 200 {
+	n1.create("test.users/none")
+	if resp, _ := post(t, n1, "test.users/none", ""); resp.StatusCode != 200 {
 		t.Fatalf("a shard of n1's own: %d", resp.StatusCode)
 	}
-	if resp, body := post(t, n1, "wallet/a", ""); resp.StatusCode != http.StatusServiceUnavailable {
+	if resp, body := post(t, n1, "test.wallet/a", ""); resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("before the adoption: %d %q", resp.StatusCode, body)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -285,17 +286,17 @@ func TestAdoptedOwnersShardIsClaimed(t *testing.T) {
 	})
 	// The lease scan forgot n0's entries when it found n0 dead. One put back by a
 	// request that raced it gets 503 to try again, and goes.
-	n1.m.Load().owners.Add("wallet/a", "n0")
-	resp, body := post(t, n1, "wallet/a", "")
+	n1.m.Load().owners.Add(shardName("test.wallet/a"), "n0")
+	resp, body := post(t, n1, "test.wallet/a", "")
 	moved(t, resp, body)
-	resp, body = post(t, n1, "wallet/a", "")
+	resp, body = post(t, n1, "test.wallet/a", "")
 	if resp.StatusCode != 200 || resp.Header.Get("X-Served-By") != "n1" {
 		t.Fatalf("after the adoption: %d %v %q", resp.StatusCode, resp.Header, body)
 	}
 	if got := apptest.Query(t, <-paths, "SELECT count(*) FROM kv"); strings.TrimSpace(got) != "5" {
 		t.Fatalf("%q rows on n1, want 5", got)
 	}
-	if owner, ok := n1.m.Load().owners.Get("wallet/a"); ok {
+	if owner, ok := n1.m.Load().owners.Get(shardName("test.wallet/a")); ok {
 		t.Fatalf("the cache still names %s", owner)
 	}
 }

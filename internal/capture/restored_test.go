@@ -5,7 +5,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -15,33 +14,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/superfly/ltx"
-
 	"github.com/luci1900/shardlite/internal/apptest"
-	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/harness"
+	"github.com/luci1900/shardlite/internal/journal"
+	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
 )
-
-// dirBytes is the size of every file under dir.
-func dirBytes(t *testing.T, dir string) (total int64, files []string) {
-	t.Helper()
-	filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return nil
-		}
-		if fi, err := d.Info(); err == nil {
-			total += fi.Size()
-			rel, _ := filepath.Rel(dir, p)
-			files = append(files, fmt.Sprintf("%s(%d)", rel, fi.Size()))
-		}
-		return nil
-	})
-	return total, files
-}
 
 // stored builds a shard of about mb megabytes in blob storage (one commit per
 // megabyte, then a delta), closes it, and returns what activating it from blob
@@ -74,65 +56,11 @@ func stored(t *testing.T, e *harness.Env, mb int) *shardfile.Restored {
 // restore restores the shard from blob storage to its path.
 func restore(t *testing.T, e *harness.Env) *shardfile.Restored {
 	t.Helper()
-	res, err := e.Files.Restore(context.Background(), name, e.Path(name), shardfile.RestoreOptions{})
+	res, err := e.Files.Restore(context.Background(), shardName(name), e.Path(name), shardfile.RestoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return res
-}
-
-// metaDir is the metadata directory of the shard under test.
-func metaDir(e *harness.Env, res *shardfile.Restored) string {
-	return capture.MetaDir(e.Meta, name, res.Handle.Manifest.Generation)
-}
-
-// What does the metadata directory of a restored shard hold? Before stage 1z,
-// Litestream's first sync wrote a snapshot the size of the database there, which
-// DropTail never deleted, so it stayed for the whole activation.
-func TestRestoredShardMetadataStaysSmall(t *testing.T) {
-	t.Parallel()
-	const mb = 20
-	e := harness.New(t)
-	res := stored(t, e, mb)
-	fi, err := os.Stat(e.Path(name))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("restored: %d bytes, position %d", fi.Size(), res.State.Position)
-
-	ctx := context.Background()
-	sh := e.Activate(res.Handle, res.Capture)
-	defer sh.Close(ctx)
-	meta := metaDir(e, res)
-	check := func(step string) {
-		t.Helper()
-		n, files := dirBytes(t, meta)
-		t.Logf("%-18s metadata %6d bytes in %v", step, n, files)
-		if n > 256<<10 {
-			t.Fatalf("%s: the metadata directory holds %d bytes for a %d byte shard", step, n, fi.Size())
-		}
-	}
-	check("created")
-	if err := sh.Sync(ctx); err != nil {
-		t.Fatal(err)
-	}
-	check("first sync")
-	if n, _ := sh.TailInfo(); n != 0 {
-		t.Fatalf("the first sync of a restored shard put %d files in the tail", n)
-	}
-	app := e.StartApp(name)
-	for i := range 4 {
-		app.Must(t, "insert", "a", "2", "200")
-		if err := sh.Sync(ctx); err != nil {
-			t.Fatal(err)
-		}
-		check("commit " + strconv.Itoa(i+1))
-		sh.DropTail(sh.Position())
-		check("  after DropTail")
-		if _, files := dirBytes(t, meta); len(files) > 1 {
-			t.Fatalf("after DropTail: %v, want only the newest file", files)
-		}
-	}
 }
 
 // readBytes is how many bytes this process has read with read system calls (the
@@ -176,9 +104,6 @@ func TestActivatingARestoredShardReadsNoPages(t *testing.T) {
 
 	fi, _ := os.Stat(e.Path(name))
 	t.Logf("activated a %d MB shard in %v, reading %d bytes", fi.Size()>>20, took, read)
-	if n, _ := dirBytes(t, metaDir(e, res)); n > 64<<10 {
-		t.Fatalf("activation wrote %d bytes of metadata: a snapshot was taken", n)
-	}
 	if n, _ := sh.TailInfo(); n != 0 {
 		t.Fatalf("activation put %d files in the tail", n)
 	}
@@ -203,12 +128,12 @@ func replayInto(t *testing.T, e *harness.Env, path string) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	var last uint64
-	err = segment.Scan(ctx, e.Store, e.Node, 1, 0, func(seq uint64, en segment.Entry) error {
-		if en.Shard != name || en.Last() <= last {
+	var last pos.Position
+	err = segment.Scan(ctx, e.Journal, 1, 0, func(seq pos.Seg, en segment.Entry) error {
+		if en.Shard.String() != name || en.Last() <= last {
 			return nil
 		}
-		b, err := harness.ReadEntry(ctx, e.Store, e.Node, seq, en)
+		b, err := harness.ReadEntry(ctx, e.Journal, seq, en)
 		if err != nil {
 			return err
 		}
@@ -224,8 +149,8 @@ func replayInto(t *testing.T, e *harness.Env, path string) {
 }
 
 // Every way the shard's WAL can go after a restored activation leaves a history
-// that restores to the database the app has. The seeded start (see seed.go) is a
-// claim about the WAL, and these are the ways it can stop being true.
+// that restores to the database the app has: the read rule is a claim about
+// the WAL, and these are the ways it can be tried.
 func TestRestoredShardCapturePaths(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -291,7 +216,7 @@ func TestRestoredShardCapturePaths(t *testing.T) {
 			if err := sh.Sync(ctx); err != nil {
 				t.Fatal(err)
 			}
-			// A short busy timeout: a TRUNCATE checkpoint waits for Litestream's reader.
+			// A short busy timeout: a TRUNCATE checkpoint waits for the node's reader.
 			app := apptest.Start(t)
 			app.Must(t, "open", "a", e.Path(name), "200")
 			tc.run(t, app, sh, ctx)
@@ -331,7 +256,7 @@ func TestRestoredShardNeverWritten(t *testing.T) {
 	if got := sh.Position(); got != res.State.Position {
 		t.Fatalf("position moved from %d to %d", res.State.Position, got)
 	}
-	if f.Empty {
+	if _, ok := f.(*capture.Deleted); ok {
 		t.Fatal("a shard with data in it counts as empty")
 	}
 }
@@ -379,113 +304,15 @@ func TestReactivationFoldsTheWALItLeft(t *testing.T) {
 	sh2.Close(ctx)
 }
 
-// The seeded start relies on parts of Litestream that are not its API. These
-// tests fail if an upgrade changes any of them (the list is in seed.go and the
-// stage 1z report).
-func TestSeedRelianceOnLitestream(t *testing.T) {
-	t.Parallel()
-	e := harness.New(t)
-	res := stored(t, e, 2)
-	ctx := context.Background()
-	var logs bytes.Buffer
-	sh, err := capture.New(capture.Config{
-		Name: name, Path: e.Path(name), Generation: res.Handle.Manifest.Generation, MetaRoot: e.Meta, Writer: e.W, Restored: res.Capture,
-		TempDir: e.Files.TempDir,
-		Logger:  slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sh.Close(ctx)
-	db := sh.DB()
-
-	// The seed is where Litestream looks for a level 0 file: one commit number,
-	// min and max alike, under the level's directory in the metadata directory.
-	seedPath := db.LTXPath(0, 2, 2)
-	if want := filepath.Join(metaDir(e, res), "ltx", "0", "0000000000000002-0000000000000002.ltx"); seedPath != want {
-		t.Fatalf("Litestream's layout changed: %s, want %s", seedPath, want)
-	}
-	f, err := os.Open(seedPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	dec := ltx.NewDecoder(f)
-	if err := dec.Verify(); err != nil { // what DB.Pos does
-		t.Fatalf("the seed does not verify: %v", err)
-	}
-	hdr := dec.Header()
-	f.Close()
-	if err := hdr.Validate(); err != nil {
-		t.Fatalf("the seed's header is not valid: %v", err)
-	}
-	if hdr.WALOffset != 32 || hdr.WALSize == 0 || hdr.PageSize == 0 {
-		t.Fatalf("unexpected seed header %+v", hdr)
-	}
-
-	// Litestream takes the seed as its position, and its first sync writes nothing.
-	pos, err := db.Pos()
-	if err != nil || pos.TXID != 2 {
-		t.Fatalf("Litestream's position is %v, %v, want commit 2", pos, err)
-	}
-	if err := sh.Sync(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if got := dirList(t, metaDir(e, res)); len(got) != 1 {
-		t.Fatalf("the first sync wrote %v", got)
-	}
-	if strings.Contains(logs.String(), "snapshotting") || strings.Contains(logs.String(), "snap=true") {
-		t.Fatalf("Litestream snapshotted at its first sync:\n%s", logs.String())
-	}
-
-	// The next file takes the next commit number, and continues without a snapshot,
-	// also after the app has opened the file and written to it.
-	app := e.StartApp(name)
-	for i := range 3 {
-		app.Must(t, "insert", "a", "1", "100")
-		if err := sh.Sync(ctx); err != nil {
-			t.Fatal(err)
-		}
-		next := db.LTXPath(0, ltx.TXID(3+i), ltx.TXID(3+i))
-		fi, err := os.Stat(next)
-		if err != nil {
-			t.Fatalf("after commit %d: %v (files %v)", i+1, err, dirList(t, metaDir(e, res)))
-		}
-		if fi.Size() > 64<<10 {
-			t.Fatalf("commit %d made a %d byte file: a snapshot", i+1, fi.Size())
-		}
-	}
-	if strings.Contains(logs.String(), "snap=true") {
-		t.Fatalf("Litestream snapshotted after the seed:\n%s", logs.String())
-	}
-	// The WAL still has the salts the seed named: the app's writes went after the
-	// seed's frame, and SQLite didn't start a new WAL.
-	walHdr := make([]byte, 32)
-	w, err := os.Open(e.Path(name) + "-wal")
-	if err != nil {
-		t.Fatal(err)
-	}
-	w.ReadAt(walHdr, 0)
-	w.Close()
-	if s1 := uint32(walHdr[16])<<24 | uint32(walHdr[17])<<16 | uint32(walHdr[18])<<8 | uint32(walHdr[19]); s1 != hdr.WALSalt1 {
-		t.Fatalf("SQLite started a new WAL: salt %x, the seed names %x", s1, hdr.WALSalt1)
-	}
-}
-
 // A commit larger than the spool limit is held in a temporary file in the
 // temporary directory (also what the segment writer builds from it), reaches the
 // journal intact, and the file is gone when the tail is dropped.
-//
-// Litestream keeps its newest level 0 file, which for a commit of this size is as
-// large as the commit and sits in the scratch directory. Litestream checkpoints
-// and writes a small file after a commit of a thousand pages, which then is the
-// newest; a smaller commit is its own newest file, and is shrunk once its delta
-// is written.
 func TestLargeCommitSpillsAndLeavesNothingBehind(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		mb   int
-	}{{"3 MB, below Litestream's checkpoint threshold", 3}, {"6 MB", 6}} {
+	}{{"3 MB", 3}, {"6 MB", 6}} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := harness.New(t)
 			res := stored(t, e, 1)
@@ -507,11 +334,11 @@ func TestLargeCommitSpillsAndLeavesNothingBehind(t *testing.T) {
 			if got := inTemp(); got != 0 {
 				t.Fatalf("%d temporary files before any commit", got)
 			}
-			// While the segment is uploaded there is the commit's file and the
-			// segment's own, both in temporary files.
+			// While the segment is uploaded there is the commit's file: the
+			// segment is composed from the tail's files rather than spooled.
 			var atUpload atomic.Int32
-			e.Blob.SetHook(func(_ context.Context, op blob.Op, key string, after bool) error {
-				if op == blob.OpCreate && !after && strings.HasPrefix(key, segment.Root) {
+			e.Blob.SetHook(func(_ context.Context, op blobtest.Op, key string, after bool) error {
+				if op == blobtest.OpCreate && !after && strings.HasPrefix(key, journal.Root) {
 					// The most there were at any upload: a later, smaller segment (the writer
 					// cuts one every few milliseconds) finds the commit's file already gone.
 					n := int32(inTemp())
@@ -530,21 +357,16 @@ func TestLargeCommitSpillsAndLeavesNothingBehind(t *testing.T) {
 			if len(tail) == 0 || !tail[0].Body.InFile() || tail[0].Body.Size() < int64(tc.mb)*1_000_000 {
 				t.Fatalf("tail %+v: want a first file of %d MB in a temporary file", tail, tc.mb)
 			}
-			capture.CloseTail(tail)
+			tail.Close()
 			if inTemp() == 0 {
 				t.Fatalf("no temporary file for a %d MB commit", tc.mb)
 			}
-			// The large file is in the scratch directory too, until the delta.
-			if n, _ := dirBytes(t, metaDir(e, res)); n < int64(tc.mb)*1_000_000 {
-				t.Fatalf("Litestream's own copy of the commit is only %d bytes", n)
-			}
-
 			// It reaches the journal, becomes a delta and restores to the same database.
 			if err := e.W.Flush(ctx); err != nil {
 				t.Fatal(err)
 			}
-			if tc.mb*1_000_000 > 4<<20 && atUpload.Load() < 2 {
-				t.Fatalf("%d temporary files while a segment of over %d MB was uploaded, want the commit's and the segment's", atUpload.Load(), tc.mb)
+			if tc.mb*1_000_000 > 4<<20 && atUpload.Load() < 1 {
+				t.Fatalf("%d temporary files while a segment of over %d MB was uploaded, want the commit's", atUpload.Load(), tc.mb)
 			}
 			if err := res.Handle.WriteDelta(ctx, sh, shardfile.Hooks{}); err != nil {
 				t.Fatal(err)
@@ -553,21 +375,16 @@ func TestLargeCommitSpillsAndLeavesNothingBehind(t *testing.T) {
 				ents, _ := os.ReadDir(tmp)
 				t.Fatalf("%d temporary files after the delta: %v", got, ents)
 			}
-			n, files := dirBytes(t, metaDir(e, res))
-			t.Logf("after the delta the metadata directory holds %d bytes: %v", n, files)
-			if n > 256<<10 {
-				t.Fatalf("after the delta the metadata directory holds %d bytes: %v", n, files)
-			}
-			// Litestream goes on from what is left of it, incrementally.
+			// Capture goes on incrementally.
 			app.Must(t, "insert", "a", "1", "200")
 			if err := sh.Sync(ctx); err != nil {
 				t.Fatal(err)
 			}
 			tail = sh.Tail()
 			if len(tail) == 0 || tail[0].Body.Size() > 64<<10 {
-				t.Fatalf("the commit after the large one made %d files, the first of %d bytes: Litestream snapshotted", len(tail), tail[0].Body.Size())
+				t.Fatalf("the commit after the large one made %d files, the first of %d bytes: capture snapshotted", len(tail), tail[0].Body.Size())
 			}
-			capture.CloseTail(tail)
+			tail.Close()
 			if err := res.Handle.WriteDelta(ctx, sh, shardfile.Hooks{}); err != nil {
 				t.Fatal(err)
 			}
@@ -578,7 +395,7 @@ func TestLargeCommitSpillsAndLeavesNothingBehind(t *testing.T) {
 			sh.Discard()
 
 			dst := filepath.Join(t.TempDir(), "restored.db")
-			if _, err := e.Files.Restore(ctx, name, dst, shardfile.RestoreOptions{}); err != nil {
+			if _, err := e.Files.Restore(ctx, shardName(name), dst, shardfile.RestoreOptions{}); err != nil {
 				t.Fatal(err)
 			}
 			if want, got := apptest.Dump(t, e.Path(name)), sqlitetest.Dump(t, dst); want != got {
@@ -591,10 +408,10 @@ func TestLargeCommitSpillsAndLeavesNothingBehind(t *testing.T) {
 	}
 }
 
-// A release that finds the app still has the shard open reopens capture over the
-// same metadata directory. That works when the tail was dropped (written as a
-// delta) before: Litestream goes on from its newest file and doesn't look for
-// the ones that were deleted.
+// A release that finds the app still has the shard open reopens capture over
+// the same WAL. That works when the tail was dropped (written as a delta)
+// before: capture goes on from where it had read to and doesn't look for the
+// files that were dropped.
 func TestRefusedReleaseAfterTheTailWasDropped(t *testing.T) {
 	t.Parallel()
 	e := harness.New(t)
@@ -626,7 +443,7 @@ func TestRefusedReleaseAfterTheTailWasDropped(t *testing.T) {
 		t.Fatal(err)
 	}
 	dst := filepath.Join(t.TempDir(), "restored.db")
-	if _, err := e.Files.Restore(ctx, name, dst, shardfile.RestoreOptions{}); err != nil {
+	if _, err := e.Files.Restore(ctx, shardName(name), dst, shardfile.RestoreOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if want, got := apptest.Dump(t, e.Path(name)), sqlitetest.Dump(t, dst); want != got {
@@ -671,15 +488,12 @@ func TestSeedAnyPageSize(t *testing.T) {
 				os.Remove(e.Path(name) + p)
 			}
 			res := restore(t, e)
-			if res.State.PageSize != uint32(size) {
+			if res.State.PageSize != capture.PageSize(size) {
 				t.Fatalf("page size %d, want %d", res.State.PageSize, size)
 			}
 			sh = e.Activate(res.Handle, res.Capture)
 			if err := sh.Sync(ctx); err != nil {
 				t.Fatal(err)
-			}
-			if got, _ := dirBytes(t, metaDir(e, res)); got > int64(size)*3 {
-				t.Fatalf("the metadata directory holds %d bytes after the first sync", got)
 			}
 			app = e.StartApp(name)
 			app.Must(t, "insert", "a", "2", "30000")
@@ -690,7 +504,7 @@ func TestSeedAnyPageSize(t *testing.T) {
 				t.Fatalf("%d tail files", n)
 			}
 			tail := sh.Tail()
-			defer capture.CloseTail(tail)
+			defer tail.Close()
 			if tail[0].Body.Size() > 2*60000+8*int64(size) {
 				t.Fatalf("the first commit after the seed made a %d byte file: a snapshot", tail[0].Body.Size())
 			}

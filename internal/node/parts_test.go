@@ -13,6 +13,7 @@ import (
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/coord"
+	"github.com/luci1900/shardlite/internal/kind"
 	"github.com/luci1900/shardlite/internal/service"
 )
 
@@ -32,7 +33,7 @@ func partsNode(t *testing.T) (*Node, *Kinds) {
 	t.Helper()
 	dir := t.TempDir()
 	n, err := Start(context.Background(), Config{
-		Name: "n1", Backend: blob.NewMemory(), TempDir: filepath.Join(dir, "tmp"),
+		Name: "n1", Backend: blob.NewMemory(), Data: dir, TempDir: filepath.Join(dir, "tmp"),
 		Blob:   blob.Options{Backoff: time.Millisecond},
 		Lease:  coord.RegistryOptions{TTL: time.Hour, Blob: blob.Options{Backoff: time.Millisecond}},
 		Keeper: coord.KeeperOptions{Interval: 100 * time.Millisecond, Margin: time.Minute},
@@ -41,14 +42,12 @@ func partsNode(t *testing.T) (*Node, *Kinds) {
 		t.Fatal(err)
 	}
 	serveJournal(t, n)
-	path := filepath.Join(dir, "kinds.json")
-	if err := os.WriteFile(path, []byte(testKinds), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	kinds, err := LoadKinds(path, 0)
+	a, err := kind.ParseApp([]byte(testKinds), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
+	kinds := NewKinds(0)
+	kinds.Update(a)
 	return n, kinds
 }
 
@@ -61,21 +60,21 @@ func TestCacheEvictionOnItsOwn(t *testing.T) {
 	data := t.TempDir()
 	tab := newTable(slog.New(slog.DiscardHandler))
 	c := &cache{data: data, tab: tab, files: n.Files, node: n.Name, clock: realClock{}, log: slog.New(slog.DiscardHandler), stats: &Stats{}}
-	if err := c.open(CacheOptions{Limit: 1, Every: time.Hour}); err != nil {
+	db := testDB(t)
+	if err := c.open(CacheOptions{Limit: 1, Every: time.Hour}, db); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.idx.close() })
-	path := c.pathFor("users", "ce1", "g1")
+	path := c.pathFor(shardName("test.users/ce1"), "g1")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(path, []byte("cached"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.idx.put(indexRow{Name: "users/ce1", Path: path, Generation: "g1", State: stateCached, LastUsed: time.Now(), Bytes: 6}); err != nil {
+	if err := c.idx.put(indexRow{Name: shardName("test.users/ce1"), Path: path, Generation: "g1", State: stateCached, LastUsed: time.Now(), Bytes: 6}); err != nil {
 		t.Fatal(err)
 	}
-	e, ok := tab.claim("users/ce1")
+	e, ok := tab.claim(shardName("test.users/ce1"))
 	if !ok {
 		t.Fatal("could not claim the name")
 	}

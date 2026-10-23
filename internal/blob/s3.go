@@ -1,6 +1,7 @@
 package blob
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -21,6 +22,9 @@ import (
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
+
+	"github.com/luci1900/shardlite/internal/cluster"
+	"github.com/luci1900/shardlite/internal/pos"
 )
 
 // writeMeta is the user metadata key that holds an object's write id (S3 sends
@@ -81,9 +85,6 @@ func NewS3(ctx context.Context, o S3Options) (*S3, error) {
 		if o.Endpoint != "" {
 			so.BaseEndpoint = aws.String(o.Endpoint)
 		}
-		// The SDK's default checksums break many compatible stores.
-		so.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
-		so.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 	})
 	return &S3{c: c, bucket: o.Bucket, region: cfg.Region}, nil
 }
@@ -112,7 +113,7 @@ func (s *S3) EnsureBucket(ctx context.Context) error {
 // encodeWriteID is the metadata value: "epoch.n.node", the node escaped so the
 // value stays plain ASCII.
 func encodeWriteID(id WriteID) string {
-	return strconv.FormatUint(id.Epoch, 10) + "." + strconv.FormatUint(id.N, 10) + "." + url.QueryEscape(id.Node)
+	return strconv.FormatUint(uint64(id.Epoch), 10) + "." + strconv.FormatUint(id.N, 10) + "." + url.QueryEscape(string(id.Node))
 }
 
 func decodeWriteID(v string) WriteID {
@@ -126,7 +127,7 @@ func decodeWriteID(v string) WriteID {
 	if err1 != nil || err2 != nil || err3 != nil {
 		return WriteID{}
 	}
-	return WriteID{Node: node, Epoch: epoch, N: n}
+	return WriteID{Node: cluster.Node(node), Epoch: pos.Epoch(epoch), N: n}
 }
 
 // s3ETag strips the quotes S3 puts around ETags, the same way everywhere.
@@ -273,10 +274,14 @@ func (s *S3) Get(ctx context.Context, key string) (io.ReadCloser, ETag, error) {
 }
 
 // GetRange reads length bytes from offset (to the end of the object if length is
-// not positive or reaches past it).
+// not positive or reaches past it). A negative offset asks for the last
+// -offset bytes, which the store serves as a suffix range.
 func (s *S3) GetRange(ctx context.Context, key string, offset, length int64) (io.ReadCloser, error) {
 	if offset < 0 {
-		return nil, fmt.Errorf("blob: range offset %d out of bounds", offset)
+		if length != 0 {
+			return nil, fmt.Errorf("blob: a range from the end takes no length (got %d)", length)
+		}
+		return s.getSuffix(ctx, key, -offset)
 	}
 	rng := fmt.Sprintf("bytes=%d-", offset)
 	if length > 0 {
@@ -287,6 +292,37 @@ func (s *S3) GetRange(ctx context.Context, key string, offset, length int64) (io
 		return nil, classify(ctx, err, kindRead, false)
 	}
 	return out.Body, nil
+}
+
+// getSuffix reads the last n bytes of an object. A store that answers a suffix
+// range with a 416 may not serve them, so the object's size is asked for and
+// the same bytes are read from the front instead. An empty object has no last
+// bytes, which is the one thing a suffix range cannot have: it is an empty
+// read.
+func (s *S3) getSuffix(ctx context.Context, key string, n int64) (io.ReadCloser, error) {
+	out, err := s.c.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key), Range: aws.String(fmt.Sprintf("bytes=-%d", n))})
+	if err == nil {
+		return out.Body, nil
+	}
+	if !rangeNotSatisfiable(err) {
+		return nil, classify(ctx, err, kindRead, false)
+	}
+	info, herr := s.Head(ctx, key)
+	if herr != nil {
+		return nil, herr
+	}
+	if info.Size == 0 {
+		return io.NopCloser(bytes.NewReader(nil)), nil
+	}
+	start := max(info.Size-n, 0)
+	return s.GetRange(ctx, key, start, info.Size-start)
+}
+
+// rangeNotSatisfiable reports whether err is the store's answer to a range it
+// cannot serve (416).
+func rangeNotSatisfiable(err error) bool {
+	re, ok := errors.AsType[*awshttp.ResponseError](err)
+	return ok && re.HTTPStatusCode() == http.StatusRequestedRangeNotSatisfiable
 }
 
 func (s *S3) Head(ctx context.Context, key string) (ObjectInfo, error) {

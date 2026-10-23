@@ -11,13 +11,16 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/blobtest"
+	"github.com/luci1900/shardlite/internal/cluster"
 	"github.com/luci1900/shardlite/internal/remindex"
+	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
 type rig struct {
 	t         *testing.T
-	hooked    *blob.Hooked
+	hooked    *blobtest.Hooked
 	manifests shardfile.ManifestStore
 	index     remindex.Index
 	now       time.Time
@@ -25,37 +28,46 @@ type rig struct {
 
 	mu    sync.Mutex
 	sent  []string // "node shard"
-	reply func(node, shard string) (Answer, error)
+	reply func(node string, name shard.Name) (Answer, error)
 }
 
 func newRig(t *testing.T, live ...string) *rig {
 	t.Helper()
-	h := blob.WithHook(blob.NewMemory())
+	h := blobtest.WithHook(blob.NewMemory())
 	store := blob.NewStore(h, "n1", 1, blob.Options{Backoff: time.Millisecond})
 	r := &rig{t: t, hooked: h, manifests: shardfile.NewManifestStore(store), index: remindex.New(store),
 		now: time.Date(2026, 10, 19, 14, 5, 10, 0, time.UTC)}
 	if len(live) == 0 {
 		live = []string{"n1"}
 	}
-	r.reply = func(string, string) (Answer, error) { return Activated, nil }
-	r.p = newDispatcher(Deps{Store: store, Live: func() []string { return live }, Now: func() time.Time { return r.now }, Log: slog.Default(),
-		Dispatch: func(_ context.Context, node, shard string) (Answer, error) {
+	r.reply = func(string, shard.Name) (Answer, error) { return Activated, nil }
+	r.p = newDispatcher(Deps{Store: store, Live: func() []cluster.Node { return liveNodes(live) }, Now: func() time.Time { return r.now }, Log: slog.Default(),
+		Dispatch: func(_ context.Context, node cluster.Node, name shard.Name) (Answer, error) {
 			r.mu.Lock()
 			defer r.mu.Unlock()
-			r.sent = append(r.sent, node+" "+shard)
-			return r.reply(node, shard)
+			r.sent = append(r.sent, string(node)+" "+name.String())
+			return r.reply(string(node), name)
 		}}, Options{Rate: 1e6})
 	return r
+}
+
+// liveNodes converts names to the type Deps.Live speaks.
+func liveNodes(names []string) []cluster.Node {
+	out := make([]cluster.Node, len(names))
+	for i, n := range names {
+		out[i] = cluster.Node(n)
+	}
+	return out
 }
 
 func (r *rig) advance(d time.Duration) { r.now = r.now.Add(d) }
 
 // manifest puts a manifest of shard with next_reminder next (0 for none), owned by
 // owner, and returns its version.
-func (r *rig) manifest(shard, owner string, next int64) blob.ETag {
+func (r *rig) manifest(name, owner string, next remindex.Minute) blob.ETag {
 	r.t.Helper()
-	m := &shardfile.Manifest{Generation: "g", Owner: owner, NodeEpoch: 1, Files: []string{}, NextReminder: next}
-	v, err := r.manifests.Put(context.Background(), shard, m, nil)
+	m := &shardfile.Manifest{Generation: "g", Owner: cluster.Node(owner), NodeEpoch: 1, Files: []shardfile.File{}, NextReminder: next}
+	v, err := r.manifests.Put(context.Background(), shard.MustParse(name), m, nil)
 	if err != nil {
 		r.t.Fatal(err)
 	}
@@ -63,9 +75,9 @@ func (r *rig) manifest(shard, owner string, next int64) blob.ETag {
 }
 
 // entry creates the entry of a write based on version, for minute m.
-func (r *rig) entry(shard string, version blob.ETag, m time.Time) remindex.Entry {
+func (r *rig) entry(name string, version blob.ETag, m time.Time) remindex.Entry {
 	r.t.Helper()
-	e := remindex.Entry{Minute: remindex.MinuteAt(m), Shard: shard, Base: remindex.BaseOf(version)}
+	e := remindex.Entry{Minute: remindex.MinuteAt(m), Shard: shard.MustParse(name), Base: remindex.BaseOf(version)}
 	if err := r.index.Create(context.Background(), e); err != nil {
 		r.t.Fatal(err)
 	}
@@ -100,15 +112,15 @@ func (r *rig) sentCount() int {
 func TestBackedEntryIsDispatchedAndMoved(t *testing.T) {
 	t.Parallel()
 	r := newRig(t)
-	v := r.manifest("users/1", "", remindex.MinuteAt(r.now))
-	r.entry("users/1", v, r.now)
+	v := r.manifest("test.users/1", "", remindex.MinuteAt(r.now))
+	r.entry("test.users/1", v, r.now)
 	if !r.pass() {
 		t.Fatal("a pass with a due entry should ask for the next one soon")
 	}
 	if r.sentCount() != 1 {
 		t.Fatalf("sent %v", r.sent)
 	}
-	want := remindex.Entry{Minute: remindex.MinuteAt(r.now) + 1, Shard: "users/1", Base: remindex.BaseOf(v), N: 1}
+	want := remindex.Entry{Minute: remindex.MinuteAt(r.now) + 1, Shard: shard.MustParse("test.users/1"), Base: remindex.BaseOf(v), N: 1}
 	if got := r.all(); len(got) != 1 || got[0] != want {
 		t.Fatalf("entries %+v, want %+v", got, want)
 	}
@@ -121,9 +133,9 @@ func TestBackedEntryIsDispatchedAndMoved(t *testing.T) {
 func TestActiveShardsEntryGoesToTheCap(t *testing.T) {
 	t.Parallel()
 	r := newRig(t)
-	r.reply = func(string, string) (Answer, error) { return Active, nil }
-	v := r.manifest("users/1", "n1", remindex.MinuteAt(r.now))
-	r.entry("users/1", v, r.now)
+	r.reply = func(string, shard.Name) (Answer, error) { return Active, nil }
+	v := r.manifest("test.users/1", "n1", remindex.MinuteAt(r.now))
+	r.entry("test.users/1", v, r.now)
 	r.pass()
 	got := r.all()
 	if len(got) != 1 || got[0].Minute != remindex.MinuteAt(r.now)+16 {
@@ -136,26 +148,26 @@ func TestActiveShardsEntryGoesToTheCap(t *testing.T) {
 func TestFailingDispatchBacksOff(t *testing.T) {
 	t.Parallel()
 	r := newRig(t)
-	r.reply = func(_, shard string) (Answer, error) {
-		if shard == "gone/1" {
+	r.reply = func(_ string, name shard.Name) (Answer, error) {
+		if name.String() == "test.gone/1" {
 			return 0, errors.New("unknown kind")
 		}
 		return Activated, nil
 	}
-	v := r.manifest("gone/1", "", remindex.MinuteAt(r.now))
-	r.entry("gone/1", v, r.now)
+	v := r.manifest("test.gone/1", "", remindex.MinuteAt(r.now))
+	r.entry("test.gone/1", v, r.now)
 	for i, minutes := range []time.Duration{1, 2, 4, 8, 16, 16} {
 		// A healthy shard due at the same minute is dispatched on time.
-		other := "users/" + string(rune('a'+i))
+		other := "test.users/" + string(rune('a'+i))
 		r.entry(other, r.manifest(other, "", remindex.MinuteAt(r.now)), r.now)
 		r.pass()
 		var failing remindex.Entry
 		for _, e := range r.all() {
-			if e.Shard == "gone/1" {
+			if e.Shard.String() == "test.gone/1" {
 				failing = e
 			}
 		}
-		if want := remindex.MinuteAt(r.now) + int64(minutes); failing.Minute != want || failing.N != i+1 {
+		if want := remindex.MinuteAt(r.now) + remindex.Minute(minutes); failing.Minute != want || failing.N != i+1 {
 			t.Fatalf("after attempt %d the entry is %+v, want %d minutes on", i+1, failing, minutes)
 		}
 		if !slices.Contains(r.sent, "n1 "+other) {
@@ -174,20 +186,20 @@ func TestPruning(t *testing.T) {
 	ctx := context.Background()
 
 	// Moved on without backing it.
-	v := r.manifest("a/1", "", 0)
-	e := r.entry("a/1", v, r.now)
-	if _, err := r.manifests.Put(ctx, "a/1", &shardfile.Manifest{Generation: "g", Files: []string{"1-1.1"}}, &v); err != nil {
+	v := r.manifest("test.a/1", "", 0)
+	e := r.entry("test.a/1", v, r.now)
+	if _, err := r.manifests.Put(ctx, shard.MustParse("test.a/1"), &shardfile.Manifest{Generation: "g", Files: []shardfile.File{{Range: shardfile.Range{Min: 1, Max: 1}, Epoch: 1}}}, &v); err != nil {
 		t.Fatal(err)
 	}
 	// No manifest.
-	r.entry("b/2", "gone", r.now)
+	r.entry("test.b/2", "gone", r.now)
 	// The write may be in flight: its base is current and nothing backs the entry.
-	cur := r.manifest("c/3", "", 0)
-	r.entry("c/3", cur, r.now)
+	cur := r.manifest("test.c/3", "", 0)
+	r.entry("test.c/3", cur, r.now)
 
 	r.pass()
 	got := r.all()
-	if len(got) != 1 || got[0].Shard != "c/3" || got[0].N != 1 {
+	if len(got) != 1 || got[0].Shard.String() != "test.c/3" || got[0].N != 1 {
 		t.Fatalf("entries %+v, want only c/3, moved once (a/1 %+v was pruned)", got, e)
 	}
 	if r.sentCount() != 0 {
@@ -201,16 +213,16 @@ func TestWriteAfterTheReadStillFindsItsEntry(t *testing.T) {
 	t.Parallel()
 	r := newRig(t)
 	ctx := context.Background()
-	v := r.manifest("a/1", "n1", 0)
-	e := r.entry("a/1", v, r.now)
+	v := r.manifest("test.a/1", "n1", 0)
+	e := r.entry("test.a/1", v, r.now)
 	later := remindex.MinuteAt(r.now) - 60 // due already: the write sets a reminder for the entry's minute
 	var once sync.Once
-	r.hooked.SetHook(func(_ context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpGet && after && key == shardfile.ManifestKey("a/1") {
+	r.hooked.SetHook(func(_ context.Context, op blobtest.Op, key string, after bool) error {
+		if op == blobtest.OpGet && after && key == shardfile.ManifestKey(shard.MustParse("test.a/1")) {
 			once.Do(func() {
 				r.hooked.SetHook(nil)
-				m := &shardfile.Manifest{Generation: "g", Owner: "n1", NodeEpoch: 1, Files: []string{"1-1.1"}, NextReminder: later}
-				if _, err := r.manifests.Put(ctx, "a/1", m, &v); err != nil {
+				m := &shardfile.Manifest{Generation: "g", Owner: "n1", NodeEpoch: 1, Files: []shardfile.File{{Range: shardfile.Range{Min: 1, Max: 1}, Epoch: 1}}, NextReminder: later}
+				if _, err := r.manifests.Put(ctx, shard.MustParse("test.a/1"), m, &v); err != nil {
 					t.Error(err)
 				}
 			})
@@ -219,10 +231,10 @@ func TestWriteAfterTheReadStillFindsItsEntry(t *testing.T) {
 	})
 	r.p.handle(ctx, e, r.now)
 	got := r.all()
-	if len(got) != 1 || got[0].Shard != "a/1" {
+	if len(got) != 1 || got[0].Shard.String() != "test.a/1" {
 		t.Fatalf("entries %+v: the write's entry is gone", got)
 	}
-	m, version, err := r.manifests.Get(ctx, "a/1")
+	m, version, err := r.manifests.Get(ctx, shard.MustParse("test.a/1"))
 	if err != nil || !remindex.Backs(m.NextReminder, got[0]) && remindex.Prunable(true, m.NextReminder, version, got[0]) {
 		t.Fatalf("the entry that remains doesn't back the manifest: %+v %v", got, err)
 	}
@@ -234,7 +246,7 @@ func TestTwoDispatchersLoseNothing(t *testing.T) {
 	t.Parallel()
 	r := newRig(t)
 	for i := range 20 {
-		s := "users/" + string(rune('a'+i))
+		s := "test.users/" + string(rune('a'+i))
 		v := r.manifest(s, "", remindex.MinuteAt(r.now))
 		r.entry(s, v, r.now)
 	}
@@ -248,7 +260,7 @@ func TestTwoDispatchersLoseNothing(t *testing.T) {
 		})
 	}
 	wg.Wait()
-	shards := map[string]bool{}
+	shards := map[shard.Name]bool{}
 	for _, e := range r.all() {
 		if e.N == 0 {
 			t.Errorf("entry %+v was not moved", e)
@@ -272,7 +284,7 @@ func TestPlacementSpreadsLoad(t *testing.T) {
 		if !ok {
 			t.Fatal("no node")
 		}
-		counts[node]++
+		counts[string(node)]++
 	}
 	for _, n := range nodes {
 		if counts[n] > 400 || counts[n] == 0 {
@@ -291,7 +303,7 @@ func TestPlacementPrefersALiveOwner(t *testing.T) {
 		}
 	}
 	for range 50 {
-		if node, _ := r.p.place("dead", ""); !strings.HasPrefix(node, "n") {
+		if node, _ := r.p.place("dead", ""); !strings.HasPrefix(string(node), "n") {
 			t.Fatalf("went to %q", node)
 		}
 	}
@@ -302,16 +314,16 @@ func TestPlacementPrefersALiveOwner(t *testing.T) {
 func TestDispatchFallsBackFromAnOwnerThatDoesntAnswer(t *testing.T) {
 	t.Parallel()
 	r := newRig(t, "n1", "n2")
-	r.reply = func(node, _ string) (Answer, error) {
+	r.reply = func(node string, _ shard.Name) (Answer, error) {
 		if node == "n1" {
 			return 0, errors.New("connection refused")
 		}
 		return Activated, nil
 	}
-	v := r.manifest("users/1", "n1", remindex.MinuteAt(r.now))
-	r.entry("users/1", v, r.now)
+	v := r.manifest("test.users/1", "n1", remindex.MinuteAt(r.now))
+	r.entry("test.users/1", v, r.now)
 	r.pass()
-	if want := []string{"n1 users/1", "n2 users/1"}; !slices.Equal(r.sent, want) {
+	if want := []string{"n1 test.users/1", "n2 test.users/1"}; !slices.Equal(r.sent, want) {
 		t.Fatalf("sent %v, want %v", r.sent, want)
 	}
 	if got := r.all(); len(got) != 1 || got[0].N != 1 || got[0].Minute != remindex.MinuteAt(r.now)+1 {

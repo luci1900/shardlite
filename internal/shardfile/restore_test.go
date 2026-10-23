@@ -11,6 +11,8 @@ import (
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/harness"
+	"github.com/luci1900/shardlite/internal/journal"
+	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
@@ -19,8 +21,8 @@ import (
 // entries returns every segment entry of a shard.
 func entries(t *testing.T, e *harness.Env, name string) (out []segment.Entry) {
 	t.Helper()
-	err := segment.Scan(context.Background(), e.Store, e.Node, 1, 0, func(_ uint64, en segment.Entry) error {
-		if en.Shard == name {
+	err := segment.Scan(context.Background(), e.Journal, 1, 0, func(_ pos.Seg, en segment.Entry) error {
+		if en.Shard.String() == name {
 			out = append(out, en)
 		}
 		return nil
@@ -50,9 +52,9 @@ func letGo(t *testing.T, e *harness.Env, app *apptest.App, sh *capture.Shard) {
 	}
 }
 
-// restoreAndCapture follows the sequence from docs/internals.md: restore, register
-// with Litestream starting from the restored state (capture's seed), sync once
-// before any app opens the file (which writes nothing), then let the app write more.
+// restoreAndCapture follows the sequence from docs/internals.md: restore,
+// capture continuing from the restored position, sync once before any app
+// opens the file (which writes nothing), then let the app write more.
 func restoreAndCapture(t *testing.T, e *harness.Env, v variant) {
 	t.Helper()
 	ctx := context.Background()
@@ -95,7 +97,7 @@ func restoreAndCapture(t *testing.T, e *harness.Env, v variant) {
 		removeLocal(t, path)
 
 		// Restore, register, and sync before any app has the file open.
-		res, err := e.Files.Restore(ctx, shard, path, shardfile.RestoreOptions{})
+		res, err := e.Files.Restore(ctx, shardName(shard), path, shardfile.RestoreOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -126,7 +128,7 @@ func restoreAndCapture(t *testing.T, e *harness.Env, v variant) {
 			if en.Position != next {
 				t.Fatalf("activation %d: entry %d is at position %d, want %d", act, i, en.Position, next)
 			}
-			next += en.Count
+			next += pos.Position(en.Count)
 		}
 		position = next - 1
 		if position != sh.Position() {
@@ -134,7 +136,7 @@ func restoreAndCapture(t *testing.T, e *harness.Env, v variant) {
 		}
 		// Nothing but the three commits was uploaded: no entry holds more than a fraction of the database's pages.
 		for _, en := range all {
-			b, err := harness.ReadEntry(ctx, e.Store, e.Node, entrySeq(t, e, en), en)
+			b, err := harness.ReadEntry(ctx, e.Journal, entrySeq(t, e, en), en)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -148,7 +150,7 @@ func restoreAndCapture(t *testing.T, e *harness.Env, v variant) {
 	// Restoring again from manifest plus tails of every activation gives the app's final state.
 	want := apptest.Dump(t, path)
 	again := filepath.Join(t.TempDir(), "again.db")
-	res, err := e.Files.Restore(ctx, shard, again, shardfile.RestoreOptions{})
+	res, err := e.Files.Restore(ctx, shardName(shard), again, shardfile.RestoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,14 +168,14 @@ func restoreAndCapture(t *testing.T, e *harness.Env, v variant) {
 		t.Fatalf("delta ends at position %d, want %d", last, position)
 	}
 	third := filepath.Join(t.TempDir(), "third.db")
-	if _, err := e.Files.Restore(ctx, shard, third, shardfile.RestoreOptions{}); err != nil {
+	if _, err := e.Files.Restore(ctx, shardName(shard), third, shardfile.RestoreOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if got := sqlitetest.Dump(t, third); got != want {
 		t.Fatal("restore after a delta differs from the app's final state")
 	}
-	// Manifests never contain Litestream's numbers: their ranges are positions from 1.
-	files, _ := res.Handle.Manifest.List()
+	// Manifests contain the shard's own positions: their ranges start at 1.
+	files := res.Handle.Manifest.Files
 	if files[0].Min != 1 {
 		t.Fatalf("first file %s does not start at position 1", files[0])
 	}
@@ -198,10 +200,10 @@ func TestRestoreThenCapture(t *testing.T) {
 }
 
 // entrySeq finds the segment holding an entry.
-func entrySeq(t *testing.T, e *harness.Env, want segment.Entry) uint64 {
+func entrySeq(t *testing.T, e *harness.Env, want segment.Entry) pos.Seg {
 	t.Helper()
-	var found uint64
-	err := segment.Scan(context.Background(), e.Store, e.Node, 1, 0, func(seq uint64, en segment.Entry) error {
+	var found pos.Seg
+	err := segment.Scan(context.Background(), e.Journal, 1, 0, func(seq pos.Seg, en segment.Entry) error {
 		if en == want {
 			found = seq
 		}
@@ -256,8 +258,8 @@ func TestRestoreFindsTailAfterOldSegmentsExpire(t *testing.T) {
 	want := apptest.Dump(t, e.Path(shard))
 
 	// The lifecycle rule has removed every segment before the tail's.
-	for seq := uint64(1); seq < firstTail; seq++ {
-		if err := e.Store.Delete(ctx, segment.Key(e.Node, seq), ""); err != nil {
+	for seq := pos.Seg(1); seq < firstTail; seq++ {
+		if err := e.Store.Delete(ctx, journal.Key(e.Node, seq), ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -273,7 +275,7 @@ func TestRestoreFindsTailAfterOldSegmentsExpire(t *testing.T) {
 		t.Fatal(err)
 	}
 	dst := filepath.Join(t.TempDir(), "explicit.db")
-	if _, err := e.Files.Restore(ctx, shard, dst, shardfile.RestoreOptions{Journal: idx}); err != nil {
+	if _, err := e.Files.Restore(ctx, shardName(shard), dst, shardfile.RestoreOptions{Journal: idx}); err != nil {
 		t.Fatal(err)
 	}
 	if got := sqlitetest.Dump(t, dst); got != want {

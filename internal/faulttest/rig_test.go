@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -27,12 +28,15 @@ import (
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/coord"
+	"github.com/luci1900/shardlite/internal/journal"
+	"github.com/luci1900/shardlite/internal/kill"
 	"github.com/luci1900/shardlite/internal/s3test"
+	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
 )
 
-const shardName = "users/1"
+const shardName = "fault.users/1"
 
 // rig is one shard with an app process and a node process, either of which
 // can be killed and started again.
@@ -53,7 +57,7 @@ func newRig(t *testing.T) *rig {
 	t.Helper()
 	st := s3test.Setup(t)
 	dir := t.TempDir()
-	r := &rig{t: t, acked: map[int]bool{}, dir: dir, store: st, path: filepath.Join(dir, "users-1.db")}
+	r := &rig{t: t, acked: map[int]bool{}, dir: dir, store: st, path: filepath.Join(dir, "fault-users-1.db")}
 	r.startNode()
 	r.startApp()
 	r.app.Must(t, "open", "a", r.path)
@@ -63,7 +67,7 @@ func newRig(t *testing.T) *rig {
 
 func (r *rig) startNode() {
 	r.t.Helper()
-	n, err := apptest.StartAt(apptest.Build(r.t, "./internal/testnode"), append(r.store.Args(), "-meta", filepath.Join(r.dir, "meta"))...)
+	n, err := apptest.StartAt(apptest.Build(r.t, "./internal/testnode"), r.store.Args()...)
 	if err != nil {
 		r.t.Fatal(err)
 	}
@@ -149,16 +153,16 @@ func (r *rig) recoverAll() string {
 // reactivate lets go of the shard (the app closes it, the node releases it) and
 // activates it again from blob storage with a kill armed at point. It returns
 // after the node has died, leaving the app and the files as they are.
-func (r *rig) reactivate(point string) {
+func (r *rig) reactivate(point kill.Point) {
 	r.t.Helper()
 	r.app.Must(r.t, "close", "a")
 	if v, err := r.node.Do("release", shardName); err != nil || v != "released" {
 		r.t.Fatalf("release: %q %v", v, err)
 	}
 	r.ackPending()
-	r.node.Must(r.t, "arm", point)
+	r.node.Must(r.t, "arm", string(point))
 	// A restart restores from blob storage, so the file is discarded first. The
-	// WAL Litestream left is removed with it, which the node's own reactivation
+	// WAL capture left is removed with it, which the node's own reactivation
 	// from its cache does not do (see TestReactivationFoldsTheWALItLeft).
 	if _, err := r.node.Do("open", shardName, r.path); err == nil {
 		r.t.Fatalf("open succeeded though the node should have died at %s", point)
@@ -169,14 +173,14 @@ func (r *rig) reactivate(point string) {
 // reactivateCached is reactivate for a shard activated from the files its release
 // left, WAL included (as a cached shard is), not from blob storage. The shard's
 // tail is written as a delta when it is released, as before a shard is cached.
-func (r *rig) reactivateCached(point string) {
+func (r *rig) reactivateCached(point kill.Point) {
 	r.t.Helper()
 	r.app.Must(r.t, "close", "a")
 	if v, err := r.node.Do("release", shardName, "delta"); err != nil || v != "released" {
 		r.t.Fatalf("release: %q %v", v, err)
 	}
 	r.ackPending()
-	r.node.Must(r.t, "arm", point)
+	r.node.Must(r.t, "arm", string(point))
 	if _, err := r.node.Do("cached", shardName, r.path); err == nil {
 		r.t.Fatalf("cached activation succeeded though the node should have died at %s", point)
 	}
@@ -186,9 +190,10 @@ func (r *rig) reactivateCached(point string) {
 // verify restores the shard from blob storage into a fresh file and checks the invariant.
 func (r *rig) verify(label string) {
 	r.t.Helper()
+	r.noChecksumError(label)
 	files := r.readFiles()
 	dst := filepath.Join(r.t.TempDir(), "verify.db")
-	res, err := files.Restore(context.Background(), shardName, dst, shardfile.RestoreOptions{})
+	res, err := files.Restore(context.Background(), shard.MustParse(shardName), dst, shardfile.RestoreOptions{})
 	if err != nil {
 		r.t.Fatalf("%s: restore: %v", label, err)
 	}
@@ -203,12 +208,23 @@ func (r *rig) verify(label string) {
 	}
 }
 
+// noChecksumError fails the test if the node logged that a snapshot's checksum
+// was not the capture's: the capture went wrong somewhere, which the fault
+// tests must never see.
+func (r *rig) noChecksumError(label string) {
+	r.t.Helper()
+	if s := r.node.Stderr(); strings.Contains(s, "the capture went wrong somewhere") {
+		r.t.Fatalf("%s: the node logged a checksum error: %s", label, s)
+	}
+}
+
 // readFiles is a reader of the rig's bucket that is no node: it finds
 // each journal's range in the node's lease.
 func (r *rig) readFiles() *shardfile.Files {
 	r.t.Helper()
 	l := r.store.Backend(r.t)
-	return &shardfile.Files{Blob: blob.NewStore(l, "verifier", 1, blob.Options{}), Node: "verifier", Leases: coord.NewRegistry(l, "verifier", coord.RegistryOptions{}), TempDir: r.t.TempDir()}
+	return &shardfile.Files{Blob: blob.NewStore(l, "verifier", 1, blob.Options{}), Backend: l, Node: "verifier",
+		JournalOptions: journal.Options(blob.Options{}), Leases: coord.NewRegistry(l, "verifier", coord.RegistryOptions{}), TempDir: r.t.TempDir()}
 }
 
 func acksIn(t *testing.T, path string) map[int]bool {
@@ -237,7 +253,7 @@ func (r *rig) hasCommit(n int) bool {
 	r.t.Helper()
 	files := r.readFiles()
 	dst := filepath.Join(r.t.TempDir(), "has.db")
-	if _, err := files.Restore(context.Background(), shardName, dst, shardfile.RestoreOptions{}); err != nil {
+	if _, err := files.Restore(context.Background(), shard.MustParse(shardName), dst, shardfile.RestoreOptions{}); err != nil {
 		r.t.Fatal(err)
 	}
 	return acksIn(r.t, dst)[n]

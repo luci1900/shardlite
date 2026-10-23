@@ -24,11 +24,11 @@ func TestGRPCThroughTheNode(t *testing.T) {
 	ctx, cancel := timeout(60 * time.Second)
 	defer cancel()
 
-	s.create(t, "wallet/g1", "wallet/g2", "wallet/g3", "wallet/g4", "wallet/g5", "wallet/g7", "wallet/g8", "wallet/r1")
+	s.create(t, "e2e.wallet/g1", "e2e.wallet/g2", "e2e.wallet/g3", "e2e.wallet/g4", "e2e.wallet/g5", "e2e.wallet/g7", "e2e.wallet/g8", "e2e.wallet/r1")
 
 	t.Run("unary with headers and trailers", func(t *testing.T) {
 		var hdr, tr metadata.MD
-		out, err := unary(withMD(ctx, "shardlite-target", "wallet/g1"), pub, "Add", "u1", grpc.Header(&hdr), grpc.Trailer(&tr))
+		out, err := unary(withMD(ctx, "shardlite-target", "e2e.wallet/g1"), pub, "Add", "u1", grpc.Header(&hdr), grpc.Trailer(&tr))
 		if err != nil || out != "ok:u1" {
 			t.Fatalf("%q %v", out, err)
 		}
@@ -38,13 +38,13 @@ func TestGRPCThroughTheNode(t *testing.T) {
 		if h := tr.Get("x-app-trailer"); len(h) != 1 || h[0] != "t-u1" {
 			t.Fatalf("trailer: %v", tr)
 		}
-		if !v.has("wallet/g1", "u1") {
+		if !v.has("e2e.wallet/g1", "u1") {
 			t.Fatal("the reply came before the commit was durable")
 		}
 	})
 
 	t.Run("server streaming", func(t *testing.T) {
-		st, err := open(withMD(ctx, "shardlite-target", "wallet/g2"), pub, "Watch", true, false)
+		st, err := open(withMD(ctx, "shardlite-target", "e2e.wallet/g2"), pub, "Watch", true, false)
 		if err != nil || send(st, "w 4") != nil || st.CloseSend() != nil {
 			t.Fatal(err)
 		}
@@ -53,7 +53,7 @@ func TestGRPCThroughTheNode(t *testing.T) {
 			if err != nil || m != fmt.Sprintf("ok:w-%d", i) {
 				t.Fatalf("message %d: %q %v", i, m, err)
 			}
-			if !v.has("wallet/g2", fmt.Sprintf("w-%d", i)) {
+			if !v.has("e2e.wallet/g2", fmt.Sprintf("w-%d", i)) {
 				t.Fatalf("message %d reached the client before its commit was durable", i)
 			}
 		}
@@ -66,7 +66,7 @@ func TestGRPCThroughTheNode(t *testing.T) {
 	})
 
 	t.Run("client streaming", func(t *testing.T) {
-		st, err := open(withMD(ctx, "shardlite-target", "wallet/g3"), pub, "Collect", false, true)
+		st, err := open(withMD(ctx, "shardlite-target", "e2e.wallet/g3"), pub, "Collect", false, true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -84,13 +84,13 @@ func TestGRPCThroughTheNode(t *testing.T) {
 		if tr := st.Trailer().Get("x-app-trailer"); len(tr) != 1 || tr[0] != "collected" {
 			t.Fatalf("trailer: %v", st.Trailer())
 		}
-		if !v.has("wallet/g3", "c-0", "c-1", "c-2", "c-3", "c-4") {
+		if !v.has("e2e.wallet/g3", "c-0", "c-1", "c-2", "c-3", "c-4") {
 			t.Fatal("the reply came before the commits were durable")
 		}
 	})
 
 	t.Run("bidirectional streaming", func(t *testing.T) {
-		st, err := open(withMD(ctx, "shardlite-target", "wallet/g4"), pub, "Chat", true, true)
+		st, err := open(withMD(ctx, "shardlite-target", "e2e.wallet/g4"), pub, "Chat", true, true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -102,7 +102,7 @@ func TestGRPCThroughTheNode(t *testing.T) {
 			if m, err := recv(st); err != nil || m != "ok:"+tok {
 				t.Fatalf("reply %d: %q %v", i, m, err)
 			}
-			if !v.has("wallet/g4", tok) {
+			if !v.has("e2e.wallet/g4", tok) {
 				t.Fatalf("reply %d reached the client before its commit was durable", i)
 			}
 		}
@@ -114,7 +114,7 @@ func TestGRPCThroughTheNode(t *testing.T) {
 
 	t.Run("the app's status and trailers", func(t *testing.T) {
 		var tr metadata.MD
-		_, err := unary(withMD(ctx, "shardlite-target", "wallet/g5"), pub, "Fail", "7 not for you, 100% sure", grpc.Trailer(&tr))
+		_, err := unary(withMD(ctx, "shardlite-target", "e2e.wallet/g5"), pub, "Fail", "7 not for you, 100% sure", grpc.Trailer(&tr))
 		if status.Code(err) != codes.PermissionDenied || status.Convert(err).Message() != "not for you, 100% sure" {
 			t.Fatalf("%v", err)
 		}
@@ -127,33 +127,33 @@ func TestGRPCThroughTheNode(t *testing.T) {
 		for _, c := range []struct {
 			name, shard string
 			code        codes.Code
-		}{{"undeclared kind", "typo/1", codes.NotFound}, {"private kind", "audit/1", codes.NotFound}, {"missing shard", "wallet/none", codes.NotFound}, {"bad target", "nokind", codes.InvalidArgument}} {
+		}{{"undeclared kind", "e2e.typo/1", codes.NotFound}, {"private kind", "e2e.audit/1", codes.NotFound}, {"missing shard", "e2e.wallet/none", codes.NotFound}, {"bad target", "nokind", codes.InvalidArgument}} {
 			_, err := unary(withMD(ctx, "shardlite-target", c.shard), pub, "Add", "x")
 			if status.Code(err) != c.code {
 				t.Errorf("%s: %v, want %v", c.name, err, c.code)
 			}
 		}
 		// Shardlite-If-Active on a shard that isn't active: NotFound, and it stays inactive.
-		_, err := unary(withMD(ctx, "shardlite-target", "wallet/g6", "shardlite-if-active", "true"), ctl, "Who", "")
+		_, err := unary(withMD(ctx, "shardlite-target", "e2e.wallet/g6", "shardlite-if-active", "true"), ctl, "Who", "")
 		if status.Code(err) != codes.NotFound {
 			t.Errorf("inactive shard: %v, want NotFound", err)
 		}
-		if _, err := unary(withMD(ctx, "shardlite-target", "wallet/g6"), ctl, "Add", "g6"); err != nil { // a call creates it
+		if _, err := unary(withMD(ctx, "shardlite-target", "e2e.wallet/g6"), ctl, "Add", "g6"); err != nil { // a call creates it
 			t.Fatal(err)
 		}
-		if _, err := unary(withMD(ctx, "shardlite-target", "wallet/g6", "shardlite-if-active", "true"), ctl, "Who", ""); err != nil {
+		if _, err := unary(withMD(ctx, "shardlite-target", "e2e.wallet/g6", "shardlite-if-active", "true"), ctl, "Who", ""); err != nil {
 			t.Errorf("active shard: %v", err)
 		}
 		// The hop limit (32 by default): a call made while serving hop 32 would be hop 33.
-		_, err = unary(withMD(ctx, "shardlite-target", "wallet/g6", "shardlite-hops", "32"), ctl, "Who", "")
+		_, err = unary(withMD(ctx, "shardlite-target", "e2e.wallet/g6", "shardlite-hops", "32"), ctl, "Who", "")
 		if status.Code(err) != codes.ResourceExhausted {
 			t.Errorf("hop limit: %v, want ResourceExhausted", err)
 		}
-		if out, err := unary(withMD(ctx, "shardlite-target", "wallet/g6", "shardlite-hops", "31"), ctl, "Who", ""); err != nil || !strings.HasSuffix(out, "hops=32") {
+		if out, err := unary(withMD(ctx, "shardlite-target", "e2e.wallet/g6", "shardlite-hops", "31"), ctl, "Who", ""); err != nil || !strings.HasSuffix(out, "hops=32") {
 			t.Errorf("last hop allowed: %q %v", out, err)
 		}
 		// A node error in a stream is the stream's status too.
-		st, err := open(withMD(ctx, "shardlite-target", "typo/1"), pub, "Chat", true, true)
+		st, err := open(withMD(ctx, "shardlite-target", "e2e.typo/1"), pub, "Chat", true, true)
 		if err == nil {
 			_, err = recv(st)
 		}
@@ -168,7 +168,7 @@ func TestGRPCThroughTheNode(t *testing.T) {
 		defer cancel()
 		hold := make(chan error, 1)
 		go func() {
-			_, err := unary(withMD(c, "shardlite-target", "wallet/g7"), pub, "Hold", "", grpc.WaitForReady(false))
+			_, err := unary(withMD(c, "shardlite-target", "e2e.wallet/g7"), pub, "Hold", "", grpc.WaitForReady(false))
 			hold <- err
 		}()
 		eventually(t, "the call to reach the app", func() bool { return s.appDebug().HoldStarted > before.HoldStarted })
@@ -178,7 +178,7 @@ func TestGRPCThroughTheNode(t *testing.T) {
 		if rec.GRPCTimeout == "" {
 			t.Errorf("the app saw no grpc-timeout")
 		}
-		if rec.Target != "wallet/g7" || rec.DeadlineMS <= 0 || rec.DeadlineMS > 2000 {
+		if rec.Target != "e2e.wallet/g7" || rec.DeadlineMS <= 0 || rec.DeadlineMS > 2000 {
 			t.Errorf("handler context: %+v", rec)
 		}
 		if err := <-hold; status.Code(err) != codes.DeadlineExceeded {
@@ -192,7 +192,7 @@ func TestGRPCThroughTheNode(t *testing.T) {
 		c, cancel := timeout(30 * time.Second)
 		done := make(chan error, 1)
 		go func() {
-			_, err := unary(withMD(c, "shardlite-target", "wallet/g8"), pub, "Hold", "")
+			_, err := unary(withMD(c, "shardlite-target", "e2e.wallet/g8"), pub, "Hold", "")
 			done <- err
 		}()
 		eventually(t, "the call to reach the app", func() bool { return s.appDebug().HoldStarted > before.HoldStarted })
@@ -204,21 +204,21 @@ func TestGRPCThroughTheNode(t *testing.T) {
 	})
 
 	t.Run("a call from the app to another shard", func(t *testing.T) {
-		out, err := unary(withMD(ctx, "shardlite-target", "wallet/r1"), pub, "Relay", "wallet/r2 rt1")
+		out, err := unary(withMD(ctx, "shardlite-target", "e2e.wallet/r1"), pub, "Relay", "e2e.wallet/r2 rt1")
 		if err != nil || out != "ok:credit:rt1" {
 			t.Fatalf("%q %v", out, err)
 		}
 		// Sync is on for the kind: both ends are durable when the reply arrives.
-		if !v.has("wallet/r1", "debit:rt1") || !v.has("wallet/r2", "credit:rt1") {
+		if !v.has("e2e.wallet/r1", "debit:rt1") || !v.has("e2e.wallet/r2", "credit:rt1") {
 			t.Fatal("the relay returned before both commits were durable")
 		}
 		// The callee sees who called it and one more hop (this is what the app sent).
-		out, err = unary(withMD(ctx, "shardlite-target", "wallet/r2", "shardlite-caller", "wallet/r1", "shardlite-hops", "3"), ctl, "Who", "")
-		if err != nil || out != "target=wallet/r2 caller=wallet/r1 hops=4" {
+		out, err = unary(withMD(ctx, "shardlite-target", "e2e.wallet/r2", "shardlite-caller", "e2e.wallet/r1", "shardlite-hops", "3"), ctl, "Who", "")
+		if err != nil || out != "target=e2e.wallet/r2 caller=e2e.wallet/r1 hops=4" {
 			t.Fatalf("who: %q %v", out, err)
 		}
 		// The callee's status passes back: the hop limit, hit by the app's own call.
-		_, err = unary(withMD(ctx, "shardlite-target", "wallet/r1", "shardlite-hops", "31"), ctl, "Relay", "wallet/r2 rt2")
+		_, err = unary(withMD(ctx, "shardlite-target", "e2e.wallet/r1", "shardlite-hops", "31"), ctl, "Relay", "e2e.wallet/r2 rt2")
 		if status.Code(err) != codes.ResourceExhausted {
 			t.Fatalf("relay at the hop limit: %v, want ResourceExhausted", err)
 		}

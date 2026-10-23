@@ -49,12 +49,12 @@ const remindersPath = apiPrefix + "reminders"
 // /_shardlite/reminders for the shard itself, through the same routing as a call
 // over the control API, in process with no socket and with the reminder timeout
 // on its context. A system shard's routing ends in its system app.
-func (s *Server) wakeApp(ctx context.Context, a *shard) (int, error) {
+func (s *Server) wakeApp(ctx context.Context, a *actor) (int, error) {
 	ctx, cancel := context.WithTimeout(ctx, s.opts.ReminderTimeout)
 	defer cancel()
 	req := (&http.Request{Method: http.MethodPost, URL: &url.URL{Path: remindersPath}, Host: "localhost", Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1, Header: http.Header{}, Body: http.NoBody}).WithContext(ctx)
-	req.Header.Set(hdrTarget, a.Name)
-	req.Header.Set(hdrCaller, a.Name)
+	req.Header.Set(hdrTarget, a.Name.String())
+	req.Header.Set(hdrCaller, a.Name.String())
 	w := &discardWriter{header: http.Header{}}
 	status, err := s.serveInternal(w, req, origin{kind: fromWake})
 	if err != nil || status/100 == 2 {

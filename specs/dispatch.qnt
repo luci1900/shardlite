@@ -563,7 +563,7 @@ module dispatch {
     }
   }
 
-  // A dispatcher stops partway (a move of `_dispatch`, a crash): it forgets its pass.
+  // A dispatcher stops partway (a move of `_system.dispatch`, a crash): it forgets its pass.
   action dStop(d) = all {
     s.disps.get(d).phase > 0,
     s' = withDisp(s, d, idle)

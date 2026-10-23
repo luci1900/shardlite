@@ -1,8 +1,8 @@
 // Package sweep is the _sweep system kind (docs/internals.md, Garbage): one
-// shard, _sweep/_cluster, that deletes the LTX files no manifest lists. Its
-// wake does one batch of a pass over data/shards/ and sets its next reminder, so
-// each wake is short, a move or a crash resumes where it stopped and the
-// reminders loop paces it.
+// shard, _system.sweep/_cluster, that deletes the LTX files no manifest lists.
+// Its wake does one batch of a pass over data/shards/ and sets its next
+// reminder, so each wake is short, a move or a crash resumes where it stopped
+// and the reminders loop paces it.
 package sweep
 
 import (
@@ -20,6 +20,7 @@ import (
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/kind"
+	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/system"
 )
@@ -64,9 +65,9 @@ func New(store *blob.Store, check func() error, now func() time.Time, log *slog.
 		opts.Every = 24 * time.Hour
 	}
 	sw := &sweeper{store: store, manifests: shardfile.NewManifestStore(store), check: check, now: now, log: log, opts: opts}
-	// Sync off: a cursor a host loss loses only repeats a batch, and nothing acts
+	// The local tier: a cursor a host loss loses only repeats a batch, and nothing acts
 	// on the sweeper's answers.
-	return kind.Kind{Name: "_sweep", Sync: kind.SyncOff, IDs: []string{"_cluster"}, Migrations: migrations, Handler: sw.handler}
+	return kind.Kind{Name: kind.SystemKind("sweep"), Sync: kind.SyncLocal, IDs: []shard.ID{"_cluster"}, Migrations: migrations, Handler: sw.handler}
 }
 
 type sweeper struct {
@@ -137,7 +138,7 @@ type batch struct {
 }
 
 type shardFiles struct {
-	name  string
+	name  shard.Name
 	files []blob.ObjectInfo
 }
 
@@ -171,12 +172,13 @@ func (sw *sweeper) list(ctx context.Context, cursor string) (batch, error) {
 
 // shardOf is the shard a key belongs to:
 // data/shards/{kind}/{id}/{generation}/{file}.ltx.
-func shardOf(key string) (string, bool) {
+func shardOf(key string) (shard.Name, bool) {
 	parts := strings.Split(strings.TrimPrefix(key, shardfile.FilesPrefix), "/")
 	if len(parts) != 4 || !strings.HasSuffix(parts[3], ".ltx") {
-		return "", false
+		return shard.Name{}, false
 	}
-	return parts[0] + "/" + parts[1], true
+	name, err := shard.ParseName(parts[0] + "/" + parts[1])
+	return name, err == nil
 }
 
 // sweep deletes the garbage among the batch's files and returns how many it
@@ -215,17 +217,17 @@ func (sw *sweeper) garbage(ctx context.Context, sh shardFiles) ([]string, error)
 	if err != nil && !errors.Is(err, blob.ErrNotFound) {
 		return nil, err
 	}
-	gens := map[string][]blob.ObjectInfo{}
+	gens := map[shard.Gen][]blob.ObjectInfo{}
 	for _, f := range sh.files {
-		gen := strings.Split(strings.TrimPrefix(f.Key, shardfile.ShardPrefix(sh.name)), "/")[0]
+		gen := shard.Gen(strings.Split(strings.TrimPrefix(f.Key, shardfile.ShardPrefix(sh.name)), "/")[0])
 		gens[gen] = append(gens[gen], f)
 	}
 	var out []string
 	for gen, files := range gens {
 		if m != nil && gen == m.Generation {
 			listed := map[string]bool{}
-			for _, name := range m.Files {
-				listed[shardfile.GenerationPrefix(sh.name, gen)+name+".ltx"] = true
+			for _, f := range m.Files {
+				listed[shardfile.FileKey(sh.name, gen, f)] = true
 			}
 			for _, f := range files {
 				if !listed[f.Key] && f.LastModified.Before(old) {

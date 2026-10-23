@@ -112,11 +112,6 @@ func (s *shardSim) liveDump() string {
 // starts the app and checks it sees what the shard held.
 func (s *shardSim) activate(res *shardfile.Restored) {
 	s.rt.Helper()
-	meta, err := os.MkdirTemp(s.e.Dir, "meta") // tmpfs in production: a crash loses it
-	if err != nil {
-		s.rt.Fatal(err)
-	}
-	s.e.Meta = meta
 	if res != nil {
 		s.h, s.sh = res.Handle, s.e.Activate(res.Handle, res.Capture)
 	} else {
@@ -133,7 +128,7 @@ func (s *shardSim) activate(res *shardfile.Restored) {
 }
 
 // startApp starts the app with a short busy timeout: a TRUNCATE checkpoint
-// waits for readers (Litestream's) until it gives up, which would otherwise be
+// waits for readers (capture's) until it gives up, which would otherwise be
 // the five seconds the other tests use.
 func (s *shardSim) startApp() {
 	s.rt.Helper()
@@ -174,7 +169,7 @@ func (s *shardSim) ensureActive() {
 func (s *shardSim) durableDump() string {
 	s.rt.Helper()
 	dst := filepath.Join(s.e.T.TempDir(), "check.db")
-	if _, err := s.e.Files.Restore(s.ctx, shard, dst, shardfile.RestoreOptions{}); err != nil {
+	if _, err := s.e.Files.Restore(s.ctx, shardName(shard), dst, shardfile.RestoreOptions{}); err != nil {
 		s.rt.Fatalf("restore: %v", err)
 	}
 	d, err := sqlitetest.TryDump(dst)
@@ -363,7 +358,7 @@ func (s *shardSim) actionsMap() map[string]func(*rapid.T) {
 			s.step(func() {
 				s.deactivate()
 				dropLocal(s.rt, s.path())
-				res, err := s.e.Files.Restore(s.ctx, shard, s.path(), shardfile.RestoreOptions{})
+				res, err := s.e.Files.Restore(s.ctx, shardName(shard), s.path(), shardfile.RestoreOptions{})
 				if err != nil {
 					s.rt.Fatalf("restore: %v", err)
 				}
@@ -378,7 +373,7 @@ func (s *shardSim) actionsMap() map[string]func(*rapid.T) {
 				s.app.Kill()
 				s.active, s.sh, s.app = false, nil, nil
 				dropLocal(s.rt, s.path())
-				res, err := s.e.Files.Restore(s.ctx, shard, s.path(), shardfile.RestoreOptions{})
+				res, err := s.e.Files.Restore(s.ctx, shardName(shard), s.path(), shardfile.RestoreOptions{})
 				if err != nil {
 					s.rt.Fatalf("restore after the crash: %v", err)
 				}

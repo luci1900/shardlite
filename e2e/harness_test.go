@@ -22,20 +22,24 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"github.com/luci1900/shardlite/e2e/e2eapp"
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/coord"
+	"github.com/luci1900/shardlite/internal/journal"
 	"github.com/luci1900/shardlite/internal/s3test"
+	shardpkg "github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
-const kindsJSON = `{"kinds": {
-	"users":  {"public": true, "sync": "off", "idle_timeout": "2s"},
-	"wallet": {"public": true, "idle_timeout": "2s"},
-	"lobby":  {"public": true, "idle_timeout": "2s"},
-	"arena":  {"public": true, "idle_timeout": "300ms"},
-	"audit":  {}
-}}`
+// declarationJSON is the declaration the app serves at its ready route
+// (docs/guide.md, Shard kinds), kept in a file in the stack's directory so a
+// rewrite stands in for a new deploy. It starts as the app's built-in
+// declaration.
+const declarationJSON = e2eapp.DefaultDeclaration
+
+// shardName is a shard's name in the tests that need the parsed type.
+func shardName(s string) shardpkg.Name { return shardpkg.MustParse(s) }
 
 type lockedBuf struct {
 	mu sync.Mutex
@@ -173,15 +177,19 @@ func newStack(t testing.TB, nodeEnv ...string) *stack {
 	s := &stack{t: t, store: s3test.Setup(t), dir: t.TempDir(), env: nodeEnv}
 	s.nodeBin = apptest.Build(t, "./cmd/shardlite")
 	appBin := buildApp(t)
-	if err := os.WriteFile(filepath.Join(s.dir, "kinds.json"), []byte(kindsJSON), 0o644); err != nil {
+	if err := os.WriteFile(s.declarePath(), []byte(declarationJSON), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	s.pub, s.ctl = freeAddr(t), freeAddr(t)
-	s.app = startProc(t, "e2eapp", appBin, nil, "-listen", "127.0.0.1:0", "-control", s.ctl)
+	s.app = startProc(t, "e2eapp", appBin, nil, "-listen", "127.0.0.1:0", "-control", s.ctl, "-declare", s.declarePath())
 	s.appAddr = s.app.waitFor(t, `listening (\S+)`, 20*time.Second)[1]
 	s.startNode()
 	return s
 }
+
+// declarePath is the file the app serves at its ready route: a rewrite of it
+// is a new deploy as far as the node's poll is concerned.
+func (s *stack) declarePath() string { return filepath.Join(s.dir, "declaration.json") }
 
 // blobEnv is the node's blob storage settings: RustFS with a prefix of this
 // stack's own.
@@ -193,8 +201,8 @@ func (s *stack) blobEnv() []string {
 func (s *stack) startNode() {
 	s.t.Helper()
 	env := append(s.blobEnv(), []string{
-		"SHARDLITE_NODE=n1", "SHARDLITE_KINDS=" + filepath.Join(s.dir, "kinds.json"),
-		"SHARDLITE_DATA=" + filepath.Join(s.dir, "data"), "SHARDLITE_SCRATCH_DIR=" + filepath.Join(s.dir, "meta"),
+		"SHARDLITE_NODE=n1",
+		"SHARDLITE_DATA=" + filepath.Join(s.dir, "data"),
 		"SHARDLITE_APP=http://" + s.appAddr, "SHARDLITE_LISTEN_PUBLIC=" + s.pub, "SHARDLITE_LISTEN_CONTROL=" + s.ctl, "SHARDLITE_LISTEN_PEER=127.0.0.1:0",
 		"SHARDLITE_FLUSH=50ms", "SHARDLITE_LEASE_TTL=5s",
 	}...)
@@ -262,8 +270,9 @@ type verifier struct {
 func newVerifier(t testing.TB, s *stack) *verifier {
 	l := s.store.Backend(t)
 	return &verifier{t, &shardfile.Files{
-		Blob: blob.NewStore(l, "verifier", 1, blob.Options{}), Node: "verifier",
-		Leases: coord.NewRegistry(l, "verifier", coord.RegistryOptions{}), TempDir: t.TempDir(),
+		Blob: blob.NewStore(l, "verifier", 1, blob.Options{}), Backend: l, Node: "verifier",
+		JournalOptions: journal.Options(blob.Options{}),
+		Leases:         coord.NewRegistry(l, "verifier", coord.RegistryOptions{}), TempDir: t.TempDir(),
 	}}
 }
 
@@ -273,7 +282,7 @@ func newVerifier(t testing.TB, s *stack) *verifier {
 func (v *verifier) tokens(shard string) (toks map[string]bool, ok bool, err error) {
 	dst := filepath.Join(v.t.TempDir(), "restore.db")
 	defer os.Remove(dst)
-	if _, err := v.files.Restore(context.Background(), shard, dst, shardfile.RestoreOptions{}); err != nil {
+	if _, err := v.files.Restore(context.Background(), shardName(shard), dst, shardfile.RestoreOptions{}); err != nil {
 		if errors.Is(err, blob.ErrNotFound) || errors.Is(err, shardfile.ErrNothingToRestore) {
 			return nil, false, nil
 		}
@@ -322,7 +331,7 @@ func (v *verifier) shards() []string {
 		if strings.HasPrefix(shard, "_") {
 			continue
 		}
-		if _, _, err := v.files.GetManifest(context.Background(), shard); errors.Is(err, blob.ErrNotFound) {
+		if _, _, err := v.files.GetManifest(context.Background(), shardName(shard)); errors.Is(err, blob.ErrNotFound) {
 			continue
 		}
 		out = append(out, shard)

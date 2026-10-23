@@ -53,7 +53,7 @@ func (w *watchdog) Serve(ctx context.Context) error {
 // check raises an alert (an error-level log line) if the shard's oldest tail
 // file is older than the tail alert age: its commits are only in journal
 // segments, which expire, and deltas should have replaced them long ago.
-func (w *watchdog) check(a *shard) {
+func (w *watchdog) check(a *actor) {
 	sh := a.cap.load()
 	if sh == nil {
 		return

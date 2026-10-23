@@ -6,28 +6,26 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/benbjohnson/litestream"
-
 	"github.com/luci1900/shardlite/internal/apptest"
-	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/harness"
+	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
 )
 
-const name = "users/7"
+const name = "test.users/7"
 
 func entriesOf(t *testing.T, e *harness.Env, shard string) (out []segment.Entry) {
 	t.Helper()
-	err := segment.Scan(context.Background(), e.Store, e.Node, 1, 0, func(_ uint64, en segment.Entry) error {
-		if en.Shard == shard {
+	err := segment.Scan(context.Background(), e.Journal, 1, 0, func(_ pos.Seg, en segment.Entry) error {
+		if en.Shard.String() == shard {
 			out = append(out, en)
 		}
 		return nil
@@ -38,157 +36,52 @@ func entriesOf(t *testing.T, e *harness.Env, shard string) (out []segment.Entry)
 	return out
 }
 
-func l0Files(t *testing.T, sh *capture.Shard) []string {
-	t.Helper()
-	ents, err := os.ReadDir(sh.DB().LTXLevelDir(0))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var out []string
-	for _, e := range ents {
-		out = append(out, e.Name())
-	}
-	return out
-}
-
-// 6.1: without the Store, does Litestream delete its local level 0 files?
-func TestL0RetentionWithoutStore(t *testing.T) {
-	t.Parallel()
-	e := harness.New(t)
-	ctx := context.Background()
-	app := e.StartApp(name)
-	h, sh := e.NewShard(name)
-	for range 30 {
-		app.Must(t, "insert", "a", "1", "100")
-		if err := sh.Sync(ctx); err != nil {
-			t.Fatal(err)
-		}
-	}
-	n := len(l0Files(t, sh))
-	t.Logf("default L0Retention=%v; after 30 commits there are %d local level 0 files", litestream.DefaultL0Retention, n)
-	if n < 30 {
-		t.Fatalf("only %d local level 0 files after 30 commits", n)
-	}
-	sh.Sync(ctx) // nothing but a Store's compaction deletes level 0 files, and there is none
-	if m := len(l0Files(t, sh)); m < n {
-		t.Fatalf("Litestream deleted local level 0 files by itself (%d -> %d)", n, m)
-	}
-	// They pile up until shardlite drops them with the tail.
-	if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); err != nil {
-		t.Fatal(err)
-	}
-	if m := len(l0Files(t, sh)); m != 1 {
-		t.Fatalf("%d local level 0 files after the delta, want 1 (the newest)", m)
-	}
-	// The shard still syncs after the trim.
-	app.Must(t, "insert", "a", "1", "100")
-	if err := sh.Sync(ctx); err != nil {
-		t.Fatal(err)
-	}
-	sh.Close(ctx)
-}
-
-// ageDatabase sets the last write time of the shard's database file (which
-// Litestream measures its checkpoint interval from, and which commits to a
-// WAL-mode database do not touch) to long ago: the interval has passed.
-func ageDatabase(t *testing.T, path string) {
-	t.Helper()
-	old := time.Now().Add(-10 * time.Hour)
-	if err := os.Chtimes(path, old, old); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// 6.2: how many commits does Litestream make by itself on an idle shard? Each
-// sync here comes after the checkpoint interval has passed since the database
-// file was last written (the worst case for an idle shard: whatever the interval
-// allows is allowed every time), and the shard has to settle.
-func TestIdleShardCommits(t *testing.T) {
-	t.Parallel()
-	for _, tc := range []struct {
-		name     string
-		interval time.Duration
-		syncs    int
-	}{
-		{"checkpoint interval 300ms", 300 * time.Millisecond, 40},
-		{"default checkpoint interval (1m)", 0, 40},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			e := harness.New(t)
-			ctx := context.Background()
-			app := e.StartApp(name)
-			h, created, _ := e.Files.Open(ctx, name)
-			_ = h
-			_ = created
-			sh, err := capture.New(capture.Config{Name: name, Path: e.Path(name), Generation: h.Manifest.Generation, MetaRoot: e.Meta, Writer: e.W,
-				Tune: func(db *litestream.DB) {
-					if tc.interval > 0 {
-						db.CheckpointInterval = tc.interval
-					}
-				}})
-			if err != nil {
-				t.Fatal(err)
-			}
-			for range 10 {
-				app.Must(t, "insert", "a", "5", "200")
-				if err := sh.Sync(ctx); err != nil {
-					t.Fatal(err)
-				}
-			}
-			lastApp := len(entriesOf(t, e, name))
-			var lastChange int
-			prev := lastApp
-			for i := 1; i <= tc.syncs; i++ {
-				ageDatabase(t, e.Path(name))
-				if err := sh.Sync(ctx); err != nil {
-					t.Fatal(err)
-				}
-				if n := len(entriesOf(t, e, name)); n != prev {
-					prev, lastChange = n, i
-				}
-			}
-			extra := prev - lastApp
-			t.Logf("idle for %d syncs: %d commits by Litestream after the last app write (last one at sync %d)", tc.syncs, extra, lastChange)
-			if extra > 0 && tc.interval > 0 && lastChange > tc.syncs/2 {
-				t.Fatalf("still committing at sync %d of %d: does not settle", lastChange, tc.syncs)
-			}
-			sh.Close(ctx)
-		})
-	}
-}
-
-// 6.3: Litestream never checkpoints frames it hasn't captured. Random bursts
-// of writes, syncs at random points, and checkpoints triggered both by size
-// (default thresholds) and by time (short interval). Replaying what was
-// captured must give the app's database.
+// 6.3: no frame is checkpointed away or wiped by a WAL restart before it is
+// captured. Bursts of writes, syncs at random points, the app's checkpoints in
+// every mode between them (all of which find the node's read transaction in the
+// way), an app that leaves checkpointing to its automatic ones or turns them
+// off entirely, and the node's own restart of the WAL at several sizes.
+// Replaying what was captured must give the app's database.
 func TestCheckpointsNeverLoseFrames(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
-		name string
-		tune func(*litestream.DB)
-		rows int // rows of 1 KB per burst
+		name    string
+		restart capture.Frame // frames before the node restarts the WAL (0 for the default)
+		rows    int           // rows of 1 KB per burst
+		manual  bool          // the app checkpoints by hand between commits; off, its automatic ones are turned off too
 	}{
-		{"default thresholds, big bursts", nil, 1400}, // a burst is over 1,000 pages (MinCheckpointPageN)
-		{"short checkpoint interval", func(db *litestream.DB) { db.CheckpointInterval = 100 * time.Millisecond }, 20},
-		{"tiny thresholds", func(db *litestream.DB) { db.MinCheckpointPageN = 10; db.TruncatePageN = 40 }, 30},
+		{"default threshold, big bursts", 0, 1400, true}, // a burst is over the default 1,000 frames
+		{"small threshold", 20, 20, true},
+		{"tiny threshold", 3, 30, true},
+		{"automatic checkpoints off", 0, 1400, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := harness.New(t)
 			ctx := context.Background()
 			app := e.StartApp(name)
-			h, _, err := e.Files.Open(ctx, name)
+			if tc.manual {
+				// The checkpoints find the read transaction in the way by
+				// design, so the app's busy timeout would spend five seconds
+				// on every one of them. A short one keeps the attempts quick:
+				// what is under test is that a checkpoint that cannot restart
+				// the WAL loses nothing, not how long the wait takes.
+				app.Must(t, "exec", "a", "PRAGMA busy_timeout=100")
+			} else {
+				app.Must(t, "exec", "a", "PRAGMA wal_autocheckpoint=0")
+			}
+			h, _, err := e.Files.Open(ctx, shardName(name))
 			if err != nil {
 				t.Fatal(err)
 			}
-			sh, err := capture.New(capture.Config{Name: name, Path: e.Path(name), Generation: h.Manifest.Generation, MetaRoot: e.Meta, Writer: e.W, Tune: tc.tune})
+			sh, err := capture.New(capture.Config{Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W, RestartFrames: tc.restart})
 			if err != nil {
 				t.Fatal(err)
 			}
 			for burst := range 12 {
 				for range 3 {
 					app.Must(t, "insert", "a", fmt.Sprint(tc.rows/3), "1000")
-					if burst%2 == 0 {
-						ageDatabase(t, e.Path(name)) // 120 ms pass between these writes
+					if tc.manual {
+						app.Must(t, "ckpt", "a", []string{"PASSIVE", "RESTART", "TRUNCATE"}[burst%3])
 					}
 				}
 				if burst%3 != 2 { // sometimes let several bursts pile up unsynced
@@ -204,11 +97,11 @@ func TestCheckpointsNeverLoseFrames(t *testing.T) {
 			replayed := filepath.Join(t.TempDir(), "replayed.db")
 			ap, _ := shardfile.NewApplier(replayed)
 			var full int
-			err = segment.Scan(ctx, e.Store, e.Node, 1, 0, func(seq uint64, en segment.Entry) error {
-				if en.Shard != name {
+			err = segment.Scan(ctx, e.Journal, 1, 0, func(seq pos.Seg, en segment.Entry) error {
+				if en.Shard.String() != name {
 					return nil
 				}
-				b, err := harness.ReadEntry(ctx, e.Store, e.Node, seq, en)
+				b, err := harness.ReadEntry(ctx, e.Journal, seq, en)
 				if err != nil {
 					return err
 				}
@@ -230,6 +123,174 @@ func TestCheckpointsNeverLoseFrames(t *testing.T) {
 	}
 }
 
+// A byte flipped in a frame past the last commit captured fails the sync and
+// captures nothing past the last good commit.
+func TestCorruptFrameFailsTheSync(t *testing.T) {
+	t.Parallel()
+	e := harness.New(t)
+	ctx := context.Background()
+	app := e.StartApp(name)
+	_, sh := e.NewShard(name)
+	app.Must(t, "insert", "a", "5", "100")
+	if err := sh.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	pos := sh.Position()
+	before := len(entriesOf(t, e, name))
+	app.Must(t, "insert", "a", "10", "100") // committed past the sync, not captured
+	// Flip a byte in the last frame's page: the last frame in the file is the
+	// last commit's, the writer being idle.
+	f, err := os.OpenFile(e.Path(name)+"-wal", os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := make([]byte, 1)
+	if _, err := f.ReadAt(b, fi.Size()-1); err != nil {
+		t.Fatal(err)
+	}
+	b[0] ^= 0xff
+	if _, err := f.WriteAt(b, fi.Size()-1); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if err := sh.Sync(ctx); err == nil {
+		t.Fatal("the sync of a corrupt WAL succeeded")
+	}
+	if sh.Position() != pos {
+		t.Fatalf("position moved from %d to %d past a corrupt frame", pos, sh.Position())
+	}
+	if got := len(entriesOf(t, e, name)); got != before {
+		t.Fatalf("%d entries captured past a corrupt frame, want %d", got-before, before)
+	}
+	if err := sh.Close(ctx); err == nil {
+		t.Fatal("the final sync of a corrupt WAL succeeded")
+	}
+}
+
+// A WAL restart between two syncs: the first sync, over the restart threshold,
+// checkpoints everything under the write lock, and the app's next write
+// restarts the WAL (new salts, frames from the start again). The second sync
+// reads the new WAL from its first frame, the positions carry on and the
+// replay matches.
+func TestSyncAfterARestartReadsTheWALFromItsFirstFrame(t *testing.T) {
+	t.Parallel()
+	e := harness.New(t)
+	ctx := context.Background()
+	app := e.StartApp(name)
+	h, _, _ := e.Files.Open(ctx, shardName(name))
+	sh, err := capture.New(capture.Config{Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W, RestartFrames: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 30 { // enough frames to pass the threshold, one commit each
+		app.Must(t, "insert", "a", "1", "300")
+	}
+	old := header(t, sh)
+	if err := sh.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	pos := sh.Position()
+	app.Must(t, "insert", "a", "10", "300") // the write after the checkpoint restarts the WAL
+	restarted := header(t, sh)
+	if string(old[32:40]) == string(restarted[32:40]) {
+		t.Fatal("the app's write after the sync's checkpoint did not restart the WAL: the test is not testing a restart between two syncs")
+	}
+	if err := sh.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if sh.Position() <= pos {
+		t.Fatal("the second sync captured nothing from the restarted WAL")
+	}
+	replayed := filepath.Join(t.TempDir(), "replayed.db")
+	replayInto(t, e, replayed)
+	if want, got := apptest.Dump(t, e.Path(name)), sqlitetest.Dump(t, replayed); want != got {
+		t.Fatal("the history across a WAL restart does not restore to the app's database")
+	}
+	sh.Close(ctx)
+}
+
+// An app that commits as fast as it can, with the node checking the WAL on
+// every sync (a locked restart tries a short busy timeout and is tried again
+// at the next sync): the WAL stays within a small multiple of its restart
+// threshold. The longest wait of one of the app's writes for the node is
+// recorded, and the replay matches the app's database.
+func TestUnthrottledWriterKeepsTheWALBounded(t *testing.T) {
+	t.Parallel()
+	e := harness.New(t)
+	ctx := context.Background()
+	app := e.StartApp(name)
+	h, _, _ := e.Files.Open(ctx, shardName(name))
+	const restartFrames = 400
+	sh, err := capture.New(capture.Config{Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W, RestartFrames: restartFrames})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const writes = 3000
+	type report struct {
+		err     error
+		longest time.Duration
+	}
+	done := make(chan report, 1)
+	go func() {
+		var r report
+		for range writes {
+			start := time.Now()
+			if _, err := app.Do("insert", "a", "1", "100"); err != nil {
+				r.err = err
+				break
+			}
+			if d := time.Since(start); d > r.longest {
+				r.longest = d
+			}
+		}
+		done <- r
+	}()
+	pageSize, err := strconv.Atoi(apptest.Query(t, e.Path(name), `PRAGMA page_size`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	threshold := int64(restartFrames) * int64(pageSize)
+	var peak int64
+	var r report
+	for stopped := false; !stopped; {
+		select {
+		case r = <-done:
+			stopped = true
+		default:
+		}
+		if err := sh.Capture(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if fi, err := os.Stat(e.Path(name) + "-wal"); err == nil && fi.Size() > peak {
+			peak = fi.Size()
+		}
+	}
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	if err := sh.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("an unthrottled writer, %d writes: peak WAL of %d bytes (%.1fx the restart threshold of %d frames), the longest write waited %v", writes, peak, float64(peak)/float64(threshold), restartFrames, r.longest)
+	// The bound catches the design the spike ruled out (a timer-checked
+	// restart, whose WAL ran to gigabytes), not load: a loaded machine can
+	// hold the node's restarts back for a while, which only grows the WAL,
+	// so the multiple is loose and the number above says what happened.
+	if peak > 8*threshold {
+		t.Fatalf("the WAL reached %d bytes, %.1fx the restart threshold of %d frames", peak, float64(peak)/float64(threshold), restartFrames)
+	}
+	replayed := filepath.Join(t.TempDir(), "replayed.db")
+	replayInto(t, e, replayed)
+	if want, got := apptest.Dump(t, e.Path(name)), sqlitetest.Dump(t, replayed); want != got {
+		t.Fatal("the history of an unthrottled writer does not restore to the app's database")
+	}
+	sh.Close(ctx)
+}
+
 // The -shm check, in the order docs/internals.md gives: the node closes everything it
 // has on the shard, then asks, then reopens capture if the app still has the
 // shard open.
@@ -238,8 +299,8 @@ func TestReleaseChecksShm(t *testing.T) {
 	e := harness.New(t)
 	ctx := context.Background()
 	app := e.StartApp(name)
-	h, _, _ := e.Files.Open(ctx, name)
-	sh, err := capture.New(capture.Config{Name: name, Path: e.Path(name), Generation: h.Manifest.Generation, MetaRoot: e.Meta, Writer: e.W})
+	h, _, _ := e.Files.Open(ctx, shardName(name))
+	sh, err := capture.New(capture.Config{Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -276,9 +337,6 @@ func TestReleaseChecksShm(t *testing.T) {
 	if released, _, err := sh.Release(ctx, nil); err != nil || !released {
 		t.Fatalf("app closed: released=%v err=%v", released, err)
 	}
-	if _, err := os.Stat(capture.MetaDir(e.Meta, name, h.Manifest.Generation)); !os.IsNotExist(err) {
-		t.Fatalf("metadata directory left behind: %v", err)
-	}
 	if err := sh.Sync(ctx); err == nil {
 		t.Fatal("sync of a released shard should fail")
 	}
@@ -294,8 +352,8 @@ func TestCheckAfterClosingKeepsAppLocks(t *testing.T) {
 	e := harness.New(t)
 	ctx := context.Background()
 	app := e.StartApp(name)
-	h, _, _ := e.Files.Open(ctx, name)
-	sh, err := capture.New(capture.Config{Name: name, Path: e.Path(name), Generation: h.Manifest.Generation, MetaRoot: e.Meta, Writer: e.W})
+	h, _, _ := e.Files.Open(ctx, shardName(name))
+	sh, err := capture.New(capture.Config{Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,7 +364,7 @@ func TestCheckAfterClosingKeepsAppLocks(t *testing.T) {
 	}
 	obs := apptest.Start(t)
 	for i := range 20 {
-		if held, err := capture.ProbeOnce(e.Path(name)); err != nil || !held {
+		if held, err := capture.WALSidecarsOf(e.Path(name)).Held(); err != nil || !held {
 			t.Fatalf("check %d: held=%v err=%v", i, held, err)
 		}
 		if v := obs.Must(t, "probe", "a", e.Path(name)); !strings.HasPrefix(v, "held") {
@@ -314,7 +372,7 @@ func TestCheckAfterClosingKeepsAppLocks(t *testing.T) {
 		}
 	}
 	app.Must(t, "close", "a")
-	if held, err := capture.ProbeOnce(e.Path(name)); err != nil || held {
+	if held, err := capture.WALSidecarsOf(e.Path(name)).Held(); err != nil || held {
 		t.Fatalf("app closed: held=%v err=%v", held, err)
 	}
 }
@@ -328,8 +386,8 @@ func TestThrowawayProbeDropsLocks(t *testing.T) {
 	e := harness.New(t)
 	ctx := context.Background()
 	app := e.StartApp(name)
-	h, _, _ := e.Files.Open(ctx, name)
-	sh, err := capture.New(capture.Config{Name: name, Path: e.Path(name), Generation: h.Manifest.Generation, MetaRoot: e.Meta, Writer: e.W})
+	h, _, _ := e.Files.Open(ctx, shardName(name))
+	sh, err := capture.New(capture.Config{Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -349,49 +407,7 @@ func TestThrowawayProbeDropsLocks(t *testing.T) {
 	sh.Close(ctx)
 }
 
-// 6.5: what Litestream creates or writes in the app's directory and database.
-func TestLitestreamFootprint(t *testing.T) {
-	t.Parallel()
-	e := harness.New(t)
-	ctx := context.Background()
-	app := e.StartApp(name)
-	app.Must(t, "insert", "a", "5", "100")
-	before := tables(t, e.Path(name))
-	h, _, _ := e.Files.Open(ctx, name)
-	sh, err := capture.New(capture.Config{Name: name, Path: e.Path(name), Generation: h.Manifest.Generation, MetaRoot: e.Meta, Writer: e.W})
-	if err != nil {
-		t.Fatal(err)
-	}
-	app.Must(t, "insert", "a", "5", "100")
-	if err := sh.Sync(ctx); err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("tables before capture: %v", before)
-	t.Logf("tables after capture:  %v", tables(t, e.Path(name)))
-	t.Logf("_litestream_seq rows: %s", rowsOf(t, e.Path(name), "_litestream_seq"))
-	t.Logf("_litestream_lock rows: %s", rowsOf(t, e.Path(name), "_litestream_lock"))
-	var files []string
-	filepath.WalkDir(e.Dir, func(p string, d os.DirEntry, err error) error {
-		if err == nil && !d.IsDir() {
-			rel, _ := filepath.Rel(e.Dir, p)
-			if strings.Contains(rel, "litestream") {
-				rel = filepath.Dir(rel) + "/*"
-			}
-			files = append(files, rel)
-		}
-		return nil
-	})
-	sort.Strings(files)
-	t.Logf("files next to the shard: %v", dedupe(files))
-	t.Logf("files in the metadata root: %v", dirList(t, e.Meta))
-	sh.Close(ctx)
-	t.Logf("after Close: next to the shard %v, metadata root %v", dirList(t, e.Dir), dirList(t, e.Meta))
-	if left := dirList(t, e.Meta); len(left) != 0 {
-		t.Fatalf("metadata left after Close: %v", left)
-	}
-}
-
-// A commit the app makes after Litestream's final sync, closing the file before
+// A commit the app makes after the final sync, closing the file before
 // the -shm check, is seen from the wal-index header: the node doesn't let go,
 // and capture picks the commit up.
 func TestReleaseSeesACommitAfterTheFinalSync(t *testing.T) {
@@ -399,12 +415,12 @@ func TestReleaseSeesACommitAfterTheFinalSync(t *testing.T) {
 	e := harness.New(t)
 	ctx := context.Background()
 	app := e.StartApp(name)
-	h, _, _ := e.Files.Open(ctx, name)
+	h, _, _ := e.Files.Open(ctx, shardName(name))
 	late := false
-	sh, err := capture.New(capture.Config{Name: name, Path: e.Path(name), Generation: h.Manifest.Generation, MetaRoot: e.Meta, Writer: e.W,
+	sh, err := capture.New(capture.Config{Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W,
 		Durable: func(ctx context.Context) error {
 			if late {
-				// Between Litestream closing and the -shm check.
+				// Between the connections closing and the -shm check.
 				late = false
 				app.Must(t, "open", "a", e.Path(name))
 				app.Must(t, "insert", "a", "5", "100")
@@ -420,7 +436,7 @@ func TestReleaseSeesACommitAfterTheFinalSync(t *testing.T) {
 		t.Fatal(err)
 	}
 	app.Must(t, "close", "a")
-	pos := sh.Position()
+	at := sh.Position()
 
 	late = true
 	if released, _, err := sh.Release(ctx, nil); err != nil || released {
@@ -429,8 +445,36 @@ func TestReleaseSeesACommitAfterTheFinalSync(t *testing.T) {
 	if err := sh.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if sh.Position() <= pos {
+	if sh.Position() <= at {
 		t.Fatal("the late commit was not captured after capture resumed")
+	}
+	// The late commit landed while the node held nothing, so the resumed
+	// release could not trust the WAL: it wrote the whole database as one
+	// file, which is the one entry past the position the release stopped at.
+	var en segment.Entry
+	var seq pos.Seg
+	if err := segment.Scan(ctx, e.Journal, 1, 0, func(s pos.Seg, en2 segment.Entry) error {
+		if en2.Shard.String() == name && en2.Position > at {
+			en, seq = en2, s
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if seq == 0 {
+		t.Fatal("the late commit was not captured as a file of its own")
+	}
+	b, err := harness.ReadEntry(ctx, e.Journal, seq, en)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pages, commit := pageCount(t, b); pages != commit {
+		t.Fatalf("the file after the refused release holds %d of the database's %d pages: the whole database was not written", pages, commit)
+	}
+	replayed := filepath.Join(t.TempDir(), "replayed.db")
+	replayInto(t, e, replayed)
+	if want, got := apptest.Dump(t, e.Path(name)), sqlitetest.Dump(t, replayed); want != got {
+		t.Fatal("the history after a commit the final sync missed does not restore to the app's database")
 	}
 	// With nothing new, the node lets go.
 	if released, _, err := sh.Release(ctx, nil); err != nil || !released {
@@ -446,10 +490,10 @@ func TestReleaseWhoseWaitFailsReopensCapture(t *testing.T) {
 	e := harness.New(t)
 	ctx := context.Background()
 	app := e.StartApp(name)
-	h, _, _ := e.Files.Open(ctx, name)
+	h, _, _ := e.Files.Open(ctx, shardName(name))
 	errStorage := errors.New("storage down")
 	fail := true
-	sh, err := capture.New(capture.Config{Name: name, Path: e.Path(name), Generation: h.Manifest.Generation, MetaRoot: e.Meta, Writer: e.W,
+	sh, err := capture.New(capture.Config{Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W,
 		Durable: func(ctx context.Context) error {
 			if fail {
 				fail = false
@@ -489,23 +533,22 @@ func TestReleaseWhoseWaitFailsReopensCapture(t *testing.T) {
 	}
 }
 
-// Litestream retries its final sync for 30 seconds by default. The client only
-// fails for good, so closing a shard whose writer has been fenced must fail at
-// once rather than hold the shard's loop.
+// The writer refuses a fenced journal for good, so closing a shard whose
+// writer has been fenced must fail at once rather than hold the shard's loop.
 func TestCloseWithAFencedWriterDoesNotRetry(t *testing.T) {
 	t.Parallel()
 	e := harness.New(t)
 	ctx := context.Background()
 	app := e.StartApp(name)
-	h, _, _ := e.Files.Open(ctx, name)
+	h, _, _ := e.Files.Open(ctx, shardName(name))
 	sh := e.Activate(h, nil)
 	app.Must(t, "insert", "a", "5", "100")
 	if err := sh.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
 	// An adopter fences the journal, and the writer finds out at its next flush.
-	adopter := blob.NewStore(e.Blob, "n2", 1, blob.Options{})
-	if _, err := segment.Fence(ctx, adopter, e.Node, 1); err != nil {
+	adopter := e.Adopter("n2", e.Node)
+	if _, err := segment.Fence(ctx, adopter, 1); err != nil {
 		t.Fatal(err)
 	}
 	app.Must(t, "insert", "a", "6", "100")

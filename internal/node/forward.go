@@ -10,6 +10,8 @@ import (
 	"net/textproto"
 	"strings"
 	"time"
+
+	"github.com/luci1900/shardlite/internal/cluster"
 )
 
 // errMoved is a forward's answer from a node that found the shard isn't its own.
@@ -25,13 +27,13 @@ var errMoved = errors.New("the shard has moved")
 // node retries nothing itself.
 func (s *Server) forward(w http.ResponseWriter, r *http.Request, info *reqInfo) {
 	if info.forwarded {
-		w.Header().Set(hdrOwner, info.owner)
-		writeError(w, r, true, http.StatusMisdirectedRequest, fmt.Sprintf("%s is owned by %s", info.target, info.owner))
+		w.Header().Set(hdrOwner, string(info.owner))
+		writeError(w, r, true, http.StatusMisdirectedRequest, fmt.Sprintf("%s is owned by %s", info.name, info.owner))
 		return
 	}
 	address, err := s.m.addrs.address(r.Context(), info.owner)
 	if err != nil {
-		s.fail(w, r, info.own, fmt.Errorf("forwarding to %s, the owner of %s: %w", info.owner, info.target, err))
+		s.fail(w, r, info.own, fmt.Errorf("forwarding to %s, the owner of %s: %w", info.owner, info.name, err))
 		return
 	}
 	info.peer = address
@@ -40,16 +42,16 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, info *reqInfo) 
 	// forward is cancelled.
 	ctx, cancel := context.WithCancelCause(r.Context())
 	defer cancel(nil)
-	info.answer.Store(answerAwaited)
+	info.answer.Store(int32(answerAwaited))
 	info.unreachable = false
 	late := time.AfterFunc(s.opts.AnswerTimeout, func() {
-		if info.answer.CompareAndSwap(answerAwaited, answerLate) {
+		if info.answer.CompareAndSwap(int32(answerAwaited), int32(answerLate)) {
 			cancel(errNoAnswer)
 		}
 	})
 	defer late.Stop()
 	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{Got1xxResponse: func(int, textproto.MIMEHeader) error {
-		info.answer.CompareAndSwap(answerAwaited, answerHeard)
+		info.answer.CompareAndSwap(int32(answerAwaited), int32(answerHeard))
 		return nil
 	}})
 	// The owner's 1xx are its own (it drops its app's), so none reaches the client.
@@ -58,11 +60,11 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, info *reqInfo) 
 	case info.unreachable:
 		s.unreachable(w, r, info)
 	case info.moved:
-		s.m.owners.Remove(info.target)
+		s.m.owners.Remove(info.name)
 		if info.movedTo != "" && info.movedTo != s.m.n.Name {
-			s.m.owners.Add(info.target, info.movedTo)
+			s.m.owners.Add(info.name, info.movedTo)
 		}
-		s.answer(w, r, info.own, &unavailable{fmt.Sprintf("%s is not owned by %s: try again", info.target, info.owner), 0})
+		s.answer(w, r, info.own, &unavailable{fmt.Sprintf("%s is not owned by %s: try again", info.name, info.owner), 0})
 	}
 }
 
@@ -76,7 +78,7 @@ func (s *Server) forwardError(w http.ResponseWriter, r *http.Request, err error)
 		return // forward reports it, and forwardOrRetry answers
 	}
 	info, _ := r.Context().Value(ctxKey{}).(*reqInfo)
-	if cause := context.Cause(r.Context()); info != nil && info.answer.Load() != answerHeard && (cause == nil || cause == errNoAnswer) {
+	if cause := context.Cause(r.Context()); info != nil && info.answer.Load() != int32(answerHeard) && (cause == nil || cause == errNoAnswer) {
 		info.unreachable = true
 		return
 	}
@@ -88,13 +90,13 @@ func (s *Server) forwardError(w http.ResponseWriter, r *http.Request, err error)
 // shard sends over an upgraded connection is gated here, on the caller.
 func (s *Server) forwardedResponse(resp *http.Response) error {
 	info, _ := resp.Request.Context().Value(ctxKey{}).(*reqInfo)
-	info.answer.Store(answerHeard)
+	info.answer.Store(int32(answerHeard))
 	s.m.checks.answered(info.owner)
 	// Only a node sets Shardlite-Owner (an owner strips the app's), though it may
 	// be empty: the node that answered didn't find the owner.
 	if owner, ok := resp.Header[hdrOwner]; ok && resp.StatusCode == http.StatusMisdirectedRequest {
-		info.moved, info.movedTo = true, strings.Join(owner, "")
-		return fmt.Errorf("%w: %s is not owned by %s but by %q", errMoved, info.target, info.owner, info.movedTo)
+		info.moved, info.movedTo = true, cluster.Node(strings.Join(owner, ""))
+		return fmt.Errorf("%w: %s is not owned by %s but by %q", errMoved, info.name, info.owner, info.movedTo)
 	}
 	if rwc, ok := resp.Body.(io.ReadWriteCloser); ok && resp.StatusCode == http.StatusSwitchingProtocols {
 		resp.Body = gatedConn{rwc, nil, &info.gates}

@@ -18,30 +18,37 @@ import (
 
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/harness"
+	"github.com/luci1900/shardlite/internal/journal"
+	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/service"
+	shardpkg "github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
 )
 
+// shardName is a shard's name in the tests that need the parsed type.
+func shardName(s string) shardpkg.Name { return shardpkg.MustParse(s) }
+
 type env struct {
-	dir   string
-	meta  string
-	store *blob.Store
-	w     *segment.Writer
+	dir     string
+	meta    string
+	journal *journal.Store
+	w       *segment.Writer
 }
 
 // newEnv is a shard's storage with a segment writer, which writes only when
 // flushed (Sync flushes it, as the node's flush cycle does).
 func newEnv(t *testing.T) *env {
 	t.Helper()
-	local := blob.WithHook(blob.NewMemory())
-	store := blob.NewStore(local, "n1", 1, blob.Options{Backoff: time.Millisecond})
-	w := segment.NewWriter(store, "n1", segment.Options{})
+	local := blobtest.WithHook(blob.NewMemory())
+	js := journal.NewStore(journal.NewBlob(local, "n1"), "n1", 1, journal.Options{Backoff: time.Millisecond})
+	w := segment.NewWriter(js, segment.Options{})
 	serveWriter(t, w)
-	return &env{dir: t.TempDir(), meta: t.TempDir(), store: store, w: w}
+	return &env{dir: t.TempDir(), meta: t.TempDir(), journal: js, w: w}
 }
 
 // serveWriter serves w, as the node's tree does, until the test ends.
@@ -50,10 +57,10 @@ func serveWriter(t *testing.T, w *segment.Writer) {
 }
 
 // entriesFor returns every segment entry of a shard, in journal order.
-func (e *env) entriesFor(t *testing.T, shard string) (out []segment.Entry, seqs []uint64) {
+func (e *env) entriesFor(t *testing.T, shard string) (out []segment.Entry, seqs []pos.Seg) {
 	t.Helper()
-	err := segment.Scan(context.Background(), e.store, "n1", 1, 0, func(seq uint64, en segment.Entry) error {
-		if en.Shard == shard {
+	err := segment.Scan(context.Background(), e.journal, 1, 0, func(seq pos.Seg, en segment.Entry) error {
+		if en.Shard.String() == shard {
 			out, seqs = append(out, en), append(seqs, seq)
 		}
 		return nil
@@ -73,7 +80,7 @@ func (e *env) replay(t *testing.T, shard, path string) shardfile.State {
 	}
 	entries, seqs := e.entriesFor(t, shard)
 	for i, en := range entries {
-		b, err := harness.ReadEntry(context.Background(), e.store, "n1", seqs[i], en)
+		b, err := harness.ReadEntry(context.Background(), e.journal, seqs[i], en)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -95,7 +102,7 @@ func TestCommitsAppearAsEntries(t *testing.T) {
 	path := filepath.Join(e.dir, "users-1.db")
 	app.Must(t, "open", "a", path)
 
-	sh, err := capture.New(capture.Config{Name: "users/1", Path: path, Generation: "g1", MetaRoot: e.meta, Writer: e.w})
+	sh, err := capture.New(capture.Config{Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,11 +113,11 @@ func TestCommitsAppearAsEntries(t *testing.T) {
 			t.Fatalf("sync %d: %v", i, err)
 		}
 	}
-	entries, _ := e.entriesFor(t, "users/1")
+	entries, _ := e.entriesFor(t, "test.users/1")
 	if len(entries) < 20 {
 		t.Fatalf("got %d entries for 20 commits", len(entries))
 	}
-	var last uint64
+	var last pos.Position
 	for _, en := range entries {
 		if en.Position != last+1 || en.Count == 0 {
 			t.Fatalf("gap or overlap: entry %d-%d after %d", en.Position, en.Last(), last)
@@ -128,7 +135,7 @@ func TestReplayEqualsApp(t *testing.T) {
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
 	app.Must(t, "open", "a", path)
-	sh, err := capture.New(capture.Config{Name: "users/1", Path: path, Generation: "g1", MetaRoot: e.meta, Writer: e.w})
+	sh, err := capture.New(capture.Config{Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +156,7 @@ func TestReplayEqualsApp(t *testing.T) {
 		t.Fatal(err)
 	}
 	replayed := filepath.Join(e.dir, "replayed.db")
-	e.replay(t, "users/1", replayed)
+	e.replay(t, "test.users/1", replayed)
 	want, got := apptest.Dump(t, path), sqlitetest.Dump(t, replayed)
 	if want != got {
 		t.Fatalf("replayed database differs from the app's\nwant %d bytes, got %d bytes", len(want), len(got))
@@ -174,7 +181,7 @@ func TestManyShardsOneSegmentPerFlush(t *testing.T) {
 	for i := range shards {
 		path := filepath.Join(e.dir, fmt.Sprintf("s%d.db", i))
 		apps[i%len(apps)].Must(t, "open", fmt.Sprint(i), path)
-		sh, err := capture.New(capture.Config{Name: fmt.Sprintf("users/%d", i), Path: path, Generation: "g", MetaRoot: e.meta, Writer: e.w})
+		sh, err := capture.New(capture.Config{Name: shardName(fmt.Sprintf("test.users/%d", i)), Path: path, Generation: "g", Writer: e.w})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -209,7 +216,7 @@ func TestManyShardsOneSegmentPerFlush(t *testing.T) {
 		t.Fatalf("%d segments for %d rounds", flushes, rounds)
 	}
 	var entries int
-	segment.Scan(ctx, e.store, "n1", 1, 0, func(uint64, segment.Entry) error { entries++; return nil })
+	segment.Scan(ctx, e.journal, 1, 0, func(pos.Seg, segment.Entry) error { entries++; return nil })
 	if perSeg := float64(entries) / float64(e.w.Flushes()); perSeg < 3 {
 		t.Fatalf("%.1f entries per segment: shards are not sharing segments", perSeg)
 	}
@@ -283,21 +290,21 @@ func pageCount(t *testing.T, b []byte) (pages, commit int) {
 	return pages, int(dec.Header().Commit)
 }
 
-// A caller that stops waiting doesn't cut the sync short: Litestream's sync
-// runs to the end on its own, so the commit reaches the journal once and a later
+// A caller that stops waiting doesn't cut the sync short: the sync runs to
+// the end on its own, so the commit reaches the journal once and a later
 // Sync finds nothing left to do.
 func TestSyncOutlivesItsCaller(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	local := blob.WithHook(blob.NewMemory())
-	e.store = blob.NewStore(local, "n1", 1, blob.Options{Backoff: time.Millisecond})
-	e.w = segment.NewWriter(e.store, "n1", segment.Options{Retry: time.Millisecond})
+	local := blobtest.WithHook(blob.NewMemory())
+	e.journal = journal.NewStore(journal.NewBlob(local, "n1"), "n1", 1, journal.Options{Backoff: time.Millisecond})
+	e.w = segment.NewWriter(e.journal, segment.Options{Retry: time.Millisecond})
 	serveWriter(t, e.w)
 
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
 	app.Must(t, "open", "a", path)
-	sh, err := capture.New(capture.Config{Name: "users/1", Path: path, Generation: "g1", MetaRoot: e.meta, Writer: e.w})
+	sh, err := capture.New(capture.Config{Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,8 +315,8 @@ func TestSyncOutlivesItsCaller(t *testing.T) {
 	}
 
 	up := make(chan struct{})
-	local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpCreate && !after {
+	local.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if op == blobtest.OpCreate && !after {
 			select { // storage hangs until released
 			case <-up:
 			case <-ctx.Done():
@@ -335,14 +342,14 @@ func TestSyncOutlivesItsCaller(t *testing.T) {
 
 	// Nothing asks again, yet the commit arrives: the writer never drops a queued file.
 	apptest.Eventually(t, 5*time.Second, "the commit to reach the journal after the caller left", func() bool {
-		entries, _ := e.entriesFor(t, "users/1")
+		entries, _ := e.entriesFor(t, "test.users/1")
 		return len(entries) == len(sh.Tail())
 	})
 	if err := sh.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
-	entries, _ := e.entriesFor(t, "users/1")
-	var last uint64
+	entries, _ := e.entriesFor(t, "test.users/1")
+	var last pos.Position
 	for _, en := range entries {
 		if en.Position != last+1 {
 			t.Fatalf("gap or repeat: entry %d-%d after %d", en.Position, en.Last(), last)
@@ -363,7 +370,7 @@ func TestTailFromFollowsTheTail(t *testing.T) {
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
 	app.Must(t, "open", "a", path)
-	sh, err := capture.New(capture.Config{Name: "users/1", Path: path, Generation: "g1", MetaRoot: e.meta, Writer: e.w})
+	sh, err := capture.New(capture.Config{Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -371,22 +378,22 @@ func TestTailFromFollowsTheTail(t *testing.T) {
 	if sh.TailFrom() != 0 {
 		t.Fatal("a shard with nothing captured has a tail")
 	}
-	var first uint64
+	var first pos.Seg
 	for i := range 6 {
 		app.Must(t, "insert", "a", "2", "100")
 		if err := sh.Sync(ctx); err != nil {
 			t.Fatal(err)
 		}
 		apptest.Eventually(t, 5*time.Second, "the commit to reach the journal", func() bool {
-			entries, _ := e.entriesFor(t, "users/1")
+			entries, _ := e.entriesFor(t, "test.users/1")
 			return len(entries) == len(sh.Tail())
 		})
 		if i == 0 {
-			_, seqs := e.entriesFor(t, "users/1")
+			_, seqs := e.entriesFor(t, "test.users/1")
 			first = seqs[0]
 		}
 	}
-	_, seqs := e.entriesFor(t, "users/1")
+	_, seqs := e.entriesFor(t, "test.users/1")
 	got := sh.TailFrom()
 	if got == 0 || got > first || got < 1 {
 		t.Fatalf("TailFrom = %d, first entry is in segment %d", got, first)
@@ -414,7 +421,7 @@ func TestCommitsInOneWindowKeepOnlyTheLatestPages(t *testing.T) {
 	for i := range 40 {
 		app.Must(t, "exec", "a", fmt.Sprintf("INSERT INTO t (id, v) VALUES (%d, randomblob(1000))", i))
 	}
-	sh, err := capture.New(capture.Config{Name: "users/1", Path: path, Generation: "g1", MetaRoot: e.meta, Writer: e.w})
+	sh, err := capture.New(capture.Config{Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,7 +430,7 @@ func TestCommitsInOneWindowKeepOnlyTheLatestPages(t *testing.T) {
 	if err := sh.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
-	before, _ := e.entriesFor(t, "users/1")
+	before, _ := e.entriesFor(t, "test.users/1")
 
 	const commits = 300
 	for range commits {
@@ -432,12 +439,11 @@ func TestCommitsInOneWindowKeepOnlyTheLatestPages(t *testing.T) {
 	if err := sh.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
-	entries, seqs := e.entriesFor(t, "users/1")
-	// Litestream may cut the window into more than one file (a checkpoint, say),
-	// but never one per commit.
+	entries, seqs := e.entriesFor(t, "test.users/1")
+	// The window may be cut into more than one file, but never one per commit.
 	var totalPages, totalBytes, dbPages int
 	for i := len(before); i < len(entries); i++ {
-		b, err := harness.ReadEntry(ctx, e.store, "n1", seqs[i], entries[i])
+		b, err := harness.ReadEntry(ctx, e.journal, seqs[i], entries[i])
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -458,7 +464,7 @@ func TestCommitsInOneWindowKeepOnlyTheLatestPages(t *testing.T) {
 }
 
 // A panic under the shard's lock ends the activation, so a caller that recovers
-// it (as net/http does for a handler) can't go on to use Litestream in whatever
+// it (as net/http does for a handler) can't go on to use the shard in whatever
 // state the panic left.
 func TestPanicUnderTheLockEndsTheActivation(t *testing.T) {
 	t.Parallel()
@@ -561,8 +567,20 @@ func TestReleaseReadsTheFinalState(t *testing.T) {
 		if err != nil || !released {
 			t.Fatalf("commit during the read %v: released %v, err %v", commitDuring, released, err)
 		}
-		if want := sh.Position(); (commitDuring && f.At != 0) || (!commitDuring && (f.At == 0 || f.At != want)) {
-			t.Fatalf("commit during the read %v: at %d, final position %d", commitDuring, f.At, want)
+		switch r := f.(type) {
+		case *capture.Kept:
+			if commitDuring {
+				t.Fatalf("commit during the read %v: kept at %d", commitDuring, r.At)
+			}
+			if want := sh.Position(); r.At != want {
+				t.Fatalf("commit during the read %v: at %d, final position %d", commitDuring, r.At, want)
+			}
+		case *capture.Uncertain:
+			if !commitDuring {
+				t.Fatalf("commit during the read %v: uncertain", commitDuring)
+			}
+		case *capture.Deleted:
+			t.Fatalf("commit during the read %v: deleted", commitDuring)
 		}
 	}
 }

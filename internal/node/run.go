@@ -59,7 +59,7 @@ func withShards(fn func(*CatalogOptions, *Catalog)) RunOption {
 
 // Run is the node: it starts everything from env, serves until ctx ends or a
 // part of the node fails, then lets go of its shards and gives up its lease
-// (docs/concurrency.md, Shutdown). A lost lease or a fenced writer stops
+// (docs/internals.md, Concurrency: Shutdown). A lost lease or a fenced writer stops
 // everything at once and keeps the lease. Run returns nil after a shutdown
 // that ctx asked for, and the failure otherwise. It returns only after every
 // goroutine it started has ended. ready (if not nil) is called with the public,
@@ -69,14 +69,11 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 	for _, o := range opts {
 		o(&ro)
 	}
-	app, err := url.Parse(env.App)
-	if err != nil || env.App == "" || app.Host == "" {
+	appURL, err := url.Parse(env.App)
+	if err != nil || appURL.Host == "" {
 		return fmt.Errorf("SHARDLITE_APP is %q, want the app's base URL such as http://127.0.0.1:9000", env.App)
 	}
-	kinds, err := LoadKinds(env.KindsFile, env.IdleTimeout)
-	if err != nil {
-		return err
-	}
+	kinds := NewKinds(env.IdleTimeout)
 
 	var bucket string
 	if ro.backend == nil {
@@ -85,11 +82,9 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 			return err
 		}
 	}
-	// Directories first: the checks look at the filesystems they are on.
-	for _, d := range []string{env.Data, env.Scratch} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
-			return err
-		}
+	// The data directory first: the check looks at the filesystem it is on.
+	if err := os.MkdirAll(env.Data, 0o755); err != nil {
+		return err
 	}
 	checks := defaultStartupChecks(log)
 	if err := checks.refuse(env.Data); err != nil {
@@ -108,7 +103,7 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 	if err := blob.CheckStore(ctx, backend, env.Name); err != nil {
 		return err
 	}
-	checks.warn(env.Scratch)
+	checks.warn()
 	// The peer listener is bound before the node starts, since the lease
 	// publishes where other nodes reach it.
 	peer, err := net.Listen("tcp", env.Peer)
@@ -125,11 +120,14 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 
 	expireAge := JournalExpiry(env.DeltaAge)
 	n, err := Start(ctx, Config{
-		Name: env.Name, Address: address, Backend: backend,
+		Name: env.Name, Address: address, Backend: backend, Data: env.Data,
 		Lease:   coord.RegistryOptions{TTL: env.LeaseTTL},
 		Keeper:  coord.KeeperOptions{Interval: env.LeaseTTL / 3, Margin: env.LeaseTTL / 5},
 		Logger:  log,
 		TempDir: tempDir,
+		// The standbys setting: how many mirrors this node names for its
+		// journal (docs/guide.md, Environment variables).
+		Standbys: env.Standbys,
 	})
 	if err != nil {
 		peer.Close()
@@ -190,7 +188,7 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 
 	var srv *Server
 	so := CatalogOptions{
-		Kinds: kinds, Data: env.Data, Scratch: env.Scratch, Logger: log,
+		Kinds: kinds, Data: env.Data, Logger: log,
 		Cache:     CacheOptions{Limit: env.CacheLimit},
 		Flush:     FlushOptions{Interval: env.Flush, Min: env.FlushMin},
 		Lifecycle: LifecycleOptions{DeltaAge: env.DeltaAge, DeltaSize: env.DeltaSize},
@@ -206,7 +204,7 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 		ro.shards(&so, nil)
 	}
 	m, err := NewCatalog(n, so, func(m *Catalog) routing {
-		srv = NewServer(m, kinds, n.Keeper, ServerOptions{App: app, HealthPath: env.HealthPath, MaxHops: env.MaxHops, Grace: ro.grace, Logger: log})
+		srv = NewServer(m, kinds, n.Keeper, ServerOptions{App: appURL, MaxHops: env.MaxHops, Grace: ro.grace, Logger: log})
 		return routing{wake: srv.wakeApp, dispatch: srv.dispatch, call: srv.call}
 	})
 	if err != nil {
@@ -216,7 +214,7 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 		ro.shards(nil, m)
 	}
 
-	// Run's services (docs/concurrency.md). From here on everything the node runs
+	// Run's services (docs/internals.md, Concurrency). From here on everything the node runs
 	// is in one of four stages, which Run stops one after another before it
 	// returns. The journal's stage is already running, and everything else is
 	// built and every listener bound before the other stages start.
@@ -237,9 +235,10 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 	shardsClosed := make(chan error, 1)
 	front := service.New(context.Background(), log)
 	front.Add(srv.publicServer(public))
-	front.Add(srv.health)
+	if srv.ready != nil {
+		front.Add(srv.ready)
+	}
 	front.Add(&expiry{store: n.Store, node: n.Name, age: expireAge, log: log})
-	front.Add(&kindsReload{kinds, log})
 	if pprof != nil {
 		front.Add(&httpServer{name: "pprof", log: log, lns: []net.Listener{pprof}, handler: http.DefaultServeMux, grace: ro.grace})
 	}
@@ -281,6 +280,11 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 	}
 	stopStage(log, "the shards", shards)
 	stopStage(log, "the journal", journal)
+	// The local database is closed once the journal's writer has ended: it
+	// writes to it, and the index's rows are in it.
+	if n.LocalDB != nil {
+		n.LocalDB.Close()
+	}
 	// The journal's state is read again, so a lost lease or a fenced writer that
 	// came while the stages stopped is not missed.
 	fatal := n.Err()

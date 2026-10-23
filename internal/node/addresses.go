@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/luci1900/shardlite/internal/cluster"
 	"github.com/luci1900/shardlite/internal/coord"
 )
 
@@ -20,15 +21,15 @@ import (
 // alone would read again at every renewal. A node that restarted within its TTL
 // is found by its refused connection.
 type addresses struct {
-	get   func(ctx context.Context, node string) (*coord.NodeLease, error)
+	get   func(ctx context.Context, node cluster.Node) (*coord.NodeLease, error)
 	nodes func() *NodeList // the lease scan's last listing
 
 	mu     sync.Mutex
-	leases map[string]*coord.NodeLease // by node, as read; their epochs say which life of the node they are
+	leases map[cluster.Node]*coord.NodeLease // by node, as read; their epochs say which life of the node they are
 }
 
 // address is where the node listens for forwards.
-func (a *addresses) address(ctx context.Context, node string) (string, error) {
+func (a *addresses) address(ctx context.Context, node cluster.Node) (string, error) {
 	a.mu.Lock()
 	l := a.leases[node]
 	a.mu.Unlock()
@@ -42,7 +43,7 @@ func (a *addresses) address(ctx context.Context, node string) (string, error) {
 		}
 		a.mu.Lock()
 		if a.leases == nil {
-			a.leases = map[string]*coord.NodeLease{}
+			a.leases = map[cluster.Node]*coord.NodeLease{}
 		}
 		a.leases[node] = l
 		a.mu.Unlock()
@@ -57,13 +58,13 @@ func (a *addresses) stale(l *coord.NodeLease) bool {
 	if list == nil {
 		return false
 	}
-	i, ok := slices.BinarySearchFunc(list.Nodes, l.Name, func(v NodeView, name string) int { return strings.Compare(v.Name, name) })
+	i, ok := slices.BinarySearchFunc(list.Nodes, l.Name, func(v NodeView, name cluster.Node) int { return strings.Compare(string(v.Name), string(name)) })
 	return ok && list.Nodes[i].LastModified.After(l.ExpiresAt())
 }
 
 // set replaces the node's lease with one read elsewhere (the check of an owner
 // that doesn't answer), and forgets the node if l is nil or has no address.
-func (a *addresses) set(node string, l *coord.NodeLease) {
+func (a *addresses) set(node cluster.Node, l *coord.NodeLease) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if l == nil || l.Address == "" {
@@ -71,7 +72,7 @@ func (a *addresses) set(node string, l *coord.NodeLease) {
 		return
 	}
 	if a.leases == nil {
-		a.leases = map[string]*coord.NodeLease{}
+		a.leases = map[cluster.Node]*coord.NodeLease{}
 	}
 	a.leases[node] = l
 }

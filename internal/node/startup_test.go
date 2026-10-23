@@ -77,7 +77,7 @@ func TestStartupWarnings(t *testing.T) {
 			limits: func() limits { return l },
 			log:    slog.New(slog.NewTextHandler(&buf, nil)),
 		}
-		c.warn("/meta")
+		c.warn()
 		return buf.String()
 	}
 	roomy := limits{maxMapCount: 1 << 20, fdHard: 1 << 20}
@@ -92,15 +92,6 @@ func TestStartupWarnings(t *testing.T) {
 	}
 	if !strings.Contains(out, "by_open_files=") {
 		t.Fatalf("no figure logged:\n%s", out)
-	}
-
-	if hasTmpfs {
-		out = run("ext4", roomy)
-		if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "not on tmpfs") {
-			t.Fatalf("metadata on ext4:\n%s", out)
-		}
-	} else if strings.Contains(run("apfs", roomy), "tmpfs") {
-		t.Fatal("macOS has no tmpfs: nothing to warn about")
 	}
 
 	// Half of what 10,000 active shards need.
@@ -191,24 +182,4 @@ func TestRealFilesystem(t *testing.T) {
 		t.Fatalf("refusal of a %q filesystem: %v", want, err)
 	}
 	t.Logf("%s: %q, refused: %v", path, got, err)
-}
-
-// SHARDLITE_SCRATCH_DIR defaults to /dev/shm/shardlite/ on Linux and is required elsewhere.
-func TestScratchDirDefault(t *testing.T) {
-	defer func(g string) { goos = g }(goos)
-	for _, tc := range []struct {
-		goos, set, want string
-		ok              bool
-	}{
-		{"linux", "", defaultScratch, true},
-		{"linux", "/tmp/s", "/tmp/s", true},
-		{"darwin", "/tmp/s", "/tmp/s", true},
-		{"darwin", "", "", false},
-	} {
-		goos = tc.goos
-		e, err := envWith(map[string]string{"SHARDLITE_SCRATCH_DIR": tc.set})
-		if (err == nil) != tc.ok || e.Scratch != tc.want {
-			t.Fatalf("%s with %q: %q %v", tc.goos, tc.set, e.Scratch, err)
-		}
-	}
 }

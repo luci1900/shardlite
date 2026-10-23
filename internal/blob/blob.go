@@ -15,6 +15,9 @@ import (
 	"io"
 	"iter"
 	"time"
+
+	"github.com/luci1900/shardlite/internal/cluster"
+	"github.com/luci1900/shardlite/internal/pos"
 )
 
 // The outcome table. Every Backend follows it for creates, updates and
@@ -58,9 +61,9 @@ type ETag string
 // increments per write. It is stored in the object's metadata with the
 // object itself.
 type WriteID struct {
-	Node  string `json:"node"`
-	Epoch uint64 `json:"epoch"`
-	N     uint64 `json:"n"`
+	Node  cluster.Node `json:"node"`
+	Epoch pos.Epoch    `json:"epoch"`
+	N     uint64       `json:"n"`
 }
 
 // IsZero reports whether the id is empty (an object written without one).
@@ -91,6 +94,11 @@ type Backend interface {
 	// Update replaces the object only if its ETag is expected (ErrConflict otherwise, ErrNotFound if missing).
 	Update(ctx context.Context, key string, body io.ReadSeeker, expected ETag, id WriteID) (ETag, error)
 	Get(ctx context.Context, key string) (io.ReadCloser, ETag, error)
+	// GetRange reads length bytes from offset (to the end of the object if length is
+	// not positive or reaches past it). A negative offset asks for the last
+	// -offset bytes of the object instead, and the length must then be zero: it
+	// is how a caller asks for a tail whose end it does not know. An empty
+	// object has no tail, which is an empty read and not an error.
 	GetRange(ctx context.Context, key string, offset, length int64) (io.ReadCloser, error)
 	// Head returns size, ETag, last modified time and write id. A size of 0 is a fence.
 	Head(ctx context.Context, key string) (ObjectInfo, error)

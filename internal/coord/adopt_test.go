@@ -11,11 +11,13 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/blobtest"
+	"github.com/luci1900/shardlite/internal/cluster"
 	"github.com/luci1900/shardlite/internal/coord"
 )
 
 // acquire takes the lease of node on b.
-func acquire(t *testing.T, b blob.Backend, node string) (*coord.Registry, coord.NodeLease) {
+func acquire(t *testing.T, b blob.Backend, node cluster.Node) (*coord.Registry, coord.NodeLease) {
 	t.Helper()
 	reg := coord.NewRegistry(b, node, opts())
 	l, err := reg.Acquire(context.Background(), coord.NodeInfo{Name: node})
@@ -25,7 +27,7 @@ func acquire(t *testing.T, b blob.Backend, node string) (*coord.Registry, coord.
 	return reg, l
 }
 
-func get(t *testing.T, reg *coord.Registry, node string) coord.NodeLease {
+func get(t *testing.T, reg *coord.Registry, node cluster.Node) coord.NodeLease {
 	t.Helper()
 	l, err := reg.Get(context.Background(), node)
 	if err != nil {
@@ -129,8 +131,8 @@ func TestAdoptSurvivesLostResponses(t *testing.T) {
 	acquire(t, b, "n1")
 	reg2, l2 := acquire(t, b, "n2")
 	var lost atomic.Int32
-	b.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpUpdate && key == coord.Key("n1") && after && lost.Add(1)%3 != 0 {
+	b.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if op == blobtest.OpUpdate && key == coord.Key("n1") && after && lost.Add(1)%3 != 0 {
 			return errors.New("response lost")
 		}
 		return nil

@@ -1,4 +1,4 @@
-package blob
+package blob_test
 
 import (
 	"bytes"
@@ -14,17 +14,20 @@ import (
 	"time"
 
 	"golang.org/x/sync/errgroup"
+
+	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/cluster"
 )
 
 // backendFactory returns a Backend whose keys are private to the test.
-type backendFactory func(t *testing.T) Backend
+type backendFactory func(t *testing.T) blob.Backend
 
-func memoryFactory(t *testing.T) Backend { return NewMemory() }
+func memoryFactory(t *testing.T) blob.Backend { return blob.NewMemory() }
 
 // s3Factory returns the S3 backend on the emulator, with the test's keys under
 // a prefix of their own. The tests that use it are skipped unless
 // SHARDLITE_TEST_S3_ENDPOINT is set (docker/compose.s3.yamls one).
-func s3Factory(t *testing.T) Backend {
+func s3Factory(t *testing.T) blob.Backend {
 	t.Helper()
 	endpoint := os.Getenv("SHARDLITE_TEST_S3_ENDPOINT")
 	if endpoint == "" {
@@ -33,21 +36,21 @@ func s3Factory(t *testing.T) Backend {
 	return s3At(t, endpoint, nil)
 }
 
-func s3At(t *testing.T, endpoint string, mutate func(*S3Options)) Backend {
+func s3At(t *testing.T, endpoint string, mutate func(*blob.S3Options)) blob.Backend {
 	t.Helper()
 	// The emulator script's credentials, unless the environment has its own (TestMain).
 	bucket := os.Getenv("SHARDLITE_TEST_S3_BUCKET")
 	if bucket == "" {
 		bucket = "shardlite-test"
 	}
-	o := S3Options{Bucket: bucket, Endpoint: endpoint}
+	o := blob.S3Options{Bucket: bucket, Endpoint: endpoint}
 	// The bucket is made with a plain client on the emulator: the mutated one may have
 	// a short timeout or faults, and the endpoint asked for may be unreachable on purpose.
 	po := o
 	if e := os.Getenv("SHARDLITE_TEST_S3_ENDPOINT"); e != "" {
 		po.Endpoint = e
 	}
-	if plain, err := NewS3(context.Background(), po); err != nil {
+	if plain, err := blob.NewS3(context.Background(), po); err != nil {
 		t.Fatal(err)
 	} else if err := plain.EnsureBucket(context.Background()); err != nil {
 		t.Fatal(err)
@@ -55,38 +58,38 @@ func s3At(t *testing.T, endpoint string, mutate func(*S3Options)) Backend {
 	if mutate != nil {
 		mutate(&o)
 	}
-	b, err := NewS3(context.Background(), o)
+	b, err := blob.NewS3(context.Background(), o)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var id [8]byte
 	rand.Read(id[:])
-	return WithPrefix(b, "conformance/"+hex.EncodeToString(id[:])+"/")
+	return blob.WithPrefix(b, "conformance/"+hex.EncodeToString(id[:])+"/")
 }
 
 func TestConformanceMemory(t *testing.T) { conformance(t, memoryFactory) }
 
 func TestConformanceS3(t *testing.T) { conformance(t, s3Factory) }
 
-func storeOf(b Backend) *Store {
-	return NewStore(b, "n1", 1, Options{Backoff: time.Millisecond})
+func storeOf(b blob.Backend) *blob.Store {
+	return blob.NewStore(b, "n1", 1, blob.Options{Backoff: time.Millisecond})
 }
 
 // conformance is what every Backend has to do, whatever its store.
 func conformance(t *testing.T, mk backendFactory) {
 	ctx := context.Background()
-	run := func(name string, f func(t *testing.T, b Backend, s *Store)) {
+	run := func(name string, f func(t *testing.T, b blob.Backend, s *blob.Store)) {
 		t.Run(name, func(t *testing.T) {
 			b := mk(t)
 			f(t, b, storeOf(b))
 		})
 	}
 
-	run("CreateTwice", func(t *testing.T, b Backend, s *Store) {
+	run("CreateTwice", func(t *testing.T, b blob.Backend, s *blob.Store) {
 		if _, err := s.Create(ctx, "a/b", strings.NewReader("one")); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := s.Create(ctx, "a/b", strings.NewReader("two")); !errors.Is(err, ErrExists) {
+		if _, err := s.Create(ctx, "a/b", strings.NewReader("two")); !errors.Is(err, blob.ErrExists) {
 			t.Fatalf("got %v, want ErrExists", err)
 		}
 		rc, _, err := s.Get(ctx, "a/b")
@@ -95,7 +98,7 @@ func conformance(t *testing.T, mk backendFactory) {
 		}
 	})
 
-	run("UpdateWithAStaleETag", func(t *testing.T, b Backend, s *Store) {
+	run("UpdateWithAStaleETag", func(t *testing.T, b blob.Backend, s *blob.Store) {
 		e1, err := s.Create(ctx, "k", strings.NewReader("v1"))
 		if err != nil {
 			t.Fatal(err)
@@ -107,10 +110,10 @@ func conformance(t *testing.T, mk backendFactory) {
 		if e2 == e1 {
 			t.Fatal("different contents, same ETag")
 		}
-		if _, err := s.Update(ctx, "k", strings.NewReader("v3"), e1); !errors.Is(err, ErrConflict) {
+		if _, err := s.Update(ctx, "k", strings.NewReader("v3"), e1); !errors.Is(err, blob.ErrConflict) {
 			t.Fatalf("got %v, want ErrConflict", err)
 		}
-		if _, err := s.Update(ctx, "missing", strings.NewReader("v"), e1); !errors.Is(err, ErrNotFound) {
+		if _, err := s.Update(ctx, "missing", strings.NewReader("v"), e1); !errors.Is(err, blob.ErrNotFound) {
 			t.Fatalf("update of a missing object: got %v, want ErrNotFound", err)
 		}
 		rc, etag, err := s.Get(ctx, "k")
@@ -123,7 +126,7 @@ func conformance(t *testing.T, mk backendFactory) {
 		}
 	})
 
-	run("ETagsAgree", func(t *testing.T, b Backend, s *Store) {
+	run("ETagsAgree", func(t *testing.T, b blob.Backend, s *blob.Store) {
 		created, err := s.Create(ctx, "data/shards/users/42/k3x9/1-2.12.ltx", strings.NewReader("contents"))
 		if err != nil {
 			t.Fatal(err)
@@ -144,8 +147,8 @@ func conformance(t *testing.T, mk backendFactory) {
 		}
 	})
 
-	run("WriteIDsComeBackWithHead", func(t *testing.T, b Backend, s *Store) {
-		for i, id := range []WriteID{{Node: "n1", Epoch: 1, N: 1}, {Node: "a:b c/é.d", Epoch: 3, N: 9}, {Node: "host.example.com", Epoch: 1 << 40, N: 1 << 33}, {}} {
+	run("WriteIDsComeBackWithHead", func(t *testing.T, b blob.Backend, s *blob.Store) {
+		for i, id := range []blob.WriteID{{Node: "n1", Epoch: 1, N: 1}, {Node: "a:b c/é.d", Epoch: 3, N: 9}, {Node: "host.example.com", Epoch: 1 << 40, N: 1 << 33}, {}} {
 			key := fmt.Sprintf("id/%d", i)
 			etag, err := b.Create(ctx, key, strings.NewReader("v"), id)
 			if err != nil {
@@ -156,7 +159,7 @@ func conformance(t *testing.T, mk backendFactory) {
 				t.Fatalf("id %+v: head %+v %v", id, info, err)
 			}
 			// An update gets its own id.
-			next := WriteID{Node: "n2", Epoch: 7, N: uint64(i + 1)}
+			next := blob.WriteID{Node: "n2", Epoch: 7, N: uint64(i + 1)}
 			if _, err := b.Update(ctx, key, strings.NewReader("w"), etag, next); err != nil {
 				t.Fatal(err)
 			}
@@ -168,12 +171,12 @@ func conformance(t *testing.T, mk backendFactory) {
 		if _, err := s.Create(ctx, "stored", strings.NewReader("one")); err != nil {
 			t.Fatal(err)
 		}
-		if info, err := s.Head(ctx, "stored"); err != nil || info.WriteID != (WriteID{Node: "n1", Epoch: 1, N: 1}) {
+		if info, err := s.Head(ctx, "stored"); err != nil || info.WriteID != (blob.WriteID{Node: "n1", Epoch: 1, N: 1}) {
 			t.Fatalf("head: %+v %v", info, err)
 		}
 	})
 
-	run("GetRange", func(t *testing.T, b Backend, s *Store) {
+	run("GetRange", func(t *testing.T, b blob.Backend, s *blob.Store) {
 		s.Create(ctx, "k", strings.NewReader("0123456789"))
 		for _, tc := range []struct {
 			off, n int64
@@ -187,34 +190,69 @@ func conformance(t *testing.T, mk backendFactory) {
 				t.Fatalf("range %d+%d: got %q, want %q", tc.off, tc.n, got, tc.want)
 			}
 		}
-		if _, err := s.GetRange(ctx, "nope", 0, 1); !errors.Is(err, ErrNotFound) {
+		if _, err := s.GetRange(ctx, "nope", 0, 1); !errors.Is(err, blob.ErrNotFound) {
 			t.Fatalf("range of a missing object: %v", err)
 		}
 		// Past the end is an error that retrying won't fix.
-		if _, err := s.GetRange(ctx, "k", 11, 1); err == nil || Transient(err) {
+		if _, err := s.GetRange(ctx, "k", 11, 1); err == nil || blob.Transient(err) {
 			t.Fatalf("range past the end: %v", err)
 		}
 	})
 
-	run("HeadAndFences", func(t *testing.T, b Backend, s *Store) {
+	// A tail: a negative offset asks for the last bytes of an object, which is
+	// how a caller asks for a tail whose end it does not know. An empty object
+	// has no tail, which is an empty read and not an error.
+	run("GetRangeTail", func(t *testing.T, b blob.Backend, s *blob.Store) {
+		s.Create(ctx, "k", strings.NewReader("0123456789"))
+		for _, tc := range []struct {
+			n    int64
+			want string
+		}{{1, "9"}, {3, "789"}, {10, "0123456789"}, {100, "0123456789"}} {
+			rc, err := s.GetRange(ctx, "k", -tc.n, 0)
+			if err != nil {
+				t.Fatalf("tail of %d bytes: %v", tc.n, err)
+			}
+			if got := readAll(t, rc); got != tc.want {
+				t.Fatalf("tail of %d bytes: got %q, want %q", tc.n, got, tc.want)
+			}
+		}
+		// A tail with a length is a mistake, not a range.
+		if _, err := s.GetRange(ctx, "k", -3, 3); err == nil || blob.Transient(err) {
+			t.Fatalf("a tail with a length: %v", err)
+		}
+		if _, err := s.GetRange(ctx, "nope", -3, 0); !errors.Is(err, blob.ErrNotFound) {
+			t.Fatalf("tail of a missing object: %v", err)
+		}
+		// An empty object has no last bytes.
+		s.Create(ctx, "fence", strings.NewReader(""))
+		rc, err := s.GetRange(ctx, "fence", -10, 0)
+		if err != nil {
+			t.Fatalf("tail of an empty object: %v", err)
+		}
+		if got := readAll(t, rc); got != "" {
+			t.Fatalf("tail of an empty object: got %q", got)
+		}
+	})
+
+	run("HeadAndFences", func(t *testing.T, b blob.Backend, s *blob.Store) {
 		s.Create(ctx, "fence", strings.NewReader(""))
 		info, err := s.Head(ctx, "fence")
 		if err != nil || info.Size != 0 || info.LastModified.IsZero() {
 			t.Fatalf("size=%d modified=%v err=%v", info.Size, info.LastModified, err)
 		}
-		if _, err := s.Head(ctx, "nope"); !errors.Is(err, ErrNotFound) {
+		if _, err := s.Head(ctx, "nope"); !errors.Is(err, blob.ErrNotFound) {
 			t.Fatalf("got %v", err)
 		}
-		if _, _, err := s.Get(ctx, "nope"); !errors.Is(err, ErrNotFound) {
+		if _, _, err := s.Get(ctx, "nope"); !errors.Is(err, blob.ErrNotFound) {
 			t.Fatalf("get of a missing object: %v", err)
 		}
 		// An empty object is a real object, which a second create finds.
-		if _, err := s.Create(ctx, "fence", strings.NewReader("")); !errors.Is(err, ErrExists) {
+		if _, err := s.Create(ctx, "fence", strings.NewReader("")); !errors.Is(err, blob.ErrExists) {
 			t.Fatalf("second create of a fence: %v", err)
 		}
 	})
 
-	run("BigAndBinaryObjects", func(t *testing.T, b Backend, s *Store) {
+	run("BigAndBinaryObjects", func(t *testing.T, b blob.Backend, s *blob.Store) {
 		data := make([]byte, 3<<20+17)
 		rand.Read(data)
 		if _, err := s.Create(ctx, "big", bytes.NewReader(data)); err != nil {
@@ -243,7 +281,7 @@ func conformance(t *testing.T, mk backendFactory) {
 		}
 	})
 
-	run("ListByPrefix", func(t *testing.T, b Backend, s *Store) {
+	run("ListByPrefix", func(t *testing.T, b blob.Backend, s *blob.Store) {
 		for _, k := range []string{"data/journal/n1/2", "data/journal/n1/1", "data/journal/n2/1", "state/leases/n1", "data/journal/n10/1"} {
 			s.Create(ctx, k, strings.NewReader(k))
 		}
@@ -268,7 +306,7 @@ func conformance(t *testing.T, mk backendFactory) {
 		}
 	})
 
-	run("ListPaginates", func(t *testing.T, b Backend, s *Store) {
+	run("ListPaginates", func(t *testing.T, b blob.Backend, s *blob.Store) {
 		const n = 1105 // a listing page is at most 1000 keys
 		var wg errgroup.Group
 		wg.SetLimit(32)
@@ -311,17 +349,17 @@ func conformance(t *testing.T, mk backendFactory) {
 		}
 	})
 
-	run("Delete", func(t *testing.T, b Backend, s *Store) {
+	run("Delete", func(t *testing.T, b blob.Backend, s *blob.Store) {
 		s.Create(ctx, "k", strings.NewReader("v"))
 		if err := s.Delete(ctx, "k", ""); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := s.Head(ctx, "k"); !errors.Is(err, ErrNotFound) {
+		if _, err := s.Head(ctx, "k"); !errors.Is(err, blob.ErrNotFound) {
 			t.Fatalf("after delete: %v", err)
 		}
 		// Deleting what isn't there is ErrNotFound on a store that says so and done
 		// on one that doesn't (S3 answers success): callers accept both.
-		if err := s.Delete(ctx, "k", ""); err != nil && !errors.Is(err, ErrNotFound) {
+		if err := s.Delete(ctx, "k", ""); err != nil && !errors.Is(err, blob.ErrNotFound) {
 			t.Fatalf("second delete: %v", err)
 		}
 		// The key can be created again.
@@ -332,7 +370,7 @@ func conformance(t *testing.T, mk backendFactory) {
 
 	// Conditional deletes are required: a stale ETag is refused and the object
 	// stays, the current one deletes it, and a missing key is not found.
-	run("ConditionalDelete", func(t *testing.T, b Backend, s *Store) {
+	run("ConditionalDelete", func(t *testing.T, b blob.Backend, s *blob.Store) {
 		e1, err := s.Create(ctx, "k", strings.NewReader("v"))
 		if err != nil {
 			t.Fatal(err)
@@ -341,7 +379,7 @@ func conformance(t *testing.T, mk backendFactory) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := s.Delete(ctx, "k", e1); !errors.Is(err, ErrConflict) {
+		if err := s.Delete(ctx, "k", e1); !errors.Is(err, blob.ErrConflict) {
 			t.Fatalf("delete with a stale ETag: %v, want ErrConflict", err)
 		}
 		if _, err := s.Head(ctx, "k"); err != nil {
@@ -350,18 +388,18 @@ func conformance(t *testing.T, mk backendFactory) {
 		if err := s.Delete(ctx, "k", e2); err != nil {
 			t.Fatalf("delete with the current ETag: %v", err)
 		}
-		if _, err := s.Head(ctx, "k"); !errors.Is(err, ErrNotFound) {
+		if _, err := s.Head(ctx, "k"); !errors.Is(err, blob.ErrNotFound) {
 			t.Fatalf("after delete: %v", err)
 		}
 		// A missing key is not found on S3 and a failed precondition on RustFS
 		// (412): either way the caller sees that somebody else deleted it.
-		if err := s.Delete(ctx, "k", e2); !errors.Is(err, ErrNotFound) && !errors.Is(err, ErrConflict) {
+		if err := s.Delete(ctx, "k", e2); !errors.Is(err, blob.ErrNotFound) && !errors.Is(err, blob.ErrConflict) {
 			t.Fatalf("conditional delete of a missing key: %v, want ErrNotFound or ErrConflict", err)
 		}
 	})
 
-	run("WithPrefixesAreSeparate", func(t *testing.T, b Backend, s *Store) {
-		x, y := storeOf(WithPrefix(b, "x/")), storeOf(WithPrefix(b, "y/"))
+	run("WithPrefixesAreSeparate", func(t *testing.T, b blob.Backend, s *blob.Store) {
+		x, y := storeOf(blob.WithPrefix(b, "x/")), storeOf(blob.WithPrefix(b, "y/"))
 		if _, err := x.Create(ctx, "state/leases/n1", strings.NewReader("x")); err != nil {
 			t.Fatal(err)
 		}
@@ -378,34 +416,34 @@ func conformance(t *testing.T, mk backendFactory) {
 		if len(keys) != 1 || keys[0] != "state/leases/n1" {
 			t.Fatalf("listing: %v", keys)
 		}
-		if _, err := s.Head(ctx, "state/leases/n1"); !errors.Is(err, ErrNotFound) {
+		if _, err := s.Head(ctx, "state/leases/n1"); !errors.Is(err, blob.ErrNotFound) {
 			t.Fatalf("head without the prefix: %v", err)
 		}
 	})
 
 	// Two conditional creates racing on one key: exactly one wins. Store's retries
 	// turn a store's "try again" answers into the real one (exists).
-	run("CreateRace", func(t *testing.T, b Backend, s *Store) {
+	run("CreateRace", func(t *testing.T, b blob.Backend, s *blob.Store) {
 		for round := range 15 {
 			key := fmt.Sprintf("race/c%d", round)
 			results := make([]error, 4)
 			var wg errgroup.Group
 			for i := range results {
 				wg.Go(func() error {
-					st := NewStore(b, fmt.Sprintf("n%d", i), 1, Options{Backoff: time.Millisecond, Attempts: 12})
+					st := blob.NewStore(b, cluster.Node(fmt.Sprintf("n%d", i)), 1, blob.Options{Backoff: time.Millisecond, Attempts: 12})
 					_, results[i] = st.Create(ctx, key, strings.NewReader(fmt.Sprint(i)))
 					return nil
 				})
 			}
 			wg.Wait()
-			assertOneWinner(t, round, results, ErrExists)
+			assertOneWinner(t, round, results, blob.ErrExists)
 			// The winner's contents are there, and its write id names it.
 			info, err := b.Head(ctx, key)
 			if err != nil {
 				t.Fatal(err)
 			}
 			for i, err := range results {
-				if err == nil && info.WriteID.Node != fmt.Sprintf("n%d", i) {
+				if err == nil && string(info.WriteID.Node) != fmt.Sprintf("n%d", i) {
 					t.Fatalf("round %d: writer %d won but the object says %+v", round, i, info.WriteID)
 				}
 			}
@@ -413,7 +451,7 @@ func conformance(t *testing.T, mk backendFactory) {
 	})
 
 	// Two (or more) conditional updates on one ETag: exactly one wins.
-	run("UpdateRace", func(t *testing.T, b Backend, s *Store) {
+	run("UpdateRace", func(t *testing.T, b blob.Backend, s *blob.Store) {
 		for round := range 15 {
 			key := fmt.Sprintf("race/u%d", round)
 			etag, err := s.Create(ctx, key, strings.NewReader("start"))
@@ -424,13 +462,13 @@ func conformance(t *testing.T, mk backendFactory) {
 			var wg errgroup.Group
 			for i := range results {
 				wg.Go(func() error {
-					st := NewStore(b, fmt.Sprintf("n%d", i), 1, Options{Backoff: time.Millisecond, Attempts: 12})
+					st := blob.NewStore(b, cluster.Node(fmt.Sprintf("n%d", i)), 1, blob.Options{Backoff: time.Millisecond, Attempts: 12})
 					_, results[i] = st.Update(ctx, key, strings.NewReader(fmt.Sprint("by ", i)), etag)
 					return nil
 				})
 			}
 			wg.Wait()
-			assertOneWinner(t, round, results, ErrConflict)
+			assertOneWinner(t, round, results, blob.ErrConflict)
 		}
 	})
 }

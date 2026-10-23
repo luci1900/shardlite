@@ -1,4 +1,4 @@
-package blob
+package blob_test
 
 import (
 	"os"

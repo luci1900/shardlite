@@ -8,9 +8,11 @@ import (
 	"slices"
 	"strconv"
 	"testing"
+
+	"github.com/luci1900/shardlite/internal/kill"
 )
 
-var killPoints = append([]string{"segment-before", "segment-after", "delta-before-manifest", "rebase-before-manifest", "rebase-after-swap"}, seedPoints...)
+var killPoints = append([]kill.Point{kill.SegmentBefore, kill.SegmentAfter, kill.DeltaBeforeManifest, kill.RebaseBeforeManifest, kill.RebaseAfterSwap}, activationPoints...)
 
 // TestRandomCrashes does random work and kills the node at random points,
 // recovering and carrying on each time. Set SHARDLITE_SEED to repeat a run.
@@ -27,7 +29,7 @@ func TestRandomCrashes(t *testing.T) {
 	for round := range rounds {
 		// One operation, maybe with a kill armed for it.
 		op := rng.IntN(11)
-		arm := ""
+		var arm kill.Point
 		if rng.IntN(4) == 0 {
 			arm = killPoints[rng.IntN(len(killPoints))]
 		}
@@ -37,7 +39,7 @@ func TestRandomCrashes(t *testing.T) {
 		case op < 6:
 			desc = "commit+sync"
 			if arm == "segment-before" || arm == "segment-after" {
-				r.node.Must(t, "arm", arm)
+				r.node.Must(t, "arm", string(arm))
 			} else {
 				arm = ""
 			}
@@ -49,7 +51,7 @@ func TestRandomCrashes(t *testing.T) {
 		case op < 9:
 			desc = "delta"
 			if arm == "delta-before-manifest" {
-				r.node.Must(t, "arm", arm)
+				r.node.Must(t, "arm", string(arm))
 			} else {
 				arm = ""
 			}
@@ -57,7 +59,7 @@ func TestRandomCrashes(t *testing.T) {
 		case op == 10:
 			// Let go of the shard and activate it again, possibly killed on the way.
 			desc = "reactivation"
-			if !slices.Contains(seedPoints, arm) {
+			if !slices.Contains(activationPoints, arm) {
 				arm = ""
 			}
 			cached := rng.IntN(2) == 0
@@ -74,7 +76,7 @@ func TestRandomCrashes(t *testing.T) {
 			}
 			r.ackPending()
 			if arm != "" {
-				r.node.Must(t, "arm", arm)
+				r.node.Must(t, "arm", string(arm))
 			}
 			// From the files the release left, or restored from blob storage as after a
 			// restart (which discards them).
@@ -89,7 +91,7 @@ func TestRandomCrashes(t *testing.T) {
 		default:
 			desc = "rebase"
 			if arm == "rebase-before-manifest" || arm == "rebase-after-swap" {
-				r.node.Must(t, "arm", arm)
+				r.node.Must(t, "arm", string(arm))
 			} else {
 				arm = ""
 			}

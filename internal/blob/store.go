@@ -9,6 +9,9 @@ import (
 	"math/rand/v2"
 	"sync/atomic"
 	"time"
+
+	"github.com/luci1900/shardlite/internal/cluster"
+	"github.com/luci1900/shardlite/internal/pos"
 )
 
 // Options tune a Store's retries.
@@ -30,14 +33,14 @@ type Options struct {
 // that persisted through every attempt.
 type Store struct {
 	b     Backend
-	node  string
-	epoch uint64
+	node  cluster.Node
+	epoch pos.Epoch
 	opts  Options
 	n     atomic.Uint64
 }
 
 // NewStore wraps a backend. node and epoch go into every write id.
-func NewStore(b Backend, node string, epoch uint64, opts Options) *Store {
+func NewStore(b Backend, node cluster.Node, epoch pos.Epoch, opts Options) *Store {
 	if opts.Attempts <= 0 {
 		opts.Attempts = 4
 	}
@@ -51,7 +54,7 @@ func NewStore(b Backend, node string, epoch uint64, opts Options) *Store {
 }
 
 // Epoch is the epoch that goes into this store's write ids.
-func (s *Store) Epoch() uint64 { return s.epoch }
+func (s *Store) Epoch() pos.Epoch { return s.epoch }
 
 // NewWriteID returns an id for CreateWithID.
 func (s *Store) NewWriteID() WriteID {

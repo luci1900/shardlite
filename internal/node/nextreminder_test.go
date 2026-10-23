@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/remindex"
 	"github.com/luci1900/shardlite/internal/system/dispatch"
 )
@@ -20,19 +21,19 @@ func TestNeverWrittenWithAnAutoincrementSequence(t *testing.T) {
 	t.Parallel()
 	r := newSRigWith(t, quick)
 	// An AUTOINCREMENT table of the app's that came and went leaves sqlite_sequence.
-	r.sql("users/s1", `DROP TABLE kv; DROP TABLE acks; CREATE TABLE tmp (id INTEGER PRIMARY KEY AUTOINCREMENT); INSERT INTO tmp DEFAULT VALUES; DROP TABLE tmp`)
-	if n := r.count("users/s1", `SELECT count(*) FROM sqlite_schema WHERE name = 'sqlite_sequence'`); n != 1 {
+	r.sql("test.users/s1", `DROP TABLE kv; DROP TABLE acks; CREATE TABLE tmp (id INTEGER PRIMARY KEY AUTOINCREMENT); INSERT INTO tmp DEFAULT VALUES; DROP TABLE tmp`)
+	if n := r.count("test.users/s1", `SELECT count(*) FROM sqlite_schema WHERE name = 'sqlite_sequence'`); n != 1 {
 		t.Fatalf("%d sqlite_sequence tables", n)
 	}
-	r.closeInApp("users/s1")
-	eventually(t, "deactivation", r.inactive("users/s1"))
-	if _, err := r.rawManifest("users/s1"); !errors.Is(err, blob.ErrNotFound) {
+	r.closeInApp("test.users/s1")
+	eventually(t, "deactivation", r.inactive("test.users/s1"))
+	if _, err := r.rawManifest("test.users/s1"); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("a shard with only the reserved table and a sequence was kept: %v", err)
 	}
 	// The app's own AUTOINCREMENT table is the app's data.
-	r.sql("users/s2", `DROP TABLE kv; DROP TABLE acks; CREATE TABLE mine (id INTEGER PRIMARY KEY AUTOINCREMENT)`)
-	r.closeInApp("users/s2")
-	eventually(t, "deactivation", func() bool { return r.cached("users/s2") })
+	r.sql("test.users/s2", `DROP TABLE kv; DROP TABLE acks; CREATE TABLE mine (id INTEGER PRIMARY KEY AUTOINCREMENT)`)
+	r.closeInApp("test.users/s2")
+	eventually(t, "deactivation", func() bool { return r.cached("test.users/s2") })
 }
 
 // --- next_reminder and the reminder index ---
@@ -43,7 +44,7 @@ func withDispatch(o *CatalogOptions) { o.Dispatch = &dispatch.Options{Idle: time
 
 // nextReminder is the minute the manifest of target says it next needs waking, 0
 // for none.
-func (r *mrig) nextReminder(target string) int64 {
+func (r *mrig) nextReminder(target string) remindex.Minute {
 	r.t.Helper()
 	m, err := r.manifest(target)
 	if err != nil {
@@ -61,7 +62,7 @@ func (r *mrig) entryCount(target string) int {
 	}
 	n := 0
 	for _, e := range all {
-		if e.Shard == target {
+		if e.Shard.String() == target {
 			n++
 		}
 	}
@@ -104,11 +105,11 @@ func TestShutdownWithAFailingHandlerLeavesAnEntryThatWakesTheShard(t *testing.T)
 			rec := &recorder{}
 			r.record(rec, "")
 			attempts := r.failUntil(&up)
-			r.remind("users/w1", "k", time.Now().Unix())
+			r.remind("test.users/w1", "k", time.Now().Unix())
 			eventually(t, "a first attempt", func() bool { return attempts.Load() >= 1 })
-			r.shutdown("users/w1")
-			if r.nextReminder("users/w1") == 0 || r.entryCount("users/w1") == 0 {
-				t.Fatalf("next_reminder %d and %d entries, want both", r.nextReminder("users/w1"), r.entryCount("users/w1"))
+			r.shutdown("test.users/w1")
+			if r.nextReminder("test.users/w1") == 0 || r.entryCount("test.users/w1") == 0 {
+				t.Fatalf("next_reminder %d and %d entries, want both", r.nextReminder("test.users/w1"), r.entryCount("test.users/w1"))
 			}
 			if tc.deleteData {
 				if err := os.RemoveAll(r.data); err != nil {
@@ -120,9 +121,9 @@ func TestShutdownWithAFailingHandlerLeavesAnEntryThatWakesTheShard(t *testing.T)
 			eventually(t, "the reminder to be delivered after the restart, with no request for the shard", func() bool {
 				return rec.count() == 1
 			})
-			eventually(t, "the reminder to be consumed", func() bool { return r.reminderRows("users/w1") == 0 })
-			r.closeInApp("users/w1") // the handler's delete opened the shard in the app again
-			eventually(t, "the next_reminder to go", func() bool { return r.cached("users/w1") && r.nextReminder("users/w1") == 0 })
+			eventually(t, "the reminder to be consumed", func() bool { return r.reminderRows("test.users/w1") == 0 })
+			r.closeInApp("test.users/w1") // the handler's delete opened the shard in the app again
+			eventually(t, "the next_reminder to go", func() bool { return r.cached("test.users/w1") && r.nextReminder("test.users/w1") == 0 })
 		})
 	}
 }
@@ -139,9 +140,9 @@ func TestCrashAfterTheWakeKeepsTheEntry(t *testing.T) {
 	rec := &recorder{}
 	r.record(rec, "")
 	attempts := r.failUntil(&up)
-	r.remind("users/c1", "k", clk.Now().Unix())
+	r.remind("test.users/c1", "k", clk.Now().Unix())
 	advanceUntil(t, clk, 100*time.Millisecond, "a first attempt", func() bool { return attempts.Load() >= 1 })
-	r.shutdown("users/c1")
+	r.shutdown("test.users/c1")
 
 	// Woken, but the receiver still fails, and the node crashes.
 	before := attempts.Load()
@@ -149,8 +150,8 @@ func TestCrashAfterTheWakeKeepsTheEntry(t *testing.T) {
 	advanceUntil(t, clk, 100*time.Millisecond, "the wake to start deliveries", func() bool { return attempts.Load() > before })
 	r.crash()
 	r.stopJournal()
-	if r.nextReminder("users/c1") == 0 || r.entryCount("users/c1") == 0 {
-		t.Fatalf("next_reminder %d and %d entries after a crash, want both", r.nextReminder("users/c1"), r.entryCount("users/c1"))
+	if r.nextReminder("test.users/c1") == 0 || r.entryCount("test.users/c1") == 0 {
+		t.Fatalf("next_reminder %d and %d entries after a crash, want both", r.nextReminder("test.users/c1"), r.entryCount("test.users/c1"))
 	}
 
 	// Woken again, once the moved entry is due.
@@ -158,9 +159,9 @@ func TestCrashAfterTheWakeKeepsTheEntry(t *testing.T) {
 	r.restart(opts)
 	clk.Advance(2 * time.Minute)
 	advanceUntil(t, clk, 100*time.Millisecond, "delivery after the second wake", func() bool { return rec.count() == 1 })
-	advanceUntil(t, clk, 100*time.Millisecond, "the reminder to be consumed", func() bool { return r.reminderRows("users/c1") == 0 })
-	r.closeInApp("users/c1") // the handler's delete opened the shard in the app again
-	advanceUntil(t, clk, 100*time.Millisecond, "the next_reminder to go", func() bool { return r.cached("users/c1") && r.nextReminder("users/c1") == 0 })
+	advanceUntil(t, clk, 100*time.Millisecond, "the reminder to be consumed", func() bool { return r.reminderRows("test.users/c1") == 0 })
+	r.closeInApp("test.users/c1") // the handler's delete opened the shard in the app again
+	advanceUntil(t, clk, 100*time.Millisecond, "the next_reminder to go", func() bool { return r.cached("test.users/c1") && r.nextReminder("test.users/c1") == 0 })
 }
 
 // --- next_reminder at manifest writes ---
@@ -214,11 +215,11 @@ func TestReminderFailingPastADeltaIsWokenAfterACrash(t *testing.T) {
 		return http.StatusServiceUnavailable
 	}}
 	r.record(rec, "")
-	r.remind("users/bi1", "k", time.Now().Unix())
+	r.remind("test.users/bi1", "k", time.Now().Unix())
 	eventually(t, "a first call", func() bool { return rec.count() >= 1 })
-	r.wokeByTheDelta("users/bi1", opts)
+	r.wokeByTheDelta("test.users/bi1", opts)
 	up.Store(true)
-	eventually(t, "the reminder to be consumed after the crash", func() bool { return r.reminderRows("users/bi1") == 0 })
+	eventually(t, "the reminder to be consumed after the crash", func() bool { return r.reminderRows("test.users/bi1") == 0 })
 }
 
 // The same for a marked shard, which is deleted when it next goes idle.
@@ -226,10 +227,10 @@ func TestMarkedShardPastADeltaIsWokenAfterACrash(t *testing.T) {
 	t.Parallel()
 	opts := both(quick, withDispatch, deltaAge(50*time.Millisecond))
 	r := newSRigWith(t, opts)
-	r.sql("slow/bm1", `INSERT INTO kv (payload) VALUES (x'01')`)
-	r.sql("slow/bm1", markSQL)
-	r.wokeByTheDelta("slow/bm1", opts)
-	eventually(t, "the shard to be woken", func() bool { return r.m.IsActive("slow/bm1") })
+	r.sql("test.slow/bm1", `INSERT INTO kv (payload) VALUES (x'01')`)
+	r.sql("test.slow/bm1", markSQL)
+	r.wokeByTheDelta("test.slow/bm1", opts)
+	eventually(t, "the shard to be woken", func() bool { return r.m.IsActive(shardName("test.slow/bm1")) })
 }
 
 // An entry that can't be created fails the delta, so the manifest never has files
@@ -240,8 +241,8 @@ func TestFailedEntryFailsTheDelta(t *testing.T) {
 	var failing atomic.Bool
 	failing.Store(true)
 	var failures atomic.Int32
-	r.local.SetHook(func(_ context.Context, op blob.Op, key string, after bool) error {
-		if failing.Load() && op == blob.OpCreate && strings.HasPrefix(key, remindex.Prefix) {
+	r.local.SetHook(func(_ context.Context, op blobtest.Op, key string, after bool) error {
+		if failing.Load() && op == blobtest.OpCreate && strings.HasPrefix(key, remindex.Prefix) {
 			failures.Add(1)
 			return errors.New("storage down")
 		}
@@ -249,16 +250,16 @@ func TestFailedEntryFailsTheDelta(t *testing.T) {
 	})
 	var up atomic.Bool
 	attempts := r.failUntil(&up)
-	r.remind("users/fd1", "k", time.Now().Unix())
+	r.remind("test.users/fd1", "k", time.Now().Unix())
 	eventually(t, "a first attempt", func() bool { return attempts.Load() >= 1 })
 	eventually(t, "a failed entry", func() bool { return failures.Load() >= 1 })
-	r.afterSnapshotLooks(3, "users/fd1")
-	if m, err := r.manifest("users/fd1"); err != nil || len(m.Files) != 0 {
+	r.afterSnapshotLooks(3, "test.users/fd1")
+	if m, err := r.manifest("test.users/fd1"); err != nil || len(m.Files) != 0 {
 		t.Fatalf("manifest %+v (%v): a delta without its entry", m, err)
 	}
 	failing.Store(false)
-	eventually(t, "the delta with its entry", r.allInADelta("users/fd1"))
-	if r.entryCount("users/fd1") == 0 {
+	eventually(t, "the delta with its entry", r.allInADelta("test.users/fd1"))
+	if r.entryCount("test.users/fd1") == 0 {
 		t.Fatal("no entry")
 	}
 }
@@ -272,16 +273,16 @@ func TestDeactivationWithNoTailClearsTheNextReminder(t *testing.T) {
 	r := newSRigWith(t, both(quick, deltaAge(50*time.Millisecond), withClock(clk)))
 	rec := &recorder{keep: true, answer: func(int, *http.Request) int { return http.StatusServiceUnavailable }}
 	r.record(rec, "")
-	r.remind("users/sw1", "k", clk.Now().Unix())
-	advanceUntil(t, clk, 100*time.Millisecond, "a delta with a next_reminder", r.allInADelta("users/sw1"))
-	before, err := r.manifest("users/sw1")
+	r.remind("test.users/sw1", "k", clk.Now().Unix())
+	advanceUntil(t, clk, 100*time.Millisecond, "a delta with a next_reminder", r.allInADelta("test.users/sw1"))
+	before, err := r.manifest("test.users/sw1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	r.closeInApp("users/sw1")
+	r.closeInApp("test.users/sw1")
 	clk.Advance(25 * time.Hour) // the reminder is stale now
-	advanceUntil(t, clk, 100*time.Millisecond, "deactivation", func() bool { return r.cached("users/sw1") })
-	after, err := r.manifest("users/sw1")
+	advanceUntil(t, clk, 100*time.Millisecond, "deactivation", func() bool { return r.cached("test.users/sw1") })
+	after, err := r.manifest("test.users/sw1")
 	if err != nil || after.NextReminder != 0 || !slices.Equal(after.Files, before.Files) {
 		t.Fatalf("manifest %+v (%v), want the files of %+v and no next_reminder", after, err, before)
 	}
@@ -303,10 +304,10 @@ func TestDeltaAheadOfAnUncapturedCommitRecordsNow(t *testing.T) {
 	// The delta timer never fires: the test runs the delta on the shard's loop.
 	r := newSRigWith(t, both(manualFlush, deltaAge(time.Nanosecond), func(o *CatalogOptions) { o.Lifecycle.SnapshotEvery = time.Hour }))
 	later := time.Now().Add(time.Hour).Unix()
-	r.remind("slow/ua1", "k", later)
+	r.remind("test.slow/ua1", "k", later)
 	r.cycle() // the row is captured, in the tail
-	a := r.shard("slow/ua1")
-	r.sql("slow/ua1", `DELETE FROM _shardlite_reminders`) // not captured: no cycle runs
+	a := r.shard("test.slow/ua1")
+	r.sql("test.slow/ua1", `DELETE FROM _shardlite_reminders`) // not captured: no cycle runs
 	if !a.cap.hasNewFrames() {
 		t.Fatal("the delete was captured")
 	}
@@ -319,7 +320,7 @@ func TestDeltaAheadOfAnUncapturedCommitRecordsNow(t *testing.T) {
 	if err := <-done; err != nil { // the delta waits for no flush cycle: the delete stays uncaptured
 		t.Fatal(err)
 	}
-	m, err := r.manifest("slow/ua1")
+	m, err := r.manifest("test.slow/ua1")
 	if err != nil {
 		t.Fatal(err)
 	}

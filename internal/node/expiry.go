@@ -7,7 +7,9 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/segment"
+	"github.com/luci1900/shardlite/internal/cluster"
+	"github.com/luci1900/shardlite/internal/journal"
+	"github.com/luci1900/shardlite/internal/pos"
 )
 
 // maxExpireEvery is the longest wait between two passes.
@@ -33,9 +35,9 @@ const maxExpireEvery = 10 * time.Minute
 // the node's next life's, written since the adoption finished.
 type expiry struct {
 	store *blob.Store
-	node  string
+	node  cluster.Node
 	age   time.Duration
-	below uint64 // only segments numbered below this, if set
+	below pos.Seg // only segments numbered below this, if set
 	log   *slog.Logger
 }
 
@@ -62,11 +64,11 @@ func (s *expiry) Serve(ctx context.Context) error {
 // pass starts again.
 func (s *expiry) expire(ctx context.Context, now time.Time) (deleted int, err error) {
 	var old []string
-	for info, err := range s.store.List(ctx, segment.Prefix(s.node)) {
+	for info, err := range s.store.List(ctx, journal.Prefix(s.node)) {
 		if err != nil {
 			return deleted, err
 		}
-		if s.below > 0 && info.Key >= segment.Key(s.node, s.below) {
+		if s.below > 0 && info.Key >= journal.Key(s.node, s.below) {
 			break // keys sort by number
 		}
 		if info.Size > 0 && (s.age == 0 || now.Sub(info.LastModified) > s.age) {

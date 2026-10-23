@@ -11,19 +11,15 @@ import (
 
 // What one active shard costs the node process, rounded up from measurements
 // (TestMeasurePerShardCost, run with -v on Linux): the descriptors and memory
-// mappings the node holds for a shard (Litestream's connection, its -shm
-// mapping, our read-only mapping of it and SQLite's per-connection memory), and
-// what the node holds before it has any (mostly OS thread stacks, two mappings
-// each, a few hundred threads under load). The app's own descriptors are in the
-// app's process.
+// mappings the node holds for a shard (capture's connection, its read
+// transaction, its -shm mapping, our read-only mapping of it and SQLite's
+// per-connection memory), and what the node holds before it has any (mostly OS
+// thread stacks, two mappings each, a few hundred threads under load). The
+// app's own descriptors are in the app's process.
 //
-// Measured on Linux with 300 shards: 6.0 descriptors and 7.05 mappings each
-// (5.0 and 6.4 before stage 1o: the reserved reminders table is created, read
-// and written through a second connection in Litestream's pool, which stays
-// open). Earlier benchmarks (stages 0b and 1f) saw 6 to 7 descriptors and 6.3
-// to 6.8 mappings per shard at up to 10,000 shards.
+// Measured on Linux with 300 shards: 7.00 descriptors and 6.8 mappings each.
 const (
-	descriptorsPerShard = 7
+	descriptorsPerShard = 8
 	mappingsPerShard    = 8
 	baseDescriptors     = 64
 	baseMappings        = 1000
@@ -83,12 +79,7 @@ func (c startupChecks) refuse(dataDir string) error {
 }
 
 // warn logs what is likely to go wrong without refusing to start.
-func (c startupChecks) warn(scratchDir string) {
-	if hasTmpfs {
-		if name, err := c.fsType(scratchDir); err == nil && name != "tmpfs" && name != "ramfs" {
-			c.log.Warn("the scratch directory is not on tmpfs: every sync of every shard does an fsync there, which costs real disk writes (put SHARDLITE_SCRATCH_DIR on tmpfs, such as under /dev/shm)", "dir", scratchDir, "filesystem", orOther(name))
-		}
-	}
+func (c startupChecks) warn() {
 	l := c.limits()
 	byFD, byMaps := l.capacity()
 	c.log.Info("how many active shards this node's limits allow",
@@ -107,11 +98,4 @@ func capacityString(n int64) string {
 		return "unknown"
 	}
 	return strconv.FormatInt(n, 10)
-}
-
-func orOther(s string) string {
-	if s == "" {
-		return "other (not tmpfs)"
-	}
-	return s
 }

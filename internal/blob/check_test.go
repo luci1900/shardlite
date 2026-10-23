@@ -1,4 +1,4 @@
-package blob
+package blob_test
 
 import (
 	"context"
@@ -6,12 +6,14 @@ import (
 	"io"
 	"strings"
 	"testing"
+
+	"github.com/luci1900/shardlite/internal/blob"
 )
 
 // misbehaving wraps a Memory and gets one thing wrong, the way a store or proxy
 // that ignores a header would.
 type misbehaving struct {
-	*Memory
+	*blob.Memory
 	ignoreIfNoneMatch bool // Create overwrites
 	ignoreIfMatch     bool // Update ignores the expected ETag
 	dropMetadata      bool // the write id is not stored
@@ -22,7 +24,7 @@ type misbehaving struct {
 	failDelete        bool // a conditional delete is refused outright (501 Not Implemented)
 }
 
-func (m misbehaving) Delete(ctx context.Context, key string, expected ETag) error {
+func (m misbehaving) Delete(ctx context.Context, key string, expected blob.ETag) error {
 	if expected != "" {
 		if m.failDelete {
 			return errors.New("501 Not Implemented")
@@ -34,12 +36,12 @@ func (m misbehaving) Delete(ctx context.Context, key string, expected ETag) erro
 	return m.Memory.Delete(ctx, key, expected)
 }
 
-func (m misbehaving) Create(ctx context.Context, key string, body io.ReadSeeker, id WriteID) (ETag, error) {
+func (m misbehaving) Create(ctx context.Context, key string, body io.ReadSeeker, id blob.WriteID) (blob.ETag, error) {
 	if m.failCreate {
 		return "", errors.New("501 Not Implemented")
 	}
 	if m.dropMetadata {
-		id = WriteID{}
+		id = blob.WriteID{}
 	}
 	if m.ignoreIfNoneMatch {
 		if info, err := m.Memory.Head(ctx, key); err == nil {
@@ -49,12 +51,12 @@ func (m misbehaving) Create(ctx context.Context, key string, body io.ReadSeeker,
 	return m.Memory.Create(ctx, key, body, id)
 }
 
-func (m misbehaving) Update(ctx context.Context, key string, body io.ReadSeeker, expected ETag, id WriteID) (ETag, error) {
+func (m misbehaving) Update(ctx context.Context, key string, body io.ReadSeeker, expected blob.ETag, id blob.WriteID) (blob.ETag, error) {
 	if m.failUpdate {
 		return "", errors.New("501 Not Implemented")
 	}
 	if m.dropMetadata {
-		id = WriteID{}
+		id = blob.WriteID{}
 	}
 	if m.ignoreIfMatch {
 		if info, err := m.Memory.Head(ctx, key); err == nil {
@@ -62,7 +64,7 @@ func (m misbehaving) Update(ctx context.Context, key string, body io.ReadSeeker,
 		}
 	}
 	if m.updateCreates {
-		if _, err := m.Memory.Head(ctx, key); errors.Is(err, ErrNotFound) {
+		if _, err := m.Memory.Head(ctx, key); errors.Is(err, blob.ErrNotFound) {
 			return m.Memory.Create(ctx, key, body, id)
 		}
 	}
@@ -86,8 +88,8 @@ func TestCheckStoreRefusesAMisbehavingStore(t *testing.T) {
 		"refuses conditional deletes": {misbehaving{failDelete: true}, "delete with a stale ETag"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			tc.store.Memory = NewMemory()
-			err := CheckStore(ctx, WithPrefix(tc.store, "p/"), "n1")
+			tc.store.Memory = blob.NewMemory()
+			err := blob.CheckStore(ctx, blob.WithPrefix(tc.store, "p/"), "n1")
 			if err == nil {
 				t.Fatal("the check passed")
 			}
@@ -110,10 +112,10 @@ func TestCheckStorePasses(t *testing.T) {
 	for name, mk := range map[string]backendFactory{"memory": memoryFactory, "s3": s3Factory} {
 		t.Run(name, func(t *testing.T) {
 			b := mk(t)
-			if err := CheckStore(ctx, b, "n1"); err != nil {
+			if err := blob.CheckStore(ctx, b, "n1"); err != nil {
 				t.Fatal(err)
 			}
-			if err := CheckStore(ctx, b, "n1"); err != nil { // and again: each run uses a key of its own
+			if err := blob.CheckStore(ctx, b, "n1"); err != nil { // and again: each run uses a key of its own
 				t.Fatal(err)
 			}
 			for info := range b.List(ctx, "check/", "") {

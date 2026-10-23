@@ -14,6 +14,8 @@ import (
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/capture"
+	"github.com/luci1900/shardlite/internal/pos"
+	"github.com/luci1900/shardlite/internal/remindex"
 	"github.com/luci1900/shardlite/internal/spool"
 )
 
@@ -43,12 +45,12 @@ type Hooks struct {
 	// none), which the update records with its entry in the reminder index
 	// (docs/internals.md, Reminder index). Without the hook the manifest keeps its
 	// own.
-	BeforeUpdate func(ctx context.Context, end uint64) (nextReminder int64, err error)
+	BeforeUpdate func(ctx context.Context, end pos.Position) (nextReminder remindex.Minute, err error)
 }
 
 // reminder calls the BeforeUpdate hook, if there is one, for files that reach end,
 // and records its answer in next with the entry that comes first.
-func (h *Handle) reminder(ctx context.Context, hk Hooks, end uint64, next *Manifest) error {
+func (h *Handle) reminder(ctx context.Context, hk Hooks, end pos.Position, next *Manifest) error {
 	if hk.BeforeUpdate == nil {
 		return nil
 	}
@@ -88,6 +90,9 @@ type source struct {
 	buf  []byte
 	pgno uint32
 	idx  int // position in the list of files: the later, the newer
+	// pre and post are the file's own checksums: the checksum of the database
+	// before it and the one after it.
+	pre, post ltx.Checksum
 }
 
 // next reads the file's next page into buf, and reports false at its end,
@@ -95,7 +100,11 @@ type source struct {
 func (s *source) next() (bool, error) {
 	var ph ltx.PageHeader
 	if err := s.dec.DecodePage(&ph, s.buf); errors.Is(err, io.EOF) {
-		return false, s.dec.Close()
+		if err := s.dec.Close(); err != nil {
+			return false, err
+		}
+		s.post = s.dec.Trailer().PostApplyChecksum
+		return false, nil
 	} else if err != nil {
 		return false, err
 	}
@@ -124,46 +133,68 @@ func (h *pageHeap) Pop() any {
 }
 
 // reencode merges captured tail files into one LTX file covering the shard's
-// positions rg, keeping the latest version of each page. The files carry
-// Litestream's commit numbers, which restart in every activation, so the
-// LTX compactor (which wants contiguous numbers) can't be used. The result
-// has the shard's own positions in its header.
+// positions rg, keeping the latest version of each page. The result has the
+// shard's own positions in its header.
 //
-// The pages of each LTX file are in order, so this is a merge of sorted lists:
-// it holds one page of each file and writes the result as it goes, however
-// many pages the files hold (a VACUUM rewrites the whole database).
+// The files are checked to be a chain: each one's pre-apply checksum is the
+// one before's post-apply checksum. A break says a file does not follow the
+// one before it, which is a bug in what was written, and fails the delta as a
+// gap in the positions does.
+//
+// The delta carries the checksums of the chain: the first file's before and
+// the last file's after. A file written before the checksums existed has none,
+// and the delta has none either, as it did before.
 func reencode(w io.Writer, files []capture.TailFile, rg Range) error {
+	return decodeFile(func() error { return merge(w, files, rg) })
+}
+
+func merge(w io.Writer, files []capture.TailFile, rg Range) error {
 	if len(files) == 0 {
 		return errors.New("no files to encode")
 	}
 	srcs := make([]*source, len(files))
-	var pageSize, commit uint32
+	var pageSize capture.PageSize
+	var pages capture.Pages
 	var ts int64
+	checksums := true // whether every file has checksums
 	for i, f := range files {
 		dec := ltx.NewDecoder(bufio.NewReaderSize(f.Body.Reader(), 64<<10))
 		if err := dec.DecodeHeader(); err != nil {
 			return err
 		}
 		hdr := dec.Header()
-		if pageSize != 0 && hdr.PageSize != pageSize {
+		if pageSize != 0 && hdr.PageSize != uint32(pageSize) {
 			return fmt.Errorf("page size changed from %d to %d", pageSize, hdr.PageSize)
 		}
-		pageSize, commit, ts = hdr.PageSize, hdr.Commit, hdr.Timestamp
-		srcs[i] = &source{dec: dec, buf: make([]byte, hdr.PageSize), idx: i}
+		pageSize, pages, ts = capture.PageSize(hdr.PageSize), capture.Pages(hdr.Commit), hdr.Timestamp
+		if hdr.NoChecksum() {
+			checksums = false
+		}
+		srcs[i] = &source{dec: dec, buf: make([]byte, hdr.PageSize), idx: i, pre: hdr.PreApplyChecksum}
 	}
 	enc, err := ltx.NewEncoder(w)
 	if err != nil {
 		return err
 	}
-	if err := enc.EncodeHeader(ltx.Header{
+	hdr := ltx.Header{
 		Version:   ltx.Version,
-		Flags:     ltx.HeaderFlagNoChecksum,
-		PageSize:  pageSize,
-		Commit:    commit,
+		PageSize:  uint32(pageSize),
+		Commit:    uint32(pages),
 		MinTXID:   ltx.TXID(rg.Min),
 		MaxTXID:   ltx.TXID(rg.Max),
 		Timestamp: ts,
-	}); err != nil {
+	}
+	if checksums {
+		// The checksum of the database before the delta. A snapshot has no
+		// database before it, and says so with no checksum.
+		hdr.PreApplyChecksum = srcs[0].pre
+		if hdr.MinTXID == 1 && hdr.PreApplyChecksum != 0 {
+			return fmt.Errorf("the file at position 1 has a checksum before it, which a snapshot cannot have")
+		}
+	} else {
+		hdr.Flags = ltx.HeaderFlagNoChecksum
+	}
+	if err := enc.EncodeHeader(hdr); err != nil {
 		return err
 	}
 	var h pageHeap
@@ -180,7 +211,7 @@ func reencode(w io.Writer, files []capture.TailFile, rg Range) error {
 		pgno := top.pgno
 		// The newest file's page is written, then every file that is at this page moves on.
 		// Pages past the end of the final database are gone.
-		if pgno <= commit {
+		if pgno <= uint32(pages) {
 			if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, top.buf); err != nil {
 				return err
 			}
@@ -195,6 +226,17 @@ func reencode(w io.Writer, files []capture.TailFile, rg Range) error {
 				heap.Pop(&h)
 			}
 		}
+	}
+	// Every file has been read to its end, so every trailer has been read.
+	if checksums {
+		for i := 1; i < len(srcs); i++ {
+			if got, want := srcs[i].pre, srcs[i-1].post; got != want {
+				return fmt.Errorf("the file at position %d does not follow the one before it: the checksum before it is %s, the one before says %s",
+					files[i].Position, got, want)
+			}
+		}
+		// The checksum of the database after the delta: the last file's.
+		enc.SetPostApplyChecksum(srcs[len(srcs)-1].post)
 	}
 	return enc.Close()
 }
@@ -223,11 +265,11 @@ func (h *Handle) putFile(ctx context.Context, f File, body blob.Body) error {
 
 // WriteDelta merges the shard's tail into one LTX file, adds it to the
 // manifest and drops the tail. It reads only captured files, never the
-// SQLite file. The delta's range continues from the manifest's last position,
-// whatever Litestream's numbers were. It does nothing if the tail is empty.
+// SQLite file. The delta's range continues from the manifest's last position.
+// It does nothing if the tail is empty.
 func (h *Handle) WriteDelta(ctx context.Context, sh *capture.Shard, hooks Hooks) error {
 	tail := sh.Tail()
-	defer capture.CloseTail(tail)
+	defer tail.Close()
 	if len(tail) == 0 {
 		return nil
 	}
@@ -246,7 +288,8 @@ func (h *Handle) putTail(ctx context.Context, tail []capture.TailFile, hooks Hoo
 		return err
 	}
 	r := Range{tail[0].Position, tail[len(tail)-1].Last()}
-	if slices.Contains(h.Manifest.Files, File{r, h.F.Blob.Epoch()}.String()) {
+	file := File{r, h.F.Blob.Epoch()}
+	if slices.Contains(h.Manifest.Files, file) {
 		return nil // an earlier call's update landed, though its answer was lost
 	}
 	if prev := h.Manifest.LastPosition(); r.Min != prev+1 {
@@ -270,11 +313,10 @@ func (h *Handle) putTail(ctx context.Context, tail []capture.TailFile, hooks Hoo
 		return fmt.Errorf("delta for %s: %w", h.Name, err)
 	}
 	defer delta.Close()
-	file := File{r, h.F.Blob.Epoch()}
 	// The reminder and its entry come before the file, so a failed entry leaves no
 	// file behind that a retry with a new handle (an adoption's) would find.
 	next := h.Manifest.clone()
-	next.Files = append(next.Files, file.String())
+	next.Files = append(next.Files, file)
 	if edit != nil {
 		edit(next)
 	}
@@ -296,7 +338,9 @@ func (h *Handle) putTail(ctx context.Context, tail []capture.TailFile, hooks Hoo
 	return nil
 }
 
-// Snapshotted says what MaybeSnapshot wrote.
+// Snapshotted says what MaybeSnapshot wrote. The zero value is Nothing, which
+// is the safe answer: nothing was written and nothing needs waiting for
+// (docs/internals.md, Failing loudly, the zero-value policy).
 type Snapshotted int
 
 const (
@@ -304,6 +348,28 @@ const (
 	WroteDelta
 	WroteRebase
 )
+
+// String names what was written, for the logs and the errors.
+func (s Snapshotted) String() string {
+	switch s {
+	case Nothing:
+		return "nothing"
+	case WroteDelta:
+		return "delta"
+	case WroteRebase:
+		return "rebase"
+	}
+	return "unknown"
+}
+
+// Valid reports whether s is one of the outcomes. The zero is one of them.
+func (s Snapshotted) Valid() bool {
+	switch s {
+	case Nothing, WroteDelta, WroteRebase:
+		return true
+	}
+	return false
+}
 
 // MaybeSnapshot is the snapshot of an active shard (docs/internals.md, Node journals
 // and snapshots): a delta when the oldest tail file is older than maxAge or the
@@ -337,8 +403,7 @@ func (h *Handle) rebase(ctx context.Context, sh *capture.Shard, hooks Hooks) (Sn
 }
 
 // Rebase replaces the manifest's files with one base: a full snapshot of the
-// shard from Litestream, as Litestream makes its own snapshots. The app keeps
-// writing meanwhile.
+// shard from capture (capture.Shard.Snapshot). The app keeps writing meanwhile.
 //
 // The snapshot covers the shard's positions up to the one capture says it is
 // at (see capture.Shard.Snapshot), so the base is 1-{position}, and the commits
@@ -349,10 +414,6 @@ func (h *Handle) rebase(ctx context.Context, sh *capture.Shard, hooks Hooks) (Sn
 // shard that has no commits, or whose only file already covers everything.
 func (h *Handle) Rebase(ctx context.Context, sh *capture.Shard, hooks Hooks) (bool, error) {
 	if err := h.settle(ctx); err != nil {
-		return false, err
-	}
-	files, err := h.Manifest.List()
-	if err != nil {
 		return false, err
 	}
 	// The snapshot goes to a file, whatever its size: it is the whole database.
@@ -377,11 +438,11 @@ func (h *Handle) Rebase(ctx context.Context, sh *capture.Shard, hooks Hooks) (bo
 		return false, fmt.Errorf("rebase %s: snapshot at position %d is behind the manifest's %d", h.Name, position, last)
 	}
 	base := File{Range{1, position}, h.F.Blob.Epoch()}
-	if len(files) == 1 && files[0].Max == position {
+	if len(h.Manifest.Files) == 1 && h.Manifest.Files[0].Max == position {
 		return false, nil // already one file that covers it
 	}
 	next := h.Manifest.clone()
-	next.Files = []string{base.String()}
+	next.Files = []File{base}
 	if err := h.reminder(ctx, hooks, position, next); err != nil {
 		return false, err
 	}
@@ -393,6 +454,9 @@ func (h *Handle) Rebase(ctx context.Context, sh *capture.Shard, hooks Hooks) (bo
 			return false, err
 		}
 	}
+	// The files the base supersedes: h.update swaps h.Manifest to the base
+	// alone, so the old list is taken here, before the swap.
+	superseded := h.Manifest.Files
 	if err := h.update(ctx, "rebase", next); err != nil {
 		return false, err
 	}
@@ -406,7 +470,7 @@ func (h *Handle) Rebase(ctx context.Context, sh *capture.Shard, hooks Hooks) (bo
 	// Superseded files are garbage now. A failure here only leaves garbage behind,
 	// and a delete that finds nothing is done.
 	var firstErr error
-	for _, f := range files {
+	for _, f := range superseded {
 		if f == base {
 			continue
 		}
@@ -420,38 +484,59 @@ func (h *Handle) Rebase(ctx context.Context, sh *capture.Shard, hooks Hooks) (bo
 
 // snapshotTo writes a snapshot of the shard to w as an LTX file covering
 // positions 1 to the position it returns. The snapshot reader is closed before
-// this returns, so Litestream's checkpoints are held off no longer than the copy.
-func (h *Handle) snapshotTo(ctx context.Context, sh *capture.Shard, w io.Writer) (position uint64, err error) {
+// this returns, so the node's WAL restart is held off no longer than the copy.
+//
+// The base carries the checksum of the database it holds, which is the
+// snapshot's own: it is the first file of the shard, and the files that follow
+// it are checked against it.
+func (h *Handle) snapshotTo(ctx context.Context, sh *capture.Shard, w io.Writer) (position pos.Position, err error) {
 	position, rc, err := sh.Snapshot(ctx)
 	if err != nil {
 		return 0, err
 	}
-	defer rc.Close()
+	defer rc.Close() // the WAL may be restarted again once the reader is closed
 	if position == 0 {
 		return 0, nil
 	}
-	// Litestream's snapshot carries its own commit numbers. Decoding and encoding
-	// it again gives it the shard's (as deltas have), and reads the snapshot's
-	// checksums before anything is uploaded.
-	dec := ltx.NewDecoder(bufio.NewReaderSize(rc, 1<<20))
-	if err := dec.DecodeHeader(); err != nil {
+	// The snapshot is decoded and encoded again rather than passed through:
+	// its whole file is read, and its header rebuilt, before anything is
+	// uploaded.
+	if err := reencodeSnapshot(w, rc, position); err != nil {
 		return 0, err
+	}
+	return position, nil
+}
+
+// reencodeSnapshot decodes the snapshot in r and encodes it again to w, with
+// the shard's own positions in the header and the snapshot's checksum in the
+// trailer.
+func reencodeSnapshot(w io.Writer, r io.Reader, position pos.Position) error {
+	return decodeFile(func() error { return encodeSnapshot(w, r, position) })
+}
+
+func encodeSnapshot(w io.Writer, r io.Reader, position pos.Position) error {
+	dec := ltx.NewDecoder(bufio.NewReaderSize(r, 1<<20))
+	if err := dec.DecodeHeader(); err != nil {
+		return err
 	}
 	hdr := dec.Header()
 	enc, err := ltx.NewEncoder(w)
 	if err != nil {
-		return 0, err
+		return err
 	}
-	if err := enc.EncodeHeader(ltx.Header{
+	out := ltx.Header{
 		Version:   ltx.Version,
-		Flags:     ltx.HeaderFlagNoChecksum,
 		PageSize:  hdr.PageSize,
 		Commit:    hdr.Commit,
 		MinTXID:   1,
 		MaxTXID:   ltx.TXID(position),
 		Timestamp: hdr.Timestamp,
-	}); err != nil {
-		return 0, err
+	}
+	if hdr.NoChecksum() {
+		out.Flags = ltx.HeaderFlagNoChecksum
+	}
+	if err := enc.EncodeHeader(out); err != nil {
+		return err
 	}
 	buf := make([]byte, hdr.PageSize)
 	for {
@@ -459,19 +544,18 @@ func (h *Handle) snapshotTo(ctx context.Context, sh *capture.Shard, w io.Writer)
 		if err := dec.DecodePage(&ph, buf); errors.Is(err, io.EOF) {
 			break
 		} else if err != nil {
-			return 0, err
+			return err
 		}
 		if err := enc.EncodePage(ph, buf); err != nil {
-			return 0, err
+			return err
 		}
 	}
 	if err := dec.Close(); err != nil {
-		return 0, err
+		return err
 	}
-	if err := rc.Close(); err != nil { // checkpoints may go on
-		return 0, err
-	}
-	return position, enc.Close()
+	// The checksum of the database the snapshot holds.
+	enc.SetPostApplyChecksum(dec.Trailer().PostApplyChecksum)
+	return enc.Close()
 }
 
 // getFile downloads one of the shard's LTX files to a temporary file.

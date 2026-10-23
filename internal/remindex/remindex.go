@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/shard"
 )
 
 // Prefix is where the index lives.
@@ -30,19 +31,22 @@ const minuteLayout = "2006-01-02T15:04Z"
 // Times in the index and in the manifest's next_reminder are Unix minutes: nothing
 // that reads them needs more, since a shard's own reminders loop fires at the second.
 
+// Minute is a Unix minute: the reminder index's unit and a manifest's next_reminder.
+type Minute int64
+
 // Entry is one object of the index: index/reminders/{minute}/{p}/{kind}/{id}/{base}.{n}.
 type Entry struct {
-	Minute int64  // Unix minutes
-	Shard  string // kind/id
-	Base   string // BaseOf the manifest version the write the entry is for CASes against
-	N      int    // how many times the dispatcher has moved the entry
+	Minute Minute     // Unix minutes
+	Shard  shard.Name // kind/id
+	Base   string     // BaseOf the manifest version the write the entry is for CASes against
+	N      int        // how many times the dispatcher has moved the entry
 }
 
 // MinuteOf is the minute a Unix time in seconds falls in.
-func MinuteOf(unix int64) int64 { return unix / 60 }
+func MinuteOf(unix int64) Minute { return Minute(unix / 60) }
 
 // MinuteAt is the minute of t.
-func MinuteAt(t time.Time) int64 { return MinuteOf(t.Unix()) }
+func MinuteAt(t time.Time) Minute { return MinuteOf(t.Unix()) }
 
 // BaseOf is the short name of a manifest version.
 func BaseOf(v blob.ETag) string {
@@ -54,8 +58,8 @@ func BaseOf(v blob.ETag) string {
 // name, so one minute's writes spread over 16 prefixes.
 func (e Entry) Key() string {
 	h := fnv.New32a()
-	h.Write([]byte(e.Shard))
-	return fmt.Sprintf("%s%s/%x/%s/%s.%d", Prefix, time.Unix(e.Minute*60, 0).UTC().Format(minuteLayout), h.Sum32()%16, e.Shard, e.Base, e.N)
+	h.Write([]byte(e.Shard.String()))
+	return fmt.Sprintf("%s%s/%x/%s/%s.%d", Prefix, time.Unix(int64(e.Minute)*60, 0).UTC().Format(minuteLayout), h.Sum32()%16, e.Shard, e.Base, e.N)
 }
 
 // ParseKey is Key's inverse.
@@ -78,7 +82,11 @@ func ParseKey(key string) (Entry, error) {
 	if !ok || err != nil || count < 0 {
 		return Entry{}, bad
 	}
-	e := Entry{Minute: minute.Unix() / 60, Shard: parts[2] + "/" + parts[3], Base: base, N: count}
+	name, err := shard.ParseName(parts[2] + "/" + parts[3])
+	if err != nil {
+		return Entry{}, bad
+	}
+	e := Entry{Minute: MinuteOf(minute.Unix()), Shard: name, Base: base, N: count}
 	if e.Key() != key {
 		return Entry{}, bad
 	}
@@ -87,7 +95,7 @@ func ParseKey(key string) (Entry, error) {
 
 // Backs reports whether a manifest whose next_reminder is next backs the entry:
 // it has one (0 means none) and it is no later than the entry's minute.
-func Backs(next int64, e Entry) bool {
+func Backs(next Minute, e Entry) bool {
 	return next > 0 && next <= e.Minute
 }
 
@@ -97,7 +105,7 @@ func Backs(next int64, e Entry) bool {
 // base the write the entry was made for may still be in flight: that write CASes
 // against its base, so once the manifest has moved off it the write has landed or
 // never will.
-func Prunable(exists bool, next int64, version blob.ETag, e Entry) bool {
+func Prunable(exists bool, next Minute, version blob.ETag, e Entry) bool {
 	if !exists {
 		return true
 	}
@@ -131,7 +139,7 @@ func (x Index) Delete(ctx context.Context, e Entry) error {
 
 // Move creates the entry's next move at minute to, then deletes it. A crash
 // between the two leaves a duplicate, which costs one more dispatch.
-func (x Index) Move(ctx context.Context, e Entry, to int64) error {
+func (x Index) Move(ctx context.Context, e Entry, to Minute) error {
 	next := Entry{Minute: to, Shard: e.Shard, Base: e.Base, N: e.N + 1}
 	if err := x.Create(ctx, next); err != nil {
 		return err

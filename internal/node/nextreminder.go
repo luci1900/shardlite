@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/luci1900/shardlite/internal/capture"
+	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/remindex"
 )
 
@@ -22,7 +23,7 @@ import (
 // (capture.Shard.UseAt). A snapshot that holds commits that aren't captured yet
 // would make the time late for files that end before them, if one of them
 // removed work.
-func (a *shard) nextReminder(ctx context.Context) (w int64, at uint64, err error) {
+func (a *actor) nextReminder(ctx context.Context) (w int64, at pos.Position, err error) {
 	now := a.d.now().Unix()
 	sh := a.cap.load()
 	if sh == nil {
@@ -64,21 +65,29 @@ func nextReminderOf(ctx context.Context, tx *sql.Tx, since, now int64, marker bo
 // position at): exact if its snapshot was at end, and now otherwise, since the
 // shard's state at end is then unknown and now is never late. It rounds down to
 // the minute, which the index is in.
-func (a *shard) recordedFor(w int64, at, end uint64) int64 {
-	switch {
-	case a.sys != nil:
-		return 0 // the claimer brings a system shard back, never an entry
-	case at != end:
-		return remindex.MinuteOf(a.d.now().Unix())
+func (a *actor) recordedFor(w int64, at, end pos.Position) remindex.Minute {
+	if a.sys == nil && at == end {
+		return remindex.MinuteOf(w)
 	}
-	return remindex.MinuteOf(w)
+	return a.recordedNow()
+}
+
+// recordedNow is the next_reminder for a shard whose state at the end is
+// unknown: now, since now is never late. It rounds down to the minute, which
+// the index is in, and is 0 for a system shard, which the claimer brings back
+// and never has an entry.
+func (a *actor) recordedNow() remindex.Minute {
+	if a.sys != nil {
+		return 0 // the claimer brings a system shard back, never an entry
+	}
+	return remindex.MinuteOf(a.d.now().Unix())
 }
 
 // reminderAtDelta is what a background delta or rebase does before its manifest
 // update: it reads the next reminder once the tail is taken, and records it if the
 // read was exactly the state the files reach (and now otherwise). A failure fails
 // the delta, which the delta timer tries again.
-func (a *shard) reminderAtDelta(ctx context.Context, end uint64) (int64, error) {
+func (a *actor) reminderAtDelta(ctx context.Context, end pos.Position) (remindex.Minute, error) {
 	w, at, err := a.nextReminder(ctx)
 	if err != nil {
 		return 0, err

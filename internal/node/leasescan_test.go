@@ -11,6 +11,8 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/blobtest"
+	"github.com/luci1900/shardlite/internal/cluster"
 	"github.com/luci1900/shardlite/internal/coord"
 	"github.com/luci1900/shardlite/internal/notify"
 	"github.com/luci1900/shardlite/internal/shardfile"
@@ -23,7 +25,7 @@ func runScan(t *testing.T, b blob.Backend, opts LeaseScanOptions) *leaseScan {
 	reg := coord.NewRegistry(b, "w", coord.RegistryOptions{})
 	store := blob.NewStore(b, "w", 1, blob.Options{})
 	s := &leaseScan{
-		reg: reg, files: &shardfile.Files{Blob: store, Node: "w", Leases: reg, TempDir: t.TempDir()}, store: store,
+		reg: reg, files: &shardfile.Files{Blob: store, Backend: b, Node: "w", Leases: reg, TempDir: t.TempDir()}, store: store,
 		self: func() coord.Incarnation { return coord.Incarnation{Node: "w", Epoch: 1} }, nodeErr: func() error { return nil },
 		clock: realClock{}, opts: opts, log: slog.New(slog.DiscardHandler), scans: &notify.Counter{}, adopted: &notify.Counter{},
 	}
@@ -37,7 +39,7 @@ func runScan(t *testing.T, b blob.Backend, opts LeaseScanOptions) *leaseScan {
 // keep takes node's lease and renews it every interval until the test ends. If
 // stall is given, the node's second renewal comes that much later than usual
 // (a pause, after which it renews as before).
-func keep(t *testing.T, b blob.Backend, node string, interval time.Duration, stall ...time.Duration) {
+func keep(t *testing.T, b blob.Backend, node cluster.Node, interval time.Duration, stall ...time.Duration) {
 	t.Helper()
 	reg := coord.NewRegistry(b, node, coord.RegistryOptions{})
 	l, err := reg.Acquire(context.Background(), coord.NodeInfo{Name: node})
@@ -73,7 +75,7 @@ func keep(t *testing.T, b blob.Backend, node string, interval time.Duration, sta
 func view(s *leaseScan) map[string]NodeView {
 	out := map[string]NodeView{}
 	for _, v := range s.Nodes().nodes() {
-		out[v.Name] = v
+		out[string(v.Name)] = v
 	}
 	return out
 }
@@ -88,7 +90,7 @@ func TestLeaseScanSpreadsWithTheNodes(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			b := blob.NewMemory()
 			for i := range nodes {
-				keep(t, b, string(rune('a'+i)), time.Minute)
+				keep(t, b, cluster.Node(string(rune('a'+i))), time.Minute)
 			}
 			s := runScan(t, b, LeaseScanOptions{Every: every, TTL: time.Hour})
 			time.Sleep(20 * every)
@@ -113,7 +115,7 @@ func TestLeaseScanSpreadsWithTheNodes(t *testing.T) {
 func TestLeaseScanTimesItsWatchFromTheRead(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
-		b := blob.WithHook(blob.NewMemory())
+		b := blobtest.WithHook(blob.NewMemory())
 		reg := coord.NewRegistry(b, "z", coord.RegistryOptions{})
 		l, err := reg.Acquire(context.Background(), coord.NodeInfo{Name: "z"})
 		if err != nil {
@@ -123,8 +125,8 @@ func TestLeaseScanTimesItsWatchFromTheRead(t *testing.T) {
 		// 3 s. z renews 2.5 s into the read and never again, so by its own clock
 		// (TTL less the 2 s margin) its lease is good until 21.5 s.
 		var once atomic.Bool
-		b.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-			if op == blob.OpGet && key == coord.Key("z") && !after && once.CompareAndSwap(false, true) {
+		b.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+			if op == blobtest.OpGet && key == coord.Key("z") && !after && once.CompareAndSwap(false, true) {
 				time.Sleep(2500 * time.Millisecond)
 				if _, err := reg.Renew(ctx, l, l.NodeInfo); err != nil {
 					t.Error(err)

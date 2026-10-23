@@ -11,11 +11,13 @@ import (
 	"context"
 	"database/sql"
 	"net/http"
+
+	"github.com/luci1900/shardlite/internal/shard"
 )
 
 // System is what a system app gets for its shard: what an app has for its shard.
 type System struct {
-	Name string // the shard's kind/id
+	Name shard.Name // the shard's kind/id
 	// Tx runs fn in a transaction on the shard's database, committed if fn
 	// returns nil. It holds the shard's capture lock while fn runs, so fn is
 	// short and does no I/O outside the shard: a handler reads what it needs in

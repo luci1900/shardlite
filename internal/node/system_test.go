@@ -15,11 +15,14 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/blobtest"
+	"github.com/luci1900/shardlite/internal/cluster"
 	"github.com/luci1900/shardlite/internal/coord"
+	"github.com/luci1900/shardlite/internal/journal"
 	"github.com/luci1900/shardlite/internal/kind"
 	"github.com/luci1900/shardlite/internal/migrate"
 	"github.com/luci1900/shardlite/internal/notify"
-	"github.com/luci1900/shardlite/internal/segment"
+	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/system"
 )
@@ -35,7 +38,7 @@ type probe struct {
 	wrote notify.Counter // writes committed
 }
 
-const probeShard = "_probe/_cluster"
+const probeShard = "_system.probe/_cluster"
 
 // probeV1 is the probe's schema, and probeV2 a release that adds a table.
 var (
@@ -55,13 +58,13 @@ func (p *probe) kind() kind.Kind { return p.kindWith(probeV1) }
 
 // kindWith is the probe kind with the migrations of one release.
 func (p *probe) kindWith(migrations fstest.MapFS) kind.Kind {
-	return p.kindAs("_probe", kind.SyncOn, migrations)
+	return p.kindAs("_system.probe", kind.SyncStorage, migrations)
 }
 
 // kindAs is a probe kind under another name or with another sync setting.
 func (p *probe) kindAs(name string, sync kind.Sync, migrations fstest.MapFS) kind.Kind {
 	return kind.Kind{
-		Name: name, Sync: sync, IDs: []string{"_cluster"}, Migrations: migrations,
+		Name: shard.Kind(name), Sync: sync, IDs: []shard.ID{"_cluster"}, Migrations: migrations,
 		Handler: func(s *system.System) http.Handler {
 			mux := http.NewServeMux()
 			mux.HandleFunc("POST /_shardlite/reminders", func(w http.ResponseWriter, r *http.Request) {
@@ -129,7 +132,7 @@ func (p *probe) kindAs(name string, sync kind.Sync, migrations fstest.MapFS) kin
 
 // probeCluster starts n nodes running the probe kind, with leases that expire
 // in real time and quick passes of the claimer and the lease scan.
-func probeCluster(t *testing.T, n int, vars map[string]string, tune ...func(*CatalogOptions)) (*cluster, *probe) {
+func probeCluster(t *testing.T, n int, vars map[string]string, tune ...func(*CatalogOptions)) (*testCluster, *probe) {
 	t.Helper()
 	p := &probe{}
 	env := map[string]string{"SHARDLITE_LEASE_TTL": "1s", "SHARDLITE_IDLE_TIMEOUT": "50ms"}
@@ -148,10 +151,10 @@ func probeCluster(t *testing.T, n int, vars map[string]string, tune ...func(*Cat
 }
 
 // owners are the running nodes the probe shard is active on.
-func owners(c *cluster) []*clusterNode {
+func owners(c *testCluster) []*clusterNode {
 	var out []*clusterNode
 	for _, nd := range c.nodes {
-		if m := nd.m.Load(); nd.cancel != nil && m != nil && m.IsActive(probeShard) {
+		if m := nd.m.Load(); nd.cancel != nil && m != nil && m.IsActive(shardName(probeShard)) {
 			out = append(out, nd)
 		}
 	}
@@ -195,7 +198,7 @@ func TestSystemShardIsClaimedAndMoves(t *testing.T) {
 
 	first.Stop()
 	waitRuns(t, p, 2, 2)
-	eventually(t, "the probe on the other node", func() bool { return other.m.Load().IsActive(probeShard) })
+	eventually(t, "the probe on the other node", func() bool { return other.m.Load().IsActive(shardName(probeShard)) })
 
 	first.Start()
 	other.cycle() // the wake's commit is in the journal: the probe counts before the gate
@@ -229,9 +232,9 @@ func TestClaimerReadsNothingInASteadyCluster(t *testing.T) {
 		kickClaims(t, nd, 1)                                                             // and the owner in the cache
 	}
 	var reads atomic.Int32
-	manifest := shardfile.ManifestKey(probeShard)
+	manifest := shardfile.ManifestKey(shardName(probeShard))
 	for _, nd := range c.nodes {
-		nd.onStore(func(_ context.Context, op blob.Op, key string, after bool) error {
+		nd.onStore(func(_ context.Context, op blobtest.Op, key string, after bool) error {
 			if !after && strings.HasSuffix(key, manifest) {
 				reads.Add(1)
 			}
@@ -254,11 +257,11 @@ func TestClaimerSlowPassChecksTheOwnerCache(t *testing.T) {
 	clk := newFakeClock()
 	var acquires atomic.Int32
 	c := &claimer{
-		targets: []string{probeShard},
-		active:  func(string) bool { return false },
-		owner:   func(string) (string, bool) { return "n1", true },
-		live:    func(string) bool { return true },
-		acquire: func(context.Context, string) (*Ref, error) {
+		targets: []shard.Name{shardName(probeShard)},
+		active:  func(shard.Name) bool { return false },
+		owner:   func(shard.Name) (cluster.Node, bool) { return "n1", true },
+		live:    func(cluster.Node) bool { return true },
+		acquire: func(context.Context, shard.Name) (*Hold, error) {
 			acquires.Add(1)
 			return nil, fmt.Errorf("%w: n1", shardfile.ErrOwnedElsewhere)
 		},
@@ -296,8 +299,8 @@ func TestSystemAnswerWaitsForDurability(t *testing.T) {
 
 	var block atomic.Bool
 	entered, release := make(chan struct{}, 1), make(chan struct{})
-	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if !after && op == blob.OpCreate && strings.HasPrefix(key, segment.Root) && block.Load() {
+	r.local.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if !after && op == blobtest.OpCreate && strings.HasPrefix(key, journal.Root) && block.Load() {
 			select {
 			case entered <- struct{}{}:
 			default:
@@ -352,8 +355,8 @@ func probeCall(t *testing.T, srv *Server, target, path string) int {
 func holdUploads(r *srig) (hold *atomic.Bool, entered chan struct{}, release func()) {
 	hold = new(atomic.Bool)
 	entered, gate := make(chan struct{}, 1), make(chan struct{})
-	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if !after && op == blob.OpCreate && strings.HasPrefix(key, segment.Root) && hold.Load() {
+	r.local.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if !after && op == blobtest.OpCreate && strings.HasPrefix(key, journal.Root) && hold.Load() {
 			select {
 			case entered <- struct{}{}:
 			default:
@@ -374,9 +377,9 @@ func holdUploads(r *srig) (hold *atomic.Bool, entered chan struct{}, release fun
 // at once when it has nothing new, and it fails once the lease is lost.
 func TestSystemSyncOff(t *testing.T) {
 	p := &probe{}
-	const shard = "_lazy/_cluster"
+	const shard = "_system.lazy/_cluster"
 	r := newSRigWith(t, func(o *CatalogOptions) {
-		o.System = []kind.Kind{p.kindAs("_lazy", kind.SyncOff, probeV1)}
+		o.System = []kind.Kind{p.kindAs("_system.lazy", kind.SyncLocal, probeV1)}
 		o.Claims = ClaimOptions{Every: time.Hour}
 	})
 	waitRuns(t, p, 1, 1)
@@ -424,8 +427,8 @@ func TestSystemSyncOff(t *testing.T) {
 		t.Fatal(err)
 	}
 	eventually(t, "the lease to be lost", func() bool { return r.n.Keeper.Check() != nil })
-	sh := r.m.tab.load(shard).sh
-	if err := sh.gate(context.Background(), true); err == nil {
+	sh := r.m.tab.load(shardName(shard)).a
+	if err := sh.gate(context.Background(), kind.SyncStorage); err == nil {
 		t.Fatal("System.Sync passed after the lease was lost")
 	}
 }
@@ -435,12 +438,12 @@ func TestSystemSyncOff(t *testing.T) {
 func TestSystemCallReachesAnotherSystemShard(t *testing.T) {
 	caller, callee := &probe{}, &probe{}
 	r := newSRigWith(t, func(o *CatalogOptions) {
-		o.System = []kind.Kind{caller.kind(), callee.kindAs("_callee", kind.SyncOn, probeV1)}
+		o.System = []kind.Kind{caller.kind(), callee.kindAs("_system.callee", kind.SyncStorage, probeV1)}
 		o.Claims = ClaimOptions{Every: time.Hour}
 	})
 	waitRuns(t, caller, 1, 1)
 	waitRuns(t, callee, 1, 1)
-	if s := probeCall(t, r.srv, probeShard, "/call?to=_callee/_cluster"); s != http.StatusCreated {
+	if s := probeCall(t, r.srv, probeShard, "/call?to=_system.callee/_cluster"); s != http.StatusCreated {
 		t.Fatalf("the call answered %d", s)
 	}
 	if n := callee.wrote.Load(); n != 1 {
@@ -469,7 +472,7 @@ func TestSystemKindsAreReachedOnlyByCalls(t *testing.T) {
 	}{
 		{"client", nd.Public, probeShard, "/write", nil, http.DefaultClient, http.StatusNotFound},
 		{"forwarded client", nd.Peer, probeShard, "/write", map[string]string{hdrOrigin: originClient}, &http.Client{Transport: &http.Transport{Protocols: h2c}}, http.StatusNotFound},
-		{"call to an id that isn't fixed", nd.Control, "_probe/other", "/write", nil, http.DefaultClient, http.StatusBadRequest},
+		{"call to an id that isn't fixed", nd.Control, "_system.probe/other", "/write", nil, http.DefaultClient, http.StatusBadRequest},
 		{"call to the node's path", nd.Control, probeShard, "/_shardlite/reminders", nil, http.DefaultClient, http.StatusNotFound},
 		{"call", nd.Control, probeShard, "/write", nil, http.DefaultClient, http.StatusCreated},
 	} {
@@ -495,24 +498,25 @@ func TestSystemKindsAreReachedOnlyByCalls(t *testing.T) {
 	}
 }
 
-// An app that isn't healthy makes the node not ready, and stops nothing of a
-// system kind's.
+// An app that answers its ready route with 500 makes the node not ready, and
+// stops nothing of a system kind's.
 func TestUnhealthyAppDoesNotStopSystemWakes(t *testing.T) {
-	c, p := probeCluster(t, 1, map[string]string{"SHARDLITE_HEALTH_PATH": "/sick"})
+	c, p := probeCluster(t, 1, nil)
 	nd := c.nodes[0]
-	nd.serve(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/sick" {
-			w.WriteHeader(http.StatusInternalServerError)
-		}
-	})
+	nd.sick.Store(true)
 	waitRuns(t, p, 1, 1)
-	resp, err := http.Get("http://" + nd.Public + readyPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("ready answered %d with the app unhealthy", resp.StatusCode)
+	var st int
+	eventually(t, "the node to report not ready", func() bool {
+		resp, err := http.Get("http://" + nd.Public + readyPath)
+		if err != nil {
+			return false
+		}
+		resp.Body.Close()
+		st = resp.StatusCode
+		return st == http.StatusServiceUnavailable
+	})
+	if st != http.StatusServiceUnavailable {
+		t.Fatalf("ready answered %d with the app unhealthy", st)
 	}
 }
 
@@ -523,14 +527,14 @@ func TestSystemKindRules(t *testing.T) {
 		name string
 		list []kind.Kind
 	}{
-		{"name without _", []kind.Kind{{Name: "probe", IDs: []string{"_cluster"}, Handler: h}}},
-		{"id without _", []kind.Kind{{Name: "_probe", IDs: []string{"cluster"}, Handler: h}}},
-		{"no ids", []kind.Kind{{Name: "_probe", Handler: h}}},
-		{"no handler", []kind.Kind{{Name: "_probe", IDs: []string{"_cluster"}}}},
-		{"id twice", []kind.Kind{{Name: "_probe", IDs: []string{"_0", "_0"}, Handler: h}}},
-		{"kind twice", []kind.Kind{{Name: "_probe", IDs: []string{"_cluster"}, Handler: h}, {Name: "_probe", IDs: []string{"_cluster"}, Handler: h}}},
+		{"name without _", []kind.Kind{{Name: "probe", IDs: []shard.ID{"_cluster"}, Handler: h}}},
+		{"id without _", []kind.Kind{{Name: "_system.probe", IDs: []shard.ID{"cluster"}, Handler: h}}},
+		{"no ids", []kind.Kind{{Name: "_system.probe", Handler: h}}},
+		{"no handler", []kind.Kind{{Name: "_system.probe", IDs: []shard.ID{"_cluster"}}}},
+		{"id twice", []kind.Kind{{Name: "_system.probe", IDs: []shard.ID{"_0", "_0"}, Handler: h}}},
+		{"kind twice", []kind.Kind{{Name: "_system.probe", IDs: []shard.ID{"_cluster"}, Handler: h}, {Name: "_system.probe", IDs: []shard.ID{"_cluster"}, Handler: h}}},
 	} {
-		if _, err := newSystemKinds(tc.list); err == nil {
+		if _, _, err := newSystemApp(tc.list, 0); err == nil {
 			t.Errorf("%s: accepted", tc.name)
 		}
 	}
@@ -611,7 +615,7 @@ func TestSystemSeedRefreshesAStaleReminder(t *testing.T) {
 }
 
 // userVersion is the system shard's version, through its connection.
-func userVersion(t *testing.T, a *shard) int {
+func userVersion(t *testing.T, a *actor) int {
 	t.Helper()
 	var v int
 	if err := a.tx(context.Background(), func(tx *sql.Tx) error {
@@ -683,19 +687,19 @@ func TestSystemShardNewerThanTheNodeIsGivenUp(t *testing.T) {
 	// means the older node claimed the probe and gave it up.
 	newer.Stop()
 	eventually(t, "the probe claimed and given up by the older node", func() bool {
-		m, _, err := shardfile.NewManifestStore(blob.NewStore(c.mem, "check", 1, blob.Options{})).Get(context.Background(), probeShard)
+		m, _, err := shardfile.NewManifestStore(blob.NewStore(c.mem, "check", 1, blob.Options{})).Get(context.Background(), shardName(probeShard))
 		return err == nil && m.Owner == ""
 	})
 	afterClaimPasses(t, older, 3) // and doesn't claim it again
-	if older.m.Load().IsActive(probeShard) || p.wakes.Load() != 1 {
+	if older.m.Load().IsActive(shardName(probeShard)) || p.wakes.Load() != 1 {
 		t.Fatal("the older node served the probe")
 	}
-	m, _, err := shardfile.NewManifestStore(blob.NewStore(c.mem, "check", 1, blob.Options{})).Get(context.Background(), probeShard)
+	m, _, err := shardfile.NewManifestStore(blob.NewStore(c.mem, "check", 1, blob.Options{})).Get(context.Background(), shardName(probeShard))
 	if err != nil || m.Owner != "" {
 		t.Fatalf("the older node claimed the probe again: %+v %v", m, err)
 	}
 
 	newer.Start()
 	waitRuns(t, p, 2, 2)
-	eventually(t, "the probe on the newer node", func() bool { return newer.m.Load().IsActive(probeShard) })
+	eventually(t, "the probe on the newer node", func() bool { return newer.m.Load().IsActive(shardName(probeShard)) })
 }

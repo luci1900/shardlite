@@ -1,7 +1,7 @@
 // Command testnode is the capture side of shardlite in its own process, so
 // tests can kill it with SIGKILL at chosen points.
 //
-//	testnode -s3-bucket <bucket> -s3-endpoint <url> -prefix <prefix> -meta <dir> [-node n1] [-flush 20ms]
+//	testnode -s3-bucket <bucket> -s3-endpoint <url> -prefix <prefix> [-node n1] [-flush 20ms]
 //
 // Starting is the node's real start (node.Start): it takes the lease with a
 // new epoch, adopts the journal the previous process left and starts the writer
@@ -15,11 +15,12 @@
 //	delta <name>          write a delta and update the manifest
 //	rebase <name>         replace all manifest files with a snapshot of the shard
 //	close <name>          final sync, then stop capturing
-//	arm   <point>         die with SIGKILL when execution reaches the point: segment-before, segment-after,
+//	arm   <point>         die with SIGKILL when execution reaches the point (a kill.Point,
+//	                      refused if the name is none): segment-before, segment-after,
 //	                      delta-before-manifest, rebase-before-manifest, rebase-after-swap, restore-before-rename
 //	fault <mode> <permille> <delay-ms>   storage faults on segment PUTs: mode "fail" (error before the write),
 //	                      "lost" (write happens, caller sees an error) or "none"; plus a delay on every PUT
-//	release <name> [delta] final sync, close Litestream and everything else on the shard, then check -shm; replies "released" or "held" (capture is reopened).
+//	release <name> [delta] final sync, close capture and everything else on the shard, then check -shm; replies "released" or "held" (capture is reopened).
 //	                      With delta the tail is written as a delta, as the node does. Without, the tail stays in the journal and the
 //	                      lease's range keeps covering it until the shard is activated again
 //	maxrss -              the process's peak resident memory in bytes
@@ -44,15 +45,20 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/capture"
+	"github.com/luci1900/shardlite/internal/cluster"
 	"github.com/luci1900/shardlite/internal/coord"
+	"github.com/luci1900/shardlite/internal/journal"
+	"github.com/luci1900/shardlite/internal/kill"
 	"github.com/luci1900/shardlite/internal/node"
 	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/service"
+	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
-type shard struct {
+type actor struct {
 	h  *shardfile.Handle
 	sh *capture.Shard
 }
@@ -61,15 +67,14 @@ type testNode struct {
 	nd     *node.Node
 	tails  node.TailSet // the shards the lease counts
 	files  *shardfile.Files
-	meta   string
 	w      *segment.Writer
 	mu     sync.Mutex
-	shards map[string]*shard
+	shards map[string]*actor
 	// Shards released without a delta: their tail is only in the journal, so they
 	// stay counted until they are activated again (the node itself always writes the delta).
 	released map[string]*capture.Shard
 
-	armed     atomic.Pointer[string]
+	armed     atomic.Pointer[kill.Point]
 	faultMode atomic.Pointer[string]
 	faultPm   atomic.Int64
 	faultMs   atomic.Int64
@@ -95,20 +100,20 @@ func die() {
 	select {}
 }
 
-func (n *testNode) at(point string) {
+func (n *testNode) at(point kill.Point) {
 	if p := n.armed.Load(); p != nil && *p == point {
 		die()
 	}
 }
 
-func (n *testNode) hook(ctx context.Context, op blob.Op, key string, after bool) error {
-	if op != blob.OpCreate || !strings.HasPrefix(key, segment.Root) {
+func (n *testNode) hook(ctx context.Context, op blobtest.Op, key string, after bool) error {
+	if op != blobtest.OpCreate || !strings.HasPrefix(key, journal.Root) {
 		return nil
 	}
 	if after {
-		n.at("segment-after")
+		n.at(kill.SegmentAfter)
 	} else {
-		n.at("segment-before")
+		n.at(kill.SegmentBefore)
 		if ms := n.faultMs.Load(); ms > 0 {
 			time.Sleep(time.Duration(rand.Int64N(ms+1)) * time.Millisecond)
 		}
@@ -130,7 +135,6 @@ func main() {
 	bucket := flag.String("s3-bucket", "", "S3 bucket (RustFS, see docker/compose.s3.yaml)")
 	endpoint := flag.String("s3-endpoint", "", "S3 endpoint URL")
 	prefix := flag.String("prefix", "", "key prefix inside the bucket")
-	meta := flag.String("meta", "", "root of the Litestream metadata directories (tmpfs in production)")
 	name := flag.String("node", "n1", "node name")
 	flush := flag.Duration("flush", 20*time.Millisecond, "segment flush interval")
 	tmp := flag.String("tmp", "", "directory for temporary files (a new one under the system's if empty)")
@@ -150,9 +154,9 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	local := blob.WithHook(blob.WithPrefix(s3, *prefix))
+	local := blobtest.WithHook(blob.WithPrefix(s3, *prefix))
 	nd, err := node.Start(context.Background(), node.Config{
-		Name:    *name,
+		Name:    cluster.Node(*name),
 		Backend: local,
 		TempDir: *tmp,
 		Blob:    blob.Options{Backoff: 2 * time.Millisecond},
@@ -163,7 +167,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	n := &testNode{nd: nd, files: nd.Files, meta: *meta, w: nd.Writer, shards: map[string]*shard{}, released: map[string]*capture.Shard{}}
+	n := &testNode{nd: nd, files: nd.Files, w: nd.Writer, shards: map[string]*actor{}, released: map[string]*capture.Shard{}}
 	nd.SetTails(&n.tails)
 	// Run serves the writer and the keeper in the real node; this one serves them
 	// while main runs.
@@ -205,16 +209,16 @@ func main() {
 }
 
 func removeLocal(path string) {
-	for _, p := range []string{path, path + "-wal", path + "-shm", path + ".restoring"} {
+	for _, p := range append(capture.WALSidecarsOf(path).Paths(), path, path+".restoring") {
 		os.RemoveAll(p)
 	}
 }
 
-// activate starts a new activation of a shard. A restored shard is registered
-// with Litestream (seeded, so it continues from the restored state) and synced
-// before any app opens the file.
-func (n *testNode) activate(ctx context.Context, name, path string, h *shardfile.Handle, restored *capture.Restored) error {
-	sh, err := capture.New(capture.Config{Name: name, Path: path, Generation: h.Manifest.Generation, MetaRoot: n.meta, Writer: leased{n.w, n.nd}, Restored: restored, TempDir: n.nd.TempDir, SpoolLimit: n.nd.SpoolLimit, At: n.at})
+// activate starts a new activation of a shard. A restored shard is captured
+// continuing from the restored position, and synced before any app opens the
+// file.
+func (n *testNode) activate(ctx context.Context, name shard.Name, path string, h *shardfile.Handle, restored *capture.Restored) error {
+	sh, err := capture.New(capture.Config{Name: name, Path: path, Generation: h.Manifest.Generation, Writer: leased{n.w, n.nd}, Restored: restored, TempDir: n.nd.TempDir, SpoolLimit: uint64(n.nd.SpoolLimit), At: n.at})
 	if err != nil {
 		return err
 	}
@@ -222,13 +226,13 @@ func (n *testNode) activate(ctx context.Context, name, path string, h *shardfile
 		if err := sh.Sync(ctx); err != nil {
 			return err
 		}
-		n.at("first-sync-done")
+		n.at(kill.FirstSyncDone)
 	}
 	n.tails.Track(sh)
 	n.mu.Lock()
-	n.shards[name] = &shard{h: h, sh: sh}
-	old := n.released[name]
-	delete(n.released, name)
+	n.shards[name.String()] = &actor{h: h, sh: sh}
+	old := n.released[name.String()]
+	delete(n.released, name.String())
 	n.mu.Unlock()
 	if old != nil {
 		n.tails.Untrack(old) // the new capture covers the tail now
@@ -236,7 +240,7 @@ func (n *testNode) activate(ctx context.Context, name, path string, h *shardfile
 	return nil
 }
 
-func (n *testNode) get(name string) (*shard, error) {
+func (n *testNode) get(name string) (*actor, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	s := n.shards[name]
@@ -254,7 +258,11 @@ func (n *testNode) do(f []string) (string, error) {
 	cmd, name := f[0], f[1]
 	switch cmd {
 	case "arm":
-		n.armed.Store(&name)
+		point, ok := kill.ByName(name)
+		if !ok {
+			return "", fmt.Errorf("unknown point %q", name)
+		}
+		n.armed.Store(&point)
 		return "", nil
 	case "maxrss":
 		// The process's peak resident memory in bytes, for the memory measurements.
@@ -277,7 +285,11 @@ func (n *testNode) do(f []string) (string, error) {
 		return "", nil
 	case "open":
 		path := f[2]
-		h, created, err := n.files.Open(ctx, name)
+		sh, err := shard.ParseName(name)
+		if err != nil {
+			return "", err
+		}
+		h, created, err := n.files.Open(ctx, sh)
 		if err != nil {
 			return "", err
 		}
@@ -292,7 +304,7 @@ func (n *testNode) do(f []string) (string, error) {
 			// reached the journal, so discard it and restore from what is durable.
 			removeLocal(path)
 			t0 := time.Now()
-			res, err := n.files.Restore(ctx, name, path, shardfile.RestoreOptions{BeforeRename: func() error { n.at("restore-before-rename"); return nil }})
+			res, err := n.files.Restore(ctx, sh, path, shardfile.RestoreOptions{BeforeRename: func() error { n.at(kill.RestoreBeforeRename); return nil }})
 			switch {
 			case errors.Is(err, shardfile.ErrNothingToRestore):
 				return "", fmt.Errorf("nothing to restore for %s: the app must create the file again, then use openempty", name)
@@ -301,11 +313,11 @@ func (n *testNode) do(f []string) (string, error) {
 			}
 			h, restored = res.Handle, res.Capture
 			how = fmt.Sprintf("restored %d", res.State.Position)
-			n.at("restored")
+			n.at(kill.Restored)
 			restoreTook = time.Since(t0)
 		}
 		t1 := time.Now()
-		if err := n.activate(ctx, name, path, h, restored); err != nil {
+		if err := n.activate(ctx, sh, path, h, restored); err != nil {
 			return "", err
 		}
 		if restored != nil {
@@ -318,23 +330,31 @@ func (n *testNode) do(f []string) (string, error) {
 		// Activate the shard from the file and WAL a release left, as the node does
 		// for a cached shard: nothing is downloaded. The shard must have been
 		// released after a delta, so that the manifest covers the file.
-		h, created, err := n.files.Open(ctx, name)
+		sh, err := shard.ParseName(name)
+		if err != nil {
+			return "", err
+		}
+		h, created, err := n.files.Open(ctx, sh)
 		if err != nil {
 			return "", err
 		} else if created {
 			return "", fmt.Errorf("%s has no manifest", name)
 		}
-		return "", n.activate(ctx, name, f[2], h, &capture.Restored{Position: h.Manifest.LastPosition()})
+		return "", n.activate(ctx, sh, f[2], h, &capture.Restored{Position: h.Manifest.LastPosition()})
 	case "openempty":
 		// A shard with a manifest but nothing durable: capture the file the app created again.
-		h, _, err := n.files.Open(ctx, name)
+		sh, err := shard.ParseName(name)
+		if err != nil {
+			return "", err
+		}
+		h, _, err := n.files.Open(ctx, sh)
 		if err != nil {
 			return "", err
 		}
 		if err := h.Claim(ctx); err != nil {
 			return "", err
 		}
-		return "", n.activate(ctx, name, f[2], h, nil)
+		return "", n.activate(ctx, sh, f[2], h, nil)
 	}
 	s, err := n.get(name)
 	if err != nil {
@@ -344,11 +364,11 @@ func (n *testNode) do(f []string) (string, error) {
 	case "sync":
 		return "", s.sh.Sync(ctx)
 	case "delta":
-		return "", s.h.WriteDelta(ctx, s.sh, shardfile.Hooks{AfterFileWrite: func() error { n.at("delta-before-manifest"); return nil }})
+		return "", s.h.WriteDelta(ctx, s.sh, shardfile.Hooks{AfterFileWrite: func() error { n.at(kill.DeltaBeforeManifest); return nil }})
 	case "rebase":
 		_, err := s.h.Rebase(ctx, s.sh, shardfile.Hooks{
-			AfterFileWrite:  func() error { n.at("rebase-before-manifest"); return nil },
-			AfterRebaseSwap: func() error { n.at("rebase-after-swap"); return nil },
+			AfterFileWrite:  func() error { n.at(kill.RebaseBeforeManifest); return nil },
+			AfterRebaseSwap: func() error { n.at(kill.RebaseAfterSwap); return nil },
 		})
 		return "", err
 	case "release":

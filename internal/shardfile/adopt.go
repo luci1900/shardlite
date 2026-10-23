@@ -6,29 +6,32 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
-	"strings"
 	"time"
 
 	"golang.org/x/sync/errgroup"
 
 	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/capture"
+	"github.com/luci1900/shardlite/internal/cluster"
+	"github.com/luci1900/shardlite/internal/journal"
+	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/remindex"
 	"github.com/luci1900/shardlite/internal/segment"
+	"github.com/luci1900/shardlite/internal/shard"
 )
 
 // AdoptReport says what AdoptJournal (or an Adoption) did.
 type AdoptReport struct {
-	Fence   uint64 // the number of the fence the adoption wrote: the journal's writer continues after it
-	From    uint64 // the first segment read (later than asked if the segments before it had expired)
-	Shards  int    // shards with entries in the range
-	Deltas  int    // deltas written
-	Expired bool   // the range began with segments that no longer exist
+	Fence   pos.Seg // the number of the fence the adoption wrote: the journal's writer continues after it
+	From    pos.Seg // the first segment read (later than asked if the segments before it had expired)
+	Shards  int     // shards with entries in the range
+	Deltas  int     // deltas written
+	Fetched int     // segments the mirrors held above the record's landed run, copied into it before the fence
+	Expired bool    // the range began with segments that no longer exist
 	// Lost lists shards whose tail has a hole, which is only tolerated when the
 	// journal's first segments had expired (Expired). Their history up to the hole is
 	// kept and what follows is gone. It is logged as an error and does not stop
 	// the start. Any other hole is a bug and fails the adoption.
-	Lost     []string
+	Lost     []shard.Name
 	Problems []error
 }
 
@@ -42,6 +45,11 @@ const adoptWorkers = 64
 // its own, left by the process it replaces (docs/internals.md, Takeover: Restart), or a dead
 // node's.
 //
+//  0. It fetches the node's mirrors: the segments they hold above the run the
+//     record landed are copied into the record first, since a fence written
+//     over their numbers would strand them (docs/internals.md, Takeover). The
+//     mirrors are the caller's: stores over the mirror protocol, empty when the
+//     node named none.
 //  1. It fences the journal: an empty segment at the first free number from next,
 //     the next segment number the lease recorded, so the old writer can't add
 //     anything below it.
@@ -54,9 +62,9 @@ const adoptWorkers = 64
 //     never delivered and the adopter can't read them (docs/internals.md,
 //     Takeover). A failed entry leaves the delta unwritten.
 //
-// It is ReadJournal (steps 1 and 2) and Adopt (step 3).
-func (f *Files) AdoptJournal(ctx context.Context, node string, from, next uint64, logger *slog.Logger) (AdoptReport, error) {
-	a, err := f.ReadJournal(ctx, node, from, next, logger)
+// It is FetchTail (step 0), ReadJournal (steps 1 and 2) and Adopt (step 3).
+func (f *Files) AdoptJournal(ctx context.Context, node cluster.Node, from, next pos.Seg, mirrors []*journal.Store, logger *slog.Logger) (AdoptReport, error) {
+	a, err := f.ReadJournal(ctx, node, from, next, mirrors, logger)
 	if err != nil {
 		return a.Report, err
 	}
@@ -64,25 +72,36 @@ func (f *Files) AdoptJournal(ctx context.Context, node string, from, next uint64
 	return a.Report, err
 }
 
-// Adoption is a journal being adopted: fenced and read (ReadJournal), with its
-// deltas still to write (Adopt).
+// Adoption is a journal being adopted: fetched, fenced and read (ReadJournal),
+// with its deltas still to write (Adopt).
 type Adoption struct {
 	f      *Files
-	node   string
+	node   cluster.Node
 	idx    *JournalIndex
 	log    *slog.Logger
 	Report AdoptReport
 }
 
-// ReadJournal fences the journal and reads its footers: steps 1 and 2 of
-// AdoptJournal. On an error the Adoption still has the Report so far.
-func (f *Files) ReadJournal(ctx context.Context, node string, from, next uint64, logger *slog.Logger) (*Adoption, error) {
+// ReadJournal fetches the mirrors (step 0) and fences the journal and reads
+// its footers: steps 0 to 2 of AdoptJournal. On an error the Adoption still
+// has the Report so far. The fetch comes first, since the fence decides what
+// may be read at all: a number the mirrors hold that the record lacks has to
+// be in the record before the fence takes the first free number above it. A
+// fetch that fails is logged and carried past (the window is the ensemble's
+// documented bound), never a failed adoption.
+func (f *Files) ReadJournal(ctx context.Context, node cluster.Node, from, next pos.Seg, mirrors []*journal.Store, logger *slog.Logger) (*Adoption, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	a := &Adoption{f: f, node: node, log: logger}
+	fetched, err := f.FetchTail(ctx, node, from, next, mirrors, logger)
+	a.Report.Fetched = fetched
+	if err != nil && ctx.Err() == nil {
+		logger.Warn("the fetch of the mirrors failed, what they hold is lost", "node", node, "err", err)
+	}
 	from, next = max(from, 1), max(next, 1)
-	fence, err := segment.Fence(ctx, f.Blob, node, next)
+	js := f.Journal(node)
+	fence, err := segment.Fence(ctx, js, next)
 	if err != nil {
 		return a, fmt.Errorf("adopt %s: fence: %w", node, err)
 	}
@@ -91,8 +110,8 @@ func (f *Files) ReadJournal(ctx context.Context, node string, from, next uint64,
 	// Segments expire. A lease that has been idle for longer than they live can
 	// name ones that are gone, and the journal then starts where the listing says.
 	if from < fence {
-		if _, err := segment.ReadFooter(ctx, f.Blob, node, from); errors.Is(err, blob.ErrNotFound) {
-			low, _, err := segment.Bounds(ctx, f.Blob, node)
+		if _, err := segment.ReadFooter(ctx, js, from); errors.Is(err, blob.ErrNotFound) {
+			low, _, err := segment.Bounds(ctx, js)
 			if err != nil {
 				return a, fmt.Errorf("adopt %s: %w", node, err)
 			}
@@ -127,11 +146,11 @@ func (f *Files) ReadJournal(ctx context.Context, node string, from, next uint64,
 // the journal. If any failed the error says so (and Problems lists them): the
 // journal's range must not be moved on, since the tails are still there.
 func (a *Adoption) Adopt(ctx context.Context) error {
-	names := make([]string, 0, len(a.idx.byShard))
+	names := make([]shard.Name, 0, len(a.idx.byShard))
 	for name := range a.idx.byShard {
 		names = append(names, name)
 	}
-	sort.Strings(names)
+	sort.Slice(names, func(i, j int) bool { return names[i].String() < names[j].String() })
 	type result struct {
 		wrote bool
 		err   error
@@ -171,16 +190,16 @@ func (a *Adoption) Adopt(ctx context.Context) error {
 	return nil
 }
 
-type gapError struct{ from, to uint64 }
+type gapError struct{ from, to pos.Position }
 
 func (g *gapError) Error() string {
 	return fmt.Sprintf("the journal has nothing for positions %d to %d", g.from, g.to)
 }
 
 // adoptShard writes the delta for one shard's uncovered entries, if it has any.
-func (f *Files) adoptShard(ctx context.Context, node, name string, idx *JournalIndex) (bool, error) {
+func (f *Files) adoptShard(ctx context.Context, node cluster.Node, n shard.Name, idx *JournalIndex) (bool, error) {
 	for range 5 {
-		h, err := f.Attach(ctx, name)
+		h, err := f.Attach(ctx, n)
 		if errors.Is(err, blob.ErrNotFound) {
 			return false, nil // deleted since: its tail is never read again
 		} else if err != nil {
@@ -190,7 +209,7 @@ func (f *Files) adoptShard(ctx context.Context, node, name string, idx *JournalI
 		if m.Journal != node {
 			return false, nil // its commits go to another journal now
 		}
-		tail, err := idx.tail(ctx, f, name, m.Generation, m.LastPosition(), time.Time{})
+		tail, err := idx.tail(ctx, f, n, m.Generation, m.LastPosition(), time.Time{})
 		if err != nil {
 			return false, err
 		}
@@ -205,12 +224,12 @@ func (f *Files) adoptShard(ctx context.Context, node, name string, idx *JournalI
 		// shard may hold reminders that were never delivered and the adopter can't
 		// read them. A system shard has none: the claimer brings it back.
 		var hooks Hooks
-		if !isSystem(name) {
+		if !n.System() {
 			now := remindex.MinuteAt(f.now())
-			hooks.BeforeUpdate = func(context.Context, uint64) (int64, error) { return now, nil }
+			hooks.BeforeUpdate = func(context.Context, pos.Position) (remindex.Minute, error) { return now, nil }
 		}
 		err = h.putTail(ctx, tail, hooks, func(n *Manifest) { n.Journal = "" })
-		capture.CloseTail(tail)
+		tail.Close()
 		if errors.Is(err, blob.ErrConflict) {
 			continue // somebody changed the manifest: look again
 		}
@@ -218,7 +237,3 @@ func (f *Files) adoptShard(ctx context.Context, node, name string, idx *JournalI
 	}
 	return false, errors.New("the manifest keeps changing")
 }
-
-// isSystem reports whether the shard is a system shard (a kind that starts with
-// "_"), which has no reminder in the index: the claimer brings it back.
-func isSystem(name string) bool { return strings.HasPrefix(name, "_") }

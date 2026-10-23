@@ -4,61 +4,49 @@ import (
 	"cmp"
 	"fmt"
 	"os"
-	"regexp"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/luci1900/shardlite/internal/cluster"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
 // Env is the node's configuration from environment variables (docs/guide.md,
-// Shard kinds): settings about the environment, set by whoever runs the
-// cluster. The settings the app's code relies on are in the kinds file.
+// Environment variables): settings about the environment, set by whoever runs
+// the cluster. The app declares its own settings (its kinds) at its ready
+// route.
 type Env struct {
-	Name        string        // SHARDLITE_NODE: the node's name (the host name by default)
+	Name        cluster.Node  // SHARDLITE_NODE: the node's name (the host name by default)
 	Advertise   string        // SHARDLITE_ADVERTISE_PEER: how other nodes reach the peer listener (host:port), the peer listener's bound address if unset and not a wildcard
 	Blob        string        // SHARDLITE_BLOB: s3://bucket
 	S3Endpoint  string        // SHARDLITE_S3_ENDPOINT: the URL of an S3-compatible store or emulator (AWS if unset)
 	Prefix      string        // SHARDLITE_PREFIX: prefix of every object path, for example "staging/"
-	KindsFile   string        // SHARDLITE_KINDS: the kinds file
 	Flush       time.Duration // SHARDLITE_FLUSH: flush interval, 250ms
 	IdleTimeout time.Duration // SHARDLITE_IDLE_TIMEOUT: default for kinds with no idle_timeout of their own (the built-in default if unset)
 	Data        string        // SHARDLITE_DATA: directory of shard files (the local cache)
-	Scratch     string        // SHARDLITE_SCRATCH_DIR: disposable working files of capture, best on tmpfs (/dev/shm/shardlite/ by default on Linux)
 	CacheLimit  int64         // SHARDLITE_CACHE_LIMIT: bytes of deactivated shards to keep, 0 for no limit
 	LeaseTTL    time.Duration // SHARDLITE_LEASE_TTL: 10s
 	FlushMin    time.Duration // SHARDLITE_FLUSH_MIN: the shortest time between two flush cycle starts, DefaultFlushMin
 	DeltaAge    time.Duration // SHARDLITE_DELTA_AGE: how old a shard's tail gets before a delta is written, 15m. A tail 3 times older raises an alert, and journal segments expire after the larger of 24h and 12 times this
 	DeltaSize   int64         // SHARDLITE_DELTA_SIZE: how many bytes of tail make a delta due, 256KB
 	App         string        // SHARDLITE_APP: the app's base URL, for example http://127.0.0.1:9000
-	HealthPath  string        // SHARDLITE_HEALTH_PATH: the app's health endpoint, /health
 	Public      string        // SHARDLITE_LISTEN_PUBLIC: the public listener, :2280
 	Peer        string        // SHARDLITE_LISTEN_PEER: the listener for traffic from other nodes, :2281
 	Control     string        // SHARDLITE_LISTEN_CONTROL: the control API on localhost TCP, 127.0.0.1:2282
 	Socket      string        // SHARDLITE_LISTEN_CONTROL_SOCKET: the control API on a Unix socket, if set
 	MaxHops     int           // SHARDLITE_MAX_HOPS: calls chained past this many hops are refused with 508, 32
 	Pprof       string        // SHARDLITE_LISTEN_PPROF: address for Go's pprof handlers, for diagnosis (off if unset)
+	Standbys    int           // SHARDLITE_STANDBYS: how many mirrors a node names for its journal, 0 or 1 for now (2 comes with the coverage gate), 0
 }
 
-// defaultScratch is SHARDLITE_SCRATCH_DIR on Linux when it isn't set: tmpfs
-// on practically every distribution and in containers. Elsewhere it is required.
-const defaultScratch = "/dev/shm/shardlite/"
-
-var goos = runtime.GOOS // for tests
-
 // ParseEnv reads the configuration from getenv (os.Getenv in the binary).
-
-// nodeName is what a node's name may be. Host names fit.
-var nodeName = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
-
 func ParseEnv(getenv func(string) string) (Env, error) {
 	e := Env{
-		Name: getenv("SHARDLITE_NODE"), Advertise: getenv("SHARDLITE_ADVERTISE_PEER"), Blob: getenv("SHARDLITE_BLOB"), S3Endpoint: getenv("SHARDLITE_S3_ENDPOINT"),
-		Prefix: getenv("SHARDLITE_PREFIX"), KindsFile: getenv("SHARDLITE_KINDS"),
-		Data: getenv("SHARDLITE_DATA"), Scratch: getenv("SHARDLITE_SCRATCH_DIR"), App: getenv("SHARDLITE_APP"),
-		HealthPath: getenv("SHARDLITE_HEALTH_PATH"), Public: getenv("SHARDLITE_LISTEN_PUBLIC"),
+		Name: cluster.Node(getenv("SHARDLITE_NODE")), Advertise: getenv("SHARDLITE_ADVERTISE_PEER"), Blob: getenv("SHARDLITE_BLOB"), S3Endpoint: getenv("SHARDLITE_S3_ENDPOINT"),
+		Prefix: getenv("SHARDLITE_PREFIX"),
+		Data:   getenv("SHARDLITE_DATA"), App: getenv("SHARDLITE_APP"),
+		Public:  getenv("SHARDLITE_LISTEN_PUBLIC"),
 		Control: getenv("SHARDLITE_LISTEN_CONTROL"), Peer: getenv("SHARDLITE_LISTEN_PEER"), Socket: getenv("SHARDLITE_LISTEN_CONTROL_SOCKET"), Pprof: getenv("SHARDLITE_LISTEN_PPROF"),
 		Flush: 250 * time.Millisecond, LeaseTTL: 10 * time.Second, FlushMin: DefaultFlushMin, DeltaAge: shardfile.DefaultDeltaAge, DeltaSize: shardfile.DefaultDeltaSize,
 	}
@@ -67,13 +55,12 @@ func ParseEnv(getenv func(string) string) (Env, error) {
 		if err != nil {
 			return e, fmt.Errorf("SHARDLITE_NODE is not set and the host name is unknown: %w", err)
 		}
-		e.Name = h
+		e.Name = cluster.Node(h)
 	}
 	// The name goes into object keys as it is (docs/guide.md, the reference).
-	if !nodeName.MatchString(e.Name) {
+	if !cluster.ValidNode(string(e.Name)) {
 		return e, fmt.Errorf("SHARDLITE_NODE is %q: a node's name is 1 to 128 ASCII letters, digits, '.', '-' and '_'", e.Name)
 	}
-	e.HealthPath = cmp.Or(e.HealthPath, "/health")
 	e.Public = cmp.Or(e.Public, ":2280")
 	e.Control = cmp.Or(e.Control, "127.0.0.1:2282")
 	e.Peer = cmp.Or(e.Peer, ":2281")
@@ -97,6 +84,13 @@ func ParseEnv(getenv func(string) string) (Env, error) {
 		}
 		e.MaxHops = n
 	}
+	if v := getenv("SHARDLITE_STANDBYS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 || n > 1 {
+			return e, fmt.Errorf("SHARDLITE_STANDBYS is %q, want 0 or 1 (2 comes with the coverage gate)", v)
+		}
+		e.Standbys = n
+	}
 	if v := getenv("SHARDLITE_DELTA_SIZE"); v != "" {
 		n, err := parseBytes(v)
 		if err != nil || n <= 0 {
@@ -111,10 +105,7 @@ func ParseEnv(getenv func(string) string) (Env, error) {
 		}
 		e.CacheLimit = n
 	}
-	if e.Scratch == "" && goos == "linux" {
-		e.Scratch = defaultScratch
-	}
-	for _, r := range []struct{ name, v string }{{"SHARDLITE_BLOB", e.Blob}, {"SHARDLITE_KINDS", e.KindsFile}, {"SHARDLITE_DATA", e.Data}, {"SHARDLITE_SCRATCH_DIR", e.Scratch}} {
+	for _, r := range []struct{ name, v string }{{"SHARDLITE_BLOB", e.Blob}, {"SHARDLITE_DATA", e.Data}} {
 		if r.v == "" {
 			return e, fmt.Errorf("%s is required", r.name)
 		}

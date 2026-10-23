@@ -4,4 +4,4 @@
 testdata/rapid/
 plans/
 _apalache-out/
-testnode
+.DS_Store

@@ -4,6 +4,8 @@ package faulttest
 
 import (
 	"testing"
+
+	"github.com/luci1900/shardlite/internal/kill"
 )
 
 // settle gives the shard a few durable commits and a delta, so a crash has history to lose.
@@ -102,18 +104,18 @@ func TestKillAfterDeltaFileBeforeManifest(t *testing.T) {
 
 func TestKillRebase(t *testing.T) {
 	t.Parallel()
-	for _, point := range []string{"rebase-before-manifest", "rebase-after-swap"} {
-		t.Run(point, func(t *testing.T) {
+	for _, point := range []kill.Point{kill.RebaseBeforeManifest, kill.RebaseAfterSwap} {
+		t.Run(string(point), func(t *testing.T) {
 			t.Parallel()
 			r := newRig(t)
 			r.settle(3)
-			r.node.Must(t, "arm", point)
+			r.node.Must(t, "arm", string(point))
 			if _, err := r.node.Do("rebase", shardName); err == nil {
 				t.Fatal("rebase succeeded though the node should have died")
 			}
 			r.crash()
 			r.verify("after crash")
-			r.continueAfterRecovery(point)
+			r.continueAfterRecovery(string(point))
 		})
 	}
 }
@@ -135,29 +137,29 @@ func TestKillDuringRestoreBeforeRename(t *testing.T) {
 	r.continueAfterRecovery("restore before rename")
 }
 
-// seedPoints are where an activation of a restored shard can be killed between
-// the restore and the first sync: after the restore, as the node folds a WAL
-// into the database file, as it writes the WAL and the seed file Litestream
-// continues from, once Litestream is open, and once the first sync is done.
-var seedPoints = []string{"restored", "seed-folded", "seed-wal", "seed-file", "litestream-opened", "first-sync-done"}
+// activationPoints are where an activation of a restored shard can be killed
+// between the restore and the first sync: after the restore, as the node folds
+// a leftover WAL into the database file, once the node holds its read
+// transaction over the database, and once the first sync is done.
+var activationPoints = []kill.Point{kill.Restored, kill.Folded, kill.ReadHeld, kill.FirstSyncDone}
 
 func TestKillBetweenRestoreAndFirstSync(t *testing.T) {
 	t.Parallel()
-	for _, point := range seedPoints {
-		t.Run(point, func(t *testing.T) {
+	for _, point := range activationPoints {
+		t.Run(string(point), func(t *testing.T) {
 			t.Parallel()
 			r := newRig(t)
 			r.settle(2)
 			r.crash()
 			r.startNode()
-			r.node.Must(t, "arm", point)
+			r.node.Must(t, "arm", string(point))
 			if _, err := r.node.Do("open", shardName, r.path); err == nil {
 				t.Fatal("open succeeded though the node should have died")
 			}
 			r.node.Kill()
 			r.verify("after the interrupted activation")
 			// The next restart finds whatever the killed one left and starts clean.
-			r.continueAfterRecovery(point)
+			r.continueAfterRecovery(string(point))
 		})
 	}
 }
@@ -167,14 +169,14 @@ func TestKillBetweenRestoreAndFirstSync(t *testing.T) {
 // activation's WAL is still there when the second begins (as for a cached shard).
 func TestKillReactivation(t *testing.T) {
 	t.Parallel()
-	for _, point := range seedPoints[1:] {
-		t.Run(point, func(t *testing.T) {
+	for _, point := range activationPoints[1:] {
+		t.Run(string(point), func(t *testing.T) {
 			t.Parallel()
 			r := newRig(t)
 			r.settle(1)
 			r.reactivate(point)
 			r.verify("after the interrupted reactivation")
-			r.continueAfterRecovery(point)
+			r.continueAfterRecovery(string(point))
 		})
 	}
 }
@@ -183,14 +185,14 @@ func TestKillReactivation(t *testing.T) {
 // into the database file before it continues from them.
 func TestKillCachedReactivation(t *testing.T) {
 	t.Parallel()
-	for _, point := range seedPoints[1:] {
-		t.Run(point, func(t *testing.T) {
+	for _, point := range activationPoints[1:] {
+		t.Run(string(point), func(t *testing.T) {
 			t.Parallel()
 			r := newRig(t)
 			r.settle(1)
 			r.reactivateCached(point)
 			r.verify("after the interrupted reactivation")
-			r.continueAfterRecovery(point)
+			r.continueAfterRecovery(string(point))
 		})
 	}
 }

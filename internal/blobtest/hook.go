@@ -1,4 +1,7 @@
-package blob
+// Package blobtest holds the fault decorator the tests put in front of a blob
+// backend: it fails an operation before it reaches the backend, or after it has
+// been applied, as a lost response would.
+package blobtest
 
 import (
 	"context"
@@ -6,6 +9,8 @@ import (
 	"io"
 	"iter"
 	"sync/atomic"
+
+	"github.com/luci1900/shardlite/internal/blob"
 )
 
 // Op names a backend operation for the fault hook.
@@ -21,24 +26,39 @@ const (
 	OpList     Op = "list"
 )
 
+// The zero Op is "", which is no operation: Valid() is false for it, so a hook
+// cannot mistake an unset Op for one of the members.
+
+// String names an operation, for the logs and the tests.
+func (o Op) String() string { return string(o) }
+
+// Valid reports whether o is one of the operations the hook sees.
+func (o Op) Valid() bool {
+	switch o {
+	case OpCreate, OpUpdate, OpGet, OpGetRange, OpHead, OpDelete, OpList:
+		return true
+	}
+	return false
+}
+
 // Hook is called before (after == false) and after (after == true) every
-// operation. An error from the before call fails the call with ErrNotApplied
-// (nothing happened). An error from the after call means the operation
-// happened but the caller sees a failure, like a lost response: ErrUnknown. A
-// hook may also block to simulate slow storage. For OpList the key is the
-// prefix.
+// operation. An error from the before call fails the call with
+// blob.ErrNotApplied (nothing happened). An error from the after call means the
+// operation happened but the caller sees a failure, like a lost response:
+// blob.ErrUnknown. A hook may also block to simulate slow storage. For OpList
+// the key is the prefix.
 type Hook func(ctx context.Context, op Op, key string, after bool) error
 
-// Hooked is a Backend with a fault hook in front of another one.
+// Hooked is a blob.Backend with a fault hook in front of another one.
 type Hooked struct {
-	b    Backend
+	b    blob.Backend
 	hook atomic.Pointer[Hook]
 }
 
 // WithHook wraps b so a test can inject faults with SetHook. It works over any
 // backend. Faults below the backend (dropped responses, refused connections)
 // belong in the S3 backend's HTTP transport instead.
-func WithHook(b Backend) *Hooked { return &Hooked{b: b} }
+func WithHook(b blob.Backend) *Hooked { return &Hooked{b: b} }
 
 // SetHook installs a fault hook (nil removes it).
 func (h *Hooked) SetHook(fn Hook) {
@@ -59,19 +79,19 @@ func (h *Hooked) call(ctx context.Context, op Op, key string, after bool) error 
 // before and afterErr map hook failures onto outcomes.
 func (h *Hooked) before(ctx context.Context, op Op, key string) error {
 	if err := h.call(ctx, op, key, false); err != nil {
-		return fmt.Errorf("%w: %v", ErrNotApplied, err)
+		return fmt.Errorf("%w: %v", blob.ErrNotApplied, err)
 	}
 	return nil
 }
 
 func (h *Hooked) after(ctx context.Context, op Op, key string) error {
 	if err := h.call(ctx, op, key, true); err != nil {
-		return fmt.Errorf("%w: %v", ErrUnknown, err)
+		return fmt.Errorf("%w: %v", blob.ErrUnknown, err)
 	}
 	return nil
 }
 
-func (h *Hooked) Create(ctx context.Context, key string, body io.ReadSeeker, id WriteID) (ETag, error) {
+func (h *Hooked) Create(ctx context.Context, key string, body io.ReadSeeker, id blob.WriteID) (blob.ETag, error) {
 	if err := h.before(ctx, OpCreate, key); err != nil {
 		return "", err
 	}
@@ -85,7 +105,7 @@ func (h *Hooked) Create(ctx context.Context, key string, body io.ReadSeeker, id 
 	return etag, nil
 }
 
-func (h *Hooked) Update(ctx context.Context, key string, body io.ReadSeeker, expected ETag, id WriteID) (ETag, error) {
+func (h *Hooked) Update(ctx context.Context, key string, body io.ReadSeeker, expected blob.ETag, id blob.WriteID) (blob.ETag, error) {
 	if err := h.before(ctx, OpUpdate, key); err != nil {
 		return "", err
 	}
@@ -99,7 +119,7 @@ func (h *Hooked) Update(ctx context.Context, key string, body io.ReadSeeker, exp
 	return etag, nil
 }
 
-func (h *Hooked) Get(ctx context.Context, key string) (io.ReadCloser, ETag, error) {
+func (h *Hooked) Get(ctx context.Context, key string) (io.ReadCloser, blob.ETag, error) {
 	if err := h.before(ctx, OpGet, key); err != nil {
 		return nil, "", err
 	}
@@ -129,21 +149,21 @@ func (h *Hooked) GetRange(ctx context.Context, key string, offset, length int64)
 	return rc, nil
 }
 
-func (h *Hooked) Head(ctx context.Context, key string) (ObjectInfo, error) {
+func (h *Hooked) Head(ctx context.Context, key string) (blob.ObjectInfo, error) {
 	if err := h.before(ctx, OpHead, key); err != nil {
-		return ObjectInfo{}, err
+		return blob.ObjectInfo{}, err
 	}
 	info, err := h.b.Head(ctx, key)
 	if err != nil {
-		return ObjectInfo{}, err
+		return blob.ObjectInfo{}, err
 	}
 	if err := h.after(ctx, OpHead, key); err != nil {
-		return ObjectInfo{}, err
+		return blob.ObjectInfo{}, err
 	}
 	return info, nil
 }
 
-func (h *Hooked) Delete(ctx context.Context, key string, expected ETag) error {
+func (h *Hooked) Delete(ctx context.Context, key string, expected blob.ETag) error {
 	if err := h.before(ctx, OpDelete, key); err != nil {
 		return err
 	}
@@ -155,22 +175,22 @@ func (h *Hooked) Delete(ctx context.Context, key string, expected ETag) error {
 
 // List collects the whole listing before the after call, so a lost response
 // loses all of it.
-func (h *Hooked) List(ctx context.Context, prefix, after string) iter.Seq2[ObjectInfo, error] {
-	return func(yield func(ObjectInfo, error) bool) {
+func (h *Hooked) List(ctx context.Context, prefix, after string) iter.Seq2[blob.ObjectInfo, error] {
+	return func(yield func(blob.ObjectInfo, error) bool) {
 		if err := h.before(ctx, OpList, prefix); err != nil {
-			yield(ObjectInfo{}, err)
+			yield(blob.ObjectInfo{}, err)
 			return
 		}
-		var infos []ObjectInfo
+		var infos []blob.ObjectInfo
 		for info, err := range h.b.List(ctx, prefix, after) {
 			if err != nil {
-				yield(ObjectInfo{}, err)
+				yield(blob.ObjectInfo{}, err)
 				return
 			}
 			infos = append(infos, info)
 		}
 		if err := h.after(ctx, OpList, prefix); err != nil {
-			yield(ObjectInfo{}, err)
+			yield(blob.ObjectInfo{}, err)
 			return
 		}
 		for _, info := range infos {
@@ -181,4 +201,4 @@ func (h *Hooked) List(ctx context.Context, prefix, after string) iter.Seq2[Objec
 	}
 }
 
-var _ Backend = (*Hooked)(nil)
+var _ blob.Backend = (*Hooked)(nil)

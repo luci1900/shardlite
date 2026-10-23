@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/cluster"
 	"github.com/luci1900/shardlite/internal/coord"
 	"github.com/luci1900/shardlite/internal/notify"
 	"github.com/luci1900/shardlite/internal/shardfile"
@@ -70,11 +71,12 @@ type leaseScan struct {
 	log     *slog.Logger
 	scans   *notify.Counter // listings made, for tests
 	adopted *notify.Counter // adoptions finished, for tests
+	mirror  *mirrorDialer   // dials the dead node's mirrors, for the fetch before the fence
 	// died, if set, is told each node a listing first shows dead (Catalog.died).
-	died func(node string)
+	died func(node cluster.Node)
 
 	view    atomic.Pointer[NodeList]
-	watches map[string]*leaseWatch // by node, the loop's own
+	watches map[cluster.Node]*leaseWatch // by node, the loop's own
 }
 
 // leaseWatch is a lease that may have expired, as of its last read.
@@ -101,7 +103,7 @@ func (s *leaseScan) Nodes() *NodeList { return s.view.Load() }
 // Serve lists at once, then on its schedule, and makes each watch's second look
 // when it is due.
 func (s *leaseScan) Serve(ctx context.Context) error {
-	s.watches = map[string]*leaseWatch{}
+	s.watches = map[cluster.Node]*leaseWatch{}
 	next := s.clock.Now()
 	for {
 		wake := next
@@ -139,7 +141,7 @@ func (s *leaseScan) scan(ctx context.Context, now time.Time) int {
 		return len(s.Nodes().nodes())
 	}
 	s.scans.Inc()
-	seen := make(map[string]bool, len(listed))
+	seen := make(map[cluster.Node]bool, len(listed))
 	out := &NodeList{At: now, Nodes: make([]NodeView, 0, len(listed))}
 	for _, e := range listed {
 		seen[e.Name] = true
@@ -167,7 +169,7 @@ func (s *leaseScan) scan(ctx context.Context, now time.Time) int {
 // publish makes out the last listing, and tells died about each node it shows
 // dead that the listing before it didn't.
 func (s *leaseScan) publish(out *NodeList) {
-	was := map[string]bool{}
+	was := map[cluster.Node]bool{}
 	for _, v := range s.Nodes().nodes() {
 		was[v.Name] = v.Dead
 	}
@@ -181,7 +183,7 @@ func (s *leaseScan) publish(out *NodeList) {
 
 // watch reads a lease that may have expired and starts its watch. A released
 // lease is dead at once. It returns the watch, nil if the lease couldn't be read.
-func (s *leaseScan) watch(ctx context.Context, node string) *leaseWatch {
+func (s *leaseScan) watch(ctx context.Context, node cluster.Node) *leaseWatch {
 	l, err := s.reg.Get(ctx, node)
 	if err != nil {
 		if !errors.Is(err, blob.ErrNotFound) && ctx.Err() == nil {
@@ -220,7 +222,7 @@ func (s *leaseScan) confirm(ctx context.Context, now time.Time) {
 }
 
 // publishDead republishes the last listing with node dead.
-func (s *leaseScan) publishDead(node string) {
+func (s *leaseScan) publishDead(node cluster.Node) {
 	cur := s.Nodes()
 	if cur == nil {
 		return
@@ -237,7 +239,7 @@ func (s *leaseScan) publishDead(node string) {
 // adoptDead adopts every dead node not adopted yet, one after the other, in
 // name order.
 func (s *leaseScan) adoptDead(ctx context.Context) {
-	names := make([]string, 0, len(s.watches))
+	names := make([]cluster.Node, 0, len(s.watches))
 	for name, w := range s.watches {
 		if w.dead && !w.done {
 			names = append(names, name)
@@ -256,7 +258,7 @@ func (s *leaseScan) adoptDead(ctx context.Context) {
 // lease another node is already adopting is left to it while that node isn't
 // known to be dead. When anything changed under it, the watch goes: the next
 // listing looks at the node afresh.
-func (s *leaseScan) adopt(ctx context.Context, x string, w *leaseWatch) {
+func (s *leaseScan) adopt(ctx context.Context, x cluster.Node, w *leaseWatch) {
 	l, me := w.lease, s.self()
 	if x == me.Node {
 		w.done = true
@@ -284,7 +286,10 @@ func (s *leaseScan) adopt(ctx context.Context, x string, w *leaseWatch) {
 		return
 	}
 	s.log.Info("adopting a dead node", "node", x, "epoch", l.Epoch, "readopted", l.AdoptedBy != nil)
-	rep, err := s.files.AdoptJournal(ctx, x, l.JournalFrom, l.JournalNext, s.log)
+	// The fetch (docs/internals.md, Takeover): the mirrors are asked before
+	// the fence is written, inside AdoptJournal, since a fence over a number a
+	// mirror holds would strand what the cluster still has.
+	rep, err := s.files.AdoptJournal(ctx, x, l.JournalFrom, l.JournalNext, s.mirror.stores(ctx, *l, s.log), s.log)
 	if err != nil {
 		if ctx.Err() == nil {
 			s.log.Error("adopting a dead node failed, it will be adopted again", "node", x, "epoch", l.Epoch, "err", err)

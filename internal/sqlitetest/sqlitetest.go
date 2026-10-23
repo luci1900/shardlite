@@ -15,7 +15,7 @@ import (
 	"github.com/luci1900/shardlite/internal/migrate"
 )
 
-// Dump returns every row of every table except Litestream's own, plus the
+// Dump returns every row of every table except SQLite's own, plus the
 // schema, as text. It also fails the test if PRAGMA integrity_check fails.
 func Dump(tb testing.TB, path string) string {
 	tb.Helper()
@@ -43,7 +43,7 @@ func TryDump(path string) (string, error) {
 	}
 
 	var sb strings.Builder
-	rows, err := db.Query(`SELECT name, sql FROM sqlite_master WHERE type IN ('table','index') AND name NOT LIKE '_litestream%' AND name NOT LIKE 'sqlite_%' ORDER BY name`)
+	rows, err := db.Query(`SELECT name, sql FROM sqlite_master WHERE type IN ('table','index') AND name NOT LIKE 'sqlite_%' ORDER BY name`)
 	if err != nil {
 		return "", err
 	}
@@ -91,7 +91,9 @@ func TryDump(path string) (string, error) {
 
 // Migrations checks a release's migrations (see package migrate): they pass
 // migrate.Check, and on a new file migrating up, down to nothing and up again
-// leaves the same tables and rows as the first time.
+// leaves the same tables and rows as the first time. Every table the files
+// create is STRICT: a value of the wrong type is refused instead of stored as
+// whatever the column's affinity makes of it.
 func Migrations(tb testing.TB, fsys fs.FS) {
 	tb.Helper()
 	if err := migrate.Check(fsys); err != nil {
@@ -119,6 +121,7 @@ func Migrations(tb testing.TB, fsys fs.FS) {
 		}
 	}
 	to(migrate.Latest)
+	strict(tb, db)
 	first := Dump(tb, path)
 	to(0)
 	if empty := Dump(tb, path); empty != "" {
@@ -127,5 +130,28 @@ func Migrations(tb testing.TB, fsys fs.FS) {
 	to(migrate.Latest)
 	if again := Dump(tb, path); again != first {
 		tb.Fatalf("up again gives:\n%s\nthe first time:\n%s", again, first)
+	}
+}
+
+// strict fails the test for every table of the database that is not STRICT
+// (docs/guide.md, Schema migrations: a save format refuses what it cannot read
+// back). SQLite's own tables, whose names begin with sqlite_, are not ours to
+// demand it of.
+func strict(tb testing.TB, db *sql.DB) {
+	tb.Helper()
+	rows, err := db.Query(`SELECT name FROM pragma_table_list WHERE schema = 'main' AND type = 'table' AND "strict" = 0 AND name NOT LIKE 'sqlite_%'`)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			tb.Fatal(err)
+		}
+		tb.Errorf("%s is not STRICT", name)
+	}
+	if err := rows.Err(); err != nil {
+		tb.Fatal(err)
 	}
 }

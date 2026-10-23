@@ -13,16 +13,17 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/apptest"
-	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/blobtest"
+	"github.com/luci1900/shardlite/internal/journal"
+	"github.com/luci1900/shardlite/internal/kind"
 	"github.com/luci1900/shardlite/internal/s3test"
-	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
-// The measurements behind the flush and delta defaults (plans/stage-1.2-report.md).
-// They run against RustFS (SHARDLITE_TEST_S3_ENDPOINT) with the latency of S3
-// Standard added to the puts that matter (30 to 60 ms, as the emulator on a
-// local disk answers in a few), and print their figures with -v:
+// The measurements behind the flush and delta defaults. They run against
+// RustFS (SHARDLITE_TEST_S3_ENDPOINT) with the latency of S3 Standard added to
+// the puts that matter (30 to 60 ms, as the emulator on a local disk answers in
+// a few), and print their figures with -v:
 //
 //	SHARDLITE_MEASURE=flush go test -tags fault -run TestMeasureFlush -v -timeout 30m ./internal/node
 //	SHARDLITE_MEASURE=delta go test -tags fault -run TestMeasureDeltas -v -timeout 30m ./internal/node
@@ -35,12 +36,12 @@ func measuring(t *testing.T, what string) {
 
 // s3Latency makes puts of segments, LTX files and manifests take as long as on S3 Standard.
 func s3Latency(r *mrig, puts *counter) {
-	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if after || (op != blob.OpCreate && op != blob.OpUpdate) {
+	r.local.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if after || (op != blobtest.OpCreate && op != blobtest.OpUpdate) {
 			return nil
 		}
 		switch {
-		case strings.HasPrefix(key, segment.Root):
+		case strings.HasPrefix(key, journal.Root):
 			puts.segments.Add(1)
 		case strings.HasPrefix(key, shardfile.FilesPrefix):
 			puts.files.Add(1)
@@ -80,12 +81,12 @@ func loadFlush(t *testing.T, cfg flushCfg, n int, d time.Duration) flushResult {
 	}, s.Backend(t))
 	var puts counter
 	const shards = 20
-	refs := make([]*Ref, shards)
+	refs := make([]*Hold, shards)
 	for i := range refs {
-		refs[i] = r.acquire(fmt.Sprintf("wallet/m%d", i))
+		refs[i] = r.acquire(fmt.Sprintf("test.wallet/m%d", i))
 		r.write(refs[i], fmt.Sprint(i))
 	}
-	if err := r.m.Gate(context.Background(), refs[0], true); err != nil {
+	if err := r.m.Gate(context.Background(), refs[0], kind.SyncStorage); err != nil {
 		t.Fatal(err)
 	}
 	s3Latency(r, &puts)
@@ -106,7 +107,7 @@ func loadFlush(t *testing.T, cfg flushCfg, n int, d time.Duration) flushResult {
 					return
 				}
 				t0 := time.Now()
-				if err := r.m.Gate(context.Background(), refs[k], true); err != nil {
+				if err := r.m.Gate(context.Background(), refs[k], kind.SyncStorage); err != nil {
 					t.Error(err)
 					return
 				}
@@ -188,9 +189,9 @@ func TestMeasureDeltas(t *testing.T) {
 			o.Lifecycle.DeltaAge, o.Lifecycle.DeltaSize, o.Lifecycle.SnapshotEvery, o.Cache.Every = age, size, 200*time.Millisecond, time.Hour
 		}, s.Backend(t))
 		var puts counter
-		refs := make([]*Ref, shards)
+		refs := make([]*Hold, shards)
 		for i := range refs {
-			refs[i] = r.acquire(fmt.Sprintf("slow/m%d", i)) // (sync off: nothing waits, the tick flushes)
+			refs[i] = r.acquire(fmt.Sprintf("test.slow/m%d", i)) // (sync off: nothing waits, the tick flushes)
 			r.write(refs[i], fmt.Sprint(i))
 		}
 		r.afterCycle()
@@ -237,9 +238,9 @@ func TestMeasureReplay(t *testing.T) {
 		r := newMRigOn(t, func(o *CatalogOptions) { o.Cache.Every = time.Hour; o.Lifecycle.DeltaAge = time.Hour }, s.Backend(t))
 		var puts counter
 		const shards = 20
-		refs := make([]*Ref, shards)
+		refs := make([]*Hold, shards)
 		for i := range refs {
-			refs[i] = r.acquire(fmt.Sprintf("wallet/m%d", i))
+			refs[i] = r.acquire(fmt.Sprintf("test.wallet/m%d", i))
 			r.write(refs[i], fmt.Sprint(i))
 		}
 		s3Latency(r, &puts)
@@ -253,7 +254,7 @@ func TestMeasureReplay(t *testing.T) {
 				k := w % shards
 				for time.Now().Before(end) {
 					r.app.Do("insert", fmt.Sprint(k), "1", "100")
-					r.m.Gate(context.Background(), refs[k], true)
+					r.m.Gate(context.Background(), refs[k], kind.SyncStorage)
 					time.Sleep(100*time.Millisecond + time.Duration(rng.Int64N(int64(200*time.Millisecond))))
 				}
 			}()

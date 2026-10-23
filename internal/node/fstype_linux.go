@@ -12,6 +12,3 @@ func filesystemOf(path string) (string, error) {
 	}
 	return linuxFSName(int64(st.Type)), nil
 }
-
-// HasTmpfs: tmpfs exists on this platform.
-const hasTmpfs = true

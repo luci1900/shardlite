@@ -9,12 +9,15 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/coord"
+	"github.com/luci1900/shardlite/internal/journal"
 )
 
 // slowFlush makes the flush interval long enough for a test to tell a request
@@ -70,7 +73,7 @@ func (r *srig) withCycles(do func()) {
 func TestGateOnResponses(t *testing.T) {
 	t.Parallel()
 	r := newSRigWith(t, manualFlush)
-	r.create("wallet/g1", "users/g2", "users/g3")
+	r.create("test.wallet/g1", "test.users/g2", "test.users/g3")
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		r.commit(q.Header.Get("Shardlite-Path"))
 		if v := q.URL.Query().Get("sync"); v != "" {
@@ -79,53 +82,131 @@ func TestGateOnResponses(t *testing.T) {
 		io.WriteString(w, "done")
 	})
 
-	// A sync-on kind: when the client has the response, the write is in blob storage.
+	// A storage-tier kind: when the client has the response, the write is in blob storage.
 	var resp *http.Response
 	r.withCycles(func() {
-		resp, _ = r.req("POST", r.pub, "/w", map[string]string{"Shardlite-Target": "wallet/g1"}, "")
+		resp, _ = r.req("POST", r.pub, "/w", map[string]string{"Shardlite-Target": "test.wallet/g1"}, "")
 	})
-	if resp.StatusCode != 200 || r.rows("wallet/g1") != 1 {
-		t.Fatalf("status %d, rows in blob storage: %d", resp.StatusCode, r.rows("wallet/g1"))
+	if resp.StatusCode != 200 || r.rows("test.wallet/g1") != 1 {
+		t.Fatalf("status %d, rows in blob storage: %d", resp.StatusCode, r.rows("test.wallet/g1"))
 	}
-	// Shardlite-Sync: off on the response skips the wait.
-	r.withoutCycle(func() {
-		for range 3 {
-			r.req("POST", r.pub, "/w?sync=off", map[string]string{"Shardlite-Target": "wallet/g1"}, "")
-		}
-	})
-	// A sync-off kind with Shardlite-Sync: on on the response waits.
+	// A local-tier kind: the answer waits for the node's own disk, which is
+	// before the record has it.
 	r.withCycles(func() {
-		r.req("POST", r.pub, "/w?sync=on", map[string]string{"Shardlite-Target": "users/g2"}, "")
+		resp, _ = r.req("POST", r.pub, "/w", map[string]string{"Shardlite-Target": "test.users/g2"}, "")
 	})
-	if r.rows("users/g2") != 1 {
-		t.Fatalf("sync on by header: %d rows in blob storage", r.rows("users/g2"))
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d", resp.StatusCode)
 	}
-	// A sync-off kind answers without a cycle, but only after the shard is created.
-	r.withoutCycle(func() {
-		r.req("POST", r.pub, "/w", map[string]string{"Shardlite-Target": "users/g3"}, "")
+	// Shardlite-Sync: storage on a local kind waits for the record.
+	r.withCycles(func() {
+		r.req("POST", r.pub, "/w?sync=storage", map[string]string{"Shardlite-Target": "test.users/g2"}, "")
 	})
-	if _, err := r.manifest("users/g3"); err != nil {
+	if r.rows("test.users/g2") != 2 {
+		t.Fatalf("sync storage by header: %d rows in blob storage", r.rows("test.users/g2"))
+	}
+	// The shard is created before the answer, whatever the tier.
+	r.withCycles(func() {
+		r.req("POST", r.pub, "/w", map[string]string{"Shardlite-Target": "test.users/g3"}, "")
+	})
+	if _, err := r.manifest("test.users/g3"); err != nil {
 		t.Fatalf("the response to the first write came before the shard existed: %v", err)
-	}
-	// The next flush cycle gets it there.
-	r.cycle()
-	if r.rows("users/g3") != 1 {
-		t.Fatal("the flush cycle did not capture the commit")
 	}
 
 	// The header never reaches the client.
 	r.withCycles(func() {
-		resp, _ = r.req("POST", r.pub, "/w?sync=on", map[string]string{"Shardlite-Target": "users/g2"}, "")
+		resp, _ = r.req("POST", r.pub, "/w?sync=storage", map[string]string{"Shardlite-Target": "test.users/g2"}, "")
 	})
 	if resp.Header.Get("Shardlite-Sync") != "" {
 		t.Fatal("Shardlite-Sync reached the client")
 	}
+
+	// A tier name that doesn't exist is refused: copying the kind's tier could
+	// quietly give less than what the app said.
+	resp, _ = r.req("POST", r.pub, "/w?sync=maybe", map[string]string{"Shardlite-Target": "test.users/g2"}, "")
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("Shardlite-Sync: maybe answered %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+}
+
+// The local tier: the answer waits for the node's own disk, not for the
+// record. The record's write waits for the answer here, so an answer that
+// waited for the record would never come.
+func TestLocalTierDoesNotWaitForTheRecord(t *testing.T) {
+	t.Parallel()
+	r := newSRigWith(t, manualFlush)
+	r.create("test.users/local")
+	r.app_(func(w http.ResponseWriter, q *http.Request) {
+		r.commit(q.Header.Get("Shardlite-Path"))
+		io.WriteString(w, "done")
+	})
+	// The record's write waits for the test to release it: an answer that
+	// waited for the record would never come.
+	release := make(chan struct{})
+	var freed sync.Once
+	letGo := func() { freed.Do(func() { close(release) }) }
+	t.Cleanup(letGo)
+	r.local.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if op == blobtest.OpCreate && strings.HasPrefix(key, journal.Root) {
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return nil
+	})
+	type arrived struct {
+		resp *http.Response
+		err  error
+	}
+	arrivals := make(chan arrived, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		q, err := http.NewRequest("POST", r.pub+"/w", nil)
+		if err != nil {
+			r.t.Fatal(err)
+		}
+		q.Header.Set("Shardlite-Target", "test.users/local")
+		resp, err := r.client.Do(q)
+		if resp != nil {
+			defer resp.Body.Close()
+		}
+		arrivals <- arrived{resp, err}
+	}()
+	// The gate is waiting: the chunk has been read and the mark is taken, so
+	// the cycle this test runs next is the one the gate waits for.
+	eventually(r.t, "the gate to wait", func() bool { return r.m.flush.waiting.Load() > 0 })
+	// The cycle captures the commit and writes it to the node's own disk; the
+	// record's write waits.
+	go r.cycle()
+	select { // the headers are gated, and they came while the record's write was held
+	case got := <-arrivals:
+		if got.err != nil {
+			t.Fatalf("after the node's disk: %v", got.err)
+		}
+		if got.resp.StatusCode != 200 {
+			t.Fatalf("status %d", got.resp.StatusCode)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the answer did not come while the record's write was held back")
+	}
+	if rows := r.rows("test.users/local"); rows != 0 {
+		t.Fatalf("the record had %d rows: the write was not held back", rows)
+	}
+	// The record is released and a cycle catches up, so the body's gate (its
+	// mark is the cycle above) is answered and the request ends.
+	letGo()
+	eventually(r.t, "the first cycle to complete", func() bool { return r.m.Flusher().Completed() >= 1 })
+	r.cycle()
+	<-done
 }
 
 func TestGateOnStreams(t *testing.T) {
 	t.Parallel()
 	r := newSRigWith(t, slowFlush)
-	r.create("wallet/sse")
+	r.create("test.wallet/sse")
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		for i := 1; i <= 3; i++ {
@@ -135,7 +216,7 @@ func TestGateOnStreams(t *testing.T) {
 		}
 	})
 	q, _ := http.NewRequest("GET", r.pub+"/events", nil)
-	q.Header.Set("Shardlite-Target", "wallet/sse")
+	q.Header.Set("Shardlite-Target", "test.wallet/sse")
 	resp, err := r.client.Do(q)
 	if err != nil {
 		t.Fatal(err)
@@ -148,7 +229,7 @@ func TestGateOnStreams(t *testing.T) {
 			t.Fatalf("%q %v", line, err)
 		}
 		// Chunk i left the app after commit i. It must not reach the client before commit i is durable.
-		if got := r.rows("wallet/sse"); got < i {
+		if got := r.rows("test.wallet/sse"); got < i {
 			t.Fatalf("event %d reached the client with %d rows in blob storage", i, got)
 		}
 		br.ReadString('\n')
@@ -158,7 +239,7 @@ func TestGateOnStreams(t *testing.T) {
 func TestGateOnUpgradedConnections(t *testing.T) {
 	t.Parallel()
 	r := newSRigWith(t, slowFlush)
-	r.create("wallet/ws")
+	r.create("test.wallet/ws")
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		path := q.Header.Get("Shardlite-Path")
 		conn, rw, err := w.(http.Hijacker).Hijack()
@@ -180,7 +261,7 @@ func TestGateOnUpgradedConnections(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	fmt.Fprintf(conn, "GET /ws HTTP/1.1\r\nHost: x\r\nShardlite-Target: wallet/ws\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+	fmt.Fprintf(conn, "GET /ws HTTP/1.1\r\nHost: x\r\nShardlite-Target: test.wallet/ws\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
 	br := bufio.NewReader(conn)
 	if resp, err := http.ReadResponse(br, nil); err != nil || resp.StatusCode != 101 {
 		t.Fatalf("%v %v", resp, err)
@@ -191,7 +272,7 @@ func TestGateOnUpgradedConnections(t *testing.T) {
 		if err != nil || line != fmt.Sprintf("echo m%d\n", i) {
 			t.Fatalf("%q %v", line, err)
 		}
-		if got := r.rows("wallet/ws"); got < i {
+		if got := r.rows("test.wallet/ws"); got < i {
 			t.Fatalf("echo %d reached the client with %d rows in blob storage", i, got)
 		}
 	}
@@ -202,7 +283,7 @@ func TestGateOnUpgradedConnections(t *testing.T) {
 func TestGateOnCalls(t *testing.T) {
 	t.Parallel()
 	r := newSRigWith(t, manualFlush)
-	r.create("wallet/call", "users/call", "wallet/call2")
+	r.create("test.wallet/call", "test.users/call", "test.wallet/call2")
 	var seen atomic.Int64 // rows of the caller in blob storage when the callee got the call
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		switch q.URL.Path {
@@ -212,7 +293,7 @@ func TestGateOnCalls(t *testing.T) {
 		default: // the caller commits, then calls another shard through the control API
 			r.commit(q.Header.Get("Shardlite-Path"))
 			c, _ := http.NewRequest("POST", r.ctl+"/callee", nil)
-			c.Header.Set("Shardlite-Target", "slow/callee")
+			c.Header.Set("Shardlite-Target", "test.slow/callee")
 			c.Header.Set("Shardlite-Caller", q.Header.Get("Shardlite-Target"))
 			if v := q.URL.Query().Get("callsync"); v != "" {
 				c.Header.Set("Shardlite-Sync", v)
@@ -229,40 +310,37 @@ func TestGateOnCalls(t *testing.T) {
 		}
 		io.WriteString(w, "ok")
 	})
-	// wallet has sync on. Its response is held too, but the callee must have seen the commit.
+	// A storage-tier caller: its response is held too, but the callee must have seen the commit.
 	r.withCycles(func() {
-		r.req("POST", r.pub, "/go?sync=off", map[string]string{"Shardlite-Target": "wallet/call"}, "")
+		r.req("POST", r.pub, "/go?sync=storage", map[string]string{"Shardlite-Target": "test.wallet/call"}, "")
 	})
 	if seen.Load() != 1 {
 		t.Fatalf("the callee got the call when blob storage had %d of the caller's rows", seen.Load())
 	}
-	// users has sync off, but the call can ask for it.
+	// A local-tier caller: the call waits for the node's own disk, and the
+	// header can ask for the record.
 	seen.Store(0)
 	r.withCycles(func() {
-		r.req("POST", r.pub, "/go?callsync=on", map[string]string{"Shardlite-Target": "users/call"}, "")
+		r.req("POST", r.pub, "/go?callsync=storage", map[string]string{"Shardlite-Target": "test.users/call"}, "")
 	})
 	if seen.Load() != 1 {
-		t.Fatalf("Shardlite-Sync: on on a call: %d rows", seen.Load())
+		t.Fatalf("Shardlite-Sync: storage on a call: %d rows", seen.Load())
 	}
-	// ...and sync off on the call skips it for a sync-on caller.
-	r.withoutCycle(func() {
-		r.req("POST", r.pub, "/go?callsync=off&sync=off", map[string]string{"Shardlite-Target": "wallet/call2"}, "")
-	})
 }
 
 func TestSyncEndpointAndLeaseLoss(t *testing.T) {
 	t.Parallel()
 	r := newSRigWith(t, slowFlush)
-	r.create("users/s1", "wallet/s2")
+	r.create("test.users/s1", "test.wallet/s2")
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		r.commit(q.Header.Get("Shardlite-Path"))
 	})
 	// A write to a sync-off shard, then POST /_shardlite/sync: durable on return.
-	r.req("POST", r.pub, "/w", map[string]string{"Shardlite-Target": "users/s1"}, "")
+	r.req("POST", r.pub, "/w", map[string]string{"Shardlite-Target": "test.users/s1"}, "")
 	if resp, _ := r.req("POST", r.ctl, "/_shardlite/sync", nil, ""); resp.StatusCode != 204 {
 		t.Fatalf("sync: %d", resp.StatusCode)
 	}
-	if r.rows("users/s1") != 1 {
+	if r.rows("test.users/s1") != 1 {
 		t.Fatal("sync returned before the commit was in blob storage")
 	}
 
@@ -275,7 +353,7 @@ func TestSyncEndpointAndLeaseLoss(t *testing.T) {
 	if resp, _ := r.req("POST", r.ctl, "/_shardlite/sync", nil, ""); resp.StatusCode != 503 {
 		t.Fatalf("sync after the lease was lost: %d", resp.StatusCode)
 	}
-	if resp, _ := r.req("POST", r.pub, "/w", map[string]string{"Shardlite-Target": "wallet/s2"}, ""); resp.StatusCode != 503 {
+	if resp, _ := r.req("POST", r.pub, "/w", map[string]string{"Shardlite-Target": "test.wallet/s2"}, ""); resp.StatusCode != 503 {
 		t.Fatalf("request after the lease was lost: %d", resp.StatusCode)
 	}
 	if resp, _ := r.req("GET", r.pub, "/_shardlite/ready", nil, ""); resp.StatusCode != 503 {
@@ -299,21 +377,21 @@ func TestCreationOverHTTP(t *testing.T) {
 		io.WriteString(w, "ok")
 	})
 	// A call creates the shard at activation: a read finds it created.
-	if resp, _ := r.req("GET", r.ctl, "/read", map[string]string{"Shardlite-Target": "users/read"}, ""); resp.StatusCode != 200 {
+	if resp, _ := r.req("GET", r.ctl, "/read", map[string]string{"Shardlite-Target": "test.users/read"}, ""); resp.StatusCode != 200 {
 		t.Fatal(resp.StatusCode)
 	}
-	if _, err := r.manifest("users/read"); err != nil {
+	if _, err := r.manifest("test.users/read"); err != nil {
 		t.Fatalf("no manifest for an active shard: %v", err)
 	}
-	if resp, _ := r.req("POST", r.ctl, "/write", map[string]string{"Shardlite-Target": "users/write"}, ""); resp.StatusCode != 200 {
+	if resp, _ := r.req("POST", r.ctl, "/write", map[string]string{"Shardlite-Target": "test.users/write"}, ""); resp.StatusCode != 200 {
 		t.Fatal(resp.StatusCode)
 	}
 	// Once idle, the shard that was only read is deleted and the written one is kept.
 	eventually(t, "idle deactivation", func() bool { return len(r.m.Active()) == 0 })
-	if _, err := r.manifest("users/read"); !errors.Is(err, blob.ErrNotFound) {
+	if _, err := r.manifest("test.users/read"); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("a shard that was only read was kept: %v", err)
 	}
-	if _, err := r.manifest("users/write"); err != nil {
+	if _, err := r.manifest("test.users/write"); err != nil {
 		t.Fatalf("a written shard was deleted: %v", err)
 	}
 }
@@ -324,7 +402,7 @@ func TestCreationOverHTTP(t *testing.T) {
 func TestGatesCheckTheLease(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
-	r.create("wallet/l1", "slow/l2", "slow/l3")
+	r.create("test.wallet/l1", "test.slow/l2", "test.slow/l3")
 	next := make(chan struct{})
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		io.WriteString(w, "data: 1\n\n")
@@ -339,7 +417,7 @@ func TestGatesCheckTheLease(t *testing.T) {
 		}
 		io.WriteString(w, "data: 2\n\n")
 	})
-	targets := []string{"wallet/l1", "slow/l2"} // sync on and off
+	targets := []string{"test.wallet/l1", "test.slow/l2"} // sync on and off
 	for _, target := range targets {
 		if resp, _ := r.req("GET", r.pub, "/", map[string]string{"Shardlite-Target": target}, ""); resp.StatusCode != 200 {
 			t.Fatalf("%s: %d", target, resp.StatusCode)
@@ -347,7 +425,7 @@ func TestGatesCheckTheLease(t *testing.T) {
 		eventually(t, "the shard to be captured", func() bool { return !r.shard(target).cap.hasNewFrames() })
 	}
 	q, _ := http.NewRequest("GET", r.pub+"/events", nil)
-	q.Header.Set("Shardlite-Target", "slow/l3")
+	q.Header.Set("Shardlite-Target", "test.slow/l3")
 	stream, err := r.client.Do(q)
 	if err != nil {
 		t.Fatal(err)

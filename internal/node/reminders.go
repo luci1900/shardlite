@@ -35,7 +35,7 @@ const (
 // wakeFunc wakes a shard's app for its reminders: a POST to
 // /_shardlite/reminders for the shard. status is the answer (0 if there was
 // none), and err says why not. The server's is given when the Catalog is built.
-type wakeFunc func(ctx context.Context, a *shard) (status int, err error)
+type wakeFunc func(ctx context.Context, a *actor) (status int, err error)
 
 // ReminderOptions configure how shards are woken for their reminders
 // (docs/guide.md, Reminders).
@@ -76,7 +76,7 @@ func (rm *reminders) backoff(n int) time.Duration {
 
 // call makes one wake of a's app, within the node's limit. A wake that ctx
 // cut short is no failure of the app's: ok is false and the loop is ending.
-func (rm *reminders) call(ctx context.Context, a *shard) (ok bool, err error) {
+func (rm *reminders) call(ctx context.Context, a *actor) (ok bool, err error) {
 	select {
 	case rm.node <- struct{}{}:
 		defer func() { <-rm.node }()
@@ -91,7 +91,7 @@ func (rm *reminders) call(ctx context.Context, a *shard) (ok bool, err error) {
 	return err == nil, err
 }
 
-// ensureTables creates the reserved table and its index through Litestream's
+// ensureTables creates the reserved table and its index through capture's
 // connection, and for a system shard (sys) applies its kind's migrations and
 // inserts its first reminder, "run", due at now if it has none or only a stale
 // one (a cluster that was down for longer than reminders are kept must not leave
@@ -131,8 +131,8 @@ func ensureTables(ctx context.Context, sh *capture.Shard, sys *kind.Kind, now, s
 	return nil
 }
 
-// useDB runs fn on the shard's connection, which is Litestream's.
-func (a *shard) useDB(ctx context.Context, fn func(*sql.DB) error) error {
+// useDB runs fn on the shard's connection, which is capture's.
+func (a *actor) useDB(ctx context.Context, fn func(*sql.DB) error) error {
 	sh := a.cap.load()
 	if sh == nil {
 		return capture.ErrClosed
@@ -156,7 +156,7 @@ func earliest(ctx context.Context, q querier, since int64) (due int64, ok bool, 
 // live reports whether the shard has a reminder that is due before before (Unix
 // seconds) and isn't stale. It reads through the shard's connection, so it fails
 // while the shard is being let go of.
-func (a *shard) live(ctx context.Context, before int64) (bool, error) {
+func (a *actor) live(ctx context.Context, before int64) (bool, error) {
 	var live bool
 	err := a.useDB(ctx, func(db *sql.DB) error {
 		due, ok, err := earliest(ctx, db, a.d.rem.since(a.d.now()))
@@ -169,7 +169,7 @@ func (a *shard) live(ctx context.Context, before int64) (bool, error) {
 // holds reports whether the shard has a reminder due and so must not
 // deactivate. It backs off the next look (idleState.wait), and logs if a shard
 // stays held for long. Only the shard's lifecycle loop calls it.
-func (a *shard) holds(ctx context.Context) bool {
+func (a *actor) holds(ctx context.Context) bool {
 	live, err := a.live(ctx, a.d.now().Unix()+1)
 	held, warn := a.idle.keptBy(err == nil && live, a.d.now(), a.d.opts.IdleRecheck)
 	if warn > 0 {
@@ -178,8 +178,8 @@ func (a *shard) holds(ctx context.Context) bool {
 	return held
 }
 
-// reminderLoop is the reminders loop of one active shard (docs/concurrency.md,
-// The tree): a sequential loop that reads the earliest due time of the shard's
+// reminderLoop is the reminders loop of one active shard (docs/internals.md,
+// Concurrency): a sequential loop that reads the earliest due time of the shard's
 // reminders, wakes the shard's app when it has come and keeps the shard's
 // reminder timer. It writes no index entries: while a reminder's commit is in the
 // shard's tail, adoption covers it after a crash, and the delta that ends the
@@ -199,8 +199,8 @@ func (a *shard) holds(ctx context.Context) bool {
 // before a release, so nothing uses the capture during the final sync.
 type reminderLoop struct {
 	rm   *reminders
-	a    *shard                                                  // whose reminders these are (the wake takes it)
-	db   func(ctx context.Context, fn func(*sql.DB) error) error // the shard's connection, Litestream's
+	a    *actor                                                  // whose reminders these are (the wake takes it)
+	db   func(ctx context.Context, fn func(*sql.DB) error) error // the shard's connection, capture's
 	gate durability
 
 	captured  *notify.Kick  // the flush cycle has captured new frames of the shard
@@ -264,13 +264,13 @@ func (g readGate) check() error {
 func (g readGate) cycleAfter(mark uint64) <-chan struct{} { return g.f.done.Reached(mark + 1) }
 
 // newReminderLoop makes the reminders loop of a.
-func newReminderLoop(rm *reminders, a *shard, db func(context.Context, func(*sql.DB) error) error, gate durability) *reminderLoop {
+func newReminderLoop(rm *reminders, a *actor, db func(context.Context, func(*sql.DB) error) error, gate durability) *reminderLoop {
 	o := &reminderLoop{rm: rm, a: a, db: db, gate: gate, captured: notify.NewKick(), ended: make(chan struct{})}
 	o.asked.Store(1) // the read at activation
 	return o
 }
 
-func (o *reminderLoop) String() string { return "reminders " + o.a.Name }
+func (o *reminderLoop) String() string { return "reminders " + o.a.Name.String() }
 
 // kick is the flush cycle telling the loop it has captured new frames of the
 // shard: its new reminders can be read, and are durable.

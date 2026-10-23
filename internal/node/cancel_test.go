@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
@@ -19,7 +19,7 @@ import (
 func TestClientDisconnectWhileHeldAtTheGate(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
-	r.create("wallet/cx1")
+	r.create("test.wallet/cx1")
 	r.slowJournal(5 * time.Second) // every flush takes 5 s
 	var appCancelled, appAnswered atomic.Bool
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
@@ -32,7 +32,7 @@ func TestClientDisconnectWhileHeldAtTheGate(t *testing.T) {
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	req, _ := http.NewRequestWithContext(ctx, "POST", r.pub+"/w", nil)
-	req.Header.Set("Shardlite-Target", "wallet/cx1")
+	req.Header.Set("Shardlite-Target", "test.wallet/cx1")
 	done := make(chan error, 1)
 	go func() {
 		resp, err := r.client.Do(req)
@@ -42,13 +42,13 @@ func TestClientDisconnectWhileHeldAtTheGate(t *testing.T) {
 		done <- err
 	}()
 	eventually(t, "the request to be held at the gate", func() bool {
-		return r.refs("wallet/cx1") == 1 && r.m.flush.Mark() > r.m.flush.Completed() && appAnswered.Load()
+		return r.refs("test.wallet/cx1") == 1 && r.m.flush.Mark() > r.m.flush.Completed() && appAnswered.Load()
 	})
 	start := time.Now()
 	cancel()
 	<-done
 	eventually(t, "the request to the app to be cancelled", appCancelled.Load)
-	eventually(t, "the shard to be released", func() bool { return r.refs("wallet/cx1") == 0 })
+	eventually(t, "the shard to be released", func() bool { return r.refs("test.wallet/cx1") == 0 })
 	if d := time.Since(start); d > 3*time.Second {
 		t.Fatalf("cancelling took %v: the node waited for the flush", d)
 	}
@@ -74,7 +74,7 @@ func TestCallerCancelsAtTheCalleesGate(t *testing.T) {
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	req, _ := http.NewRequestWithContext(ctx, "POST", r.ctl+"/x", nil)
-	req.Header.Set("Shardlite-Target", "wallet/cx2")
+	req.Header.Set("Shardlite-Target", "test.wallet/cx2")
 	req.Header.Set("Shardlite-Caller", "app")
 	done := make(chan error, 1)
 	go func() {
@@ -84,14 +84,14 @@ func TestCallerCancelsAtTheCalleesGate(t *testing.T) {
 		}
 		done <- err
 	}()
-	eventually(t, "the call to be held at the callee's gate", func() bool { return r.refs("wallet/cx2") == 1 && r.m.flush.Mark() > r.m.flush.Completed() })
+	eventually(t, "the call to be held at the callee's gate", func() bool { return r.refs("test.wallet/cx2") == 1 && r.m.flush.Mark() > r.m.flush.Completed() })
 	// Cancel only once the request has reached the app: a cancel before that
 	// means the app never sees it, and there is nothing for the node to cancel.
 	eventually(t, "the callee's request to reach the app", calleeEntered.Load)
 	cancel()
 	<-done
 	eventually(t, "the callee's request to be cancelled", calleeCancelled.Load)
-	eventually(t, "the callee to be released", func() bool { return r.refs("wallet/cx2") == 0 })
+	eventually(t, "the callee to be released", func() bool { return r.refs("test.wallet/cx2") == 0 })
 }
 
 // ...and held at the caller's gate, before the callee is activated or even asked.
@@ -104,11 +104,11 @@ func TestCallerCancelsAtItsOwnGate(t *testing.T) {
 			reached.Add(1)
 		}
 	})
-	r.commitTo("wallet/cx3") // sync on, and no flush cycle will ever run
+	r.commitTo("test.wallet/cx3") // sync on, and no flush cycle will ever run
 	ctx, cancel := context.WithCancel(context.Background())
 	req, _ := http.NewRequestWithContext(ctx, "POST", r.ctl+"/x", nil)
-	req.Header.Set("Shardlite-Target", "slow/cx3callee")
-	req.Header.Set("Shardlite-Caller", "wallet/cx3")
+	req.Header.Set("Shardlite-Target", "test.slow/cx3callee")
+	req.Header.Set("Shardlite-Caller", "test.wallet/cx3")
 	done := make(chan error, 1)
 	go func() {
 		resp, err := r.client.Do(req)
@@ -117,12 +117,12 @@ func TestCallerCancelsAtItsOwnGate(t *testing.T) {
 		}
 		done <- err
 	}()
-	eventually(t, "the call to be held at the caller's gate", func() bool { return r.refs("wallet/cx3") == 1 })
+	eventually(t, "the call to be held at the caller's gate", func() bool { return r.refs("test.wallet/cx3") == 1 })
 	cancel()
 	<-done
-	eventually(t, "the caller to be released", func() bool { return r.refs("wallet/cx3") == 0 })
-	if reached.Load() != 0 || r.m.IsActive("slow/cx3callee") {
-		t.Fatalf("the callee was reached (%d) or activated (%v) by a call that was cancelled", reached.Load(), r.m.IsActive("slow/cx3callee"))
+	eventually(t, "the caller to be released", func() bool { return r.refs("test.wallet/cx3") == 0 })
+	if reached.Load() != 0 || r.m.IsActive(shardName("test.slow/cx3callee")) {
+		t.Fatalf("the callee was reached (%d) or activated (%v) by a call that was cancelled", reached.Load(), r.m.IsActive(shardName("test.slow/cx3callee")))
 	}
 }
 
@@ -139,8 +139,8 @@ func TestCallerCancelsDuringActivation(t *testing.T) {
 	})
 	entered, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
-	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if !after && op == blob.OpCreate && strings.HasPrefix(key, shardfile.ManifestPrefix) {
+	r.local.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if !after && op == blobtest.OpCreate && strings.HasPrefix(key, shardfile.ManifestPrefix) {
 			once.Do(func() { close(entered) })
 			<-release // a slow activation
 		}
@@ -148,7 +148,7 @@ func TestCallerCancelsDuringActivation(t *testing.T) {
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	req, _ := http.NewRequestWithContext(ctx, "POST", r.ctl+"/x", nil)
-	req.Header.Set("Shardlite-Target", "slow/cx4")
+	req.Header.Set("Shardlite-Target", "test.slow/cx4")
 	req.Header.Set("Shardlite-Caller", "app")
 	done := make(chan error, 1)
 	go func() {
@@ -162,14 +162,14 @@ func TestCallerCancelsDuringActivation(t *testing.T) {
 	<-entered
 	cancel()
 	<-done
-	if r.m.IsActive("slow/cx4") {
+	if r.m.IsActive(shardName("test.slow/cx4")) {
 		t.Fatal("the activation did not take as long as the hook made it")
 	}
 	close(release)
 	// The activation is not the caller's to cancel (others may be waiting for it): it ends.
-	eventually(t, "the activation to finish", func() bool { return r.m.IsActive("slow/cx4") })
-	if r.refs("slow/cx4") != 0 {
-		t.Fatalf("the cancelled call holds the shard: %d", r.refs("slow/cx4"))
+	eventually(t, "the activation to finish", func() bool { return r.m.IsActive(shardName("test.slow/cx4")) })
+	if r.refs("test.slow/cx4") != 0 {
+		t.Fatalf("the cancelled call holds the shard: %d", r.refs("test.slow/cx4"))
 	}
 	if reached.Load() != 0 {
 		t.Fatal("the app was called by a cancelled call")
@@ -198,7 +198,7 @@ func TestCancelledStreamingCall(t *testing.T) {
 			var calleeErr atomic.Value
 			done := make(chan struct{})
 			r.app_(func(w http.ResponseWriter, q *http.Request) {
-				if q.Header.Get("Shardlite-Caller") != "wallet/cx5" {
+				if q.Header.Get("Shardlite-Caller") != "test.wallet/cx5" {
 					return
 				}
 				close(started)
@@ -215,12 +215,12 @@ func TestCancelledStreamingCall(t *testing.T) {
 				}
 				close(done)
 			})
-			r.commitTo("wallet/cx5")
+			r.commitTo("test.wallet/cx5")
 			pr, pw := io.Pipe()
 			ctx, cancel := context.WithCancel(context.Background())
 			req, _ := http.NewRequestWithContext(ctx, "POST", r.ctl+"/stream", pr)
-			req.Header.Set("Shardlite-Target", "slow/cx5callee")
-			req.Header.Set("Shardlite-Caller", "wallet/cx5")
+			req.Header.Set("Shardlite-Target", "test.slow/cx5callee")
+			req.Header.Set("Shardlite-Caller", "test.wallet/cx5")
 			client := r.client
 			if tc.h2 {
 				client = r.h2c
@@ -235,7 +235,7 @@ func TestCancelledStreamingCall(t *testing.T) {
 				cerr <- err
 			}()
 			cyclesUntil(r, started)
-			r.commitTo("wallet/cx5")
+			r.commitTo("test.wallet/cx5")
 			pw.Write([]byte("held")) // waits for a flush cycle that has not run
 			select {                 // no flush cycle runs, so the chunk stays at the gate
 			case c := <-seen:
@@ -261,7 +261,7 @@ func TestCancelledStreamingCall(t *testing.T) {
 			if e, _ := calleeErr.Load().(string); e == "EOF" {
 				t.Fatalf("the callee saw a clean end of the body: %q", e)
 			}
-			eventually(t, "the caller and the callee to be released", func() bool { return r.refs("wallet/cx5") == 0 && r.refs("slow/cx5callee") == 0 })
+			eventually(t, "the caller and the callee to be released", func() bool { return r.refs("test.wallet/cx5") == 0 && r.refs("test.slow/cx5callee") == 0 })
 			// Over HTTP/2 nothing the cancelled call held goes on to the callee. Over
 			// HTTP/1.1 the chunk held at the gate is let through by the cycle that
 			// makes its commit durable, and then the callee's read fails.

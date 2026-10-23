@@ -8,12 +8,17 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/capture"
+	"github.com/luci1900/shardlite/internal/cluster"
+	"github.com/luci1900/shardlite/internal/localdb"
+	"github.com/luci1900/shardlite/internal/pos"
+	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
@@ -23,8 +28,8 @@ type CacheOptions struct {
 	Every time.Duration // how often the cache is trimmed and the files held from before a restart are looked at, 1 s if zero
 }
 
-// cache is the node's local cache of shard files (docs/concurrency.md, The
-// tree): the index, the trim to its limit and the files still held from before
+// cache is the node's local cache of shard files (docs/internals.md,
+// Concurrency): the index, the trim to its limit and the files still held from before
 // a restart, whose loop is a part of the Catalog. Whatever it does to a shard that
 // isn't active (eviction, the sweep of a held file, the delete of a cached
 // shard) runs under an entry of its own in the table, so an activation of the
@@ -34,24 +39,29 @@ type cache struct {
 	data  string
 	tab   *table
 	files *shardfile.Files
-	node  string // the node's name: eviction gives up only the manifests it owns
+	node  cluster.Node // the node's name: eviction gives up only the manifests it owns
 	clock Clock
 	every time.Duration
 	log   *slog.Logger
 	stats *Stats
 
 	limit atomic.Int64
-	held  map[string]string // shard files from before the restart that an app still had open, and their shards' names (only the loop uses it)
+	held  map[string]shard.Name // shard files from before the restart that an app still had open, and their shards' names (only the loop uses it)
 }
 
 // open does what a start does to the data directory (clearCache), then opens
-// the cache index.
-func (c *cache) open(opts CacheOptions) error {
+// the cache index in the node's local database and empties it: a restart is
+// treated as a crash, so the index's rows would be stale.
+func (c *cache) open(opts CacheOptions, db *localdb.DB) error {
 	left, err := clearCache(c.data, c.log)
 	if err != nil {
 		return err
 	}
-	if c.idx, err = openIndex(filepath.Join(c.data, indexName)); err != nil {
+	if db == nil {
+		return errors.New("the node has no local database for the cache index")
+	}
+	c.idx = newIndex(db.DB)
+	if err := db.ClearIndex(context.Background()); err != nil {
 		return err
 	}
 	c.held, c.every = left, opts.Every
@@ -59,24 +69,33 @@ func (c *cache) open(opts CacheOptions) error {
 	return nil
 }
 
-// indexName is the cache index's file in the data directory.
+// indexName is the cache index's old file in the data directory, from before
+// the index and the journal shared one database. It is deleted at the first
+// start with the new layout: it holds nothing worth keeping.
 const indexName = ".index.db"
 
 // clearCache is what a start does to the data directory, after the node has
-// adopted its own journal: it deletes the cache index (and its journal files),
-// the contents of the temporary directory and every shard file that no process
-// has open, so the node starts with an empty cache, as a new one would. The
-// index runs with synchronous=OFF and the apps' files with NORMAL, so after an
-// OS crash neither can be trusted to agree with the other or with blob storage.
+// adopted its own journal: it deletes the old cache index (and its journal
+// files), the contents of the temporary directory and every shard file that no
+// process has open, so the node starts with an empty cache, as a new one
+// would. The index's rows are cleared with it, and the journal's rows are
+// kept: they hold the node's own acknowledged writes.
+//
+// The index runs with synchronous=FULL and the apps' files with NORMAL, so
+// after an OS crash the index cannot be trusted to agree with the files or
+// with blob storage, and the files cannot either.
 //
 // A file that an app still has open (from before the restart) is never deleted:
 // the app could go on committing to it with no error. The returned map holds
 // their paths and their shards' names ("" for a file that isn't a shard's); the
 // cache loop looks at them again until the app has closed them, and activating
 // the shard meanwhile is refused (ErrAppHolds).
-func clearCache(data string, log *slog.Logger) (held map[string]string, err error) {
-	for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
-		if err := os.Remove(filepath.Join(data, indexName+suffix)); err != nil && !errors.Is(err, os.ErrNotExist) {
+func clearCache(data string, log *slog.Logger) (held map[string]shard.Name, err error) {
+	// The node's own old index database and its files: the WAL sidecars beside
+	// it, and the rollback journal of a time before WAL mode.
+	index := filepath.Join(data, indexName)
+	for _, p := range append(capture.WALSidecarsOf(index).Paths(), index, index+"-journal") {
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return nil, err
 		}
 	}
@@ -88,6 +107,8 @@ func clearCache(data string, log *slog.Logger) (held map[string]string, err erro
 		}
 	}
 	bases := map[string]bool{} // the database file of each set of shard files
+	local := filepath.Join(data, localdb.Name)
+	localFiles := append(capture.WALSidecarsOf(local).Paths(), local, local+"-journal")
 	err = filepath.WalkDir(data, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -98,7 +119,14 @@ func clearCache(data string, log *slog.Logger) (held map[string]string, err erro
 			}
 			return nil
 		}
-		for _, suffix := range []string{"-wal", "-shm", ".restoring"} {
+		// The node's local database is not a shard's file: it holds the
+		// journal's segments, which are kept.
+		if slices.Contains(localFiles, p) {
+			return nil
+		}
+		// A database's files beside it: the WAL sidecars, and the leftover of
+		// an interrupted restore.
+		for _, suffix := range append(capture.WALSidecarSuffixes(), ".restoring") {
 			p = strings.TrimSuffix(p, suffix)
 		}
 		bases[p] = true
@@ -107,9 +135,9 @@ func clearCache(data string, log *slog.Logger) (held map[string]string, err erro
 	if err != nil {
 		return nil, err
 	}
-	held = map[string]string{}
+	held = map[string]shard.Name{}
 	for p := range bases {
-		if isHeld, err := capture.ProbeOnce(p); err != nil {
+		if isHeld, err := capture.WALSidecarsOf(p).Held(); err != nil {
 			return nil, err
 		} else if isHeld {
 			held[p] = shardOfPath(data, p)
@@ -121,18 +149,18 @@ func clearCache(data string, log *slog.Logger) (held map[string]string, err erro
 	return held, nil
 }
 
-// shardOfPath is the name of the shard whose file is at path (see pathFor), ""
-// if it is not a shard's file.
-func shardOfPath(data, path string) string {
+// shardOfPath is the name of the shard whose file is at path (see pathFor),
+// zero if it is not a shard's file.
+func shardOfPath(data, path string) shard.Name {
 	rel, err := filepath.Rel(data, path)
 	if err != nil {
-		return ""
+		return shard.Name{}
 	}
 	kind, file := filepath.Split(rel)
 	id, _, _ := strings.Cut(file, ".")
-	name := strings.TrimSuffix(filepath.ToSlash(kind), "/") + "/" + id
-	if _, _, err := ParseTarget(name); err != nil {
-		return ""
+	name, err := shard.ParseName(strings.TrimSuffix(filepath.ToSlash(kind), "/") + "/" + id)
+	if err != nil {
+		return shard.Name{}
 	}
 	return name
 }
@@ -161,7 +189,7 @@ func (c *cache) Serve(ctx context.Context) error {
 // shard, so that an activation of the shard never sees half of it deleted.
 func (c *cache) sweepHeld() {
 	for p, name := range c.held {
-		if name != "" {
+		if !name.IsZero() {
 			e, ok := c.tab.claim(name)
 			if !ok {
 				continue // the shard is being activated (which refuses while the file is held), or something else is happening to it
@@ -175,7 +203,7 @@ func (c *cache) sweepHeld() {
 }
 
 func (c *cache) sweep(path string) {
-	if isHeld, err := capture.ProbeOnce(path); err != nil || isHeld {
+	if isHeld, err := capture.WALSidecarsOf(path).Held(); err != nil || isHeld {
 		return
 	}
 	removeLocal(path)
@@ -183,21 +211,21 @@ func (c *cache) sweep(path string) {
 }
 
 func removeLocal(path string) {
-	for _, p := range []string{path, path + "-wal", path + "-shm", path + ".restoring"} {
+	for _, p := range append(capture.WALSidecarsOf(path).Paths(), path, path+".restoring") {
 		os.RemoveAll(p)
 	}
 }
 
 // pathFor is the opaque name of a shard's file: it carries the generation, so
 // a shard deleted and created again never reuses a file. Kinds and ids need no
-// escaping (see ParseTarget).
-func (c *cache) pathFor(kind, id, generation string) string {
-	return filepath.Join(c.data, kind, id+"."+generation+".db")
+// escaping (see shard.ValidID).
+func (c *cache) pathFor(name shard.Name, generation shard.Gen) string {
+	return filepath.Join(c.data, string(name.Kind()), string(name.ID())+"."+string(generation)+".db")
 }
 
 // put records a shard in the index: active, or cached with what reactivating
 // it in this process needs (its manifest and its files as they are at rest).
-func (c *cache) put(a *shard, state string, pos uint64) error {
+func (c *cache) put(a *actor, state rowState, pos pos.Position) error {
 	row := indexRow{Name: a.Name, Path: a.Path, Generation: a.Gen, Position: pos, State: state, LastUsed: time.Now()}
 	if state == stateCached {
 		mj, err := json.Marshal(a.h.Manifest)
@@ -209,15 +237,26 @@ func (c *cache) put(a *shard, state string, pos uint64) error {
 		}
 		sig := statSig(a.Path)
 		row.Manifest, row.ETag = string(mj), string(a.h.ETag)
-		row.Size, row.MTimeNs, row.WalSize, row.WalMTimeNs = sig.db, sig.dbMod, sig.wal, sig.walMod
+		row.Size, row.MTimeNs, row.WALSize, row.WALMTimeNs = sig.db, sig.dbMod, sig.wal, sig.walMod
 		row.Bytes = sig.db + sig.wal
+		// The CRCs of the pages, so the shard is activated again without reading
+		// them. They are of the database as the final sync left it.
+		if sh := a.cap.load(); sh != nil {
+			if cks := sh.Checksums(); cks != nil {
+				b, err := cks.MarshalBinary()
+				if err != nil {
+					return err
+				}
+				row.CRCs = b
+			}
+		}
 	}
 	return c.idx.put(row)
 }
 
 // clearLocal removes leftovers at path, unless another process has the file open.
 func (c *cache) clearLocal(path string) error {
-	if held, err := capture.ProbeOnce(path); err != nil {
+	if held, err := capture.WALSidecarsOf(path).Held(); err != nil {
 		return err
 	} else if held {
 		return fmt.Errorf("%w: %s", ErrAppHolds, path)
@@ -259,7 +298,7 @@ func (c *cache) evict(ctx context.Context, row indexRow) (bool, error) {
 // are deleted. The caller holds an entry for the shard. A shard the app has open is not dropped (ErrAppHolds), and on any other
 // error the files stay for a later try.
 func (c *cache) drop(ctx context.Context, cur indexRow) error {
-	if held, err := capture.ProbeOnce(cur.Path); err != nil {
+	if held, err := capture.WALSidecarsOf(cur.Path).Held(); err != nil {
 		return err
 	} else if held {
 		return fmt.Errorf("%w: %s", ErrAppHolds, cur.Name)
@@ -331,7 +370,7 @@ func (c *cache) evictIfNeeded(ctx context.Context) {
 // in blob storage, and the local files, which the next start finds in the index
 // as left by an earlier process and discards. A crash before it leaves the shard
 // as it was.
-func (c *cache) deleteReleased(ctx context.Context, target, path string, h *shardfile.Handle, resume func() error) error {
+func (c *cache) deleteReleased(ctx context.Context, target shard.Name, path string, h *shardfile.Handle, resume func() error) error {
 	if err := h.DeleteShard(ctx); err != nil {
 		// If the manifest is gone the shard is deleted, whatever else failed.
 		if _, _, gerr := c.files.GetManifest(ctx, target); !errors.Is(gerr, blob.ErrNotFound) {
@@ -350,12 +389,12 @@ func (c *cache) deleteReleased(ctx context.Context, target, path string, h *shar
 }
 
 // cached returns the names of the deactivated shards on disk.
-func (c *cache) cached() ([]string, error) {
+func (c *cache) cached() ([]shard.Name, error) {
 	rows, err := c.idx.rows(`WHERE state = ?`, stateCached)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]string, len(rows))
+	out := make([]shard.Name, len(rows))
 	for i, r := range rows {
 		out[i] = r.Name
 	}

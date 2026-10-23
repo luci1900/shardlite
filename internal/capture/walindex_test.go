@@ -10,12 +10,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/benbjohnson/litestream"
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/capture"
+	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/segment"
+	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/spool"
-	"github.com/luci1900/shardlite/internal/sqlitetest"
 )
 
 func shmIdent(t *testing.T, path string) (ino uint64, size int64) {
@@ -29,7 +29,7 @@ func shmIdent(t *testing.T, path string) (ino uint64, size int64) {
 
 func newShard(t *testing.T, e *env, path string) *capture.Shard {
 	t.Helper()
-	sh, err := capture.New(capture.Config{Name: "users/1", Path: path, Generation: "g1", MetaRoot: e.meta, Writer: e.w})
+	sh, err := capture.New(capture.Config{Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,13 +38,13 @@ func newShard(t *testing.T, e *env, path string) *capture.Shard {
 
 // Before any connection has opened the database, the mapped page is beyond
 // the end of the file: reading it must be an error, not a crash.
-func TestWalIndexBeforeOpenIsAnError(t *testing.T) {
+func TestWALIndexBeforeOpenIsAnError(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "users-1.db")
 	if err := os.WriteFile(path, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	w, err := capture.MapWalIndex(path)
+	w, err := capture.MapWALIndex(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +57,7 @@ func TestWalIndexBeforeOpenIsAnError(t *testing.T) {
 // A missing -shm is made with the database file's permissions, as SQLite would
 // make it, whatever the node's umask: SQLite reuses the file, so an app running
 // as another user in the database's group would otherwise find it read-only.
-func TestWalIndexCreatesShmWithTheDatabaseMode(t *testing.T) {
+func TestWALIndexCreatesShmWithTheDatabaseMode(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "users-1.db")
 	if err := os.WriteFile(path, nil, 0o660); err != nil {
@@ -66,7 +66,7 @@ func TestWalIndexCreatesShmWithTheDatabaseMode(t *testing.T) {
 	if err := os.Chmod(path, 0o660); err != nil { // the umask may have narrowed it
 		t.Fatal(err)
 	}
-	w, err := capture.MapWalIndex(path)
+	w, err := capture.MapWALIndex(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,17 +80,17 @@ func TestWalIndexCreatesShmWithTheDatabaseMode(t *testing.T) {
 	}
 }
 
-// The mapping made before Litestream opens the shard stays valid: the -shm
-// file is truncated once, when the first connection (Litestream's) opens it,
+// The mapping made before capture opens the shard stays valid: the -shm
+// file is truncated once, when the first connection (capture's) opens it,
 // and never again however often the app connects and disconnects.
-func TestWalIndexSurvivesAppChurn(t *testing.T) {
+func TestWALIndexSurvivesAppChurn(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
 	app.Must(t, "open", "a", path)
 	app.Must(t, "close", "a") // the app is gone before the node maps
-	w, err := capture.MapWalIndex(path)
+	w, err := capture.MapWALIndex(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,17 +142,17 @@ func appendInt(b []byte, i int) []byte {
 	return append(b, byte('0'+i%10))
 }
 
-// Reads in a tight loop while Litestream syncs, checkpoints and the app
-// connects and disconnects: none may fault once Litestream has opened the
+// Reads in a tight loop while capture syncs, restarts the WAL and the app
+// connects and disconnects: none may fault once capture has opened the
 // shard (SIGBUS would mean SQLite shortened -shm under the mapping).
-func TestWalIndexNeverFaultsWhileCaptured(t *testing.T) {
+func TestWALIndexNeverFaultsWhileCaptured(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
 	app.Must(t, "open", "a", path)
 	app.Must(t, "close", "a")
-	w, err := capture.MapWalIndex(path)
+	w, err := capture.MapWALIndex(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,15 +202,15 @@ func TestWalIndexNeverFaultsWhileCaptured(t *testing.T) {
 	t.Logf("%d reads", reads)
 }
 
-// Release closes Litestream's connection. With the app holding the shard the
+// Release closes capture's connections. With the app holding the shard the
 // -shm stays and capture reopens; the mapping, made again, is valid.
-func TestWalIndexAcrossHeldRelease(t *testing.T) {
+func TestWALIndexAcrossHeldRelease(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
 	app.Must(t, "open", "a", path)
-	w, err := capture.MapWalIndex(path)
+	w, err := capture.MapWALIndex(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +229,7 @@ func TestWalIndexAcrossHeldRelease(t *testing.T) {
 	if err != nil || released {
 		t.Fatalf("release: %v %v", released, err)
 	}
-	if w, err = capture.MapWalIndex(path); err != nil {
+	if w, err = capture.MapWALIndex(path); err != nil {
 		t.Fatal(err)
 	}
 	defer w.Close()
@@ -249,10 +249,11 @@ func TestWalIndexAcrossHeldRelease(t *testing.T) {
 	}
 }
 
-// A release refused because the app holds the shard leaves Litestream holding
-// its read lock again, so the app closing the file afterwards can't checkpoint
-// and reset the WAL behind it: the next sync and release capture nothing new,
-// where Litestream would otherwise have to snapshot the whole database.
+// A release refused because the app holds the shard leaves capture holding
+// its read transaction again, so the app closing the file afterwards can't
+// checkpoint and reset the WAL behind it: the next sync and release capture
+// nothing new, where the node would otherwise have to write the whole
+// database again.
 func TestHeldReleaseKeepsTheWALForTheNextRelease(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
@@ -268,7 +269,7 @@ func TestHeldReleaseKeepsTheWALForTheNextRelease(t *testing.T) {
 	if released, _, err := sh.Release(ctx, nil); err != nil || released {
 		t.Fatalf("release with the app holding the shard: %v %v", released, err)
 	}
-	before, _ := e.entriesFor(t, "users/1")
+	before, _ := e.entriesFor(t, "test.users/1")
 	app.Must(t, "close", "a")
 	if err := sh.Sync(ctx); err != nil { // the next flush cycle, or the messages owner's first read
 		t.Fatal(err)
@@ -276,28 +277,28 @@ func TestHeldReleaseKeepsTheWALForTheNextRelease(t *testing.T) {
 	if released, _, err := sh.Release(ctx, nil); err != nil || !released {
 		t.Fatalf("release once the app closed it: %v %v", released, err)
 	}
-	if after, _ := e.entriesFor(t, "users/1"); len(after) != len(before) {
+	if after, _ := e.entriesFor(t, "test.users/1"); len(after) != len(before) {
 		t.Fatalf("the shard's sync and release after the app closed it captured %d files, want none", len(after)-len(before))
 	}
 }
 
 // Every commit changes the header, including two within one clock tick and
-// across WAL restarts (Litestream checkpoints every few pages here, so the log
-// restarts many times and its salts change).
-func TestWalIndexSeesEveryCommit(t *testing.T) {
+// across WAL restarts (the node restarts the WAL every few frames here, so
+// the log restarts many times and its salts change).
+func TestWALIndexSeesEveryCommit(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
 	app.Must(t, "open", "a", path)
-	w, err := capture.MapWalIndex(path)
+	w, err := capture.MapWALIndex(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer w.Close()
 	sh, err := capture.New(capture.Config{
-		Name: "users/1", Path: path, Generation: "g1", MetaRoot: e.meta, Writer: e.w,
-		Tune: func(db *litestream.DB) { db.MinCheckpointPageN = 3; db.TruncatePageN = 6 },
+		Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w,
+		RestartFrames: 3,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -324,7 +325,7 @@ func TestWalIndexSeesEveryCommit(t *testing.T) {
 			if err := sh.Sync(ctx); err != nil {
 				t.Fatal(err)
 			}
-			// Litestream's own checkpoints change the header too (an extra
+			// The node's own WAL restarts change the header too (an extra
 			// sync for the node, never a missed one).
 			last = header(t, sh)
 		}
@@ -333,45 +334,6 @@ func TestWalIndexSeesEveryCommit(t *testing.T) {
 		t.Fatalf("the WAL restarted %d times: the test is not testing restarts", len(salts)-1)
 	}
 	t.Logf("%d WAL restarts", len(salts)-1)
-}
-
-// A sync that uploads several files (Litestream uploads every LTX file since
-// the replica's position, so a file made by an earlier db.Sync joins the next
-// round) finishes without any flush: the files are queued in the writer and the
-// sync returns. They are in blob storage once the writer has been flushed.
-func TestSyncWithSeveralFilesFinishesWithoutAFlush(t *testing.T) {
-	t.Parallel()
-	e := newEnv(t)
-	app := apptest.Start(t)
-	path := filepath.Join(e.dir, "users-1.db")
-	app.Must(t, "open", "a", path)
-	sh := newShard(t, e, path)
-	// (No Close: its final sync would wait for a flush nobody does.)
-	ctx := context.Background()
-	app.Must(t, "ack", "a", "1")
-	if err := sh.DB().Sync(ctx); err != nil { // a local LTX file, not uploaded
-		t.Fatal(err)
-	}
-	app.Must(t, "ack", "a", "2")
-	if err := sh.Capture(ctx); err != nil { // returns with no flush having happened
-		t.Fatal(err)
-	}
-	if entries, _ := e.entriesFor(t, "users/1"); len(entries) != 0 {
-		t.Fatalf("%d entries in blob storage before any flush", len(entries))
-	}
-	if sh.Position() < 2 {
-		t.Fatalf("position %d: the sync's files are not in the tail", sh.Position())
-	}
-	if err := e.w.Flush(ctx); err != nil {
-		t.Fatal(err)
-	}
-	entries, _ := e.entriesFor(t, "users/1")
-	if len(entries) < 2 {
-		t.Fatalf("%d entries after the flush, want the sync's several files", len(entries))
-	}
-	if want, got := apptest.Dump(t, path), sqlitetest.Dump(t, e.replayTo(t, "users/1")); want != got {
-		t.Fatal("what blob storage holds is not the app's database")
-	}
 }
 
 // header reads the shard's wal-index header.
@@ -399,9 +361,9 @@ type appendHook struct {
 	before func()
 }
 
-func (w appendHook) AppendFile(shard, generation string, position uint64, ltxFile *spool.File) error {
+func (w appendHook) AppendFile(name shard.Name, generation shard.Gen, position pos.Position, ltxFile *spool.File) error {
 	w.before()
-	return w.Writer.AppendFile(shard, generation, position, ltxFile)
+	return w.Writer.AppendFile(name, generation, position, ltxFile)
 }
 
 // A header read while a sync is held up (here as the sync queues its file in
@@ -416,7 +378,7 @@ func TestHeaderDuringASlowSyncAnswers(t *testing.T) {
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
 	app.Must(t, "open", "a", path)
-	sh, err := capture.New(capture.Config{Name: "users/1", Path: path, Generation: "g1", MetaRoot: e.meta, Writer: appendHook{e.w, func() {
+	sh, err := capture.New(capture.Config{Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: appendHook{e.w, func() {
 		if armed.CompareAndSwap(true, false) {
 			close(entered)
 			<-release
@@ -474,7 +436,7 @@ func TestHeaderAfterCloseIsClosed(t *testing.T) {
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
 	app.Must(t, "open", "a", path)
-	sh, err := capture.New(capture.Config{Name: "users/1", Path: path, Generation: "g1", MetaRoot: e.meta, Writer: e.w})
+	sh, err := capture.New(capture.Config{Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w})
 	if err != nil {
 		t.Fatal(err)
 	}

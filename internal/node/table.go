@@ -10,12 +10,14 @@ import (
 	"time"
 
 	"golang.org/x/sync/errgroup"
+
+	"github.com/luci1900/shardlite/internal/shard"
 )
 
 // errShardsStopped is what a request gets once the shards have stopped.
 var errShardsStopped = errors.New("node: the shards have stopped")
 
-// table maps each shard's name to its entry (docs/concurrency.md, The tree), and
+// table maps each shard's name to its entry (docs/internals.md, Concurrency), and
 // runs the shards' loops until it stops. Each loop runs its shard's reminders
 // loop. Nothing locks the whole table: an activation adds its entry with LoadOrStore,
 // and whoever finds one already there waits for it; removal marks the entry
@@ -23,7 +25,7 @@ var errShardsStopped = errors.New("node: the shards have stopped")
 // can only remove the entry it means to. A request that found an entry just
 // before it was marked gone looks the name up again.
 type table struct {
-	entries syncMap[string, *entry]
+	entries syncMap[shard.Name, *entry]
 	log     *slog.Logger
 
 	// The shards' loops run on ctx until stop. mu guards running and stopped, so
@@ -33,16 +35,16 @@ type table struct {
 	loops   errgroup.Group
 	mu      sync.Mutex
 	stopped bool
-	running map[*shard]struct{}
+	running map[*actor]struct{}
 }
 
 func newTable(log *slog.Logger) *table {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &table{log: log, ctx: ctx, cancel: cancel, running: map[*shard]struct{}{}}
+	return &table{log: log, ctx: ctx, cancel: cancel, running: map[*actor]struct{}{}}
 }
 
 // run starts a shard's loop, unless the table has stopped.
-func (t *table) run(a *shard) bool {
+func (t *table) run(a *actor) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.stopped {
@@ -95,8 +97,8 @@ const (
 // its own mutex. Requests take and release references here, never through the
 // shard's loop, so a delta or a release never delays them.
 type entry struct {
-	name string
-	sh   *shard // the shard, nil for the entry of a cached shard being evicted or deleted; set before the entry is in the table
+	name shard.Name
+	a    *actor // the shard's actor, nil for the entry of a cached shard being evicted or deleted; set before the entry is in the table
 
 	mu      sync.Mutex
 	state   entryState
@@ -106,7 +108,7 @@ type entry struct {
 	changed chan struct{} // closed and replaced whenever state changes
 }
 
-func newEntry(name string, state entryState) *entry {
+func newEntry(name shard.Name, state entryState) *entry {
 	return &entry{name: name, state: state, changed: make(chan struct{})}
 }
 
@@ -132,6 +134,9 @@ func (e *entry) take(now time.Time) (ok bool, wait <-chan struct{}, err error) {
 		return false, nil, e.err
 	case entryStopped:
 		return false, nil, errShardsStopped
+	case entryActivating, entryBusy:
+		// The shard is being activated, or is being let go of: the caller waits
+		// for the entry to change.
 	}
 	return false, e.changed, nil
 }
@@ -197,20 +202,20 @@ func (e *entry) stop() {
 	e.mu.Unlock()
 }
 
-func (t *table) load(name string) *entry {
+func (t *table) load(name shard.Name) *entry {
 	e, _ := t.entries.Load(name)
 	return e
 }
 
 // start adds an entry for name and starts its shard (made by mk), unless the
 // name has an entry already, which it returns instead.
-func (t *table) start(name string, mk func(*entry) *shard) *entry {
+func (t *table) start(name shard.Name, mk func(*entry) *actor) *entry {
 	e := newEntry(name, entryActivating)
-	e.sh = mk(e)
+	e.a = mk(e)
 	if had, loaded := t.entries.LoadOrStore(name, e); loaded {
 		return had
 	}
-	if !t.run(e.sh) {
+	if !t.run(e.a) {
 		t.remove(e, errShardsStopped)
 	}
 	return e
@@ -220,7 +225,7 @@ func (t *table) start(name string, mk func(*entry) *shard) *entry {
 // that isn't active (eviction, the delete of a cached shard, the sweep of a file
 // from before a restart). It reports false if the name has an entry already.
 // The caller removes the entry when it is done.
-func (t *table) claim(name string) (*entry, bool) {
+func (t *table) claim(name shard.Name) (*entry, bool) {
 	e := newEntry(name, entryBusy)
 	if _, loaded := t.entries.LoadOrStore(name, e); loaded {
 		return nil, false
@@ -243,10 +248,10 @@ func (t *table) remove(e *entry, err error) {
 func (t *table) forget(e *entry) { t.entries.CompareAndDelete(e.name, e) }
 
 // shards calls fn for the shard of every entry in one of the given states.
-func (t *table) shards(fn func(*shard), states ...entryState) {
-	t.entries.Range(func(_ string, e *entry) bool {
-		if e.sh != nil && e.is(states...) {
-			fn(e.sh)
+func (t *table) shards(fn func(*actor), states ...entryState) {
+	t.entries.Range(func(_ shard.Name, e *entry) bool {
+		if e.a != nil && e.is(states...) {
+			fn(e.a)
 		}
 		return true
 	})

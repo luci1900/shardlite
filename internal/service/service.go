@@ -1,5 +1,5 @@
 // Package service runs the node's long-lived parts: a Group is started and
-// stopped by its owner, which joins every service in it (docs/concurrency.md).
+// stopped by its owner, which joins every service in it (docs/internals.md, Concurrency).
 // Nothing restarts. A service that returns before its group is stopped has
 // failed, and the owner learns it from Done.
 package service

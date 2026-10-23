@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/shard"
 )
 
 func newIndex(t *testing.T) (Index, *blob.Store) {
@@ -17,11 +18,11 @@ func newIndex(t *testing.T) (Index, *blob.Store) {
 func at(h, m int) time.Time { return time.Date(2026, 10, 19, h, m, 0, 0, time.UTC) }
 
 // minuteAt is the minute of 14:05, say, on the test day.
-func minuteAt(h, m int) int64 { return MinuteAt(at(h, m)) }
+func minuteAt(h, m int) Minute { return MinuteAt(at(h, m)) }
 
 func TestKeyRoundTrip(t *testing.T) {
 	t.Parallel()
-	e := Entry{Minute: minuteAt(14, 5), Shard: "users/42", Base: BaseOf("etag"), N: 3}
+	e := Entry{Minute: minuteAt(14, 5), Shard: shard.MustParse("app.users/42"), Base: BaseOf("etag"), N: 3}
 	got, err := ParseKey(e.Key())
 	if err != nil || got != e {
 		t.Fatalf("%q parses to %+v (%v), want %+v", e.Key(), got, err, e)
@@ -38,7 +39,7 @@ func TestKeysSpreadOverPrefixes(t *testing.T) {
 	t.Parallel()
 	seen := map[string]bool{}
 	for i := range 200 {
-		e := Entry{Minute: minuteAt(14, 5), Shard: "users/" + string(rune('a'+i%26)) + string(rune('a'+i/26)), Base: "b"}
+		e := Entry{Minute: minuteAt(14, 5), Shard: shard.MustParse("app.users/" + string(rune('a'+i%26)) + string(rune('a'+i/26))), Base: "b"}
 		seen[e.Key()[len(Prefix)+len("2026-10-19T14:05Z/"):][:1]] = true
 	}
 	if len(seen) != 16 {
@@ -50,7 +51,7 @@ func TestBacks(t *testing.T) {
 	t.Parallel()
 	e := Entry{Minute: minuteAt(14, 5)}
 	for _, c := range []struct {
-		next int64
+		next Minute
 		want bool
 	}{
 		{0, false},
@@ -73,7 +74,7 @@ func TestPrunable(t *testing.T) {
 	for _, c := range []struct {
 		name    string
 		exists  bool
-		next    int64
+		next    Minute
 		version blob.ETag
 		want    bool
 	}{
@@ -95,8 +96,10 @@ func TestDueListsInTimeOrderUpToNow(t *testing.T) {
 	t.Parallel()
 	x, _ := newIndex(t)
 	ctx := context.Background()
-	mk := func(shard string, m time.Time) Entry { return Entry{Minute: MinuteAt(m), Shard: shard, Base: "b"} }
-	all := []Entry{mk("a/1", at(14, 7)), mk("b/2", at(14, 5)), mk("c/3", at(14, 6)), mk("d/4", at(14, 9))}
+	mk := func(name string, m time.Time) Entry {
+		return Entry{Minute: MinuteAt(m), Shard: shard.MustParse(name), Base: "b"}
+	}
+	all := []Entry{mk("app.a/1", at(14, 7)), mk("app.b/2", at(14, 5)), mk("app.c/3", at(14, 6)), mk("app.d/4", at(14, 9))}
 	for _, e := range all {
 		if err := x.Create(ctx, e); err != nil {
 			t.Fatal(err)
@@ -106,7 +109,7 @@ func TestDueListsInTimeOrderUpToNow(t *testing.T) {
 		}
 	}
 	got, err := x.Due(ctx, at(14, 7).Add(30*time.Second), 10)
-	if err != nil || len(got) != 3 || got[0].Shard != "b/2" || got[1].Shard != "c/3" || got[2].Shard != "a/1" {
+	if err != nil || len(got) != 3 || got[0].Shard.String() != "app.b/2" || got[1].Shard.String() != "app.c/3" || got[2].Shard.String() != "app.a/1" {
 		t.Fatalf("due %+v (%v), want b/2 c/3 a/1", got, err)
 	}
 	if got, _ := x.Due(ctx, at(14, 9), 2); len(got) != 2 {
@@ -118,7 +121,7 @@ func TestMoveCreatesTheNextThenDeletesTheOld(t *testing.T) {
 	t.Parallel()
 	x, _ := newIndex(t)
 	ctx := context.Background()
-	e := Entry{Minute: minuteAt(14, 5), Shard: "a/1", Base: "b"}
+	e := Entry{Minute: minuteAt(14, 5), Shard: shard.MustParse("app.a/1"), Base: "b"}
 	if err := x.Create(ctx, e); err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +129,7 @@ func TestMoveCreatesTheNextThenDeletesTheOld(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, err := x.Due(ctx, at(15, 0), 10)
-	want := Entry{Minute: minuteAt(14, 6), Shard: "a/1", Base: "b", N: 1}
+	want := Entry{Minute: minuteAt(14, 6), Shard: shard.MustParse("app.a/1"), Base: "b", N: 1}
 	if err != nil || len(got) != 1 || got[0] != want {
 		t.Fatalf("entries %+v (%v), want just %+v", got, err, want)
 	}

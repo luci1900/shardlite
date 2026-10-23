@@ -6,8 +6,7 @@ import (
 	"github.com/luci1900/shardlite/internal/spool"
 )
 
-// tempDir is where files too large for memory go (never the scratch directory,
-// which is tmpfs and so memory too).
+// tempDir is where files too large for memory go.
 func (f *Files) tempDir() (string, error) {
 	if f.TempDir == "" {
 		return "", errors.New("shardfile: no temporary directory set (Files.TempDir)")

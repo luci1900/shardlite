@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"maps"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -17,15 +17,16 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/coord"
 )
 
-// cluster is several nodes in one process: Run on one in-memory store, each
+// testCluster is several nodes in one process: Run on one in-memory store, each
 // with its own directories, listeners on 127.0.0.1:0 and a fake app (HTTP/1.1
 // and h2c) that answers 200 unless a test gives it a handler. The fake app never
 // opens a shard, so commits are for tests that start a real one. Stage 2.14's
 // fault rig is for real crashes.
-type cluster struct {
+type testCluster struct {
 	t     *testing.T
 	mem   *blob.Memory
 	vars  map[string]string // environment variables every node gets, over the defaults
@@ -37,9 +38,10 @@ type clusterNode struct {
 	t      *testing.T
 	mem    *blob.Memory
 	env    Env
-	hooked *blob.Hooked // the node's view of the store, cut off by Kill
-	hook   atomic.Pointer[blob.Hook]
+	hooked *blobtest.Hooked // the node's view of the store, cut off by Kill
+	hook   atomic.Pointer[blobtest.Hook]
 	app    atomic.Pointer[http.HandlerFunc]
+	sick   atomic.Bool // the ready route answers 500, as a failing app would
 	killed chan struct{}
 	// tune changes the shards' options at each start, and m is the running shards.
 	tune   func(*CatalogOptions)
@@ -52,18 +54,18 @@ type clusterNode struct {
 
 // newCluster starts n nodes named n0, n1 and so on, and stops them when the
 // test ends.
-func newCluster(t *testing.T, n int) *cluster { return newClusterWith(t, n, nil) }
+func newCluster(t *testing.T, n int) *testCluster { return newClusterWith(t, n, nil) }
 
 // newClusterWith is newCluster with the shards' options changed by tune.
-func newClusterWith(t *testing.T, n int, tune func(*CatalogOptions)) *cluster {
+func newClusterWith(t *testing.T, n int, tune func(*CatalogOptions)) *testCluster {
 	t.Helper()
 	return newClusterEnv(t, n, nil, tune)
 }
 
 // newClusterEnv is newClusterWith with environment variables set on every node.
-func newClusterEnv(t *testing.T, n int, vars map[string]string, tune func(*CatalogOptions)) *cluster {
+func newClusterEnv(t *testing.T, n int, vars map[string]string, tune func(*CatalogOptions)) *testCluster {
 	t.Helper()
-	c := &cluster{t: t, mem: blob.NewMemory(), vars: vars}
+	c := &testCluster{t: t, mem: blob.NewMemory(), vars: vars}
 	for i := range n {
 		nd := c.newNode(fmt.Sprintf("n%d", i))
 		nd.tune = tune
@@ -75,11 +77,22 @@ func newClusterEnv(t *testing.T, n int, vars map[string]string, tune func(*Catal
 	return c
 }
 
-func (c *cluster) newNode(name string) *clusterNode {
+func (c *testCluster) newNode(name string) *clusterNode {
 	t := c.t
 	nd := &clusterNode{t: t, mem: c.mem}
 	fake := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
-		if h := nd.app.Load(); h != nil && q.URL.Path != "/health" {
+		// The ready route is the app's own and the fake answers it for the
+		// node: a test's handler stands in for the app's shard routes and
+		// would not know what to do with the declaration.
+		if q.URL.Path == appReadyPath {
+			if nd.sick.Load() {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			io.WriteString(w, clusterKinds)
+			return
+		}
+		if h := nd.app.Load(); h != nil {
 			(*h)(w, q)
 		}
 	}))
@@ -89,13 +102,9 @@ func (c *cluster) newNode(name string) *clusterNode {
 	fake.Start()
 	t.Cleanup(fake.Close)
 	dir := t.TempDir()
-	kinds := filepath.Join(dir, "kinds.json")
-	if err := os.WriteFile(kinds, []byte(clusterKinds), 0o644); err != nil {
-		t.Fatal(err)
-	}
 	vars := map[string]string{
-		"SHARDLITE_NODE": name, "SHARDLITE_BLOB": "s3://unused", "SHARDLITE_KINDS": kinds,
-		"SHARDLITE_DATA": filepath.Join(dir, "data"), "SHARDLITE_SCRATCH_DIR": filepath.Join(dir, "meta"),
+		"SHARDLITE_NODE": name, "SHARDLITE_BLOB": "s3://unused",
+		"SHARDLITE_DATA":          filepath.Join(dir, "data"),
 		"SHARDLITE_APP":           fake.URL,
 		"SHARDLITE_LISTEN_PUBLIC": "127.0.0.1:0", "SHARDLITE_LISTEN_CONTROL": "127.0.0.1:0", "SHARDLITE_LISTEN_PEER": "127.0.0.1:0",
 		"SHARDLITE_FLUSH": "50ms",
@@ -110,37 +119,38 @@ func (c *cluster) newNode(name string) *clusterNode {
 	return nd
 }
 
-const clusterKinds = `{"kinds": {
-	"users":  {"public": true, "sync": "off", "idle_timeout": "1h"},
+const clusterKinds = `{"app": "test", "kinds": {
+	"users":  {"public": true, "sync": "local", "idle_timeout": "1h"},
 	"wallet": {"public": true, "idle_timeout": "1h"},
 	"audit":  {"idle_timeout": "1h"},
-	"brief":  {"public": true, "sync": "off", "idle_timeout": "100ms"}
+	"brief":  {"public": true, "sync": "local", "idle_timeout": "100ms"}
 }}`
 
 // create creates a shard on the node, as an app's call would, without asking the
 // app: clients can only reach shards that exist.
 func (n *clusterNode) create(target string) {
 	n.t.Helper()
-	ref, err := n.m.Load().Acquire(context.Background(), target)
+	ref, err := n.m.Load().Acquire(context.Background(), shardName(target))
 	if err != nil {
 		n.t.Fatalf("creating %s: %v", target, err)
 	}
 	ref.Release()
 }
 
-// serve makes h the node's app (but for its health endpoint).
+// serve makes h the node's app (but for its ready route, which answers the
+// declaration).
 func (n *clusterNode) serve(h http.HandlerFunc) { n.app.Store(&h) }
 
 // onStore runs h before and after every operation of the node on the store.
-func (n *clusterNode) onStore(h blob.Hook) { n.hook.Store(&h) }
+func (n *clusterNode) onStore(h blobtest.Hook) { n.hook.Store(&h) }
 
 // Start runs the node (again, after Stop or Kill) and waits until it serves.
 func (n *clusterNode) Start() {
 	n.t.Helper()
-	n.hooked = blob.WithHook(n.mem)
+	n.hooked = blobtest.WithHook(n.mem)
 	n.killed = make(chan struct{})
 	killed := n.killed
-	n.hooked.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
+	n.hooked.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
 		select {
 		case <-killed:
 			return errors.New("the node was killed")
@@ -175,6 +185,16 @@ func (n *clusterNode) Start() {
 	case <-time.After(20 * time.Second):
 		n.t.Fatalf("%s did not come up", n.env.Name)
 	}
+	// The kinds come from the app's declaration now, not a file read at
+	// startup: the first tests to touch a shard wait for the poll to land.
+	eventually(n.t, "the app's declaration", func() bool {
+		m := n.m.Load()
+		if m == nil {
+			return false
+		}
+		_, err := m.opts.Kinds.Lookup("test.users")
+		return err == nil
+	})
 }
 
 // Stop shuts the node down as Run does on a signal: shards are let go of and

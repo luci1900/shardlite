@@ -2,6 +2,7 @@ package shardfile
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
 	"maps"
@@ -15,6 +16,7 @@ import (
 	"pgregory.net/rapid"
 
 	"github.com/luci1900/shardlite/internal/capture"
+	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/spool"
 )
 
@@ -133,30 +135,30 @@ type run struct {
 	pageSize int
 	tails    []capture.TailFile
 	specs    []commitSpec // one per tail file
-	start    uint64
+	start    pos.Position
 }
 
 func (r run) rangeOf(i, j int) Range { // tail files i..j-1
 	last := r.tails[j-1]
-	return Range{r.tails[i].Position, last.Position + last.Count - 1}
+	return Range{r.tails[i].Position, last.Position.Add(last.Count)}
 }
 
 // genRun draws a database size and page size and a sequence of commits (each a
 // set of pages, some repeated across commits, the database growing and
-// shrinking), encoded the way capture's tail files are: Litestream's own
-// transaction numbers (which restart in every activation) in the header and
-// the shard's positions beside them.
+// shrinking), encoded with transaction numbers of their own in the header and
+// the shard's positions beside them, to check that the numbers inside the
+// files are never used.
 func genRun(t *rapid.T) run {
 	r := run{pageSize: rapid.SampledFrom([]int{512, 1024, 4096}).Draw(t, "pageSize")}
-	r.start = rapid.SampledFrom([]uint64{1, 1, 1, 2, 17}).Draw(t, "startPosition")
+	r.start = pos.Position(rapid.SampledFrom([]uint64{1, 1, 1, 2, 17}).Draw(t, "startPosition"))
 	n := rapid.IntRange(1, 10).Draw(t, "files")
 	var prev uint32
 	if r.start > 1 { // a delta run after a restore: the database already has pages
 		prev = uint32(rapid.IntRange(1, 12).Draw(t, "sizeBefore"))
 	}
-	// Litestream's numbers restart in every activation. Only a file that starts at
-	// 1 is a snapshot, so a delta run's must not.
-	pos, txid := r.start, ltx.TXID(1)
+	// A file that starts at position 1 is a snapshot, so its numbers start
+	// at 1; a delta run's start elsewhere.
+	at, txid := r.start, ltx.TXID(1)
 	if r.start > 1 {
 		txid = ltx.TXID(rapid.IntRange(2, 1000).Draw(t, "firstTXID"))
 	}
@@ -174,15 +176,15 @@ func genRun(t *rapid.T) run {
 		for pgno := uint32(1); pgno <= size; pgno++ {
 			if snapshot || pgno > prev || rapid.Bool().Draw(t, "writePage") {
 				page := bytes.Repeat([]byte{fill ^ byte(pgno)}, r.pageSize)
-				copy(page, []byte{byte(i), byte(pgno), fill, byte(pos)})
+				copy(page, []byte{byte(i), byte(pgno), fill, byte(at)})
 				spec.pages[pgno] = page
 			}
 		}
-		count := uint64(rapid.IntRange(1, 3).Draw(t, "commits"))
+		count := pos.Count(rapid.IntRange(1, 3).Draw(t, "commits"))
 		data := encodeSpec(t, r.pageSize, spec, txid, txid+ltx.TXID(count)-1, int64(i+1))
-		r.tails = append(r.tails, capture.TailFile{Position: pos, Count: count, Body: spool.Bytes(data)})
+		r.tails = append(r.tails, capture.TailFile{Position: at, Count: count, Body: spool.Bytes(data)})
 		r.specs = append(r.specs, spec)
-		pos += count
+		at += pos.Position(count)
 		txid += ltx.TXID(count)
 		prev = size
 	}
@@ -268,7 +270,7 @@ func TestReencodeEqualsApplyingTheTail(t *testing.T) {
 // manifestFiles groups a run's tail files into the files of a manifest (deltas
 // written one after another), each from reencode over its own range.
 func manifestFiles(t *rapid.T, r run) (files []File, data [][]byte, groups [][]commitSpec) {
-	epoch := uint64(rapid.IntRange(1, 1<<30).Draw(t, "epoch"))
+	epoch := pos.Epoch(rapid.IntRange(1, 1<<30).Draw(t, "epoch"))
 	for i := 0; i < len(r.tails); {
 		j := i + rapid.IntRange(1, len(r.tails)-i).Draw(t, "filesInDelta")
 		rg := r.rangeOf(i, j)
@@ -276,7 +278,7 @@ func manifestFiles(t *rapid.T, r run) (files []File, data [][]byte, groups [][]c
 		if err != nil {
 			t.Fatal(err)
 		}
-		files = append(files, File{rg, epoch + uint64(len(files))})
+		files = append(files, File{rg, epoch + pos.Epoch(len(files))})
 		data, groups = append(data, b), append(groups, r.specs[i:j])
 		i = j
 	}
@@ -284,20 +286,22 @@ func manifestFiles(t *rapid.T, r run) (files []File, data [][]byte, groups [][]c
 }
 
 // The manifest's file list built from these is contiguous and round-trips
-// through ParseFile.
+// through the manifest's JSON.
 func TestManifestListFromADeltaRun(t *testing.T) {
 	t.Parallel()
 	rapid.Check(t, func(t *rapid.T) {
 		r := genRun(t)
 		files, _, _ := manifestFiles(t, r)
-		m := &Manifest{}
-		for _, f := range files {
-			m.Files = append(m.Files, f.String())
-		}
-		got, err := m.List()
+		m := &Manifest{Files: files}
+		b, err := json.Marshal(m)
 		if err != nil {
 			t.Fatal(err)
 		}
+		var stored Manifest
+		if err := json.Unmarshal(b, &stored); err != nil {
+			t.Fatal(err)
+		}
+		got := stored.Files
 		if !slices.Equal(got, files) {
 			t.Fatalf("list %v, want %v", got, files)
 		}
@@ -319,8 +323,8 @@ func TestManifestListFromADeltaRun(t *testing.T) {
 func TestParseFileRoundTrip(t *testing.T) {
 	t.Parallel()
 	rapid.Check(t, func(t *rapid.T) {
-		min := rapid.Uint64Range(1, 1<<62).Draw(t, "min")
-		f := File{Range{min, min + rapid.Uint64Range(0, 1<<40).Draw(t, "extra")}, rapid.Uint64().Draw(t, "epoch")}
+		min := pos.Position(rapid.Uint64Range(1, 1<<62).Draw(t, "min"))
+		f := File{Range{min, min + pos.Position(rapid.Uint64Range(0, 1<<40).Draw(t, "extra"))}, pos.Epoch(rapid.Uint64().Draw(t, "epoch"))}
 		got, err := ParseFile(f.String())
 		if err != nil || got != f {
 			t.Fatalf("%q parses as %v, %v", f.String(), got, err)

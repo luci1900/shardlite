@@ -12,6 +12,3 @@ func filesystemOf(path string) (string, error) {
 	}
 	return macFSName(unix.ByteSliceToString(st.Fstypename[:])), nil
 }
-
-// macOS has no tmpfs, so Litestream's metadata can't be put on one there.
-const hasTmpfs = false

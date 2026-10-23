@@ -5,23 +5,20 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
-	"time"
 
-	"github.com/benbjohnson/litestream"
 	"github.com/superfly/ltx"
 
 	"github.com/luci1900/shardlite/internal/apptest"
-	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/harness"
 )
 
-// logFiles prints every file the shard's client has passed to the writer, as
-// segment entries (one per WriteLTXFile call).
+// logFiles prints every file the shard's capture has passed to the writer, as
+// segment entries (one per AppendFile call).
 func logFiles(t *testing.T, e *env, label string) {
 	t.Helper()
-	entries, seqs := e.entriesFor(t, "users/1")
+	entries, seqs := e.entriesFor(t, "test.users/1")
 	for i, en := range entries {
-		b, err := harness.ReadEntry(context.Background(), e.store, "n1", seqs[i], en)
+		b, err := harness.ReadEntry(context.Background(), e.journal, seqs[i], en)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -46,7 +43,6 @@ func TestFilesFromActivationToFirstWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	logFiles(t, e, "after the first sync")
-	t.Logf("litestream's tables: %s", apptest.Query(t, path, `SELECT name FROM sqlite_master WHERE name LIKE '_litestream%'`))
 	app.Must(t, "insert", "a", "1", "100")
 	if err := sh.Sync(ctx); err != nil {
 		t.Fatal(err)
@@ -57,42 +53,5 @@ func TestFilesFromActivationToFirstWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	logFiles(t, e, "after the second write")
-	sh.Close(ctx)
-}
-
-// A sync made after Litestream's checkpoint interval has passed since the last
-// write to the database makes two files: the commits, and then the checkpoint
-// it runs at the end of the sync followed by a write to _litestream_seq
-// (db.go, checkpointIfNeeded and bumpLitestreamSeq). Both are uploaded by the
-// same Replica.Sync.
-func TestTimeBasedCheckpointMakesASecondFile(t *testing.T) {
-	t.Parallel()
-	e := newEnv(t)
-	app := apptest.Start(t)
-	path := filepath.Join(e.dir, "users-1.db")
-	app.Must(t, "open", "a", path)
-	sh, err := capture.New(capture.Config{
-		Name: "users/1", Path: path, Generation: "g1", MetaRoot: e.meta, Writer: e.w,
-		Tune: func(db *litestream.DB) { db.CheckpointInterval = 100 * time.Millisecond },
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx := context.Background()
-	app.Must(t, "insert", "a", "1", "100")
-	if err := sh.Sync(ctx); err != nil {
-		t.Fatal(err)
-	}
-	logFiles(t, e, "first sync")
-	ageDatabase(t, path) // longer than the checkpoint interval since the last write
-	app.Must(t, "insert", "a", "1", "100")
-	before := sh.Position()
-	if err := sh.Sync(ctx); err != nil {
-		t.Fatal(err)
-	}
-	logFiles(t, e, "sync after the interval")
-	if got := sh.Position() - before; got != 2 {
-		t.Fatalf("the sync added %d commits to the shard's position, want 2 (the write and the checkpoint's bookkeeping)", got)
-	}
 	sh.Close(ctx)
 }

@@ -8,8 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/harness"
+	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/remindex"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
@@ -21,16 +22,16 @@ type opLog struct {
 	ops []string
 }
 
-func (l *opLog) hook(_ context.Context, op blob.Op, key string, after bool) error {
+func (l *opLog) hook(_ context.Context, op blobtest.Op, key string, after bool) error {
 	if after {
 		return nil
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	switch {
-	case op == blob.OpCreate && strings.HasPrefix(key, remindex.Prefix):
+	case op == blobtest.OpCreate && strings.HasPrefix(key, remindex.Prefix):
 		l.ops = append(l.ops, "entry")
-	case op == blob.OpUpdate && key == shardfile.ManifestKey(shard):
+	case op == blobtest.OpUpdate && key == shardfile.ManifestKey(shardName(shard)):
 		l.ops = append(l.ops, "manifest")
 	}
 	return nil
@@ -46,7 +47,7 @@ func (l *opLog) take() []string {
 
 // reminderAt is a hook that records the reminder at the minute of unix seconds.
 func reminderAt(unix int64) shardfile.Hooks {
-	return shardfile.Hooks{BeforeUpdate: func(context.Context, uint64) (int64, error) {
+	return shardfile.Hooks{BeforeUpdate: func(context.Context, pos.Position) (remindex.Minute, error) {
 		if unix == 0 {
 			return 0, nil
 		}
@@ -86,11 +87,11 @@ func TestNextReminderHasItsEntryFirst(t *testing.T) {
 	if got := log.take(); len(got) != 2 || got[0] != "entry" || got[1] != "manifest" {
 		t.Fatalf("operations %v, want the entry and then the manifest", got)
 	}
-	m, _, err := e.Files.GetManifest(ctx, shard)
+	m, _, err := e.Files.GetManifest(ctx, shardName(shard))
 	if err != nil || m.NextReminder != remindex.MinuteOf(due) {
 		t.Fatalf("manifest %+v (%v), want next_reminder %d", m, err, remindex.MinuteOf(due))
 	}
-	want := remindex.Entry{Minute: remindex.MinuteOf(due), Shard: shard, Base: base}
+	want := remindex.Entry{Minute: remindex.MinuteOf(due), Shard: shardName(shard), Base: base}
 	if got := dueEntries(t, e, time.Unix(due, 0)); len(got) != 1 || got[0] != want {
 		t.Fatalf("entries %+v, want %+v", got, want)
 	}
@@ -124,7 +125,7 @@ func TestNextReminderHasItsEntryFirst(t *testing.T) {
 	if got := log.take(); len(got) != 1 || got[0] != "manifest" {
 		t.Fatalf("operations %v, want the manifest alone", got)
 	}
-	if m, _, err := e.Files.GetManifest(ctx, shard); err != nil || m.NextReminder != 0 {
+	if m, _, err := e.Files.GetManifest(ctx, shardName(shard)); err != nil || m.NextReminder != 0 {
 		t.Fatalf("manifest %+v (%v), want no next_reminder", m, err)
 	}
 }
@@ -141,8 +142,8 @@ func TestFailedEntryFailsTheWrite(t *testing.T) {
 	ack(t, app, sh, 1)
 
 	boom := errors.New("storage is down")
-	e.Blob.SetHook(func(_ context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpCreate && strings.HasPrefix(key, remindex.Prefix) {
+	e.Blob.SetHook(func(_ context.Context, op blobtest.Op, key string, after bool) error {
+		if op == blobtest.OpCreate && strings.HasPrefix(key, remindex.Prefix) {
 			return boom
 		}
 		return nil
@@ -176,18 +177,18 @@ func TestAdoptionRecordsAnEntryDueNow(t *testing.T) {
 	var log opLog
 	e.Blob.SetHook(log.hook)
 
-	rep, err := e.Files.AdoptJournal(ctx, e.Node, 1, e.W.NextSeq(), nil)
+	rep, err := e.Files.AdoptJournal(ctx, e.Node, 1, e.W.NextSeq(), nil, nil)
 	if err != nil || rep.Deltas != 1 {
 		t.Fatalf("adoption: %+v %v", rep, err)
 	}
 	if got := log.take(); len(got) != 2 || got[0] != "entry" || got[1] != "manifest" {
 		t.Fatalf("operations %v, want the entry and then the manifest", got)
 	}
-	m, _, err := e.Files.GetManifest(ctx, shard)
+	m, _, err := e.Files.GetManifest(ctx, shardName(shard))
 	if err != nil || m.NextReminder != remindex.MinuteAt(now) {
 		t.Fatalf("manifest %+v (%v), want next_reminder %d", m, err, remindex.MinuteAt(now))
 	}
-	want := remindex.Entry{Minute: remindex.MinuteOf(now.Unix()), Shard: shard, Base: base}
+	want := remindex.Entry{Minute: remindex.MinuteOf(now.Unix()), Shard: shardName(shard), Base: base}
 	if got := dueEntries(t, e, now); len(got) != 1 || got[0] != want {
 		t.Fatalf("entries %+v, want %+v", got, want)
 	}
@@ -204,13 +205,13 @@ func TestAdoptionWithAFailedEntryWritesNoDelta(t *testing.T) {
 	defer sh.Close(ctx)
 	write(t, e, app, func() error { return sh.Sync(ctx) }, 0)
 
-	e.Blob.SetHook(func(_ context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpCreate && strings.HasPrefix(key, remindex.Prefix) {
+	e.Blob.SetHook(func(_ context.Context, op blobtest.Op, key string, after bool) error {
+		if op == blobtest.OpCreate && strings.HasPrefix(key, remindex.Prefix) {
 			return errors.New("storage is down")
 		}
 		return nil
 	})
-	rep, err := e.Files.AdoptJournal(ctx, e.Node, 1, e.W.NextSeq(), nil)
+	rep, err := e.Files.AdoptJournal(ctx, e.Node, 1, e.W.NextSeq(), nil, nil)
 	if err == nil || rep.Deltas != 0 {
 		t.Fatalf("adoption with a failing entry: %+v %v", rep, err)
 	}
@@ -218,7 +219,7 @@ func TestAdoptionWithAFailedEntryWritesNoDelta(t *testing.T) {
 		t.Fatalf("a delta was written: %v", files)
 	}
 	e.Blob.SetHook(nil)
-	if rep, err := e.Files.AdoptJournal(ctx, e.Node, 1, e.W.NextSeq(), nil); err != nil || rep.Deltas != 1 {
+	if rep, err := e.Files.AdoptJournal(ctx, e.Node, 1, e.W.NextSeq(), nil, nil); err != nil || rep.Deltas != 1 {
 		t.Fatalf("adoption: %+v %v", rep, err)
 	}
 }

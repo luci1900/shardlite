@@ -1,4 +1,4 @@
-package blob
+package blob_test
 
 import (
 	"context"
@@ -10,13 +10,16 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/blobtest"
 )
 
 // loseResponse makes the first call of op that has reached the backend and
 // succeeded report a failure instead.
-func loseResponse(l *Hooked, op Op) *atomic.Int32 {
+func loseResponse(l *blobtest.Hooked, op blobtest.Op) *atomic.Int32 {
 	var fired atomic.Int32
-	l.SetHook(func(ctx context.Context, o Op, key string, after bool) error {
+	l.SetHook(func(ctx context.Context, o blobtest.Op, key string, after bool) error {
 		if o == op && after && fired.Add(1) == 1 {
 			return errors.New("response lost")
 		}
@@ -29,7 +32,7 @@ func TestCreateLostResponse(t *testing.T) {
 	t.Parallel()
 	s, l := newStore(t)
 	ctx := context.Background()
-	fired := loseResponse(l, OpCreate)
+	fired := loseResponse(l, blobtest.OpCreate)
 	etag, err := s.Create(ctx, "k", strings.NewReader("v"))
 	if err != nil || fired.Load() != 1 {
 		t.Fatalf("etag=%q err=%v fired=%d", etag, err, fired.Load())
@@ -49,7 +52,7 @@ func TestUpdateLostResponse(t *testing.T) {
 	s, l := newStore(t)
 	ctx := context.Background()
 	e1, _ := s.Create(ctx, "k", strings.NewReader("v1"))
-	fired := loseResponse(l, OpUpdate)
+	fired := loseResponse(l, blobtest.OpUpdate)
 	e2, err := s.Update(ctx, "k", strings.NewReader("v2"), e1)
 	if err != nil || fired.Load() != 1 {
 		t.Fatalf("err=%v fired=%d", err, fired.Load())
@@ -64,15 +67,15 @@ func TestDeleteLostResponse(t *testing.T) {
 	s, l := newStrictStore(t)
 	ctx := context.Background()
 	s.Create(ctx, "k", strings.NewReader("v"))
-	fired := loseResponse(l, OpDelete)
+	fired := loseResponse(l, blobtest.OpDelete)
 	if err := s.Delete(ctx, "k", ""); err != nil || fired.Load() != 1 {
 		t.Fatalf("err=%v fired=%d", err, fired.Load())
 	}
-	if _, err := s.Head(ctx, "k"); !errors.Is(err, ErrNotFound) {
+	if _, err := s.Head(ctx, "k"); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatal(err)
 	}
 	// A first attempt that finds nothing is still an error. Only a retry's is done.
-	if err := s.Delete(ctx, "k", ""); !errors.Is(err, ErrNotFound) {
+	if err := s.Delete(ctx, "k", ""); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("got %v, want ErrNotFound", err)
 	}
 }
@@ -84,14 +87,14 @@ func TestConditionalDeleteLostResponse(t *testing.T) {
 	s, l := newStore(t)
 	ctx := context.Background()
 	e1, _ := s.Create(ctx, "k", strings.NewReader("v1"))
-	if err := s.Delete(ctx, "k", "stale"); !errors.Is(err, ErrConflict) {
+	if err := s.Delete(ctx, "k", "stale"); !errors.Is(err, blob.ErrConflict) {
 		t.Fatalf("stale delete: %v", err)
 	}
-	fired := loseResponse(l, OpDelete)
+	fired := loseResponse(l, blobtest.OpDelete)
 	if err := s.Delete(ctx, "k", e1); err != nil || fired.Load() != 1 {
 		t.Fatalf("err=%v fired=%d", err, fired.Load())
 	}
-	if _, err := s.Head(ctx, "k"); !errors.Is(err, ErrNotFound) {
+	if _, err := s.Head(ctx, "k"); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatal(err)
 	}
 }
@@ -103,13 +106,13 @@ func TestDeleteNotFoundAfterNotApplied(t *testing.T) {
 	s, l := newStrictStore(t)
 	ctx := context.Background()
 	var calls atomic.Int32
-	l.SetHook(func(ctx context.Context, o Op, key string, after bool) error {
-		if o == OpDelete && !after && calls.Add(1) == 1 {
+	l.SetHook(func(ctx context.Context, o blobtest.Op, key string, after bool) error {
+		if o == blobtest.OpDelete && !after && calls.Add(1) == 1 {
 			return errors.New("refused")
 		}
 		return nil
 	})
-	if err := s.Delete(ctx, "never-there", ""); !errors.Is(err, ErrNotFound) {
+	if err := s.Delete(ctx, "never-there", ""); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("got %v, want ErrNotFound", err)
 	}
 	if calls.Load() != 2 {
@@ -121,36 +124,36 @@ func TestDeleteNotFoundAfterNotApplied(t *testing.T) {
 func TestLostResponseThenSomeoneElsesObject(t *testing.T) {
 	t.Parallel()
 	s, l := newStore(t)
-	other := NewStore(l, "n2", 1, Options{})
+	other := blob.NewStore(l, "n2", 1, blob.Options{})
 	ctx := context.Background()
 	// Our create fails with an unknown outcome and the object is not ours: another node got there first.
 	var fired atomic.Int32
-	l.SetHook(func(ctx context.Context, o Op, key string, after bool) error {
-		if o == OpCreate && !after && fired.Add(1) == 1 {
+	l.SetHook(func(ctx context.Context, o blobtest.Op, key string, after bool) error {
+		if o == blobtest.OpCreate && !after && fired.Add(1) == 1 {
 			other.Create(ctx, "k", strings.NewReader("theirs")) // lands first
 			return nil
 		}
-		if o == OpCreate && after && fired.Load() == 1 {
+		if o == blobtest.OpCreate && after && fired.Load() == 1 {
 			fired.Add(1)
 			return errors.New("response lost")
 		}
 		return nil
 	})
 	// Our first attempt hits ErrExists directly (someone else's), which is not ambiguous.
-	if _, err := s.Create(ctx, "k", strings.NewReader("mine")); !errors.Is(err, ErrExists) {
+	if _, err := s.Create(ctx, "k", strings.NewReader("mine")); !errors.Is(err, blob.ErrExists) {
 		t.Fatalf("got %v, want ErrExists", err)
 	}
 	// Now with a lost response first: ours is written, response lost, retry finds ours.
 	l.SetHook(nil)
 	s.Delete(ctx, "k", "")
 	fired.Store(0)
-	loseResponse(l, OpCreate)
+	loseResponse(l, blobtest.OpCreate)
 	if _, err := s.Create(ctx, "k", strings.NewReader("mine")); err != nil {
 		t.Fatal(err)
 	}
 	// And a different node creating the same key afterwards is a conflict.
 	l.SetHook(nil)
-	if _, err := other.Create(ctx, "k", strings.NewReader("theirs")); !errors.Is(err, ErrExists) {
+	if _, err := other.Create(ctx, "k", strings.NewReader("theirs")); !errors.Is(err, blob.ErrExists) {
 		t.Fatalf("got %v, want ErrExists", err)
 	}
 }
@@ -160,8 +163,8 @@ func TestNotAppliedIsRetried(t *testing.T) {
 	s, l := newStore(t)
 	ctx := context.Background()
 	var calls atomic.Int32
-	l.SetHook(func(ctx context.Context, o Op, key string, after bool) error {
-		if o == OpCreate && !after && calls.Add(1) <= 2 {
+	l.SetHook(func(ctx context.Context, o blobtest.Op, key string, after bool) error {
+		if o == blobtest.OpCreate && !after && calls.Add(1) <= 2 {
 			return errors.New("busy")
 		}
 		return nil
@@ -180,14 +183,14 @@ func TestNotAppliedIsRetried(t *testing.T) {
 func TestUnknownStaysUnknownAfterNotApplied(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	for _, op := range []Op{OpUpdate, OpDelete} {
+	for _, op := range []blobtest.Op{blobtest.OpUpdate, blobtest.OpDelete} {
 		s, l := newStore(t)
 		etag, err := s.Create(ctx, "k", strings.NewReader("v1"))
 		if err != nil {
 			t.Fatal(err)
 		}
 		var landed atomic.Bool
-		l.SetHook(func(ctx context.Context, o Op, key string, after bool) error {
+		l.SetHook(func(ctx context.Context, o blobtest.Op, key string, after bool) error {
 			if o == op && after && !landed.Load() {
 				landed.Store(true)
 				return errors.New("response lost")
@@ -197,12 +200,12 @@ func TestUnknownStaysUnknownAfterNotApplied(t *testing.T) {
 			}
 			return nil
 		})
-		if op == OpUpdate {
+		if op == blobtest.OpUpdate {
 			_, err = s.Update(ctx, "k", strings.NewReader("v2"), etag)
 		} else {
 			err = s.Delete(ctx, "k", etag)
 		}
-		if !errors.Is(err, ErrUnknown) || errors.Is(err, ErrNotApplied) {
+		if !errors.Is(err, blob.ErrUnknown) || errors.Is(err, blob.ErrNotApplied) {
 			t.Fatalf("%s: got %v, want ErrUnknown and not ErrNotApplied", op, err)
 		}
 	}
@@ -212,19 +215,19 @@ func TestPersistentFailureIsReturned(t *testing.T) {
 	t.Parallel()
 	s, l := newStore(t)
 	ctx := context.Background()
-	l.SetHook(func(ctx context.Context, o Op, key string, after bool) error {
-		if o == OpCreate && !after {
+	l.SetHook(func(ctx context.Context, o blobtest.Op, key string, after bool) error {
+		if o == blobtest.OpCreate && !after {
 			return errors.New("storage down")
 		}
 		return nil
 	})
-	if _, err := s.Create(ctx, "k", strings.NewReader("v")); !errors.Is(err, ErrNotApplied) {
+	if _, err := s.Create(ctx, "k", strings.NewReader("v")); !errors.Is(err, blob.ErrNotApplied) {
 		t.Fatalf("got %v, want ErrNotApplied", err)
 	}
 	// Reads are retried too.
 	var calls atomic.Int32
-	l.SetHook(func(ctx context.Context, o Op, key string, after bool) error {
-		if o == OpHead && !after && calls.Add(1) == 1 {
+	l.SetHook(func(ctx context.Context, o blobtest.Op, key string, after bool) error {
+		if o == blobtest.OpHead && !after && calls.Add(1) == 1 {
 			return errors.New("busy")
 		}
 		return nil
@@ -243,7 +246,7 @@ func TestDeleteOfAMissingKeyOnS3Semantics(t *testing.T) {
 	s, l := newStore(t)
 	ctx := context.Background()
 	s.Create(ctx, "k", strings.NewReader("v"))
-	loseResponse(l, OpDelete)
+	loseResponse(l, blobtest.OpDelete)
 	if err := s.Delete(ctx, "k", ""); err != nil {
 		t.Fatal(err)
 	}
@@ -268,11 +271,11 @@ func TestRetryResendsTheWholeBody(t *testing.T) {
 	body := io.NewSectionReader(f, 0, int64(len(want)))
 
 	var attempts atomic.Int32
-	l.SetHook(func(ctx context.Context, o Op, key string, after bool) error {
-		if o == OpCreate && !after && attempts.Add(1) == 1 {
+	l.SetHook(func(ctx context.Context, o blobtest.Op, key string, after bool) error {
+		if o == blobtest.OpCreate && !after && attempts.Add(1) == 1 {
 			return errors.New("refused") // nothing written
 		}
-		if o == OpCreate && after && attempts.Load() == 2 && attempts.Add(1) == 3 {
+		if o == blobtest.OpCreate && after && attempts.Load() == 2 && attempts.Add(1) == 3 {
 			return errors.New("response lost") // written, but the caller isn't told
 		}
 		return nil
@@ -298,17 +301,17 @@ func TestRetryResendsTheWholeBody(t *testing.T) {
 // bodyKeeper is a backend that keeps the reader of its first Create, after
 // reading half of it, so a test can see whether a later attempt disturbed it.
 type bodyKeeper struct {
-	Backend
+	blob.Backend
 	first io.ReadSeeker
 	half  int
 }
 
-func (k *bodyKeeper) Create(ctx context.Context, key string, body io.ReadSeeker, id WriteID) (ETag, error) {
+func (k *bodyKeeper) Create(ctx context.Context, key string, body io.ReadSeeker, id blob.WriteID) (blob.ETag, error) {
 	if k.first == nil {
 		k.first = body
 		buf := make([]byte, k.half)
 		io.ReadFull(body, buf)
-		return "", fmt.Errorf("%w: busy", ErrNotApplied)
+		return "", fmt.Errorf("%w: busy", blob.ErrNotApplied)
 	}
 	return k.Backend.Create(ctx, key, body, id)
 }
@@ -319,8 +322,8 @@ func (k *bodyKeeper) Create(ctx context.Context, key string, body io.ReadSeeker,
 func TestAttemptsReadTheBodyThroughReadersOfTheirOwn(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	k := &bodyKeeper{Backend: NewMemory(), half: 5}
-	s := NewStore(k, "n1", 1, Options{Backoff: time.Millisecond})
+	k := &bodyKeeper{Backend: blob.NewMemory(), half: 5}
+	s := blob.NewStore(k, "n1", 1, blob.Options{Backoff: time.Millisecond})
 	if _, err := s.Create(ctx, "k", strings.NewReader("0123456789")); err != nil {
 		t.Fatal(err)
 	}
@@ -333,7 +336,7 @@ func TestAttemptsReadTheBodyThroughReadersOfTheirOwn(t *testing.T) {
 	}
 }
 
-func mustGet(t *testing.T, s *Store, key string) io.ReadCloser {
+func mustGet(t *testing.T, s *blob.Store, key string) io.ReadCloser {
 	t.Helper()
 	rc, _, err := s.Get(context.Background(), key)
 	if err != nil {
@@ -344,11 +347,11 @@ func mustGet(t *testing.T, s *Store, key string) io.ReadCloser {
 
 // conflictOnMissing is a store that answers a conditional delete of a missing
 // key with a failed precondition, as RustFS does.
-type conflictOnMissing struct{ Backend }
+type conflictOnMissing struct{ blob.Backend }
 
-func (c conflictOnMissing) Delete(ctx context.Context, key string, expected ETag) error {
+func (c conflictOnMissing) Delete(ctx context.Context, key string, expected blob.ETag) error {
 	if _, err := c.Backend.Head(ctx, key); err != nil && expected != "" {
-		return fmt.Errorf("%w: precondition failed", ErrConflict)
+		return fmt.Errorf("%w: precondition failed", blob.ErrConflict)
 	}
 	return c.Backend.Delete(ctx, key, expected)
 }
@@ -357,17 +360,17 @@ func (c conflictOnMissing) Delete(ctx context.Context, key string, expected ETag
 // "conflict" on such a store. The object is gone, so the delete is done.
 func TestConditionalDeleteLostResponseOnAStoreThatAnswersConflict(t *testing.T) {
 	t.Parallel()
-	l := WithHook(conflictOnMissing{NewMemory()})
-	s := NewStore(l, "n1", 1, Options{Backoff: time.Millisecond})
+	l := blobtest.WithHook(conflictOnMissing{blob.NewMemory()})
+	s := blob.NewStore(l, "n1", 1, blob.Options{Backoff: time.Millisecond})
 	ctx := context.Background()
 	e1, _ := s.Create(ctx, "k", strings.NewReader("v1"))
-	fired := loseResponse(l, OpDelete)
+	fired := loseResponse(l, blobtest.OpDelete)
 	if err := s.Delete(ctx, "k", e1); err != nil || fired.Load() != 1 {
 		t.Fatalf("err=%v fired=%d", err, fired.Load())
 	}
 	// Without an unknown outcome before it, the same answer is a conflict the caller sees.
 	l.SetHook(nil)
-	if err := s.Delete(ctx, "k", e1); !errors.Is(err, ErrConflict) {
+	if err := s.Delete(ctx, "k", e1); !errors.Is(err, blob.ErrConflict) {
 		t.Fatalf("got %v, want ErrConflict", err)
 	}
 }
@@ -375,15 +378,15 @@ func TestConditionalDeleteLostResponseOnAStoreThatAnswersConflict(t *testing.T) 
 // lostDelete fails its first delete with an unknown outcome after running
 // between, which does not apply it.
 type lostDelete struct {
-	Backend
+	blob.Backend
 	between func()
 	calls   atomic.Int32
 }
 
-func (d *lostDelete) Delete(ctx context.Context, key string, expected ETag) error {
+func (d *lostDelete) Delete(ctx context.Context, key string, expected blob.ETag) error {
 	if d.calls.Add(1) == 1 {
 		d.between()
-		return fmt.Errorf("%w: response lost", ErrUnknown)
+		return fmt.Errorf("%w: response lost", blob.ErrUnknown)
 	}
 	return d.Backend.Delete(ctx, key, expected)
 }
@@ -391,17 +394,17 @@ func (d *lostDelete) Delete(ctx context.Context, key string, expected ETag) erro
 // After an unknown outcome, a conflict with the object still there is a real one.
 func TestConditionalDeleteConflictAfterUnknownIsReal(t *testing.T) {
 	t.Parallel()
-	mem := NewMemory()
+	mem := blob.NewMemory()
 	ctx := context.Background()
-	e1, _ := NewStore(mem, "n1", 1, Options{}).Create(ctx, "k", strings.NewReader("v1"))
+	e1, _ := blob.NewStore(mem, "n1", 1, blob.Options{}).Create(ctx, "k", strings.NewReader("v1"))
 	d := &lostDelete{Backend: mem, between: func() {
-		if _, err := NewStore(mem, "n2", 1, Options{}).Update(ctx, "k", strings.NewReader("v2"), e1); err != nil {
+		if _, err := blob.NewStore(mem, "n2", 1, blob.Options{}).Update(ctx, "k", strings.NewReader("v2"), e1); err != nil {
 			t.Error(err)
 		}
 	}}
-	s := NewStore(d, "n1", 1, Options{Backoff: time.Millisecond})
+	s := blob.NewStore(d, "n1", 1, blob.Options{Backoff: time.Millisecond})
 	err := s.Delete(ctx, "k", e1)
-	if !errors.Is(err, ErrConflict) || errors.Is(err, ErrUnknown) {
+	if !errors.Is(err, blob.ErrConflict) || errors.Is(err, blob.ErrUnknown) {
 		t.Fatalf("got %v, want ErrConflict", err)
 	}
 	if _, err := mem.Head(ctx, "k"); err != nil {

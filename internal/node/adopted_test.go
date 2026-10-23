@@ -8,7 +8,9 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/coord"
+	"github.com/luci1900/shardlite/internal/journal"
 	"github.com/luci1900/shardlite/internal/node"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
@@ -21,10 +23,10 @@ func TestRestartAfterAnotherNodeAdoptedIt(t *testing.T) {
 	ctx := context.Background()
 	r := newRig(t)
 	n1 := r.mustStart()
-	s := r.create(n1, "users/1")
+	s := r.create(n1, "test.users/1")
 	r.commit(s, 3)
 	dead := publishRange(t, n1)
-	want := r.restoreDump(n1, "users/1")
+	want := r.restoreDump(n1, "test.users/1")
 
 	// n2 adopts n1's journal: mark, fence and deltas, then finish.
 	reg2 := coord.NewRegistry(r.local, "n2", coord.RegistryOptions{TTL: time.Hour})
@@ -32,12 +34,13 @@ func TestRestartAfterAnotherNodeAdoptedIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	files2 := &shardfile.Files{Blob: blob.NewStore(r.local, "n2", l2.Epoch, blob.Options{Backoff: time.Millisecond}), Node: "n2", Leases: reg2, TempDir: t.TempDir()}
+	files2 := &shardfile.Files{Blob: blob.NewStore(r.local, "n2", l2.Epoch, blob.Options{Backoff: time.Millisecond}), Backend: r.local, Node: "n2",
+		JournalOptions: journal.Options{Backoff: time.Millisecond}, Leases: reg2, TempDir: t.TempDir()}
 	marked, err := reg2.Adopt(ctx, dead, l2.Incarnation())
 	if err != nil {
 		t.Fatal(err)
 	}
-	rep, err := files2.AdoptJournal(ctx, "n1", dead.JournalFrom, dead.JournalNext, nil)
+	rep, err := files2.AdoptJournal(ctx, "n1", dead.JournalFrom, dead.JournalNext, nil, nil)
 	if err != nil || rep.Deltas != 1 {
 		t.Fatalf("adoption by n2: %+v %v", rep, err)
 	}
@@ -56,7 +59,7 @@ func TestRestartAfterAnotherNodeAdoptedIt(t *testing.T) {
 	if l.Epoch != 2 || l.Adopted != 1 || l.AdoptedBy != nil || l.JournalNext != n1b.Adopted.Fence+1 {
 		t.Fatalf("lease: %+v", l)
 	}
-	if got := r.restoreDump(n1b, "users/1"); got != want {
+	if got := r.restoreDump(n1b, "test.users/1"); got != want {
 		t.Fatalf("restored after the restart:\n%s\nwant:\n%s", got, want)
 	}
 }
@@ -68,7 +71,7 @@ func TestRestartRenewsItsLeaseWhileItAdopts(t *testing.T) {
 	t.Parallel()
 	r := newRig(t)
 	n1 := r.mustStart()
-	s := r.create(n1, "users/1")
+	s := r.create(n1, "test.users/1")
 	r.commit(s, 2)
 	publishRange(t, n1)
 
@@ -76,14 +79,14 @@ func TestRestartRenewsItsLeaseWhileItAdopts(t *testing.T) {
 	// renewed three times, well past its TTL.
 	renewed := make(chan struct{}, 16)
 	var unrenewed atomic.Bool
-	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
+	r.local.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
 		switch {
-		case op == blob.OpUpdate && key == coord.Key("n1") && after:
+		case op == blobtest.OpUpdate && key == coord.Key("n1") && after:
 			select {
 			case renewed <- struct{}{}:
 			default:
 			}
-		case op == blob.OpUpdate && strings.HasPrefix(key, shardfile.ManifestPrefix) && !after:
+		case op == blobtest.OpUpdate && strings.HasPrefix(key, shardfile.ManifestPrefix) && !after:
 			for len(renewed) > 0 {
 				<-renewed // the restart's Acquire
 			}

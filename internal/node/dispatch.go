@@ -11,11 +11,13 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/cluster"
+	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/system/dispatch"
 )
 
-// Dispatches (docs/internals.md, System kinds: _dispatch): the call _dispatch
+// Dispatches (docs/internals.md, System kinds): the call _dispatch
 // makes to the node a due shard belongs on, which makes the shard active there so
 // its reminders loop covers it.
 
@@ -26,7 +28,7 @@ const dispatchPath = apiPrefix + "dispatch"
 const dispatchTimeout = 30 * time.Second
 
 type dispatchRequest struct {
-	Shard string `json:"shard"`
+	Shard shard.Name `json:"shard"`
 }
 
 type dispatchReply struct {
@@ -37,58 +39,62 @@ type dispatchReply struct {
 // created, as a wake does. Active here answers at once, cached here is
 // reactivated, and an unowned or claimable shard is claimed here and restored. The
 // shard is then active and its reminders loop covers it.
-func (m *Catalog) dispatchHere(ctx context.Context, shard string) (dispatch.Answer, error) {
-	if m.IsActive(shard) {
+func (m *Catalog) dispatchHere(ctx context.Context, n shard.Name) (dispatch.Answer, error) {
+	if m.IsActive(n) {
 		return dispatch.Active, nil
 	}
-	ref, err := m.acquireExisting(ctx, shard)
+	hold, err := m.acquireExisting(ctx, n)
 	if err != nil {
 		if errors.Is(err, blob.ErrNotFound) {
-			return 0, dispatch.ErrNotFound
+			return dispatch.Unknown, dispatch.ErrNotFound
 		}
-		return 0, err
+		return dispatch.Unknown, err
 	}
-	ref.Release()
+	hold.Release()
 	return dispatch.Activated, nil
 }
 
 // dispatch sends a dispatch of the shard to node, in process when node is this one.
-func (s *Server) dispatch(ctx context.Context, node, shard string) (dispatch.Answer, error) {
+// A failure answers dispatch.Unknown, which is no answer at all.
+func (s *Server) dispatch(ctx context.Context, node cluster.Node, n shard.Name) (dispatch.Answer, error) {
 	ctx, cancel := context.WithTimeout(ctx, dispatchTimeout)
 	defer cancel()
 	if node == s.m.n.Name {
-		return s.m.dispatchHere(ctx, shard)
+		return s.m.dispatchHere(ctx, n)
 	}
 	address, err := s.m.addrs.address(ctx, node)
 	if err != nil {
-		return 0, fmt.Errorf("dispatching to %s: %w", node, err)
+		return dispatch.Unknown, fmt.Errorf("dispatching to %s: %w", node, err)
 	}
-	body, _ := json.Marshal(dispatchRequest{Shard: shard}) // a struct of a string
+	body, err := json.Marshal(dispatchRequest{Shard: n})
+	if err != nil {
+		return dispatch.Unknown, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+address+dispatchPath, bytes.NewReader(body))
 	if err != nil {
-		return 0, err
+		return dispatch.Unknown, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := s.peers.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("dispatching to %s: %w", node, err)
+		return dispatch.Unknown, fmt.Errorf("dispatching to %s: %w", node, err)
 	}
 	defer resp.Body.Close()
 	switch resp.StatusCode {
 	case http.StatusOK:
 		var r dispatchReply
 		if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&r); err != nil {
-			return 0, fmt.Errorf("dispatching to %s: %w", node, err)
+			return dispatch.Unknown, fmt.Errorf("dispatching to %s: %w", node, err)
 		}
 		if r.Activated {
 			return dispatch.Activated, nil
 		}
 		return dispatch.Active, nil
 	case http.StatusNotFound:
-		return 0, dispatch.ErrNotFound
+		return dispatch.Unknown, dispatch.ErrNotFound
 	}
 	msg, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
-	return 0, fmt.Errorf("dispatching to %s: %d %s", node, resp.StatusCode, bytes.TrimSpace(msg))
+	return dispatch.Unknown, fmt.Errorf("dispatching to %s: %d %s", node, resp.StatusCode, bytes.TrimSpace(msg))
 }
 
 // serveDispatch serves POST /_shardlite/dispatch: 200 once the shard is active
@@ -100,8 +106,8 @@ func (s *Server) serveDispatch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, true, http.StatusBadRequest, "a dispatch is {\"shard\": ...}")
 		return
 	}
-	if _, _, err := ParseTarget(req.Shard); err != nil {
-		writeError(w, r, true, http.StatusBadRequest, err.Error())
+	if req.Shard.IsZero() {
+		writeError(w, r, true, http.StatusBadRequest, "a dispatch is {\"shard\": ...}")
 		return
 	}
 	ans, err := s.m.dispatchHere(r.Context(), req.Shard)
@@ -112,7 +118,7 @@ func (s *Server) serveDispatch(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, dispatch.ErrNotFound):
 		writeError(w, r, true, http.StatusNotFound, err.Error())
 	case owned:
-		w.Header().Set(hdrOwner, oe.Owner)
+		w.Header().Set(hdrOwner, string(oe.Owner))
 		writeError(w, r, true, http.StatusMisdirectedRequest, err.Error())
 	case errors.Is(err, shardfile.ErrOwnerNotAdopted):
 		w.Header().Set("Retry-After", "1")

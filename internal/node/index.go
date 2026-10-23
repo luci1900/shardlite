@@ -2,83 +2,77 @@ package node
 
 import (
 	"database/sql"
-	_ "embed"
-	"fmt"
 	"time"
 
 	_ "modernc.org/sqlite"
+
+	"github.com/luci1900/shardlite/internal/pos"
+	"github.com/luci1900/shardlite/internal/shard"
 )
 
-// Row states of the cache index.
+// Row states of the cache index. The value stored in SQL is the same string an
+// older node wrote, so an index written before this type still scans.
+type rowState string
+
 const (
-	stateActive = "active" // in use by this process
-	stateCached = "cached" // deactivated, files at rest, still owned
+	stateActive rowState = "active" // in use by this process
+	stateCached rowState = "cached" // deactivated, files at rest, still owned
 )
 
 // indexRow describes one shard file on this node's disk.
 type indexRow struct {
-	Name       string
+	Name       shard.Name
 	Path       string
-	Generation string
-	Position   uint64 // the shard's position in the file, once the shard was deactivated
-	State      string
+	Generation shard.Gen
+	Position   pos.Position // the shard's position in the file, once the shard was deactivated
+	State      rowState
 	LastUsed   time.Time
 	Bytes      int64 // disk used by the file at rest
 	Size       int64 // size and modification time of the database file and its -wal at deactivation: files that differ were touched since
 	MTimeNs    int64
-	WalSize    int64
-	WalMTimeNs int64
+	WALSize    int64
+	WALMTimeNs int64
 	Manifest   string // the manifest and its version as of deactivation, so reactivating in the same epoch needs no blob storage call
 	ETag       string
+	// CRCs is the CRC of each page of the database at deactivation, so a shard
+	// activated from the cache reads no pages. It is empty for a row written
+	// before the checksums existed, and the pages are read then.
+	CRCs []byte
 }
 
-// indexSchema is the cache index's schema.
-//
-//go:embed index.sql
-var indexSchema string
-
-// index is the on-disk record of the node's shard files (a SQLite file), so a
-// million cached shards don't cost memory.
+// index is the on-disk record of the node's shard files (rows in the node's
+// local database, internal/localdb), so a million cached shards don't cost
+// memory. Its rows are cleared at every start: the files they point at are
+// deleted then too.
 type index struct{ db *sql.DB }
 
-func openIndex(path string) (*index, error) {
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=journal_mode(WAL)&_pragma=synchronous(OFF)&_pragma=busy_timeout(5000)")
-	if err != nil {
-		return nil, err
-	}
-	db.SetMaxOpenConns(4)
-	_, err = db.Exec(indexSchema)
-	if err != nil {
-		db.Close()
-		return nil, fmt.Errorf("cache index: %w", err)
-	}
-	return &index{db}, nil
-}
-
-func (x *index) close() error { return x.db.Close() }
+// newIndex makes the index over the node's local database.
+func newIndex(db *sql.DB) *index { return &index{db} }
 
 func (x *index) put(r indexRow) error {
 	_, err := x.db.Exec(`INSERT OR REPLACE INTO shards (`+cols+`)
-		VALUES (:name, :path, :generation, :position, :state, :last_used, :bytes, :size, :mtime_ns, :wal_size, :wal_mtime_ns, :manifest, :etag)`,
-		sql.Named("name", r.Name), sql.Named("path", r.Path), sql.Named("generation", r.Generation), sql.Named("position", r.Position),
+		VALUES (:name, :path, :generation, :position, :state, :last_used, :bytes, :size, :mtime_ns, :wal_size, :wal_mtime_ns, :manifest, :etag, :crcs)`,
+		sql.Named("name", r.Name), sql.Named("path", r.Path), sql.Named("generation", r.Generation), sql.Named("position", uint64(r.Position)),
 		sql.Named("state", r.State), sql.Named("last_used", r.LastUsed.UnixNano()), sql.Named("bytes", r.Bytes),
-		sql.Named("size", r.Size), sql.Named("mtime_ns", r.MTimeNs), sql.Named("wal_size", r.WalSize), sql.Named("wal_mtime_ns", r.WalMTimeNs),
-		sql.Named("manifest", r.Manifest), sql.Named("etag", r.ETag))
+		sql.Named("size", r.Size), sql.Named("mtime_ns", r.MTimeNs), sql.Named("wal_size", r.WALSize), sql.Named("wal_mtime_ns", r.WALMTimeNs),
+		sql.Named("manifest", r.Manifest), sql.Named("etag", r.ETag), sql.Named("crcs", r.CRCs))
 	return err
 }
 
-const cols = `name, path, generation, position, state, last_used, bytes, size, mtime_ns, wal_size, wal_mtime_ns, manifest, etag`
+const cols = `name, path, generation, position, state, last_used, bytes, size, mtime_ns, wal_size, wal_mtime_ns, manifest, etag, crcs`
 
 func scan(s interface{ Scan(...any) error }) (indexRow, error) {
 	var r indexRow
 	var used int64
-	err := s.Scan(&r.Name, &r.Path, &r.Generation, &r.Position, &r.State, &used, &r.Bytes, &r.Size, &r.MTimeNs, &r.WalSize, &r.WalMTimeNs, &r.Manifest, &r.ETag)
+	var position uint64
+	err := s.Scan(&r.Name, &r.Path, &r.Generation, &position, &r.State, &used, &r.Bytes, &r.Size, &r.MTimeNs, &r.WALSize, &r.WALMTimeNs, &r.Manifest, &r.ETag, &r.CRCs)
+	r.Position = pos.Position(position)
 	r.LastUsed = time.Unix(0, used)
 	return r, err
 }
 
 // get returns a shard's row, ok false if there is none.
-func (x *index) get(name string) (indexRow, bool, error) {
+func (x *index) get(name shard.Name) (indexRow, bool, error) {
 	r, err := scan(x.db.QueryRow(`SELECT `+cols+` FROM shards WHERE name = ?`, name))
 	if err == sql.ErrNoRows {
 		return indexRow{}, false, nil
@@ -86,7 +80,7 @@ func (x *index) get(name string) (indexRow, bool, error) {
 	return r, err == nil, err
 }
 
-func (x *index) delete(name string) error {
+func (x *index) delete(name shard.Name) error {
 	_, err := x.db.Exec(`DELETE FROM shards WHERE name = ?`, name)
 	return err
 }

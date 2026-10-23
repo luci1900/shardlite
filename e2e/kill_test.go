@@ -82,7 +82,7 @@ func TestKillNodeUnderLoad(t *testing.T) {
 	wallets := make([]string, nShards)
 	users := make([]string, nShards)
 	for i := range nShards {
-		wallets[i], users[i] = fmt.Sprintf("wallet/w%d", i), fmt.Sprintf("users/u%d", i)
+		wallets[i], users[i] = fmt.Sprintf("e2e.wallet/w%d", i), fmt.Sprintf("e2e.users/u%d", i)
 	}
 	s.create(t, append(wallets, users...)...)
 

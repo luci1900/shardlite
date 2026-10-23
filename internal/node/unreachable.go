@@ -12,6 +12,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/cluster"
 	"github.com/luci1900/shardlite/internal/coord"
 )
 
@@ -22,10 +23,12 @@ var errNoAnswer = errors.New("the owner's node did not answer")
 // What a forward has heard from the owner's node (reqInfo.answer). A node
 // acknowledges every forward with 102 Processing as soon as it arrives, so the
 // forwarding node can tell a node that doesn't answer from a slow app.
+type answerState int32
+
 const (
-	answerAwaited int32 = iota // nothing yet
-	answerHeard                // the owner's 102, or the response's headers
-	answerLate                 // nothing within the answer timeout: the forward was cancelled
+	answerAwaited answerState = iota // nothing yet
+	answerHeard                      // the owner's 102, or the response's headers
+	answerLate                       // nothing within the answer timeout: the forward was cancelled
 )
 
 // leaseCheckTimeout bounds one read of an unreachable owner's lease, which the
@@ -38,7 +41,7 @@ const leaseCheckTimeout = 5 * time.Second
 // come after it for a period, so a burst against a dead node costs one lease
 // read a period.
 type ownerChecks struct {
-	get   func(ctx context.Context, node string) (*coord.NodeLease, error)
+	get   func(ctx context.Context, node cluster.Node) (*coord.NodeLease, error)
 	now   func() time.Time
 	every time.Duration
 	log   *slog.Logger
@@ -47,7 +50,7 @@ type ownerChecks struct {
 	// mu guards found: the nodes found unreachable, until a forward to one is
 	// answered. It is a leaf.
 	mu    sync.Mutex
-	found map[string]*ownerCheck
+	found map[cluster.Node]*ownerCheck
 }
 
 // ownerCheck is one read of an unreachable owner's lease.
@@ -59,11 +62,11 @@ type ownerCheck struct {
 }
 
 // check returns a read of the node's lease no older than the period.
-func (c *ownerChecks) check(ctx context.Context, node string) *ownerCheck {
+func (c *ownerChecks) check(ctx context.Context, node cluster.Node) *ownerCheck {
 	if oc := c.fresh(node); oc != nil {
 		return oc
 	}
-	v, _, _ := c.flight.Do(node, func() (any, error) {
+	v, _, _ := c.flight.Do(string(node), func() (any, error) {
 		if oc := c.fresh(node); oc != nil {
 			return oc, nil // a read that ended just before this one began
 		}
@@ -75,7 +78,7 @@ func (c *ownerChecks) check(ctx context.Context, node string) *ownerCheck {
 		oc.dead = errors.Is(err, blob.ErrNotFound) || (err == nil && !l.ValidAt(oc.at))
 		c.mu.Lock()
 		if c.found == nil {
-			c.found = map[string]*ownerCheck{}
+			c.found = map[cluster.Node]*ownerCheck{}
 		}
 		prev := c.found[node]
 		c.found[node] = oc
@@ -92,7 +95,7 @@ func (c *ownerChecks) check(ctx context.Context, node string) *ownerCheck {
 }
 
 // fresh is the node's last read if it is younger than the period.
-func (c *ownerChecks) fresh(node string) *ownerCheck {
+func (c *ownerChecks) fresh(node cluster.Node) *ownerCheck {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if oc := c.found[node]; oc != nil && c.now().Sub(oc.at) < c.every {
@@ -102,7 +105,7 @@ func (c *ownerChecks) fresh(node string) *ownerCheck {
 }
 
 // answered is for a forward the node answered: it is reachable again.
-func (c *ownerChecks) answered(node string) {
+func (c *ownerChecks) answered(node cluster.Node) {
 	c.mu.Lock()
 	delete(c.found, node)
 	c.mu.Unlock()
@@ -151,10 +154,10 @@ func (s *Server) unreachable(w http.ResponseWriter, r *http.Request, info *reqIn
 		s.m.addrs.set(info.owner, oc.lease)
 	}
 	retry, adopted := oc.answer(s.m.now())
-	msg := fmt.Sprintf("%s, the owner of %s, does not answer", info.owner, info.target)
+	msg := fmt.Sprintf("%s, the owner of %s, does not answer", info.owner, info.name)
 	switch {
 	case adopted:
-		s.m.owners.Remove(info.target)
+		s.m.owners.Remove(info.name)
 		retry, msg = 0, msg+", and it is adopted: try again"
 	case oc.err != nil:
 		msg += fmt.Sprintf(", and its lease could not be read: %v", oc.err)

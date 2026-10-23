@@ -46,9 +46,9 @@ func TestMeasurePerShardCost(t *testing.T) {
 	const n = 300
 	r := newMRig(t)
 	fds0, maps0 := processCosts()
-	var refs []*Ref
+	var refs []*Hold
 	for i := range n {
-		refs = append(refs, r.acquire(fmt.Sprintf("slow/m%d", i)))
+		refs = append(refs, r.acquire(fmt.Sprintf("test.slow/m%d", i)))
 	}
 	defer func() {
 		for _, ref := range refs {

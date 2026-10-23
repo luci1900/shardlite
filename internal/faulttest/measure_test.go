@@ -15,6 +15,7 @@ import (
 
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/s3test"
+	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
@@ -34,9 +35,9 @@ func TestMeasureMemory(t *testing.T) {
 	}
 	st := s3test.Setup(t)
 	dir := t.TempDir()
-	path := filepath.Join(dir, "users-1.db")
+	path := filepath.Join(dir, "fault-users-1.db")
 	start := func() *apptest.App {
-		n, err := apptest.StartAt(apptest.Build(t, "./internal/testnode"), append(st.Args(), "-meta", filepath.Join(dir, "meta"))...)
+		n, err := apptest.StartAt(apptest.Build(t, "./internal/testnode"), st.Args()...)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -94,7 +95,7 @@ func TestMeasureMemory(t *testing.T) {
 
 	// What it left is the whole shard in one file.
 	reader := (&rig{t: t, store: st}).readFiles()
-	m, _, err := reader.GetManifest(context.Background(), shardName)
+	m, _, err := reader.GetManifest(context.Background(), shard.MustParse(shardName))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +103,7 @@ func TestMeasureMemory(t *testing.T) {
 		t.Fatalf("manifest files %v", m.Files)
 	}
 	dst := filepath.Join(t.TempDir(), "check.db")
-	if _, err := reader.Restore(context.Background(), shardName, dst, shardfile.RestoreOptions{}); err != nil {
+	if _, err := reader.Restore(context.Background(), shard.MustParse(shardName), dst, shardfile.RestoreOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	db, err := sql.Open("sqlite", "file:"+dst+"?_pragma=busy_timeout(5000)")
@@ -149,19 +150,18 @@ func shmem() int64 {
 	return -1
 }
 
-// watch samples the scratch directory, the temporary directory and Shmem while
-// something runs, and reports the highest of each.
+// watch samples the temporary directory and Shmem while something runs, and
+// reports the highest of each.
 type watcher struct {
-	stop                    chan struct{}
-	done                    chan struct{}
-	scratch, temp, shm, now int64
+	stop      chan struct{}
+	done      chan struct{}
+	temp, shm int64
 }
 
-func watch(scratch, temp string) *watcher {
+func watch(temp string) *watcher {
 	w := &watcher{stop: make(chan struct{}), done: make(chan struct{})}
 	base := shmem()
 	sample := func() {
-		w.scratch = max(w.scratch, dirSize(scratch))
 		w.temp = max(w.temp, dirSize(temp))
 		if base >= 0 {
 			w.shm = max(w.shm, shmem()-base)
@@ -185,18 +185,17 @@ func watch(scratch, temp string) *watcher {
 func (w *watcher) Stop() *watcher { close(w.stop); <-w.done; return w }
 
 func (w *watcher) String() string {
-	s := fmt.Sprintf("scratch peak %.0f MB, temporary files peak %.0f MB", float64(w.scratch)/(1<<20), float64(w.temp)/(1<<20))
+	s := fmt.Sprintf("temporary files peak %.0f MB", float64(w.temp)/(1<<20))
 	if w.shm >= 0 && w.shm != 0 {
 		s += fmt.Sprintf(", Shmem peak +%.0f MB", float64(w.shm)/(1<<20))
 	}
 	return s
 }
 
-// TestMeasureStage1z measures what stage 1z is about, on Linux with the scratch
-// directory on tmpfs (SHARDLITE_MEASURE_META, for example /dev/shm/shardlite):
+// TestMeasureStage1z measures what stage 1z is about, on Linux:
 //
 //  1. a shard of SHARDLITE_MEASURE_MB megabytes restored and activated: the node's
-//     peak resident memory, the bytes in the scratch directory and the time;
+//     peak resident memory, the bytes in the temporary directory and the time;
 //  2. an import of that size into an empty shard in one transaction, then a
 //     VACUUM, each through to its delta: the same figures.
 //
@@ -209,15 +208,10 @@ func TestMeasureStage1z(t *testing.T) {
 	}
 	st := s3test.Setup(t)
 	dir := t.TempDir()
-	meta := os.Getenv("SHARDLITE_MEASURE_META")
-	if meta == "" {
-		meta = filepath.Join(dir, "meta")
-	}
-	os.RemoveAll(meta)
 	tmp := filepath.Join(dir, "tmp")
 	os.MkdirAll(tmp, 0o755)
 	start := func() *apptest.App {
-		n, err := apptest.StartAt(apptest.Build(t, "./internal/testnode"), append(st.Args(), "-meta", meta, "-tmp", tmp)...)
+		n, err := apptest.StartAt(apptest.Build(t, "./internal/testnode"), append(st.Args(), "-tmp", tmp)...)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -233,7 +227,7 @@ func TestMeasureStage1z(t *testing.T) {
 	}
 
 	// 1. Build a shard of about mb megabytes in blob storage, then restore it.
-	path := filepath.Join(dir, "users-1.db")
+	path := filepath.Join(dir, "fault-users-1.db")
 	const rowsPerCommit, rowBytes = 5000, 1000
 	commits := mb * (1 << 20) / (rowsPerCommit * rowBytes)
 	node, app := start(), apptest.Start(t)
@@ -257,38 +251,37 @@ func TestMeasureStage1z(t *testing.T) {
 	for _, p := range []string{"", "-wal", "-shm"} {
 		os.Remove(path + p)
 	}
-	os.RemoveAll(meta)
+	os.RemoveAll(tmp)
 
 	n := start()
-	w := watch(meta, tmp)
+	w := watch(tmp)
 	how := n.Must(t, "open", shardName, path)
 	w.Stop()
 	t.Logf("1. restore and activate a %.0f MB shard: %s", float64(fi.Size())/(1<<20), how)
 	t.Logf("   node peak memory %.0f MB; %s", rss(n), w)
-	t.Logf("   scratch directory now: %.1f MB", float64(dirSize(meta))/(1<<20))
-	// A few commits, as an active shard has, and the scratch directory after each.
+	// A few commits, as an active shard has, and the temporary directory after each.
 	app = apptest.Start(t)
 	app.Must(t, "open", "a", path)
 	for range 3 {
 		app.Must(t, "insert", "a", "10", "1000")
 		n.Must(t, "sync", shardName)
 	}
-	t.Logf("   after three commits: scratch directory %.1f MB, node peak memory %.0f MB", float64(dirSize(meta))/(1<<20), rss(n))
+	t.Logf("   after three commits: temporary files %.1f MB, node peak memory %.0f MB", float64(dirSize(tmp))/(1<<20), rss(n))
 	app.Must(t, "close", "a")
 	app.Exit()
 	n.Must(t, "close", shardName)
 	n.Kill()
-	os.RemoveAll(meta)
+	os.RemoveAll(tmp)
 
 	// 2. An import in one transaction into an empty shard, then a VACUUM.
-	path2, name2 := filepath.Join(dir, "users-2.db"), "users/2"
+	path2, name2 := filepath.Join(dir, "fault-users-2.db"), "fault.users/2"
 	n = start()
 	app = apptest.Start(t)
 	app.Must(t, "open", "a", path2)
 	n.Must(t, "open", name2, path2)
 	n.Must(t, "sync", name2) // the first sync of a new shard is its (empty) first position, as at activation
 	rows := mb               // rows of 1 MB
-	w = watch(meta, tmp)
+	w = watch(tmp)
 	t0 = time.Now()
 	app.Must(t, "insert", "a", strconv.Itoa(rows), "1000000")
 	imported := time.Since(t0)
@@ -297,14 +290,14 @@ func TestMeasureStage1z(t *testing.T) {
 	w.Stop()
 	t.Logf("2a. import of %d MB in one transaction: app %v, through the sync %v", rows, imported.Round(time.Millisecond), synced.Round(time.Millisecond))
 	t.Logf("    node peak memory %.0f MB after the sync; %s", rss(n), w)
-	w = watch(meta, tmp)
+	w = watch(tmp)
 	t0 = time.Now()
 	n.Must(t, "delta", name2)
 	w.Stop()
 	t.Logf("2b. its delta: %v, node peak memory %.0f MB; %s", time.Since(t0).Round(time.Millisecond), rss(n), w)
-	t.Logf("    scratch directory now: %.1f MB", float64(dirSize(meta))/(1<<20))
+	t.Logf("    temporary files now: %.1f MB", float64(dirSize(tmp))/(1<<20))
 
-	w = watch(meta, tmp)
+	w = watch(tmp)
 	t0 = time.Now()
 	app.Must(t, "exec", "a", "VACUUM")
 	n.Must(t, "sync", name2)
@@ -312,7 +305,7 @@ func TestMeasureStage1z(t *testing.T) {
 	n.Must(t, "delta", name2)
 	w.Stop()
 	t.Logf("2d. VACUUM through its delta: %v, node peak memory %.0f MB; %s", time.Since(t0).Round(time.Millisecond), rss(n), w)
-	t.Logf("    scratch directory now: %.1f MB", float64(dirSize(meta))/(1<<20))
+	t.Logf("    temporary files now: %.1f MB", float64(dirSize(tmp))/(1<<20))
 	app.Must(t, "close", "a")
 	app.Exit()
 	n.Must(t, "close", name2)
@@ -321,7 +314,7 @@ func TestMeasureStage1z(t *testing.T) {
 	// Both restore to what the app had.
 	reader := (&rig{t: t, store: st}).readFiles()
 	dst := filepath.Join(t.TempDir(), "check.db")
-	if _, err := reader.Restore(context.Background(), name2, dst, shardfile.RestoreOptions{}); err != nil {
+	if _, err := reader.Restore(context.Background(), shard.MustParse(name2), dst, shardfile.RestoreOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	db, err := sql.Open("sqlite", "file:"+dst+"?_pragma=busy_timeout(5000)")

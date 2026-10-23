@@ -17,7 +17,7 @@ This is the Orleans / Durable Objects model, with SQLite as the state and with t
 
 As virtual actors, any shard id can be called and the first call creates the shard, with no create step. The app creates shards and clients reach the ones that exist, so a random id from a client finds nothing and creates nothing.
 
-Shardlite keeps Orleans' operational trade-offs. Blob storage (S3 or compatible) is the system of record, run by someone else. Nodes keep shards on local disk only as a cache, so they are disposable. Durability comes from shipping changes to blob storage, and the storage is the final check against duplicate owners (as Orleans' storage ETags are). Shardlite is a router and a cache in front of blob storage, not a database to operate.
+Shardlite keeps Orleans' operational trade-offs. Blob storage (S3 or compatible) is the system of record, run by someone else. Nodes keep shards on local disk only as a cache, so they are disposable; the node's own database there holds the journal's copy its `local` tier acknowledges, which answers for the node's crash and not the host's. Durability comes from shipping changes to blob storage, and the storage is the final check against duplicate owners (as Orleans' storage ETags are). Shardlite is a router and a cache in front of blob storage, not a database to operate.
 
 An actor's state is always its SQLite file, never objects in memory. That makes activation and deactivation almost free:
 
@@ -26,6 +26,8 @@ An actor's state is always its SQLite file, never objects in memory. That makes 
 - **Memory follows the working set,** not the number or size of actors. Idle shards can deactivate early, and a node can hold far more actors than fit in memory. The OS file cache keeps recently used pages warm, so a shard that comes back quickly is still cheap.
 
 The trade-off is that reads go through SQLite (microseconds from cache) rather than plain objects, and anything the app keeps in memory outside SQLite is lost on deactivation.
+
+A shard is an actor, but not a turn-based one. Requests for the same shard run concurrently, as they would on any database, and the app's transactions are the concurrency control: a handler that reads and then writes has to do both in one transaction. Orleans and Durable Objects give a grain one turn at a time, so an app written for those loses updates here.
 
 The same goes for shardlite's own state about a shard: it lives in the shard, and anything global only points into it. Reminders are rows in the shard's own table, written in the app's transactions, the way an intrusive list keeps its links inside the elements. Where something outside the shard is needed, such as the reminder index, it holds no payload, just which shard to look at when. So nothing global has to stay consistent with the shards, deleting a shard takes its state with it, and the node's memory is a cache it can lose at any time.
 
@@ -41,15 +43,15 @@ A shardlite app should be no more exposed to abuse than any web app. Clients can
 
 | Term | Meaning |
 |---|---|
-| **Shard** | One SQLite database, identified by `kind/id` (e.g. `users/42`). |
-| **Shard kind** | A category of shards (`users`, `zone`) with shared configuration: sync, idle timeout. |
+| **Shard** | One SQLite database, identified by `app.kind/id` (e.g. `game.users/42`). |
+| **Shard kind** | A category of shards (`users`, `zone`) with shared configuration: sync, idle timeout. A kind's name is qualified by the app that serves it (`game.users`), so a shard's name says whose it is. |
 | **Node** | The shardlite process (`shardlited`), one per host (a machine, VM or Kubernetes node) and shared by the app processes on it. Written in Go. Disposable. |
-| **App** | Any process on the host that uses shardlite, in any language. It serves whole shard kinds or pins specific shards. |
+| **App** | Any process on the host that uses shardlite, in any language. It serves whole shard kinds or pins specific shards. Its name is the namespace its kinds are qualified by, chosen once, since it is in every stored path. |
 | **Owner** | The node allowed to write a shard. A node keeps ownership of its active and cached shards while its lease is valid. |
 | **Active shard** | A shard that is open on its owner and shipping changes. Costs memory and CPU. |
 | **Local cache** | Shard files kept on a node's disk after deactivation. Evictable. Costs disk only. |
 | **Pin** | A process's hold on a shard: the node proxies the shard to that process and never hands it off until the process lets go. The process serves its own clients over any protocol. |
-| **Gate** | For kinds with sync on, the node holds a shard's output (responses, streams and calls) until the writes before it are in blob storage, as Durable Objects' output gates do and as Orleans code does by awaiting `WriteStateAsync` before returning. |
+| **Gate** | The node holds a shard's output (responses, streams and calls) until the writes before it meet the kind's tier: the node's own database for `local`, blob storage for `storage` (the default), as Durable Objects' output gates do and as Orleans code does by awaiting `WriteStateAsync` before returning. |
 
 ## Architecture
 
@@ -80,20 +82,20 @@ The node does all of the distributed work: leases, ownership, routing, shipping 
 
 ## Consistency model
 
-- One shard, one writer. Within a shard, transactions are SQLite's (serializable), and with sync on (the default) every read and write of the shard is linearizable: the guarantee CockroachDB gives for a key, for a whole database. It assumes working clocks (their rates, not their synchronisation), and a request can ask for reads that hold under any clocks and pauses. The levels and their conditions are in [Consistency](guide.md#consistency).
+- One shard, one writer. Within a shard, transactions are SQLite's (serializable), and on the storage tier (the default) every read and write of the shard is linearizable: the guarantee CockroachDB gives for a key, for a whole database. It assumes working clocks (their rates, not their synchronisation), and a request can ask for reads that hold under any clocks and pauses. The levels and their conditions are in [Consistency](guide.md#consistency).
 - Across shards, consistency is the app's problem.
 - Anything needing agreement goes through a shard that owns it:
   - A trade is a `trade/{id}` shard running a saga: reserve on both player shards, then commit or release, with idempotent steps and resumable state.
   - Shardlite provides no locks across shards. Apps that want them can write them as data in their shards.
   - Global data (name registry, tournament brackets) lives in a global shard. It is single-writer, so very hot global data (leaderboards) should be sharded or aggregated in batches.
   - Global shards are a single point of availability. If their owner crashes, they are unavailable until the lease expires and another node restores them.
-- Payments: keep sync on (the default), store payments as an append-only ledger keyed by the provider's transaction id and reconcile against the payment provider.
+- Payments: keep the storage tier (the default), store payments as an append-only ledger keyed by the provider's transaction id and reconcile against the payment provider.
 
 ## Prior art
 
 - HBase and Bigtable: one write-ahead log per server shared by many regions, and log splitting when a server dies. The closest precedent for node journals.
 - Neon: the same split as node journals and snapshots (safekeepers for the WAL, image and delta layers in object storage), and generations for fencing page servers.
-- Litestream: snapshots plus WAL segments per database, stored as LTX files. Shardlite uses it as a library and shares the WAL across a node's shards.
+- Litestream: snapshots plus WAL segments per database, stored as LTX files. Shardlite stores the same LTX files, reads the WAL itself and shares the WAL across a node's shards.
 - BookKeeper: garbage collection of shared logs.
 - WarpStream: stateless agents on object storage.
 - SlateDB: an LSM tree on object storage. Its fencing of WAL writers by conditional creates is the model for node journals.

@@ -16,10 +16,14 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/capture"
+	"github.com/luci1900/shardlite/internal/cluster"
 	"github.com/luci1900/shardlite/internal/coord"
 	"github.com/luci1900/shardlite/internal/kind"
 	"github.com/luci1900/shardlite/internal/notify"
+	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/service"
+	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/system/dispatch"
 )
@@ -34,18 +38,17 @@ var (
 )
 
 // tempDirName is the directory of Data that holds the temporary files of deltas,
-// snapshots and downloads (not Scratch, which is tmpfs and so memory too). The
-// node empties it at startup, and no kind may have its name.
+// snapshots and downloads. The node empties it at startup, and no kind may have
+// its name.
 const tempDirName = ".tmp"
 
 // CatalogOptions configure Shards: what Shards itself needs, and an options
 // struct for each of its parts.
 type CatalogOptions struct {
-	Kinds   *Kinds
-	Data    string // directory of shard files, which is the local cache
-	Scratch string // capture's disposable working files, Litestream's metadata directories (tmpfs in production)
-	Logger  *slog.Logger
-	Clock   Clock // the time of reminders, next_reminder, reminder ages, reminder backoff, idle shards, the shards' timers and the cache, watchdog and lease scan periods, the real one if nil
+	Kinds  *Kinds
+	Data   string // directory of shard files, which is the local cache
+	Logger *slog.Logger
+	Clock  Clock // the time of reminders, next_reminder, reminder ages, reminder backoff, idle shards, the shards' timers and the cache, watchdog and lease scan periods, the real one if nil
 
 	Cache     CacheOptions
 	Flush     FlushOptions
@@ -96,10 +99,11 @@ type Stats struct {
 
 	ReminderWakes        atomic.Int64 // wakes of apps for reminders, however they ended
 	ReminderWakeFailures atomic.Int64 // wakes that failed and will be repeated after a backoff
+	ChecksumMismatches   atomic.Int64 // snapshots whose checksum was not the capture's: the capture went wrong somewhere
 }
 
-// Catalog owns the node's shards, active and cached (docs/concurrency.md, The
-// tree). Its parts are the table of shards and their actors, the flush loop,
+// Catalog owns the node's shards, active and cached (docs/internals.md,
+// Concurrency). Its parts are the table of shards and their actors, the flush loop,
 // the cache loop, the lease scan, the watchdog and the claimer,
 // which Serve runs. The reminders' limits and the cache index are its too. Each part gets what it
 // depends on passed in, and Catalog orders its own stop (Serve).
@@ -117,12 +121,12 @@ type Catalog struct {
 	watch  *watchdog
 	claim  *claimer
 	sys    systemKinds
-	deps   *shardDeps // what every shard is given
+	deps   *actorDeps // what every shard is given
 
 	// owners maps a shard's name to the node that owned it when this node last
 	// found out. It is a hint: a wrong entry costs a misdirected request, never
 	// correctness.
-	owners *lru.Cache[string, string]
+	owners *lru.Cache[shard.Name, cluster.Node]
 	addrs  *addresses   // where the nodes listen for forwards
 	checks *ownerChecks // the leases of owners that don't answer forwards
 
@@ -173,35 +177,29 @@ func NewCatalog(n *Node, opts CatalogOptions, newRouting func(*Catalog) routing)
 	if opts.Dispatch != nil {
 		opts.System = append(slices.Clone(opts.System), dispatch.New(dispatch.Deps{
 			Store: n.Store,
-			Live:  func() []string { return m.liveNodes() },
-			Dispatch: func(ctx context.Context, node, shard string) (dispatch.Answer, error) {
-				return rt.dispatch(ctx, node, shard)
+			Live:  func() []cluster.Node { return m.liveNodes() },
+			Dispatch: func(ctx context.Context, node cluster.Node, name shard.Name) (dispatch.Answer, error) {
+				return rt.dispatch(ctx, node, name)
 			},
 			Now: opts.Clock.Now,
 			Log: opts.Logger,
 		}, *opts.Dispatch))
 	}
-	sys, err := newSystemKinds(opts.System)
+	sysApp, sys, err := newSystemApp(opts.System, opts.Kinds.defaultIdle)
 	if err != nil {
 		return nil, err
 	}
-	opts.Kinds.setSystem(sys)
-	// Litestream's metadata never needs to outlive the process.
-	if err := os.RemoveAll(opts.Scratch); err != nil {
+	opts.Kinds.setSystem(sysApp)
+	if err := os.MkdirAll(opts.Data, 0o755); err != nil {
 		return nil, err
-	}
-	for _, d := range []string{opts.Data, opts.Scratch} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
-			return nil, err
-		}
 	}
 	m = &Catalog{n: n, opts: opts, log: opts.Logger, tab: newTable(opts.Logger), sys: sys}
 	n.Files.Now = opts.Clock.Now
 	log, clk, st := opts.Logger, opts.Clock, &m.Stats
 	// A restart is treated as a crash: nothing on disk from before it is trusted.
-	m.owners, _ = lru.New[string, string](opts.OwnerCache) // only a size below 1 fails
+	m.owners, _ = lru.New[shard.Name, cluster.Node](opts.OwnerCache) // only a size below 1 fails
 	m.cache = &cache{data: opts.Data, tab: m.tab, files: n.Files, node: n.Name, clock: clk, log: log, stats: st}
-	if err := m.cache.open(opts.Cache); err != nil {
+	if err := m.cache.open(opts.Cache, n.LocalDB); err != nil {
 		return nil, err
 	}
 	rt = newRouting(m)
@@ -211,6 +209,7 @@ func NewCatalog(n *Node, opts CatalogOptions, newRouting func(*Catalog) routing)
 		reg: n.Registry, files: n.Files, store: n.Store, nodeErr: n.Err,
 		self:  func() coord.Incarnation { l := n.Keeper.Lease(); return l.Incarnation() },
 		clock: clk, opts: opts.Leases, log: log, scans: &st.LeaseScans, adopted: &st.Adoptions, died: m.died,
+		mirror: newMirrorDialer(n.Registry, n.Files.JournalOptions),
 	}
 	m.claim = &claimer{targets: sys.targets(), active: m.IsActive, owner: m.owners.Get, live: m.isLive, acquire: m.Acquire,
 		clock: clk, opts: opts.Claims, log: log, kick: notify.NewKick(), adopted: &st.Adoptions, passes: &st.ClaimPasses}
@@ -219,10 +218,10 @@ func NewCatalog(n *Node, opts CatalogOptions, newRouting func(*Catalog) routing)
 	m.watch = &watchdog{tab: m.tab, clock: clk, every: lc.SnapshotEvery, alertAge: tailAlertAge(lc.DeltaAge), log: log, stats: st}
 	var base context.Context
 	base, m.cancelBase = context.WithCancel(context.Background())
-	m.deps = &shardDeps{
-		opts: opts.Lifecycle, kinds: opts.Kinds, call: rt.call, clock: clk, log: log, stats: st,
+	m.deps = &actorDeps{
+		opts: opts.Lifecycle, kinds: opts.Kinds, sys: sys, call: rt.call, clock: clk, log: log, stats: st,
 		tab: m.tab, cache: m.cache, flush: m.flush, rem: m.rem,
-		files: n.Files, writer: n.Writer, scratch: opts.Scratch, tempDir: n.TempDir, spool: n.SpoolLimit,
+		files: n.Files, writer: n.Writer, tempDir: n.TempDir, spool: n.SpoolLimit,
 		base:          base,
 		deactivations: make(chan struct{}, opts.limits.deactivate),
 		snapshots:     make(chan struct{}, opts.limits.snapshot),
@@ -237,7 +236,7 @@ func NewCatalog(n *Node, opts CatalogOptions, newRouting func(*Catalog) routing)
 // (Server.dispatch) and its calls to system shards (Server.call).
 type routing struct {
 	wake     wakeFunc
-	dispatch func(ctx context.Context, node, shard string) (dispatch.Answer, error)
+	dispatch func(ctx context.Context, node cluster.Node, name shard.Name) (dispatch.Answer, error)
 	call     func(*http.Request) (*http.Response, error)
 }
 
@@ -249,7 +248,7 @@ func orDefault[T int | int64 | time.Duration](v *T, def T) {
 }
 
 // Serve runs the shards until ctx ends, then stops in order
-// (docs/concurrency.md, Shutdown). Every request has been joined by then (Run
+// (docs/internals.md, Concurrency: Shutdown). Every request has been joined by then (Run
 // ends ctx only once both servers have ended). First the
 // lease scan, the watchdog and the cache loop stop, so that nothing activates any
 // more; then every shard is let go of, with the flusher still running; then the flusher,
@@ -286,7 +285,8 @@ func (m *Catalog) Serve(ctx context.Context) error {
 	cancel()
 	m.stopPart(flusher)
 	m.cancelBase()
-	m.cache.idx.close()
+	// The local database is not closed here: the journal's writer is still
+	// running (the journal's stage stops after this one), and it writes to it.
 	return err
 }
 
@@ -306,8 +306,8 @@ func (m *Catalog) stopPart(g *service.Group) {
 // transient storage failure (the final sync or the delta) is tried again until
 // ctx ends. Other failures are not.
 func (m *Catalog) letGo(ctx context.Context) error {
-	var list []*shard
-	m.tab.shards(func(a *shard) { list = append(list, a) }, entryActivating, entryActive, entryBusy)
+	var list []*actor
+	m.tab.shards(func(a *actor) { list = append(list, a) }, entryActivating, entryActive, entryBusy)
 	var g errgroup.Group
 	g.SetLimit(m.opts.limits.deactivate)
 	for _, a := range list {
@@ -335,7 +335,7 @@ func (m *Catalog) letGo(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-func (m *Catalog) letGoOf(ctx context.Context, a *shard) error {
+func (m *Catalog) letGoOf(ctx context.Context, a *actor) error {
 	wait := 100 * time.Millisecond
 	for {
 		ok, err := a.deactivateNow(ctx)
@@ -361,23 +361,23 @@ func (m *Catalog) letGoOf(ctx context.Context, a *shard) error {
 // reminder, claims it (docs/internals.md, Takeover). An active shard is
 // deactivated first. A shard in use is not evicted (ErrBusy), nor one the app
 // has open (ErrAppHolds), and one that isn't here is ErrNotHere.
-func (m *Catalog) Evict(ctx context.Context, target string) error {
+func (m *Catalog) Evict(ctx context.Context, n shard.Name) error {
 	for {
-		e := m.tab.load(target)
+		e := m.tab.load(n)
 		switch {
 		case e == nil:
-			row, ok, err := m.cache.idx.get(target)
+			row, ok, err := m.cache.idx.get(n)
 			switch {
 			case err != nil:
 				return err
 			case !ok || row.State != stateCached:
-				return fmt.Errorf("%w: %s", ErrNotHere, target)
+				return fmt.Errorf("%w: %s", ErrNotHere, n)
 			}
 			if evicted, err := m.cache.evict(ctx, row); evicted || err != nil {
 				return err
 			}
 			// An entry was added meanwhile: look again.
-		case e.sh == nil: // a cached shard being evicted or deleted
+		case e.a == nil: // a cached shard being evicted or deleted
 			if _, wait, _ := e.take(m.now()); wait != nil {
 				select {
 				case <-wait:
@@ -390,7 +390,7 @@ func (m *Catalog) Evict(ctx context.Context, target string) error {
 		case e.is(entryStopped):
 			return errShardsStopped
 		default:
-			if done, err := e.sh.evict(ctx); done {
+			if done, err := e.a.evict(ctx); done {
 				return err
 			}
 		}
@@ -409,89 +409,85 @@ func statSig(path string) fileSig {
 	if fi, err := os.Stat(path); err == nil {
 		s.db, s.dbMod = fi.Size(), fi.ModTime().UnixNano()
 	}
-	if fi, err := os.Stat(path + "-wal"); err == nil {
-		s.wal, s.walMod = fi.Size(), fi.ModTime().UnixNano()
+	if size, mod, ok := capture.WALSidecarsOf(path).WALStat(); ok {
+		s.wal, s.walMod = size, mod
 	}
 	return s
 }
 
-// Ref is a hold on an active shard: it stays active until the last Ref is
-// released. A request holds one while it runs, and a WebSocket, a stream or a
-// streaming call for as long as it is open.
-type Ref struct {
+// Hold keeps an active shard active until it is released. A request holds one
+// while it runs, and a WebSocket, a stream or a streaming call for as long as it
+// is open.
+type Hold struct {
 	m    *Catalog
-	a    *shard
+	a    *actor
 	once sync.Once
 }
 
-// Name is the shard's kind/id.
-func (r *Ref) Name() string { return r.a.Name }
-
 // Path is the opaque path of the shard's file, for Shardlite-Path.
-func (r *Ref) Path() string { return r.a.Path }
+func (h *Hold) Path() string { return h.a.Path }
 
-// Sync reports whether the shard's kind has sync on right now.
-func (r *Ref) Sync() bool {
-	k, err := r.m.opts.Kinds.Lookup(r.a.Kind)
-	return err == nil && k.Sync == kind.SyncOn
+// Sync is the shard's kind's durability tier: where its output waits for the
+// commits before it to be durable.
+func (h *Hold) Sync() kind.Sync {
+	k, err := h.m.opts.Kinds.Lookup(h.a.Name.Kind())
+	if err != nil {
+		return kind.SyncStorage
+	}
+	return k.Sync
 }
 
 // Release gives up the hold.
-func (r *Ref) Release() {
-	r.once.Do(func() { r.a.e.put(r.m.now()) })
+func (h *Hold) Release() {
+	h.once.Do(func() { h.a.e.put(h.m.now()) })
 }
 
-// Acquire activates the shard if it is not active and holds it. target is a
-// Shardlite-Target value. However many requests ask at once, the shard is
-// activated once: the first adds its entry and the others wait for it. The
-// activation runs in the shard's own loop, so one caller giving up doesn't fail
-// the others. A shard another node owns is not activated at all: the manifest
-// is read before the entry is added, and the owner is remembered
-// (*shardfile.OwnedElsewhereError).
-func (m *Catalog) Acquire(ctx context.Context, target string) (*Ref, error) {
-	return m.take(ctx, target, false)
+// Acquire activates the shard if it is not active and holds it. However many
+// requests ask at once, the shard is activated once: the first adds its entry
+// and the others wait for it. The activation runs in the shard's own loop, so
+// one caller giving up doesn't fail the others. A shard another node owns is not
+// activated at all: the manifest is read before the entry is added, and the
+// owner is remembered (*shardfile.OwnedElsewhereError).
+func (m *Catalog) Acquire(ctx context.Context, n shard.Name) (*Hold, error) {
+	return m.take(ctx, n, false)
 }
 
 // acquireExisting is Acquire for a shard that exists already: one with no
 // manifest that isn't active or cached here is not created, and the error is
 // blob.ErrNotFound. Wakes use it, since a hint never creates a shard.
-func (m *Catalog) acquireExisting(ctx context.Context, target string) (*Ref, error) {
-	return m.take(ctx, target, true)
+func (m *Catalog) acquireExisting(ctx context.Context, n shard.Name) (*Hold, error) {
+	return m.take(ctx, n, true)
 }
 
-func (m *Catalog) take(ctx context.Context, target string, existing bool) (*Ref, error) {
-	kind, id, err := ParseTarget(target)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := m.opts.Kinds.Lookup(kind); err != nil {
+func (m *Catalog) take(ctx context.Context, n shard.Name, existing bool) (*Hold, error) {
+	if _, err := m.opts.Kinds.Lookup(n.Kind()); err != nil {
 		return nil, err
 	}
 	// A system kind has only its fixed ids.
-	if k := m.sys[kind]; k != nil && !slices.Contains(k.IDs, id) {
-		return nil, fmt.Errorf("%w: %q is not an id of %s", ErrBadTarget, id, kind)
+	if k := m.sys[n.Kind()]; k != nil && !slices.Contains(k.IDs, n.ID()) {
+		return nil, fmt.Errorf("%w: %q is not an id of %s", ErrBadTarget, n.ID(), n.Kind())
 	}
-	ref, err := m.acquire(ctx, target, kind, id, existing)
+	hold, err := m.acquire(ctx, n, existing)
 	if oe, ok := errors.AsType[*shardfile.OwnedElsewhereError](err); ok {
-		m.owners.Add(target, oe.Owner)
+		m.owners.Add(n, oe.Owner)
 	}
-	return ref, err
+	return hold, err
 }
 
-func (m *Catalog) acquire(ctx context.Context, target, kind, id string, existing bool) (*Ref, error) {
+func (m *Catalog) acquire(ctx context.Context, n shard.Name, existing bool) (*Hold, error) {
 	for {
-		e := m.tab.load(target)
+		e := m.tab.load(n)
 		if e == nil {
 			if err := m.n.Keeper.Check(); err != nil {
 				return nil, err
 			}
-			read, err := m.readManifest(ctx, target, existing)
+			read, err := m.readManifest(ctx, n, existing)
 			if err != nil {
 				return nil, err
 			}
-			m.owners.Remove(target) // this node claims it now
-			e = m.tab.start(target, func(e *entry) *shard {
-				a := newShard(m.deps, e, kind, id)
+			m.owners.Remove(n) // this node claims it now
+			e = m.tab.start(n, func(e *entry) *actor {
+				a := newActor(m.deps, e)
 				a.read = read
 				return a
 			})
@@ -511,7 +507,7 @@ func (m *Catalog) acquire(ctx context.Context, target, kind, id string, existing
 		}
 		switch {
 		case ok:
-			return &Ref{m: m, a: e.sh}, nil
+			return &Hold{m: m, a: e.a}, nil
 		case err != nil && (waited || errors.Is(err, errShardsStopped)):
 			return nil, err
 		}
@@ -523,11 +519,11 @@ func (m *Catalog) acquire(ctx context.Context, target, kind, id string, existing
 // activation to start from, and fails if another node owns the shard. The
 // handle is nil for a cached shard (its file is reopened with no storage call)
 // and for one with no manifest yet, which is blob.ErrNotFound if it must exist.
-func (m *Catalog) readManifest(ctx context.Context, target string, existing bool) (*shardfile.Handle, error) {
-	if row, ok, err := m.cache.idx.get(target); err != nil || (ok && row.State == stateCached) {
+func (m *Catalog) readManifest(ctx context.Context, n shard.Name, existing bool) (*shardfile.Handle, error) {
+	if row, ok, err := m.cache.idx.get(n); err != nil || (ok && row.State == stateCached) {
 		return nil, err
 	}
-	h, err := m.n.Files.Attach(ctx, target)
+	h, err := m.n.Files.Attach(ctx, n)
 	if errors.Is(err, blob.ErrNotFound) && !existing {
 		return nil, nil
 	}
@@ -537,32 +533,32 @@ func (m *Catalog) readManifest(ctx context.Context, target string, existing bool
 	return h, h.CheckClaimable(ctx)
 }
 
-// hold takes a hold on an active shard, nil if it isn't (or is being let go of).
-func (m *Catalog) hold(target string) *Ref {
-	e := m.tab.load(target)
-	if e == nil || e.sh == nil {
+// tryHold takes a hold on an active shard, nil if it isn't (or is being let go of).
+func (m *Catalog) tryHold(n shard.Name) *Hold {
+	e := m.tab.load(n)
+	if e == nil || e.a == nil {
 		return nil
 	}
 	if ok, _, _ := e.take(m.now()); !ok {
 		return nil
 	}
-	return &Ref{m: m, a: e.sh}
+	return &Hold{m: m, a: e.a}
 }
 
 // IsActive reports whether the shard is active (for Shardlite-If-Active).
-func (m *Catalog) IsActive(target string) bool {
-	e := m.tab.load(target)
-	return e != nil && e.sh != nil && e.is(entryActive, entryBusy)
+func (m *Catalog) IsActive(n shard.Name) bool {
+	e := m.tab.load(n)
+	return e != nil && e.a != nil && e.is(entryActive, entryBusy)
 }
 
 // Tails is what the node's lease counts: the captured shards and the lowest
 // segment their tails still need.
-func (m *Catalog) Tails() (shards int, from uint64) {
-	m.tab.entries.Range(func(_ string, e *entry) bool {
-		if e.sh == nil {
+func (m *Catalog) Tails() (shards int, from pos.Seg) {
+	m.tab.entries.Range(func(_ shard.Name, e *entry) bool {
+		if e.a == nil {
 			return true
 		}
-		if sh := e.sh.cap.lease.Load(); sh != nil {
+		if sh := e.a.cap.lease.Load(); sh != nil {
 			shards++
 			if f := sh.TailFrom(); f != 0 && (from == 0 || f < from) {
 				from = f
@@ -591,14 +587,14 @@ const snapshotLimit = 64
 const rebaseLimit = 4
 
 // Active returns the names of the active shards.
-func (m *Catalog) Active() []string {
-	var out []string
-	m.tab.shards(func(a *shard) { out = append(out, a.Name) }, entryActive, entryBusy)
+func (m *Catalog) Active() []shard.Name {
+	var out []shard.Name
+	m.tab.shards(func(a *actor) { out = append(out, a.Name) }, entryActive, entryBusy)
 	return out
 }
 
 // Cached returns the names of the deactivated shards on disk.
-func (m *Catalog) Cached() ([]string, error) { return m.cache.cached() }
+func (m *Catalog) Cached() ([]shard.Name, error) { return m.cache.cached() }
 
 // SetCacheLimit changes the disk limit for deactivated shards (0 for none).
 func (m *Catalog) SetCacheLimit(n int64) { m.cache.limit.Store(n) }
@@ -612,10 +608,10 @@ func (m *Catalog) Nodes() *NodeList { return m.leases.Nodes() }
 // a request for one goes through Acquire rather than to a node that can't answer
 // or no longer owns it. It walks the cache once, which a dead node is rare
 // enough to afford. The claimer then looks for system shards the node owned.
-func (m *Catalog) died(node string) {
-	for _, shard := range m.owners.Keys() {
-		if owner, ok := m.owners.Peek(shard); ok && owner == node {
-			m.owners.Remove(shard)
+func (m *Catalog) died(node cluster.Node) {
+	for _, n := range m.owners.Keys() {
+		if owner, ok := m.owners.Peek(n); ok && owner == node {
+			m.owners.Remove(n)
 		}
 	}
 	m.claim.kick.Kick()
@@ -623,12 +619,12 @@ func (m *Catalog) died(node string) {
 
 // isLive reports whether the lease scan's last listing has node and doesn't
 // count it as dead.
-func (m *Catalog) isLive(node string) bool { return slices.Contains(m.liveNodes(), node) }
+func (m *Catalog) isLive(node cluster.Node) bool { return slices.Contains(m.liveNodes(), node) }
 
 // liveNodes is the names of the nodes the lease scan's last listing doesn't
 // count as dead.
-func (m *Catalog) liveNodes() []string {
-	var out []string
+func (m *Catalog) liveNodes() []cluster.Node {
+	var out []cluster.Node
 	for _, v := range m.leases.Nodes().nodes() {
 		if !v.Dead {
 			out = append(out, v.Name)

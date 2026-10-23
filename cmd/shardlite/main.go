@@ -1,7 +1,7 @@
 // Command shardlite is the node: it sits in front of an app, keeps each shard's
 // SQLite file backed up in blob storage and routes requests to shards (see
-// docs/overview.md). It is configured by environment variables (internal/node/env.go)
-// and a kinds file.
+// docs/overview.md). It is configured by environment variables (internal/node/env.go);
+// the app declares its kinds at its ready route.
 package main
 
 import (

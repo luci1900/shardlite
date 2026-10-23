@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/apptest"
-	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/harness"
 	"github.com/luci1900/shardlite/internal/shardfile"
@@ -254,7 +254,7 @@ func TestRebaseOfAnActiveShardWhileTheAppWrites(t *testing.T) {
 				return
 			}
 			last.Store(int64(n))
-			time.Sleep(time.Millisecond) // the app's pace: writes back to back reach a Litestream race (a nil Replica position in uploadLTXFile) that the rebase has nothing to do with
+			time.Sleep(time.Millisecond) // the app's pace, so the rebase runs while the writer writes
 		}
 	}()
 	apptest.Eventually(t, 10*time.Second, "the writer to get going", func() bool { return last.Load() >= 8 })
@@ -285,7 +285,7 @@ func TestRebaseOfAnActiveShardWhileTheAppWrites(t *testing.T) {
 
 	// The base alone is the database at its position.
 	base := filepath.Join(t.TempDir(), "base.db")
-	res, err := e.Files.Restore(ctx, shard, base, shardfile.RestoreOptions{NoJournal: true})
+	res, err := e.Files.Restore(ctx, shardName(shard), base, shardfile.RestoreOptions{NoJournal: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -344,7 +344,7 @@ func TestCrashBetweenBaseAndManifest(t *testing.T) {
 	if _, err := h.Rebase(ctx, sh, shardfile.Hooks{AfterFileWrite: func() error { return crash }}); !errors.Is(err, crash) {
 		t.Fatalf("got %v", err)
 	}
-	m, _, err := e.Files.GetManifest(ctx, shard)
+	m, _, err := e.Files.GetManifest(ctx, shardName(shard))
 	if err != nil || !slices.Equal(m.Files, files) {
 		t.Fatalf("stored manifest %+v err=%v, want files %v", m, err, files)
 	}
@@ -371,7 +371,7 @@ func TestCrashBetweenBaseAndManifest(t *testing.T) {
 func restoreTo(t *testing.T, e *harness.Env, name string) string {
 	t.Helper()
 	dst := filepath.Join(t.TempDir(), name+".db")
-	if _, err := e.Files.Restore(context.Background(), shard, dst, shardfile.RestoreOptions{}); err != nil {
+	if _, err := e.Files.Restore(context.Background(), shardName(shard), dst, shardfile.RestoreOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	return dst
@@ -385,7 +385,7 @@ func tailFiles(sh *capture.Shard) int32 {
 func countFiles(t *testing.T, e *harness.Env) int {
 	t.Helper()
 	n := 0
-	for _, err := range e.Store.List(context.Background(), shardfile.ShardPrefix(shard)) {
+	for _, err := range e.Store.List(context.Background(), shardfile.ShardPrefix(shardName(shard))) {
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -428,16 +428,16 @@ func TestLargeFilesGoThroughTemporaryFiles(t *testing.T) {
 	// for that), so an upload is a file of its own if there are more than there
 	// were before the operation started.
 	var seen, gets, base atomic.Int32
-	e.Blob.SetHook(func(_ context.Context, op blob.Op, key string, after bool) error {
+	e.Blob.SetHook(func(_ context.Context, op blobtest.Op, key string, after bool) error {
 		if after {
 			return nil
 		}
 		switch {
-		case op == blob.OpCreate && strings.HasPrefix(key, shardfile.FilesPrefix):
+		case op == blobtest.OpCreate && strings.HasPrefix(key, shardfile.FilesPrefix):
 			if int32(inTemp()) > base.Load() { // the body being uploaded is a file
 				seen.Add(1)
 			}
-		case op == blob.OpGet && strings.HasPrefix(key, shardfile.FilesPrefix):
+		case op == blobtest.OpGet && strings.HasPrefix(key, shardfile.FilesPrefix):
 			gets.Add(1)
 		}
 		return nil
@@ -474,14 +474,16 @@ func TestLargeFilesGoThroughTemporaryFiles(t *testing.T) {
 		t.Fatalf("%d files left after the restore", n)
 	}
 
-	// A failed restore cleans up too.
-	e.Blob.SetHook(func(_ context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpGet && strings.HasSuffix(key, ".ltx") && strings.Contains(key, "5-5") {
+	// A failed restore cleans up too. The shard's last file is the delta, which
+	// the restore has to download.
+	lastFile := h.Manifest.Files[len(h.Manifest.Files)-1]
+	e.Blob.SetHook(func(_ context.Context, op blobtest.Op, key string, after bool) error {
+		if op == blobtest.OpGet && strings.HasSuffix(key, ".ltx") && strings.Contains(key, lastFile.String()) {
 			return errors.New("injected")
 		}
 		return nil
 	})
-	if _, err := e.Files.Restore(ctx, shard, filepath.Join(t.TempDir(), "x.db"), shardfile.RestoreOptions{}); err == nil {
+	if _, err := e.Files.Restore(ctx, shardName(shard), filepath.Join(t.TempDir(), "x.db"), shardfile.RestoreOptions{}); err == nil {
 		t.Fatal("restore succeeded")
 	}
 	if n := leftInTemp(); n != 0 {

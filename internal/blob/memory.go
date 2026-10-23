@@ -135,7 +135,8 @@ func (m *Memory) Get(ctx context.Context, key string) (io.ReadCloser, ETag, erro
 }
 
 // GetRange reads length bytes from offset (to the end of the object if length
-// is not positive or reaches past it). An offset past the end is a plain error.
+// is not positive or reaches past it). A negative offset asks for the last
+// -offset bytes. An offset past the end is a plain error.
 func (m *Memory) GetRange(ctx context.Context, key string, offset, length int64) (io.ReadCloser, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -144,7 +145,15 @@ func (m *Memory) GetRange(ctx context.Context, key string, offset, length int64)
 		return nil, ErrNotFound
 	}
 	size := int64(len(o.data))
-	if offset < 0 || offset > size {
+	if offset < 0 {
+		if length != 0 {
+			return nil, fmt.Errorf("blob: a range from the end takes no length (got %d)", length)
+		}
+		// A suffix range: the last -offset bytes, or all of them.
+		start := max(size+offset, 0)
+		return io.NopCloser(bytes.NewReader(slices.Clone(o.data[start:]))), nil
+	}
+	if offset > size {
 		return nil, fmt.Errorf("blob: range offset %d out of bounds (size %d)", offset, size)
 	}
 	if length <= 0 || offset+length > size {

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -20,7 +21,12 @@ import (
 
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/blobtest"
+	"github.com/luci1900/shardlite/internal/journal"
+	"github.com/luci1900/shardlite/internal/localdb"
+	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/service"
+	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/spool"
 )
 
@@ -51,29 +57,39 @@ func testLTX(t testing.TB, txid ltx.TXID, fill byte) []byte {
 	return buf.Bytes()
 }
 
-// testStore is a Store over a memory backend, with the backend's fault hook within reach.
+// testStore is n1's journal store over a memory backend, with the blob store
+// that shapes the record by key and the backend's fault hook within reach.
 type testStore struct {
-	*blob.Store
-	L *blob.Hooked
+	*journal.Store
+	B *blob.Store
+	L *blobtest.Hooked
 }
 
-func (s testStore) SetHook(h blob.Hook) { s.L.SetHook(h) }
+func (s testStore) SetHook(h blobtest.Hook) { s.L.SetHook(h) }
 
 func newStore(t *testing.T) testStore {
 	t.Helper()
-	l := blob.WithHook(blob.NewMemory())
-	return testStore{blob.NewStore(l, "n1", 1, blob.Options{Backoff: time.Millisecond}), l}
+	l := blobtest.WithHook(blob.NewMemory())
+	return testStore{
+		Store: journal.NewStore(journal.NewBlob(l, "n1"), "n1", 1, journal.Options{Backoff: time.Millisecond}),
+		B:     blob.NewStore(l, "n1", 1, blob.Options{Backoff: time.Millisecond}),
+		L:     l,
+	}
 }
 
 // appendBytes queues one LTX file held in memory.
-func appendBytes(w *Writer, shard, generation string, position uint64, ltxBytes []byte) error {
+func appendBytes(w *Writer, name, generation string, position pos.Position, ltxBytes []byte) error {
+	n, err := shard.ParseName(name)
+	if err != nil {
+		return err
+	}
 	f := spool.Bytes(ltxBytes)
 	defer f.Close()
-	return w.AppendFile(shard, generation, position, f)
+	return w.AppendFile(n, shard.Gen(generation), position, f)
 }
 
 // mustAppend queues one LTX file of shard (generation "g").
-func mustAppend(t testing.TB, w *Writer, shard string, position uint64, ltxBytes []byte) {
+func mustAppend(t testing.TB, w *Writer, shard string, position pos.Position, ltxBytes []byte) {
 	t.Helper()
 	if err := appendBytes(w, shard, "g", position, ltxBytes); err != nil {
 		t.Fatal(err)
@@ -83,14 +99,14 @@ func mustAppend(t testing.TB, w *Writer, shard string, position uint64, ltxBytes
 func TestManyGoroutinesOneSegment(t *testing.T) {
 	t.Parallel()
 	store, ctx := newStore(t), context.Background()
-	w := NewWriter(store.Store, "n1", Options{})
+	w := NewWriter(store.Store, Options{})
 	serve(t, w)
 
 	const n = 100
 	var wg errgroup.Group
 	for i := range n {
 		wg.Go(func() error {
-			return appendBytes(w, fmt.Sprintf("users/%d", i), "g", uint64(i+1), testLTX(t, ltx.TXID(i+1), byte(i)))
+			return appendBytes(w, fmt.Sprintf("test.users/%d", i), "g", pos.Position(i+1), testLTX(t, ltx.TXID(i+1), byte(i)))
 		})
 	}
 	if err := wg.Wait(); err != nil {
@@ -102,23 +118,23 @@ func TestManyGoroutinesOneSegment(t *testing.T) {
 	if w.Flushes() != 1 {
 		t.Fatalf("flushes=%d, want 1", w.Flushes())
 	}
-	entries, err := ReadFooter(ctx, store.Store, "n1", 1)
+	entries, err := ReadFooter(ctx, store.Store, 1)
 	if err != nil || len(entries) != n {
 		t.Fatalf("entries=%d err=%v", len(entries), err)
 	}
 	// Round trip of every entry.
 	for _, e := range entries {
-		b, err := readRange(ctx, store.Store, Key("n1", 1), e.Offset, e.Length)
+		b, err := readRange(ctx, store.Store, 1, e.Offset, e.Length)
 		if err != nil {
 			t.Fatal(err)
 		}
 		hdr, _, err := ltx.PeekHeader(bytes.NewReader(b))
-		if err != nil || uint64(hdr.MaxTXID-hdr.MinTXID)+1 != e.Count {
+		if err != nil || pos.Count(hdr.MaxTXID-hdr.MinTXID)+1 != e.Count {
 			t.Fatalf("%s: hdr=%v err=%v", e.Shard, hdr.MinTXID, err)
 		}
 		var i int
-		fmt.Sscanf(e.Shard, "users/%d", &i)
-		if e.Position != uint64(i+1) || e.Count != 1 {
+		fmt.Sscanf(e.Shard.String(), "test.users/%d", &i)
+		if e.Position != pos.Position(i+1) || e.Count != 1 {
 			t.Fatalf("%s: position %d count %d", e.Shard, e.Position, e.Count)
 		}
 		if !bytes.Equal(b, testLTX(t, ltx.TXID(i+1), byte(i))) {
@@ -131,21 +147,108 @@ func TestManyGoroutinesOneSegment(t *testing.T) {
 	}
 }
 
+// localStore is the node's own disk as a journal's home: the local database
+// in a temporary directory.
+func localStore(t *testing.T) *journal.Store {
+	t.Helper()
+	db, err := localdb.Open(filepath.Join(t.TempDir(), localdb.Name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return journal.NewStore(journal.NewLocal(db.DB, "n1"), "n1", 1, journal.Options{Backoff: time.Millisecond})
+}
+
+// The local copy is written beside the record's, out of the same body: a slow
+// record doesn't hold the local tier's acknowledgement, and the local copy
+// goes once the record has the segment.
+func TestLocalCopyIsWrittenBesideTheRecord(t *testing.T) {
+	t.Parallel()
+	store, ctx := newStore(t), context.Background()
+	local := localStore(t)
+	// The record's write is held back.
+	release := make(chan struct{})
+	held := make(chan struct{})
+	var once atomic.Bool
+	store.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if op == blobtest.OpCreate && !after && once.CompareAndSwap(false, true) {
+			close(held)
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return nil
+	})
+	w := NewWriter(store.Store, Options{Local: local})
+	serve(t, w)
+	mustAppend(t, w, "test.users/1", 1, testLTX(t, 1, 1))
+	go w.Flush(ctx)
+	select {
+	case <-held:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the record's write did not start")
+	}
+	// The local store has the segment while the record's write is held, and
+	// the counter the gate waits for has moved.
+	apptest.Eventually(t, 5*time.Second, "the local copy", func() bool {
+		info, err := local.Head(ctx, 1)
+		return err == nil && info.Size > 0
+	})
+	if w.Written(StoreLocal) != 1 {
+		t.Fatalf("the local store has %d entries, want 1", w.Written(StoreLocal))
+	}
+	if w.Written(StoreRecord) != 0 {
+		t.Fatalf("the record has %d entries, want none", w.Written(StoreRecord))
+	}
+	// The bytes are the same in both stores: the body is composed, not copied.
+	localBytes, err := io.ReadAll(mustGet(ctx, local, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := w.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	recordBytes, err := io.ReadAll(mustGet(ctx, store.Store, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(localBytes, recordBytes) {
+		t.Fatal("the local copy and the record's differ")
+	}
+	// The local copy goes once the record has the segment.
+	apptest.Eventually(t, 5*time.Second, "the local copy to go", func() bool {
+		_, err := local.Head(ctx, 1)
+		return errors.Is(err, blob.ErrNotFound)
+	})
+}
+
+// mustGet reads a segment whole.
+func mustGet(ctx context.Context, s *journal.Store, seq pos.Seg) io.ReadCloser {
+	rc, err := s.Get(ctx, seq)
+	if err != nil {
+		panic(err)
+	}
+	return rc
+}
+
 func TestFlushReturnsAfterPut(t *testing.T) {
 	t.Parallel()
 	store, ctx := newStore(t), context.Background()
 	release := make(chan struct{})
 	var inPut atomic.Bool
-	store.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpCreate && !after {
+	store.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if op == blobtest.OpCreate && !after {
 			inPut.Store(true)
 			<-release
 		}
 		return nil
 	})
-	w := NewWriter(store.Store, "n1", Options{})
+	w := NewWriter(store.Store, Options{})
 	serve(t, w)
-	mustAppend(t, w, "users/1", 1, testLTX(t, 1, 1))
+	mustAppend(t, w, "test.users/1", 1, testLTX(t, 1, 1))
 	flushed := make(chan error, 1)
 	go func() { flushed <- w.Flush(ctx) }()
 	apptest.Eventually(t, 5*time.Second, "the PUT to start", inPut.Load)
@@ -158,7 +261,7 @@ func TestFlushReturnsAfterPut(t *testing.T) {
 	if err := <-flushed; err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Head(ctx, Key("n1", 1)); err != nil {
+	if _, err := store.B.Head(ctx, journal.Key("n1", 1)); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -167,8 +270,8 @@ func TestSlowPutDelaysNextSegment(t *testing.T) {
 	t.Parallel()
 	store := newStore(t)
 	var cur, max atomic.Int32
-	store.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if op != blob.OpCreate {
+	store.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if op != blobtest.OpCreate {
 			return nil
 		}
 		if !after {
@@ -185,12 +288,12 @@ func TestSlowPutDelaysNextSegment(t *testing.T) {
 		}
 		return nil
 	})
-	w := NewWriter(store.Store, "n1", Options{})
+	w := NewWriter(store.Store, Options{})
 	serve(t, w)
 	// A flush after every append, many of them waiting at once.
 	var g errgroup.Group
 	for i := range 20 {
-		mustAppend(t, w, "users/1", uint64(i+1), testLTX(t, ltx.TXID(i+1), 1))
+		mustAppend(t, w, "test.users/1", pos.Position(i+1), testLTX(t, ltx.TXID(i+1), 1))
 		g.Go(func() error { return w.Flush(context.Background()) })
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -201,9 +304,9 @@ func TestSlowPutDelaysNextSegment(t *testing.T) {
 		t.Fatalf("saw %d concurrent uploads", max.Load())
 	}
 	// Entries that arrived during an upload went into later segments, not out of order.
-	var last uint64
-	for seq := uint64(1); seq <= uint64(w.Flushes()); seq++ {
-		es, err := ReadFooter(context.Background(), store.Store, "n1", seq)
+	var last pos.Position
+	for seq := pos.Seg(1); seq <= pos.Seg(w.Flushes()); seq++ {
+		es, err := ReadFooter(context.Background(), store.Store, seq)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -222,19 +325,21 @@ func TestSlowPutDelaysNextSegment(t *testing.T) {
 func TestErrExistsFencesWriter(t *testing.T) {
 	t.Parallel()
 	store, ctx := newStore(t), context.Background()
-	// A newer writer already took segment 1 (here, as a fence).
-	store.Create(ctx, Key("n1", 1), strings.NewReader(""))
-	w := NewWriter(store.Store, "n1", Options{})
+	// A newer writer already took segment 1 (here, as a fence: a fence of
+	// another writer's, so its write id is not this writer's).
+	adopter := journal.NewStore(journal.NewBlob(store.L, "n1"), "n2", 1, journal.Options{})
+	adopter.Create(ctx, 1, strings.NewReader(""))
+	w := NewWriter(store.Store, Options{})
 	serve(t, w)
-	mustAppend(t, w, "users/1", 1, testLTX(t, 1, 1))
+	mustAppend(t, w, "test.users/1", 1, testLTX(t, 1, 1))
 	if err := w.Flush(ctx); !errors.Is(err, ErrFenced) {
 		t.Fatalf("flush got %v, want ErrFenced", err)
 	}
 	// Stopped for good: later appends fail at once and nothing is written.
-	if err := appendBytes(w, "users/1", "g", 1, testLTX(t, 2, 1)); !errors.Is(err, ErrFenced) {
+	if err := appendBytes(w, "test.users/1", "g", 1, testLTX(t, 2, 1)); !errors.Is(err, ErrFenced) {
 		t.Fatalf("got %v, want ErrFenced", err)
 	}
-	if _, err := store.Head(ctx, Key("n1", 2)); !errors.Is(err, blob.ErrNotFound) {
+	if _, err := store.B.Head(ctx, journal.Key("n1", 2)); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("segment 2 exists: %v", err)
 	}
 }
@@ -242,8 +347,8 @@ func TestErrExistsFencesWriter(t *testing.T) {
 func TestFenceRecognised(t *testing.T) {
 	t.Parallel()
 	store, ctx := newStore(t), context.Background()
-	store.Create(ctx, Key("n1", 7), strings.NewReader(""))
-	if _, err := ReadFooter(ctx, store.Store, "n1", 7); !errors.Is(err, ErrFence) {
+	store.B.Create(ctx, journal.Key("n1", 7), strings.NewReader(""))
+	if _, err := ReadFooter(ctx, store.Store, 7); !errors.Is(err, ErrFence) {
 		t.Fatalf("got %v, want ErrFence", err)
 	}
 }
@@ -256,33 +361,33 @@ func TestFailedSegmentIsRetriedNotDropped(t *testing.T) {
 	store, ctx := newStore(t), context.Background()
 	var fail atomic.Bool
 	fail.Store(true)
-	store.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpCreate && !after && fail.Load() {
+	store.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if op == blobtest.OpCreate && !after && fail.Load() {
 			return errors.New("storage down")
 		}
 		return nil
 	})
-	w := NewWriter(store.Store, "n1", Options{})
+	w := NewWriter(store.Store, Options{})
 	serve(t, w)
-	mustAppend(t, w, "users/1", 1, testLTX(t, 1, 1))
+	mustAppend(t, w, "test.users/1", 1, testLTX(t, 1, 1))
 	short, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
 	defer cancel()
 	if err := w.Flush(short); err == nil {
 		t.Fatal("want the caller's timeout")
 	}
 	// A later commit queues behind it.
-	mustAppend(t, w, "users/1", 2, testLTX(t, 2, 1))
+	mustAppend(t, w, "test.users/1", 2, testLTX(t, 2, 1))
 	fail.Store(false)
 	if err := w.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
-	for seq, want := range map[uint64]uint64{1: 1, 2: 2} {
-		es, err := ReadFooter(ctx, store.Store, "n1", seq)
+	for seq, want := range map[pos.Seg]pos.Position{1: 1, 2: 2} {
+		es, err := ReadFooter(ctx, store.Store, seq)
 		if err != nil || len(es) != 1 || es[0].Position != want {
 			t.Fatalf("segment %d: %v %v, want position %d", seq, es, err, want)
 		}
 	}
-	if _, err := ReadFooter(ctx, store.Store, "n1", 3); !errors.Is(err, blob.ErrNotFound) {
+	if _, err := ReadFooter(ctx, store.Store, 3); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("segment 3: %v", err)
 	}
 }
@@ -296,41 +401,41 @@ func TestLongRunOfFaultsWritesSegmentOnce(t *testing.T) {
 	// ownership). Then one is applied and its response lost, and the reads that
 	// check ownership fail 10 times before they answer.
 	var creates, heads atomic.Int32
-	store.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
+	store.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
 		switch {
-		case op == blob.OpCreate && !after && creates.Add(1) <= 60:
+		case op == blobtest.OpCreate && !after && creates.Add(1) <= 60:
 			return errors.New("request failed")
-		case op == blob.OpCreate && after && creates.Load() == 61:
+		case op == blobtest.OpCreate && after && creates.Load() == 61:
 			return errors.New("response lost")
-		case op == blob.OpHead && !after && creates.Load() > 60 && heads.Add(1) <= 10:
+		case op == blobtest.OpHead && !after && creates.Load() > 60 && heads.Add(1) <= 10:
 			return errors.New("head failed")
 		}
 		return nil
 	})
-	w := NewWriter(store.Store, "n1", Options{Retry: time.Millisecond})
+	w := NewWriter(store.Store, Options{Retry: time.Millisecond})
 	serve(t, w)
-	mustAppend(t, w, "users/1", 1, testLTX(t, 1, 7))
+	mustAppend(t, w, "test.users/1", 1, testLTX(t, 1, 7))
 	if err := w.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if creates.Load() <= 4 {
-		t.Fatalf("only %d create calls: blob.Store's own retries were never exhausted", creates.Load())
+		t.Fatalf("only %d create calls: journal.Store's own retries were never exhausted", creates.Load())
 	}
 	if w.Flushes() != 1 || w.NextSeq() != 2 {
 		t.Fatalf("flushes=%d next=%d", w.Flushes(), w.NextSeq())
 	}
-	es, err := ReadFooter(ctx, store.Store, "n1", 1)
+	es, err := ReadFooter(ctx, store.Store, 1)
 	if err != nil || len(es) != 1 {
 		t.Fatalf("%v %v", es, err)
 	}
-	if _, err := store.Head(ctx, Key("n1", 2)); !errors.Is(err, blob.ErrNotFound) {
+	if _, err := store.B.Head(ctx, journal.Key("n1", 2)); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("segment 2: %v", err)
 	}
-	if info, _ := store.Head(ctx, Key("n1", 1)); info.WriteID.Node != "n1" || info.WriteID.Epoch != 1 {
+	if info, _ := store.B.Head(ctx, journal.Key("n1", 1)); info.WriteID.Node != "n1" || info.WriteID.Epoch != 1 {
 		t.Fatalf("segment 1 written by %+v", info.WriteID)
 	}
 	// Nothing later is fenced either.
-	mustAppend(t, w, "users/1", 2, testLTX(t, 2, 1))
+	mustAppend(t, w, "test.users/1", 2, testLTX(t, 2, 1))
 	if err := w.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -342,8 +447,8 @@ func TestCloseEndsAWaitingFlush(t *testing.T) {
 	t.Parallel()
 	store := newStore(t)
 	inPut := make(chan struct{}, 1)
-	store.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpCreate && !after {
+	store.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if op == blobtest.OpCreate && !after {
 			select {
 			case inPut <- struct{}{}:
 			default:
@@ -352,9 +457,9 @@ func TestCloseEndsAWaitingFlush(t *testing.T) {
 		}
 		return nil
 	})
-	w := NewWriter(store.Store, "n1", Options{})
+	w := NewWriter(store.Store, Options{})
 	stop := serve(t, w)
-	mustAppend(t, w, "users/1", 1, testLTX(t, 1, 1))
+	mustAppend(t, w, "test.users/1", 1, testLTX(t, 1, 1))
 	flushed := make(chan error, 1)
 	go func() { flushed <- w.Flush(context.Background()) }()
 	<-inPut
@@ -370,7 +475,7 @@ func TestCloseEndsAWaitingFlush(t *testing.T) {
 	if err := w.Flush(context.Background()); !errors.Is(err, ErrClosed) {
 		t.Fatalf("flush after Close got %v, want ErrClosed", err)
 	}
-	if err := appendBytes(w, "users/1", "g", 2, testLTX(t, 2, 1)); !errors.Is(err, ErrClosed) {
+	if err := appendBytes(w, "test.users/1", "g", 2, testLTX(t, 2, 1)); !errors.Is(err, ErrClosed) {
 		t.Fatalf("append after Close got %v, want ErrClosed", err)
 	}
 }
@@ -381,23 +486,23 @@ func TestFenceFoundWhileRetrying(t *testing.T) {
 	store, ctx := newStore(t), context.Background()
 	var down atomic.Bool
 	down.Store(true)
-	store.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpCreate && !after && down.Load() {
+	store.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if op == blobtest.OpCreate && !after && down.Load() {
 			return errors.New("storage down")
 		}
 		return nil
 	})
-	w := NewWriter(store.Store, "n1", Options{})
+	w := NewWriter(store.Store, Options{})
 	serve(t, w)
-	mustAppend(t, w, "users/1", 1, testLTX(t, 1, 1))
+	mustAppend(t, w, "test.users/1", 1, testLTX(t, 1, 1))
 	short, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 	defer cancel()
 	w.Flush(short)
-	mustAppend(t, w, "users/1", 2, testLTX(t, 2, 1))
+	mustAppend(t, w, "test.users/1", 2, testLTX(t, 2, 1))
 	// An adopter fences the journal while the writer is stuck.
 	down.Store(false)
-	adopter := blob.NewStore(store.L, "n2", 1, blob.Options{})
-	if _, err := Fence(ctx, adopter, "n1", 1); err != nil {
+	adopter := journal.NewStore(journal.NewBlob(store.L, "n1"), "n2", 1, journal.Options{})
+	if _, err := Fence(ctx, adopter, 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := w.Flush(ctx); !errors.Is(err, ErrFenced) {
@@ -406,23 +511,23 @@ func TestFenceFoundWhileRetrying(t *testing.T) {
 }
 
 // A PUT that succeeds but whose response is lost must not fence the writer:
-// blob.Store retries, finds its own write id on the object and succeeds.
+// journal.Store retries, finds its own write id on the object and succeeds.
 func TestLostResponseIsNotAFence(t *testing.T) {
 	t.Parallel()
 	store, ctx := newStore(t), context.Background()
 	var lost, creates atomic.Int32
-	store.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpCreate && !after {
+	store.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if op == blobtest.OpCreate && !after {
 			creates.Add(1)
 		}
-		if op == blob.OpCreate && after && lost.Add(1) == 1 {
+		if op == blobtest.OpCreate && after && lost.Add(1) == 1 {
 			return errors.New("response lost")
 		}
 		return nil
 	})
-	w := NewWriter(store.Store, "n1", Options{})
+	w := NewWriter(store.Store, Options{})
 	serve(t, w)
-	mustAppend(t, w, "users/1", 1, testLTX(t, 1, 1))
+	mustAppend(t, w, "test.users/1", 1, testLTX(t, 1, 1))
 	if err := w.Flush(ctx); err != nil {
 		t.Fatalf("lost response: %v", err)
 	}
@@ -430,11 +535,11 @@ func TestLostResponseIsNotAFence(t *testing.T) {
 		t.Fatalf("%d creates, want the lost one and its retry", creates.Load())
 	}
 	// And it carries on with the next number.
-	mustAppend(t, w, "users/1", 2, testLTX(t, 2, 1))
+	mustAppend(t, w, "test.users/1", 2, testLTX(t, 2, 1))
 	if err := w.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ReadFooter(ctx, store.Store, "n1", 2); err != nil {
+	if _, err := ReadFooter(ctx, store.Store, 2); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -445,20 +550,21 @@ func TestLostResponseIsNotAFence(t *testing.T) {
 func TestAdopterFence(t *testing.T) {
 	t.Parallel()
 	store, ctx := newStore(t), context.Background()
-	zombie := blob.NewStore(store.L, "dead", 7, blob.Options{})
-	zombie.Create(ctx, Key("dead", 5), strings.NewReader("a zombie's segment"))
+	zombie := journal.NewStore(journal.NewBlob(store.L, "dead"), "dead", 7, journal.Options{})
+	zombie.Create(ctx, 5, strings.NewReader("a zombie's segment"))
+	adopter := journal.NewStore(journal.NewBlob(store.L, "dead"), "n2", 1, journal.Options{})
 
 	var lost, creates atomic.Int32
-	store.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpCreate && !after && key == Key("dead", 6) {
+	store.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if op == blobtest.OpCreate && !after && key == journal.Key("dead", 6) {
 			creates.Add(1)
 		}
-		if op == blob.OpCreate && after && key == Key("dead", 6) && lost.Add(1) == 1 {
+		if op == blobtest.OpCreate && after && key == journal.Key("dead", 6) && lost.Add(1) == 1 {
 			return errors.New("response lost")
 		}
 		return nil
 	})
-	seq, err := Fence(ctx, store.Store, "dead", 5)
+	seq, err := Fence(ctx, adopter, 5)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -468,14 +574,14 @@ func TestAdopterFence(t *testing.T) {
 	if creates.Load() != 2 {
 		t.Fatalf("%d creates at 6, want the lost one and its retry", creates.Load())
 	}
-	if _, err := ReadFooter(ctx, store.Store, "dead", 6); !errors.Is(err, ErrFence) {
+	if _, err := ReadFooter(ctx, adopter, 6); !errors.Is(err, ErrFence) {
 		t.Fatalf("got %v, want ErrFence", err)
 	}
 	// The zombie's own writer now finds its next numbers taken and is fenced.
 	store.SetHook(nil)
-	w := NewWriter(zombie, "dead", Options{StartSeq: 6})
+	w := NewWriter(zombie, Options{StartSeq: 6})
 	serve(t, w)
-	mustAppend(t, w, "users/1", 1, testLTX(t, 1, 1))
+	mustAppend(t, w, "test.users/1", 1, testLTX(t, 1, 1))
 	select {
 	case <-w.Fenced():
 		t.Fatal("Fenced is closed before the writer was fenced")
@@ -490,10 +596,10 @@ func TestAdopterFence(t *testing.T) {
 		t.Fatal("Fenced is not closed after the writer was fenced")
 	}
 	// A number already taken, by anyone, is skipped.
-	if _, err := store.Create(ctx, Key("dead", 9), strings.NewReader("")); err != nil {
+	if _, err := store.B.Create(ctx, journal.Key("dead", 9), strings.NewReader("")); err != nil {
 		t.Fatal(err)
 	}
-	if seq, err := Fence(ctx, store.Store, "dead", 9); err != nil || seq != 10 {
+	if seq, err := Fence(ctx, adopter, 9); err != nil || seq != 10 {
 		t.Fatalf("seq=%d err=%v, want 10", seq, err)
 	}
 }
@@ -501,13 +607,13 @@ func TestAdopterFence(t *testing.T) {
 func TestBounds(t *testing.T) {
 	t.Parallel()
 	store, ctx := newStore(t), context.Background()
-	if lo, hi, err := Bounds(ctx, store.Store, "n1"); err != nil || lo != 0 || hi != 0 {
+	if lo, hi, err := Bounds(ctx, store.Store); err != nil || lo != 0 || hi != 0 {
 		t.Fatalf("empty: %d %d %v", lo, hi, err)
 	}
-	store.Create(ctx, Key("n1", 5), strings.NewReader("x"))
-	store.Create(ctx, Key("n1", 7), strings.NewReader(""))
-	store.Create(ctx, Key("n2", 2), strings.NewReader("x"))
-	if lo, hi, err := Bounds(ctx, store.Store, "n1"); err != nil || lo != 5 || hi != 7 {
+	store.B.Create(ctx, journal.Key("n1", 5), strings.NewReader("x"))
+	store.B.Create(ctx, journal.Key("n1", 7), strings.NewReader(""))
+	store.B.Create(ctx, journal.Key("n2", 2), strings.NewReader("x"))
+	if lo, hi, err := Bounds(ctx, store.Store); err != nil || lo != 5 || hi != 7 {
 		t.Fatalf("got %d %d %v, want 5 7", lo, hi, err)
 	}
 }
@@ -520,7 +626,7 @@ type failCreate struct {
 }
 
 func (f *failCreate) Create(ctx context.Context, key string, body io.ReadSeeker, id blob.WriteID) (blob.ETag, error) {
-	if e := f.err.Load(); e != nil && strings.HasPrefix(key, Root) {
+	if e := f.err.Load(); e != nil && strings.HasPrefix(key, journal.Root) {
 		return "", *e
 	}
 	return f.Backend.Create(ctx, key, body, id)
@@ -553,11 +659,12 @@ func TestErrorsRetryingCannotFixAreLogged(t *testing.T) {
 	denied := errors.New("permission denied")
 	fc.err.Store(&denied)
 	store := blob.NewStore(fc, "n1", 1, blob.Options{Backoff: time.Millisecond})
+	js := journal.NewStore(journal.NewBlob(fc, "n1"), "n1", 1, journal.Options{Backoff: time.Millisecond})
 	rec := &recorder{}
-	w := NewWriter(store, "n1", Options{Retry: time.Millisecond, Logger: slog.New(rec)})
+	w := NewWriter(js, Options{Retry: time.Millisecond, Logger: slog.New(rec)})
 	serve(t, w)
 
-	mustAppend(t, w, "users/1", 1, testLTX(t, 1, 1))
+	mustAppend(t, w, "test.users/1", 1, testLTX(t, 1, 1))
 	// The caller gives up at once: the uploader goes on alone.
 	short, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
@@ -570,7 +677,7 @@ func TestErrorsRetryingCannotFixAreLogged(t *testing.T) {
 	if err := w.Flush(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Head(context.Background(), Key("n1", 1)); err != nil {
+	if _, err := store.Head(context.Background(), journal.Key("n1", 1)); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -579,16 +686,16 @@ func TestTransientTroubleIsNotLoggedAsUnfixable(t *testing.T) {
 	t.Parallel()
 	store := newStore(t)
 	var fails atomic.Int32
-	store.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpCreate && !after && fails.Add(1) <= 20 {
+	store.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if op == blobtest.OpCreate && !after && fails.Add(1) <= 20 {
 			return errors.New("storage unavailable")
 		}
 		return nil
 	})
 	rec := &recorder{}
-	w := NewWriter(store.Store, "n1", Options{Retry: time.Millisecond, Logger: slog.New(rec)})
+	w := NewWriter(store.Store, Options{Retry: time.Millisecond, Logger: slog.New(rec)})
 	serve(t, w)
-	mustAppend(t, w, "users/1", 1, testLTX(t, 1, 1))
+	mustAppend(t, w, "test.users/1", 1, testLTX(t, 1, 1))
 	if err := w.Flush(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -597,9 +704,9 @@ func TestTransientTroubleIsNotLoggedAsUnfixable(t *testing.T) {
 	}
 }
 
-// Segments and the files in them are built in temporary files once they are
-// larger than the spool limit, and read back the same. Nothing is left behind
-// when the segment is written, or when the writer is closed with files pending.
+// The segment's bytes are composed, not spooled: the queued files are read
+// where they are, and nothing is left behind when the segment is written, or
+// when the writer is closed with files pending.
 func TestLargeSegmentsGoThroughTemporaryFiles(t *testing.T) {
 	t.Parallel()
 	store, ctx := newStore(t), context.Background()
@@ -611,12 +718,12 @@ func TestLargeSegmentsGoThroughTemporaryFiles(t *testing.T) {
 		}
 		return len(ents)
 	}
-	w := NewWriter(store.Store, "n1", Options{TempDir: dir, SpoolLimit: 100})
+	w := NewWriter(store.Store, Options{})
 	stop := serve(t, w)
 
 	var seen atomic.Int32
-	store.SetHook(func(_ context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpCreate && !after {
+	store.SetHook(func(_ context.Context, op blobtest.Op, key string, after bool) error {
+		if op == blobtest.OpCreate && !after {
 			seen.Store(int32(left()))
 		}
 		return nil
@@ -634,7 +741,7 @@ func TestLargeSegmentsGoThroughTemporaryFiles(t *testing.T) {
 		files = append(files, f)
 	}
 	for i, f := range files {
-		if err := w.AppendFile(fmt.Sprintf("users/%d", i+1), "g", 1, f); err != nil {
+		if err := w.AppendFile(shard.MustParse(fmt.Sprintf("test.users/%d", i+1)), "g", 1, f); err != nil {
 			t.Fatal(err)
 		}
 		f.Close() // the writer holds its own reference
@@ -645,19 +752,20 @@ func TestLargeSegmentsGoThroughTemporaryFiles(t *testing.T) {
 	if err := w.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
-	// While the upload ran, the segment had a file of its own.
-	if seen.Load() != 1 {
-		t.Fatalf("%d temporary files during the upload, want the segment's", seen.Load())
+	// While the upload ran, the segment had no file of its own: the queued
+	// files were read where they were.
+	if seen.Load() != 2 {
+		t.Fatalf("%d temporary files during the upload, want the queued ones", seen.Load())
 	}
 	if left() != 0 {
 		t.Fatalf("%d temporary files after the segment was written", left())
 	}
-	entries, err := ReadFooter(ctx, store.Store, "n1", 1)
+	entries, err := ReadFooter(ctx, store.Store, 1)
 	if err != nil || len(entries) != 2 {
 		t.Fatalf("%v %v", entries, err)
 	}
 	for i, e := range entries {
-		got, err := ReadEntryFile(ctx, store.Store, "n1", 1, e, dir, 100)
+		got, err := ReadEntryFile(ctx, store.Store, 1, e, dir, 100)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -670,7 +778,7 @@ func TestLargeSegmentsGoThroughTemporaryFiles(t *testing.T) {
 
 	// Closed with a file still queued.
 	f, _ := spool.Collect(dir, 100, bytes.NewReader(testLTX(t, 3, 3)))
-	if err := w.AppendFile("users/3", "g", 1, f); err != nil {
+	if err := w.AppendFile(shard.MustParse("test.users/3"), "g", 1, f); err != nil {
 		t.Fatal(err)
 	}
 	f.Close()
@@ -689,29 +797,29 @@ func TestLargeSegmentsGoThroughTemporaryFiles(t *testing.T) {
 func TestScanReadsWindowsInOrder(t *testing.T) {
 	t.Parallel()
 	store, ctx := newStore(t), context.Background()
-	w := NewWriter(store.Store, "n1", Options{})
+	w := NewWriter(store.Store, Options{})
 	serve(t, w)
 	const n = 2*scanWindow + 10
-	for i := uint64(1); i <= n; i++ {
-		mustAppend(t, w, "users/1", i, testLTX(t, ltx.TXID(i), byte(i)))
+	for i := pos.Position(1); i <= n; i++ {
+		mustAppend(t, w, "test.users/1", i, testLTX(t, ltx.TXID(i), byte(i)))
 		if err := w.Flush(ctx); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// Two fences, one of them first in its window.
-	fences := map[uint64]bool{10: true, scanWindow + 1: true}
+	fences := map[pos.Seg]bool{10: true, scanWindow + 1: true}
 	for seq := range fences {
-		if err := store.Delete(ctx, Key("n1", seq), ""); err != nil {
+		if err := store.B.Delete(ctx, journal.Key("n1", seq), ""); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.Create(ctx, Key("n1", seq), strings.NewReader("")); err != nil {
+		if _, err := store.B.Create(ctx, journal.Key("n1", seq), strings.NewReader("")); err != nil {
 			t.Fatal(err)
 		}
 	}
-	scan := func(to uint64) ([]uint64, error) {
-		var seqs []uint64
-		err := Scan(ctx, store.Store, "n1", 1, to, func(seq uint64, e Entry) error {
-			if e.Position != seq {
+	scan := func(to pos.Seg) ([]pos.Seg, error) {
+		var seqs []pos.Seg
+		err := Scan(ctx, store.Store, 1, to, func(seq pos.Seg, e Entry) error {
+			if e.Position != pos.Position(seq) {
 				return fmt.Errorf("segment %d holds position %d", seq, e.Position)
 			}
 			seqs = append(seqs, seq)
@@ -719,27 +827,27 @@ func TestScanReadsWindowsInOrder(t *testing.T) {
 		})
 		return seqs, err
 	}
-	want := func(last uint64) (seqs []uint64) {
-		for seq := uint64(1); seq <= last; seq++ {
+	want := func(last pos.Seg) (seqs []pos.Seg) {
+		for seq := pos.Seg(1); seq <= last; seq++ {
 			if !fences[seq] {
 				seqs = append(seqs, seq)
 			}
 		}
 		return seqs
 	}
-	for _, to := range []uint64{0, n} {
+	for _, to := range []pos.Seg{0, pos.Seg(n)} {
 		if got, err := scan(to); err != nil || !slices.Equal(got, want(n)) {
 			t.Fatalf("to %d: %v %v", to, got, err)
 		}
 	}
 	// A number missing below the end.
-	if err := store.Delete(ctx, Key("n1", 100), ""); err != nil {
+	if err := store.B.Delete(ctx, journal.Key("n1", 100), ""); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := scan(0); err != nil || !slices.Equal(got, want(99)) {
 		t.Fatalf("to 0 with 100 missing: %v %v", got, err)
 	}
-	if _, err := scan(n); !errors.Is(err, ErrMissing) || !strings.Contains(err.Error(), Key("n1", 100)) {
+	if _, err := scan(n); !errors.Is(err, ErrMissing) || !strings.Contains(err.Error(), segName(store.Store, 100)) {
 		t.Fatalf("through 100 missing: %v", err)
 	}
 }
@@ -749,29 +857,51 @@ func TestScanReadsWindowsInOrder(t *testing.T) {
 func TestFooterReadsTheEndOnce(t *testing.T) {
 	t.Parallel()
 	store, ctx := newStore(t), context.Background()
-	w := NewWriter(store.Store, "n1", Options{})
+	w := NewWriter(store.Store, Options{})
 	serve(t, w)
 	sizes := []int{1, 1000} // a thousand entries make a footer larger than footerRead
 	for _, entries := range sizes {
 		for i := range entries {
-			mustAppend(t, w, fmt.Sprintf("users/%d", i), 1, testLTX(t, 1, byte(i)))
+			mustAppend(t, w, fmt.Sprintf("test.users/%d", i), 1, testLTX(t, 1, byte(i)))
 		}
 		if err := w.Flush(ctx); err != nil {
 			t.Fatal(err)
 		}
 	}
-	var ranges atomic.Int32
-	store.L.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpGetRange && !after {
+	var ranges, heads atomic.Int32
+	store.L.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if after {
+			return nil
+		}
+		switch op {
+		case blobtest.OpGetRange:
 			ranges.Add(1)
+		case blobtest.OpHead:
+			heads.Add(1)
+		case blobtest.OpCreate, blobtest.OpUpdate, blobtest.OpGet, blobtest.OpDelete, blobtest.OpList:
+			return nil
 		}
 		return nil
 	})
 	for i, entries := range sizes {
 		ranges.Store(0)
-		got, err := ReadFooter(ctx, store.Store, "n1", uint64(i+1))
+		heads.Store(0)
+		got, err := ReadFooter(ctx, store.Store, pos.Seg(i+1))
 		if err != nil || len(got) != entries || int(ranges.Load()) != i+1 {
 			t.Fatalf("%d entries: read %d with %d range reads, want %d: %v", entries, len(got), ranges.Load(), i+1, err)
 		}
+		if heads.Load() != 0 {
+			t.Fatalf("%d entries: read the head %d times, want none: a footer is read from the end", entries, heads.Load())
+		}
 	}
+}
+
+// readRange reads a range of a segment's bytes.
+func readRange(ctx context.Context, store *journal.Store, seq pos.Seg, off, n int64) ([]byte, error) {
+	rc, err := store.GetRange(ctx, seq, off, n)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	return io.ReadAll(rc)
 }

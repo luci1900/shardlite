@@ -21,6 +21,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,7 +38,22 @@ import (
 type Options struct {
 	Control   string        // the node's control API, host:port (127.0.0.1:2282 if empty)
 	IdleClose time.Duration // close a shard's database after this long unused (500 ms if zero)
+	// Declare names a file holding the app's declaration (docs/guide.md, The
+	// ready route), read again on every request to the ready route, so a
+	// rewrite stands in for a new deploy. Empty serves DefaultDeclaration.
+	Declare string
 }
+
+const DefaultDeclaration = `{"app": "e2e", "version": "1", "kinds": {
+	"users":  {"public": true, "sync": "local", "idle_timeout": "2s"},
+	"wallet": {"public": true, "idle_timeout": "2s"},
+	"lobby":  {"public": true, "idle_timeout": "2s"},
+	"arena":  {"public": true, "idle_timeout": "300ms"},
+	"audit":  {}
+}}`
+
+// DefaultDeclaration is what the app declares when Options.Declare is empty:
+// the kinds the e2e tests use.
 
 // App is the application.
 type App struct {
@@ -79,7 +95,7 @@ func (a *App) Close() {
 // HTTP/2 over cleartext (the server must have UnencryptedHTTP2 enabled).
 func (a *App) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok\n") })
+	mux.HandleFunc("GET /_shardlite/ready", a.ready)
 	mux.HandleFunc("POST /login", a.login)
 	mux.HandleFunc("POST /create", a.shard(a.create))
 	mux.HandleFunc("POST /add", a.shard(a.add))
@@ -112,6 +128,24 @@ func (a *App) serveDebug(w http.ResponseWriter, r *http.Request) {
 	defer a.debug.mu.Unlock()
 	a.debug.OpenDBs = int(a.pool.open.Load())
 	writeJSON(w, &a.debug)
+}
+
+// ready answers the app's declaration: the node's poll is both the health
+// check and how the app's kinds reach it. The route is under /_shardlite/,
+// which the node refuses to client requests, so the declaration (which lists
+// every kind, including ones clients may not name) only reaches the node.
+func (a *App) ready(w http.ResponseWriter, r *http.Request) {
+	data := []byte(DefaultDeclaration)
+	if a.opts.Declare != "" {
+		b, err := os.ReadFile(a.opts.Declare)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		data = b
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(data)
 }
 
 // shardReq is a request for a shard.
@@ -296,7 +330,7 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad user name", http.StatusBadRequest)
 		return
 	}
-	shard := "users/" + name
+	shard := "e2e.users/" + name
 	// The client can only reach a shard that exists, so create it first.
 	q, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, "http://"+a.opts.Control+"/create", nil)
 	q.Header.Set("Shardlite-Target", shard)
@@ -315,7 +349,7 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 }
 
 // transfer debits this shard, then credits another one by calling it through
-// the node's control API: ?to=wallet/b&token=t. The debit is committed before the
+// the node's control API: ?to=e2e.wallet/b&token=t. The debit is committed before the
 // call, and the call carries this shard as its caller, so the node holds it until
 // the debit is durable if this shard's kind has sync on.
 func (a *App) transfer(w http.ResponseWriter, r *http.Request, s *shardReq) {
@@ -361,7 +395,7 @@ func (a *App) credit(w http.ResponseWriter, r *http.Request, s *shardReq) {
 
 // notify is a durable send (docs/guide.md, Durable send). It records a row, the
 // call to another shard and a reminder due now under one key, in one
-// transaction: ?to=wallet/b&token=t. The node wakes this shard's reminders
+// transaction: ?to=e2e.wallet/b&token=t. The node wakes this shard's reminders
 // handler once the transaction is durable, and the handler makes the call to
 // /receive on the target.
 func (a *App) notify(w http.ResponseWriter, r *http.Request, s *shardReq) {
@@ -372,7 +406,7 @@ func (a *App) notify(w http.ResponseWriter, r *http.Request, s *shardReq) {
 	}
 	key := "send:" + token
 	_, _, err := s.insertWith(r.Context(), "sent:"+token, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(r.Context(), `INSERT INTO sends (key, target, path, body) VALUES (?, ?, '/receive', ?)`, key, to, token); err != nil {
+		if _, err := tx.ExecContext(r.Context(), `INSERT INTO sends (key, target, path, body) VALUES (?, ?, '/receive', ?)`, key, to, []byte(token)); err != nil {
 			return err
 		}
 		_, err := tx.ExecContext(r.Context(), `INSERT INTO _shardlite_reminders (key, due) VALUES (?, unixepoch())`, key)

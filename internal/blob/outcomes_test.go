@@ -1,4 +1,4 @@
-package blob
+package blob_test
 
 import (
 	"context"
@@ -12,6 +12,9 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/blobtest"
 )
 
 // The outcome table in blob.go, as cases. Each backend gets the same faults
@@ -39,18 +42,18 @@ type outcomeRig struct {
 	name string
 	// backend returns the backend under test, whose next call fails as asked, and
 	// the same store without faults for looking at the result.
-	backend func(t *testing.T) (faulty Backend, plain Backend, arm func(f fault, cancel context.CancelFunc))
+	backend func(t *testing.T) (faulty blob.Backend, plain blob.Backend, arm func(f fault, cancel context.CancelFunc))
 }
 
 func memoryRig() outcomeRig {
-	return outcomeRig{name: "memory", backend: func(t *testing.T) (Backend, Backend, func(fault, context.CancelFunc)) {
-		mem := NewMemory()
-		h := WithHook(mem)
+	return outcomeRig{name: "memory", backend: func(t *testing.T) (blob.Backend, blob.Backend, func(fault, context.CancelFunc)) {
+		mem := blob.NewMemory()
+		h := blobtest.WithHook(mem)
 		var armed atomic.Pointer[fault]
 		var cancel atomic.Pointer[context.CancelFunc]
-		h.SetHook(func(ctx context.Context, op Op, key string, after bool) error {
+		h.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
 			f := armed.Load()
-			if f == nil || (op != OpCreate && op != OpUpdate && op != OpDelete) {
+			if f == nil || (op != blobtest.OpCreate && op != blobtest.OpUpdate && op != blobtest.OpDelete) {
 				return nil
 			}
 			switch {
@@ -87,6 +90,8 @@ func (s *s3Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 		return s3Error(409, "ConditionalRequestConflict"), nil
 	case tooMany:
 		return s3Error(429, "SlowDown"), nil
+	case cancelBefore, cancelAfter, dropped:
+		// The request goes through: the fault is in what the caller sees of it.
 	}
 	resp, err := s.inner.RoundTrip(r) // written, and applied
 	if err != nil {
@@ -102,13 +107,13 @@ func (s *s3Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 func s3Rig() outcomeRig {
-	return outcomeRig{name: "s3", backend: func(t *testing.T) (Backend, Backend, func(fault, context.CancelFunc)) {
+	return outcomeRig{name: "s3", backend: func(t *testing.T) (blob.Backend, blob.Backend, func(fault, context.CancelFunc)) {
 		endpoint := os.Getenv("SHARDLITE_TEST_S3_ENDPOINT")
 		if endpoint == "" {
 			t.Skip("SHARDLITE_TEST_S3_ENDPOINT is not set")
 		}
 		tr := &s3Transport{inner: http.DefaultTransport}
-		faulty := s3At(t, endpoint, func(o *S3Options) { o.HTTPClient = &http.Client{Transport: tr} })
+		faulty := s3At(t, endpoint, func(o *blob.S3Options) { o.HTTPClient = &http.Client{Transport: tr} })
 		// Setup and checks use PUT/DELETE before arming and HEAD/GET after, which the transport leaves alone.
 		plain := faulty
 		return faulty, plain, func(f fault, c context.CancelFunc) { tr.f.Store(&f); tr.cancel.Store(&c) }
@@ -124,8 +129,8 @@ func TestWriteOutcomesFollowTheTable(t *testing.T) {
 					t.Run(op+"/"+f.String(), func(t *testing.T) {
 						faulty, plain, arm := rig.backend(t)
 						bg := context.Background()
-						id := WriteID{Node: "n1", Epoch: 1, N: 7}
-						etag, err := plain.Create(bg, "k", strings.NewReader("old"), WriteID{Node: "n0", Epoch: 1, N: 1})
+						id := blob.WriteID{Node: "n1", Epoch: 1, N: 7}
+						etag, err := plain.Create(bg, "k", strings.NewReader("old"), blob.WriteID{Node: "n0", Epoch: 1, N: 1})
 						if err != nil {
 							t.Fatal(err)
 						}
@@ -146,11 +151,11 @@ func TestWriteOutcomesFollowTheTable(t *testing.T) {
 						}
 						applied := f == cancelAfter || f == dropped
 						if applied {
-							if !errors.Is(callErr, ErrUnknown) || errors.Is(callErr, ErrNotApplied) {
+							if !errors.Is(callErr, blob.ErrUnknown) || errors.Is(callErr, blob.ErrNotApplied) {
 								t.Fatalf("got %v, want ErrUnknown", callErr)
 							}
 						} else {
-							if !errors.Is(callErr, ErrNotApplied) || errors.Is(callErr, ErrUnknown) {
+							if !errors.Is(callErr, blob.ErrNotApplied) || errors.Is(callErr, blob.ErrUnknown) {
 								t.Fatalf("got %v, want ErrNotApplied", callErr)
 							}
 							if f == cancelBefore && !errors.Is(callErr, context.Canceled) {
@@ -175,7 +180,7 @@ func TestWriteOutcomesFollowTheTable(t *testing.T) {
 							}
 						case "delete":
 							_, err := plain.Head(bg, "k")
-							if gone := errors.Is(err, ErrNotFound); gone != applied {
+							if gone := errors.Is(err, blob.ErrNotFound); gone != applied {
 								t.Fatalf("object gone = %v, want %v (%v)", gone, applied, err)
 							}
 						}
@@ -193,17 +198,17 @@ func TestPreconditionsAndSetupErrorsArePlain(t *testing.T) {
 		t.Run(rig.name, func(t *testing.T) {
 			faulty, _, _ := rig.backend(t)
 			ctx := context.Background()
-			etag, err := faulty.Create(ctx, "k", strings.NewReader("v"), WriteID{})
+			etag, err := faulty.Create(ctx, "k", strings.NewReader("v"), blob.WriteID{})
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := faulty.Create(ctx, "k", strings.NewReader("w"), WriteID{}); !errors.Is(err, ErrExists) || Transient(err) {
+			if _, err := faulty.Create(ctx, "k", strings.NewReader("w"), blob.WriteID{}); !errors.Is(err, blob.ErrExists) || blob.Transient(err) {
 				t.Fatalf("create over an object: %v", err)
 			}
-			if _, err := faulty.Update(ctx, "k", strings.NewReader("w"), "stale", WriteID{}); !errors.Is(err, ErrConflict) || Transient(err) {
+			if _, err := faulty.Update(ctx, "k", strings.NewReader("w"), "stale", blob.WriteID{}); !errors.Is(err, blob.ErrConflict) || blob.Transient(err) {
 				t.Fatalf("update with a stale ETag: %v", err)
 			}
-			if err := faulty.Delete(ctx, "k", "stale"); !errors.Is(err, ErrConflict) || Transient(err) {
+			if err := faulty.Delete(ctx, "k", "stale"); !errors.Is(err, blob.ErrConflict) || blob.Transient(err) {
 				t.Fatalf("delete with a stale ETag: %v", err)
 			}
 			_ = etag
@@ -214,11 +219,11 @@ func TestPreconditionsAndSetupErrorsArePlain(t *testing.T) {
 // --- Store ---
 
 // hookedStore is a Store over memory with a hook, and the memory behind it.
-func hookedStore(hook Hook) (*Store, *Memory) {
-	mem := NewMemory()
-	h := WithHook(mem)
+func hookedStore(hook blobtest.Hook) (*blob.Store, *blob.Memory) {
+	mem := blob.NewMemory()
+	h := blobtest.WithHook(mem)
 	h.SetHook(hook)
-	return NewStore(h, "n1", 1, Options{Backoff: time.Millisecond, Settle: time.Second}), mem
+	return blob.NewStore(h, "n1", 1, blob.Options{Backoff: time.Millisecond, Settle: time.Second}), mem
 }
 
 // An unknown outcome that the read-back can't settle either, followed by the
@@ -228,18 +233,18 @@ func TestStoreKeepsAnUnknownOutcomeWhenTheContextEnds(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	s, mem := hookedStore(func(c context.Context, op Op, key string, after bool) error {
+	s, mem := hookedStore(func(c context.Context, op blobtest.Op, key string, after bool) error {
 		switch {
-		case op == OpCreate && after:
+		case op == blobtest.OpCreate && after:
 			cancel()
 			return errors.New("response lost")
-		case op == OpHead:
+		case op == blobtest.OpHead:
 			return errors.New("storage slow") // even on the store's own context
 		}
 		return nil
 	})
 	_, err := s.Create(ctx, "k", strings.NewReader("v"))
-	if !errors.Is(err, ErrUnknown) || !errors.Is(err, context.Canceled) {
+	if !errors.Is(err, blob.ErrUnknown) || !errors.Is(err, context.Canceled) {
 		t.Fatalf("got %v, want ErrUnknown and context.Canceled", err)
 	}
 	if _, err := mem.Head(context.Background(), "k"); err != nil {
@@ -248,18 +253,18 @@ func TestStoreKeepsAnUnknownOutcomeWhenTheContextEnds(t *testing.T) {
 	// The same for an update and a delete.
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	defer cancel2()
-	s2, mem2 := hookedStore(func(c context.Context, op Op, key string, after bool) error {
-		if (op == OpUpdate || op == OpDelete) && after {
+	s2, mem2 := hookedStore(func(c context.Context, op blobtest.Op, key string, after bool) error {
+		if (op == blobtest.OpUpdate || op == blobtest.OpDelete) && after {
 			cancel2()
 			return errors.New("response lost")
 		}
-		if op == OpHead {
+		if op == blobtest.OpHead {
 			return errors.New("storage slow")
 		}
 		return nil
 	})
-	etag, _ := mem2.Create(context.Background(), "k", strings.NewReader("v"), WriteID{})
-	if _, err := s2.Update(ctx2, "k", strings.NewReader("w"), etag); !errors.Is(err, ErrUnknown) || !errors.Is(err, context.Canceled) {
+	etag, _ := mem2.Create(context.Background(), "k", strings.NewReader("v"), blob.WriteID{})
+	if _, err := s2.Update(ctx2, "k", strings.NewReader("w"), etag); !errors.Is(err, blob.ErrUnknown) || !errors.Is(err, context.Canceled) {
 		t.Fatalf("update: got %v", err)
 	}
 }
@@ -274,17 +279,17 @@ func TestStoreSettlesALandedWriteAfterTheCallerGaveUp(t *testing.T) {
 			defer cancel()
 			var readBackCtxEnded atomic.Bool
 			var fired atomic.Bool
-			s, mem := hookedStore(func(c context.Context, o Op, key string, after bool) error {
-				if o == OpHead && fired.Load() && c.Err() != nil {
+			s, mem := hookedStore(func(c context.Context, o blobtest.Op, key string, after bool) error {
+				if o == blobtest.OpHead && fired.Load() && c.Err() != nil {
 					readBackCtxEnded.Store(true)
 				}
-				if after && (o == OpCreate || o == OpUpdate || o == OpDelete) && fired.CompareAndSwap(false, true) {
+				if after && (o == blobtest.OpCreate || o == blobtest.OpUpdate || o == blobtest.OpDelete) && fired.CompareAndSwap(false, true) {
 					cancel()
 					return errors.New("response lost")
 				}
 				return nil
 			})
-			var etag ETag
+			var etag blob.ETag
 			if op != "create" {
 				fired.Store(true) // not for the setup
 				etag, _ = s.Create(context.Background(), "k", strings.NewReader("old"))
@@ -308,7 +313,7 @@ func TestStoreSettlesALandedWriteAfterTheCallerGaveUp(t *testing.T) {
 			info, herr := mem.Head(context.Background(), "k")
 			switch op {
 			case "delete":
-				if !errors.Is(herr, ErrNotFound) {
+				if !errors.Is(herr, blob.ErrNotFound) {
 					t.Fatalf("object still there: %v", herr)
 				}
 			case "update":
@@ -330,18 +335,18 @@ func TestStoreKeepsNotAppliedWhenTheContextEnds(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	s, mem := hookedStore(func(c context.Context, op Op, key string, after bool) error {
-		if op == OpCreate && !after {
+	s, mem := hookedStore(func(c context.Context, op blobtest.Op, key string, after bool) error {
+		if op == blobtest.OpCreate && !after {
 			cancel()
 			return errors.New("503 SlowDown")
 		}
 		return nil
 	})
 	_, err := s.Create(ctx, "k", strings.NewReader("v"))
-	if !errors.Is(err, ErrNotApplied) || errors.Is(err, ErrUnknown) || !errors.Is(err, context.Canceled) {
+	if !errors.Is(err, blob.ErrNotApplied) || errors.Is(err, blob.ErrUnknown) || !errors.Is(err, context.Canceled) {
 		t.Fatalf("got %v", err)
 	}
-	if _, err := mem.Head(context.Background(), "k"); !errors.Is(err, ErrNotFound) {
+	if _, err := mem.Head(context.Background(), "k"); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatal("nothing should have been written")
 	}
 }

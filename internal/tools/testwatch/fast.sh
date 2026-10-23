@@ -1,29 +1,19 @@
 #!/bin/sh
-# The fast suite: every package's tests in the main module on the in-memory
-# blob store only (no S3 emulator, containers, fault tag or measurements), run
-# through testwatch so a stuck test binary is dumped and killed after 30 seconds
-# without CPU. The failures, a line per package and the twenty slowest tests are printed at the end.
-#
-#	internal/tools/testwatch/fast.sh          # without -race
-#	internal/tools/testwatch/fast.sh -race    # with -race
-#
-# Extra arguments go to go test. SHARDLITE_MEASURE must be unset. If TESTWATCH_OUT
-# names a directory, the go test -json output and the report are copied there
-# (CI uploads them).
-set -e
+# The fast suite: every test in the main module on the in-memory blob store,
+# under testwatch, with gotestsum's report. Details and the arguments are in
+# the testwatch README.
+set -eu
 cd "$(dirname "$0")/../../.."
 unset SHARDLITE_MEASURE SHARDLITE_MEASURE_MB SHARDLITE_TEST_S3_ENDPOINT
-bin=$(mktemp -d)
-trap 'rm -rf "$bin"' EXIT
-go build -o "$bin/testwatch" ./internal/tools/testwatch
+watch=$(mktemp); trap 'rm -f "$watch" "$watch.json" "$watch.rep"' EXIT
+go build -o "$watch" ./internal/tools/testwatch
 status=0
-go test -json -exec "$bin/testwatch" -timeout 15m "$@" ./internal/... >"$bin/out.json" || status=$?
-"$bin/testwatch" report -n 20 <"$bin/out.json" >"$bin/report.txt" 2>&1 || status=$?
-cat "$bin/report.txt"
+go tool -modfile=tools.mod gotestsum --jsonfile "$watch.json" -- -exec "$watch" -timeout 10m "$@" ./internal/... >"$watch.rep" 2>&1 || status=$?
+go tool -modfile=tools.mod gotestsum tool slowest --num 20 --jsonfile "$watch.json" >>"$watch.rep" 2>&1 || true
+cat "$watch.rep"
 if [ -n "${TESTWATCH_OUT:-}" ]; then
 	mkdir -p "$TESTWATCH_OUT"
-	tag=fast$(printf '%s' "$*" | tr -c 'A-Za-z0-9' _)
-	cp "$bin/out.json" "$TESTWATCH_OUT/$tag.json"
-	cp "$bin/report.txt" "$TESTWATCH_OUT/$tag.report.txt"
+	cp "$watch.json" "$TESTWATCH_OUT/out.json"
+	cp "$watch.rep" "$TESTWATCH_OUT/report.txt"
 fi
 exit $status

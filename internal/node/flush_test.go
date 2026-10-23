@@ -12,8 +12,9 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/luci1900/shardlite/internal/apptest"
-	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/segment"
+	"github.com/luci1900/shardlite/internal/blobtest"
+	"github.com/luci1900/shardlite/internal/journal"
+	"github.com/luci1900/shardlite/internal/kind"
 )
 
 // longInterval makes the flush interval so long that a cycle in a test can only
@@ -27,8 +28,8 @@ func longInterval(coalesce, min time.Duration) func(*CatalogOptions) {
 // journalPuts records when each journal segment is created in blob storage.
 func (r *mrig) journalPuts() (times func() []time.Time) {
 	var at apptest.Log[time.Time]
-	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpCreate && after && strings.HasPrefix(key, segment.Root) {
+	r.local.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if op == blobtest.OpCreate && after && strings.HasPrefix(key, journal.Root) {
 			at.Add(time.Now())
 		}
 		return nil
@@ -41,12 +42,12 @@ func (r *mrig) journalPuts() (times func() []time.Time) {
 func TestGatedResponseDoesNotWaitForTheInterval(t *testing.T) {
 	t.Parallel()
 	r := newMRigWith(t, longInterval(2*time.Millisecond, 0))
-	ref := r.acquire("wallet/f1")
+	ref := r.acquire("test.wallet/f1")
 	defer ref.Release()
 	r.write(ref, "a")
 	before := r.m.Flusher().Completed()
 	start := time.Now()
-	if err := r.m.Gate(context.Background(), ref, true); err != nil {
+	if err := r.m.Gate(context.Background(), ref, kind.SyncStorage); err != nil {
 		t.Fatal(err)
 	}
 	if d := time.Since(start); d > 5*time.Second {
@@ -55,7 +56,7 @@ func TestGatedResponseDoesNotWaitForTheInterval(t *testing.T) {
 	if got := r.m.Flusher().Completed() - before; got != 1 {
 		t.Fatalf("%d cycles ran for the gate, want 1", got)
 	}
-	if got := strings.Count(r.dumpBlob("wallet/f1"), "kv: "); got != 2 {
+	if got := strings.Count(r.dumpBlob("test.wallet/f1"), "kv: "); got != 2 {
 		t.Fatalf("%d rows durable when the gate opened", got)
 	}
 	r.app.Must(t, "close", "a")
@@ -66,9 +67,9 @@ func TestConcurrentGatedResponsesShareCycles(t *testing.T) {
 	t.Parallel()
 	const n = 200
 	r := newMRigWith(t, longInterval(20*time.Millisecond, 0))
-	var refs []*Ref
+	var refs []*Hold
 	for i := range 20 {
-		ref := r.acquire(fmt.Sprintf("wallet/c%d", i))
+		ref := r.acquire(fmt.Sprintf("test.wallet/c%d", i))
 		defer ref.Release()
 		r.write(ref, fmt.Sprint(i))
 		refs = append(refs, ref)
@@ -76,7 +77,7 @@ func TestConcurrentGatedResponsesShareCycles(t *testing.T) {
 	before := r.m.Flusher().Completed()
 	var g errgroup.Group
 	for i := range n {
-		g.Go(func() error { return r.m.Gate(context.Background(), refs[i%len(refs)], true) })
+		g.Go(func() error { return r.m.Gate(context.Background(), refs[i%len(refs)], kind.SyncStorage) })
 	}
 	if err := g.Wait(); err != nil {
 		t.Fatal(err)
@@ -95,12 +96,12 @@ func TestCyclesAreSpacedByFlushMin(t *testing.T) {
 	const min = 150 * time.Millisecond
 	r := newMRigWith(t, longInterval(0, min))
 	times := r.journalPuts()
-	ref := r.acquire("wallet/f2")
+	ref := r.acquire("test.wallet/f2")
 	defer ref.Release()
 	r.write(ref, "a")
 	for range 6 {
 		r.app.Must(t, "insert", "a", "2", "100")
-		if err := r.m.Gate(context.Background(), ref, true); err != nil {
+		if err := r.m.Gate(context.Background(), ref, kind.SyncStorage); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -125,7 +126,7 @@ func TestNothingWaitingRunsCyclesOnTheTick(t *testing.T) {
 	const interval = 300 * time.Millisecond
 	r := newMRigWith(t, func(o *CatalogOptions) { o.Flush.Interval = interval })
 	times := r.journalPuts()
-	ref := r.acquire("wallet/f3")
+	ref := r.acquire("test.wallet/f3")
 	defer ref.Release()
 	r.write(ref, "a") // nobody waits for it
 	cycles := r.m.Flusher().Completed()
@@ -151,10 +152,10 @@ func TestNothingWaitingRunsCyclesOnTheTick(t *testing.T) {
 func TestOutputWithNoNewFramesTriggersNoCycle(t *testing.T) {
 	t.Parallel()
 	r := newMRigWith(t, longInterval(time.Millisecond, 0))
-	ref := r.acquire("wallet/f4")
+	ref := r.acquire("test.wallet/f4")
 	defer ref.Release()
 	r.write(ref, "a")
-	if err := r.m.Gate(context.Background(), ref, true); err != nil {
+	if err := r.m.Gate(context.Background(), ref, kind.SyncStorage); err != nil {
 		t.Fatal(err)
 	}
 	// The capture can lag the gate that just returned: wait for it, or a later
@@ -164,7 +165,7 @@ func TestOutputWithNoNewFramesTriggersNoCycle(t *testing.T) {
 	for range 20 {
 		// A gate that wants a cycle waits for it, so one asked for has completed
 		// by the time the loop is done.
-		if err := r.m.Gate(context.Background(), ref, true); err != nil {
+		if err := r.m.Gate(context.Background(), ref, kind.SyncStorage); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -179,13 +180,13 @@ func TestOutputWithNoNewFramesTriggersNoCycle(t *testing.T) {
 func TestCancelledWaiterTriggersNoCycle(t *testing.T) {
 	t.Parallel()
 	r := newMRigWith(t, longInterval(400*time.Millisecond, 0))
-	ref := r.acquire("wallet/f5")
+	ref := r.acquire("test.wallet/f5")
 	defer ref.Release()
 	r.write(ref, "a")
 	before := r.m.Flusher().Completed()
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	if err := r.m.Gate(ctx, ref, true); !errors.Is(err, context.DeadlineExceeded) {
+	if err := r.m.Gate(ctx, ref, kind.SyncStorage); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("gate: %v, want the context's end", err)
 	}
 	time.Sleep(900 * time.Millisecond) // past the coalescing delay
@@ -193,7 +194,7 @@ func TestCancelledWaiterTriggersNoCycle(t *testing.T) {
 		t.Fatalf("%d cycles ran for a waiter that had gone", got)
 	}
 	// A waiter that comes later is served.
-	if err := r.m.Gate(context.Background(), ref, true); err != nil {
+	if err := r.m.Gate(context.Background(), ref, kind.SyncStorage); err != nil {
 		t.Fatal(err)
 	}
 	r.app.Must(t, "close", "a")
@@ -205,19 +206,19 @@ func TestWaiterGivingUpInACycleDoesNotCancelIt(t *testing.T) {
 	r := newMRigWith(t, longInterval(time.Millisecond, 0))
 	var stall atomic.Bool
 	release := make(chan struct{})
-	r.local.SetHook(func(ctx context.Context, op blob.Op, key string, after bool) error {
-		if op == blob.OpCreate && !after && strings.HasPrefix(key, segment.Root) && stall.Load() {
+	r.local.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if op == blobtest.OpCreate && !after && strings.HasPrefix(key, journal.Root) && stall.Load() {
 			<-release
 		}
 		return nil
 	})
-	ref := r.acquire("wallet/f6")
+	ref := r.acquire("test.wallet/f6")
 	defer ref.Release()
 	r.write(ref, "a")
 	stall.Store(true)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- r.m.Gate(ctx, ref, true) }()
+	go func() { done <- r.m.Gate(ctx, ref, kind.SyncStorage) }()
 	eventually(t, "the cycle to start", func() bool { return r.m.Flusher().started.Load() > 0 })
 	cancel()
 	if err := <-done; !errors.Is(err, context.Canceled) {
@@ -226,7 +227,7 @@ func TestWaiterGivingUpInACycleDoesNotCancelIt(t *testing.T) {
 	stall.Store(false)
 	close(release)
 	eventually(t, "the cycle to complete anyway", func() bool { return r.m.Flusher().Completed() > 0 })
-	if got := strings.Count(r.dumpBlob("wallet/f6"), "kv: "); got != 2 {
+	if got := strings.Count(r.dumpBlob("test.wallet/f6"), "kv: "); got != 2 {
 		t.Fatalf("%d rows durable after the cycle", got)
 	}
 	r.app.Must(t, "close", "a")
@@ -236,7 +237,7 @@ func TestWaiterGivingUpInACycleDoesNotCancelIt(t *testing.T) {
 func TestBarrierIsReleasedByAnEarlyCycle(t *testing.T) {
 	t.Parallel()
 	r := newMRigWith(t, longInterval(time.Millisecond, 0))
-	ref := r.acquire("wallet/f7")
+	ref := r.acquire("test.wallet/f7")
 	defer ref.Release()
 	r.write(ref, "a")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -244,7 +245,7 @@ func TestBarrierIsReleasedByAnEarlyCycle(t *testing.T) {
 	if err := r.m.Barrier(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Count(r.dumpBlob("wallet/f7"), "kv: "); got != 2 {
+	if got := strings.Count(r.dumpBlob("test.wallet/f7"), "kv: "); got != 2 {
 		t.Fatalf("%d rows durable after the barrier", got)
 	}
 	r.app.Must(t, "close", "a")
@@ -254,11 +255,11 @@ func TestBarrierIsReleasedByAnEarlyCycle(t *testing.T) {
 func TestDeactivationDoesNotWaitForTheInterval(t *testing.T) {
 	t.Parallel()
 	r := newMRigWith(t, longInterval(time.Millisecond, 0))
-	ref := r.acquire("users/f8")
+	ref := r.acquire("test.users/f8")
 	r.write(ref, "a")
 	r.app.Must(t, "close", "a")
 	ref.Release()
-	eventually(t, "deactivation", func() bool { return r.cached("users/f8") })
+	eventually(t, "deactivation", func() bool { return r.cached("test.users/f8") })
 }
 
 // A tail that passes DeltaSize gets a delta long before it is DeltaAge old.
@@ -268,22 +269,22 @@ func TestTailPassingTheSizeGetsADeltaBeforeTheAge(t *testing.T) {
 	r.crash()
 	r.startShards(func(o *CatalogOptions) { o.Lifecycle.DeltaAge, o.Lifecycle.DeltaSize = time.Hour, 8<<10 })
 	ctx := context.Background()
-	ref := r.acquire("wallet/d1")
+	ref := r.acquire("test.wallet/d1")
 	defer ref.Release()
 	r.write(ref, "a")
-	if err := r.m.Gate(ctx, ref, true); err != nil {
+	if err := r.m.Gate(ctx, ref, kind.SyncStorage); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(100 * time.Millisecond) // several looks of the delta timer
-	if m, _ := r.manifest("wallet/d1"); len(m.Files) != 0 {
+	if m, _ := r.manifest("test.wallet/d1"); len(m.Files) != 0 {
 		t.Fatalf("a delta for a small tail: %v", m.Files)
 	}
 	r.app.Must(t, "insert", "a", "20", "1000") // about 20 KB in one commit
-	if err := r.m.Gate(ctx, ref, true); err != nil {
+	if err := r.m.Gate(ctx, ref, kind.SyncStorage); err != nil {
 		t.Fatal(err)
 	}
 	eventually(t, "a delta for the large tail", func() bool {
-		m, err := r.manifest("wallet/d1")
+		m, err := r.manifest("test.wallet/d1")
 		return err == nil && len(m.Files) == 1
 	})
 	if r.m.Stats.TailBytesMax.Load() < 8<<10 {
@@ -302,20 +303,20 @@ func TestSmallTailGetsADeltaAtTheAge(t *testing.T) {
 	r.startShards(func(o *CatalogOptions) { o.Lifecycle.DeltaAge = age })
 	ctx := context.Background()
 	start := time.Now() // the tail starts with the shard's first commit
-	ref := r.acquire("wallet/d2")
+	ref := r.acquire("test.wallet/d2")
 	defer ref.Release()
 	r.write(ref, "a")
-	if err := r.m.Gate(ctx, ref, true); err != nil {
+	if err := r.m.Gate(ctx, ref, kind.SyncStorage); err != nil {
 		t.Fatal(err)
 	}
 	for time.Since(start) < age-100*time.Millisecond {
-		if m, _ := r.manifest("wallet/d2"); len(m.Files) != 0 {
+		if m, _ := r.manifest("test.wallet/d2"); len(m.Files) != 0 {
 			t.Fatalf("a delta after %v, before the age %v: %v", time.Since(start), age, m.Files)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	eventually(t, "the delta at the age", func() bool {
-		m, err := r.manifest("wallet/d2")
+		m, err := r.manifest("test.wallet/d2")
 		return err == nil && len(m.Files) == 1
 	})
 	r.app.Must(t, "close", "a")

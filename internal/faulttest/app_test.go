@@ -13,7 +13,9 @@ import (
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/harness"
+	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/segment"
+	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
 )
@@ -22,16 +24,17 @@ import (
 func replayDump(t *testing.T, e *harness.Env, name string) (dump string, entries, big int) {
 	t.Helper()
 	ctx := context.Background()
+	target := shard.MustParse(name)
 	path := filepath.Join(t.TempDir(), "replay.db")
 	ap, err := shardfile.NewApplier(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = segment.Scan(ctx, e.Store, e.Node, 1, 0, func(seq uint64, en segment.Entry) error {
-		if en.Shard != name {
+	err = segment.Scan(ctx, e.Journal, 1, 0, func(seq pos.Seg, en segment.Entry) error {
+		if en.Shard != target {
 			return nil
 		}
-		b, err := harness.ReadEntry(ctx, e.Store, e.Node, seq, en)
+		b, err := harness.ReadEntry(ctx, e.Journal, seq, en)
 		if err != nil {
 			return err
 		}
@@ -71,19 +74,19 @@ func syncUntil(t *testing.T, sh *capture.Shard, done <-chan struct{}) *sync.Wait
 	return &wg
 }
 
-// An app that checkpoints by itself while it writes (Litestream issue #1540's area).
+// An app that checkpoints by itself while it writes (the WAL-reset hazard, Litestream issue #1540's area).
 func TestAppCheckpointsItself(t *testing.T) {
 	t.Parallel()
 	for _, mode := range []string{"PASSIVE", "FULL", "RESTART", "TRUNCATE"} {
 		t.Run(mode, func(t *testing.T) {
 			t.Parallel()
 			e := harness.New(t)
-			// A short busy timeout: Litestream's read transaction makes the app's
+			// A short busy timeout: the node's read transaction makes the app's
 			// FULL, RESTART and TRUNCATE checkpoints wait for it on every call.
 			app := apptest.Start(t)
-			app.Must(t, "open", "a", e.Path("users/1"), "20")
+			app.Must(t, "open", "a", e.Path("fault.users/1"), "20")
 			app.Must(t, "insert", "a", "50", "1000")
-			_, sh := e.NewShard("users/1")
+			_, sh := e.NewShard("fault.users/1")
 			if err := sh.Sync(context.Background()); err != nil {
 				t.Fatal(err)
 			}
@@ -97,8 +100,8 @@ func TestAppCheckpointsItself(t *testing.T) {
 			if err := sh.Sync(context.Background()); err != nil {
 				t.Fatal(err)
 			}
-			got, entries, big := replayDump(t, e, "users/1")
-			if want := apptest.Dump(t, e.Path("users/1")); got != want {
+			got, entries, big := replayDump(t, e, "fault.users/1")
+			if want := apptest.Dump(t, e.Path("fault.users/1")); got != want {
 				t.Fatalf("captured history differs from the app's database (%d entries)", entries)
 			}
 			t.Logf("%s checkpoint in a loop of 30 (rows,busy): %s in %v; %d entries, %d over 100 KB", mode, res, took.Round(time.Millisecond), entries, big)
@@ -111,9 +114,9 @@ func TestAppCheckpointsItself(t *testing.T) {
 func TestAppReconnectsConstantly(t *testing.T) {
 	t.Parallel()
 	e := harness.New(t)
-	app := e.StartApp("users/1")
+	app := e.StartApp("fault.users/1")
 	app.Must(t, "insert", "a", "50", "1000")
-	_, sh := e.NewShard("users/1")
+	_, sh := e.NewShard("fault.users/1")
 	if err := sh.Sync(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -125,8 +128,8 @@ func TestAppReconnectsConstantly(t *testing.T) {
 	if err := sh.Sync(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	got, entries, big := replayDump(t, e, "users/1")
-	if want := apptest.Dump(t, e.Path("users/1")); got != want {
+	got, entries, big := replayDump(t, e, "fault.users/1")
+	if want := apptest.Dump(t, e.Path("fault.users/1")); got != want {
 		t.Fatalf("captured history differs from the app's database (%d entries)", entries)
 	}
 	t.Logf("reconnect churn: %d entries, %d over 100 KB", entries, big)

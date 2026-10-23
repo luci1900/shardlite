@@ -1,4 +1,4 @@
-package blob
+package blob_test
 
 import (
 	"context"
@@ -9,22 +9,25 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/blobtest"
 )
 
 // newStore returns a Store over a fresh memory backend behind a fault hook,
 // with short backoffs.
-func newStore(t *testing.T) (*Store, *Hooked) {
+func newStore(t *testing.T) (*blob.Store, *blobtest.Hooked) {
 	t.Helper()
-	h := WithHook(NewMemory())
-	return NewStore(h, "n1", 1, Options{Backoff: time.Millisecond}), h
+	h := blobtest.WithHook(blob.NewMemory())
+	return blob.NewStore(h, "n1", 1, blob.Options{Backoff: time.Millisecond}), h
 }
 
 // notFoundOnDelete is a store that answers a delete of a missing key with
 // ErrNotFound, which the Backend contract allows (S3 and the memory backend
 // answer success instead). Store has to treat both alike.
-type notFoundOnDelete struct{ Backend }
+type notFoundOnDelete struct{ blob.Backend }
 
-func (n notFoundOnDelete) Delete(ctx context.Context, key string, expected ETag) error {
+func (n notFoundOnDelete) Delete(ctx context.Context, key string, expected blob.ETag) error {
 	if _, err := n.Backend.Head(ctx, key); err != nil {
 		return err
 	}
@@ -33,10 +36,10 @@ func (n notFoundOnDelete) Delete(ctx context.Context, key string, expected ETag)
 
 // newStrictStore is newStore over a backend that answers ErrNotFound to a
 // delete of a missing key.
-func newStrictStore(t *testing.T) (*Store, *Hooked) {
+func newStrictStore(t *testing.T) (*blob.Store, *blobtest.Hooked) {
 	t.Helper()
-	h := WithHook(notFoundOnDelete{NewMemory()})
-	return NewStore(h, "n1", 1, Options{Backoff: time.Millisecond}), h
+	h := blobtest.WithHook(notFoundOnDelete{blob.NewMemory()})
+	return blob.NewStore(h, "n1", 1, blob.Options{Backoff: time.Millisecond}), h
 }
 
 func readAll(t *testing.T, rc io.ReadCloser) string {
@@ -49,70 +52,13 @@ func readAll(t *testing.T, rc io.ReadCloser) string {
 	return string(b)
 }
 
-// The hook maps failures onto outcomes: before the operation is "not applied",
-// after it is "unknown" (the write happened, the response was lost).
-func TestHookOutcomes(t *testing.T) {
-	t.Parallel()
-	h, ctx := WithHook(NewMemory()), context.Background()
-	boom := errors.New("boom")
-	h.SetHook(func(ctx context.Context, op Op, key string, after bool) error {
-		if op == OpCreate && key == "before" && !after || op == OpCreate && key == "after" && after {
-			return boom
-		}
-		return nil
-	})
-	if _, err := h.Create(ctx, "before", strings.NewReader("v"), WriteID{}); !errors.Is(err, ErrNotApplied) {
-		t.Fatalf("got %v, want ErrNotApplied", err)
-	}
-	if _, err := h.Head(ctx, "before"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("a not-applied create wrote the object: %v", err)
-	}
-	if _, err := h.Create(ctx, "after", strings.NewReader("v"), WriteID{}); !errors.Is(err, ErrUnknown) {
-		t.Fatalf("got %v, want ErrUnknown", err)
-	}
-	if _, err := h.Head(ctx, "after"); err != nil {
-		t.Fatalf("an unknown-outcome create should have happened: %v", err)
-	}
-	// Every operation goes through the hook, a listing with its prefix as the key.
-	seen := map[Op]string{}
-	h.SetHook(func(ctx context.Context, op Op, key string, after bool) error {
-		if !after {
-			seen[op] = key
-		}
-		return nil
-	})
-	rc, _, _ := h.Get(ctx, "after")
-	rc.Close()
-	rc, _ = h.GetRange(ctx, "after", 0, 1)
-	rc.Close()
-	h.Head(ctx, "after")
-	for range h.List(ctx, "af", "") {
-	}
-	h.Delete(ctx, "after", "")
-	if len(seen) != 5 || seen[OpList] != "af" || seen[OpDelete] != "after" {
-		t.Fatalf("hook saw %v", seen)
-	}
-	// A lost listing is an error, not a partial listing.
-	h.SetHook(func(ctx context.Context, op Op, key string, after bool) error {
-		if op == OpList && after {
-			return boom
-		}
-		return nil
-	})
-	for _, err := range h.List(ctx, "", "") {
-		if !errors.Is(err, ErrUnknown) {
-			t.Fatalf("list: %v, want ErrUnknown", err)
-		}
-	}
-}
-
 func TestWriteIDStoredWithObject(t *testing.T) {
 	t.Parallel()
 	s, _ := newStore(t)
 	ctx := context.Background()
 	s.Create(ctx, "a", strings.NewReader("one"))
 	info, err := s.Head(ctx, "a")
-	if err != nil || info.WriteID != (WriteID{Node: "n1", Epoch: 1, N: 1}) {
+	if err != nil || info.WriteID != (blob.WriteID{Node: "n1", Epoch: 1, N: 1}) {
 		t.Fatalf("head: %+v %v", info, err)
 	}
 	if _, err := s.Update(ctx, "a", strings.NewReader("two"), info.ETag); err != nil {
@@ -136,17 +82,17 @@ func TestWriteIDStoredWithObject(t *testing.T) {
 
 func TestWithPrefix(t *testing.T) {
 	t.Parallel()
-	m := NewMemory()
-	b := WithPrefix(m, "staging/")
+	m := blob.NewMemory()
+	b := blob.WithPrefix(m, "staging/")
 	ctx := context.Background()
-	if _, err := b.Create(ctx, "state/leases/n1", strings.NewReader("x"), WriteID{}); err != nil {
+	if _, err := b.Create(ctx, "state/leases/n1", strings.NewReader("x"), blob.WriteID{}); err != nil {
 		t.Fatal(err)
 	}
 	// It is stored under the prefix, and invisible without it.
 	if _, err := m.Head(ctx, "staging/state/leases/n1"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.Head(ctx, "state/leases/n1"); !errors.Is(err, ErrNotFound) {
+	if _, err := m.Head(ctx, "state/leases/n1"); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("head without the prefix: %v", err)
 	}
 	var keys []string
@@ -183,7 +129,7 @@ func TestETagIsTheContentsMD5(t *testing.T) {
 	if err != nil || e3 == e1 {
 		t.Fatalf("different bytes: %q %v", e3, err)
 	}
-	if _, err := s.Update(ctx, "k", strings.NewReader("x"), e1); !errors.Is(err, ErrConflict) {
+	if _, err := s.Update(ctx, "k", strings.NewReader("x"), e1); !errors.Is(err, blob.ErrConflict) {
 		t.Fatalf("update with the old ETag: got %v, want ErrConflict", err)
 	}
 }
@@ -191,9 +137,9 @@ func TestETagIsTheContentsMD5(t *testing.T) {
 // Contents are copied on the way in and out.
 func TestMemoryCopiesContents(t *testing.T) {
 	t.Parallel()
-	m, ctx := NewMemory(), context.Background()
+	m, ctx := blob.NewMemory(), context.Background()
 	in := []byte("hello")
-	if _, err := m.Create(ctx, "k", strings.NewReader(string(in)), WriteID{}); err != nil {
+	if _, err := m.Create(ctx, "k", strings.NewReader(string(in)), blob.WriteID{}); err != nil {
 		t.Fatal(err)
 	}
 	rc, _, _ := m.Get(ctx, "k")
@@ -210,7 +156,7 @@ func TestMemoryCopiesContents(t *testing.T) {
 	}
 	// A body slice the caller keeps is not the stored object.
 	body := []byte("world")
-	if _, err := m.Create(ctx, "w", strings.NewReader(string(body)), WriteID{}); err != nil {
+	if _, err := m.Create(ctx, "w", strings.NewReader(string(body)), blob.WriteID{}); err != nil {
 		t.Fatal(err)
 	}
 	body[0] = 'W'
@@ -222,13 +168,13 @@ func TestMemoryCopiesContents(t *testing.T) {
 func TestMemoryClockAndMissingKeys(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	m, ctx := NewMemory(WithClock(func() time.Time { return now })), context.Background()
-	e, err := m.Create(ctx, "k", strings.NewReader("v"), WriteID{Node: "n", Epoch: 1, N: 1})
+	m, ctx := blob.NewMemory(blob.WithClock(func() time.Time { return now })), context.Background()
+	e, err := m.Create(ctx, "k", strings.NewReader("v"), blob.WriteID{Node: "n", Epoch: 1, N: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
 	now = now.Add(time.Hour)
-	m.Create(ctx, "later", strings.NewReader("v"), WriteID{})
+	m.Create(ctx, "later", strings.NewReader("v"), blob.WriteID{})
 	info, _ := m.Head(ctx, "k")
 	later, _ := m.Head(ctx, "later")
 	if !info.LastModified.Equal(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)) || later.LastModified.Sub(info.LastModified) != time.Hour {
@@ -243,10 +189,10 @@ func TestMemoryClockAndMissingKeys(t *testing.T) {
 	if err := m.Delete(ctx, "nope", ""); err != nil {
 		t.Fatalf("unconditional delete of a missing key: %v", err)
 	}
-	if err := m.Delete(ctx, "nope", e); !errors.Is(err, ErrNotFound) {
+	if err := m.Delete(ctx, "nope", e); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("conditional delete of a missing key: %v", err)
 	}
-	if _, err := m.Update(ctx, "nope", strings.NewReader("v"), e, WriteID{}); !errors.Is(err, ErrNotFound) {
+	if _, err := m.Update(ctx, "nope", strings.NewReader("v"), e, blob.WriteID{}); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("update of a missing key: %v", err)
 	}
 }

@@ -6,7 +6,7 @@
 //
 // The rest of the world is nondeterministic: other nodes claim and release the shard, the node's lease
 // expires, the process crashes, the app opens and closes the file. See docs/internals.md (Activation,
-// Letting go of a shard, Fencing, Takeover) and internal/node/manager.go.
+// Letting go of a shard, Fencing, Takeover) and internal/node/actor.go and catalog.go.
 //
 // Run:
 //   quint typecheck specs/shard.qnt
@@ -47,7 +47,7 @@ module shard {
   type State = {
     phase: Phase,
     source: Source,       // meaningful while Activating
-    capturing: bool,      // Litestream has the file open. False in Deactivating once the node has let go
+    capturing: bool,      // Capture has the file open. False in Deactivating once the node has let go
     manifest: Manifest,
     local: int,           // last commit in the file this node has (meaningful while working)
     durable: int,         // last commit of this process in its node journal
@@ -313,7 +313,7 @@ module shard {
     s' = { ...s, phase: Deactivating, capturing: true }
   }
 
-  // The node waits for the last commit to be in the journal, closes Litestream's connection and checks that
+  // The node waits for the last commit to be in the journal, closes capture's connection and checks that
   // the app has the file closed.
   action releaseFile = all {
     s.phase == Deactivating,

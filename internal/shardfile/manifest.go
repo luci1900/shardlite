@@ -9,34 +9,39 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/cluster"
 	"github.com/luci1900/shardlite/internal/coord"
+	"github.com/luci1900/shardlite/internal/journal"
+	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/remindex"
+	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/spool"
 )
 
 // Manifest is the per-shard record in blob storage (see docs/internals.md,
 // Manifest). Last owner and pin come with the cluster and pinning.
 type Manifest struct {
-	Generation string   `json:"generation"` // random, set at creation, part of the shard's object paths
-	Owner      string   `json:"owner"`      // the node allowed to write the shard, "" if released
-	NodeEpoch  uint64   `json:"node_epoch"` // the owner's lease epoch when it claimed the shard
-	Files      []string `json:"files"`      // base and deltas, "min-max.epoch" (min-max in the shard's own positions), in order
-	Journal    string   `json:"journal"`    // the node journal holding commits after the last file, "" if there are none
+	Generation shard.Gen    `json:"generation"` // random, set at creation, part of the shard's object paths
+	Owner      cluster.Node `json:"owner"`      // the node allowed to write the shard, "" if released
+	NodeEpoch  pos.Epoch    `json:"node_epoch"` // the owner's lease epoch when it claimed the shard
+	Files      []File       `json:"files"`      // base and deltas ("min-max.epoch" in JSON), in order
+	Journal    cluster.Node `json:"journal"`    // the node journal holding commits after the last file, "" if there are none
 	// NextReminder is when the shard next needs waking, Unix minutes, omitted when
 	// there is none (docs/internals.md, Manifest). The owner's deltas, rebases and
 	// deactivations set it, with its entry in the reminder index created before the
 	// write. Claims and releases keep it.
-	NextReminder int64 `json:"next_reminder,omitempty"`
+	NextReminder remindex.Minute `json:"next_reminder,omitempty"`
 	// Rev counts the manifest's writes, so no two versions have the same bytes and
 	// ETag. The reminder index's pruning rule relies on a changed version staying changed.
 	Rev uint64 `json:"rev,omitempty"`
 }
 
 // Range is a range of the shard's own positions covered by one LTX file.
-type Range struct{ Min, Max uint64 }
+type Range struct{ Min, Max pos.Position }
 
 func (r Range) String() string { return fmt.Sprintf("%d-%d", r.Min, r.Max) }
 
@@ -45,10 +50,25 @@ func (r Range) String() string { return fmt.Sprintf("%d-%d", r.Min, r.Max) }
 // with a new one.
 type File struct {
 	Range
-	Epoch uint64
+	Epoch pos.Epoch
 }
 
 func (f File) String() string { return fmt.Sprintf("%s.%d", f.Range, f.Epoch) }
+
+// MarshalText is the file's "min-max.epoch" name, so the manifest's JSON stays
+// the list of strings it was.
+func (f File) MarshalText() ([]byte, error) { return []byte(f.String()), nil }
+
+// UnmarshalText parses a file's name (ParseFile). A manifest with an entry
+// that doesn't parse fails its read: the manifest is then corrupt.
+func (f *File) UnmarshalText(b []byte) error {
+	parsed, err := ParseFile(string(b))
+	if err != nil {
+		return err
+	}
+	*f = parsed
+	return nil
+}
 
 // ParseFile parses "min-max.epoch".
 func ParseFile(s string) (File, error) {
@@ -67,34 +87,20 @@ func ParseFile(s string) (File, error) {
 	if err1 != nil || err2 != nil || err3 != nil || min == 0 || max < min {
 		return File{}, bad
 	}
-	return File{Range{min, max}, epoch}, nil
-}
-
-// List parses the manifest's file list.
-func (m *Manifest) List() ([]File, error) {
-	out := make([]File, len(m.Files))
-	for i, s := range m.Files {
-		f, err := ParseFile(s)
-		if err != nil {
-			return nil, err
-		}
-		out[i] = f
-	}
-	return out, nil
+	return File{Range{pos.Position(min), pos.Position(max)}, pos.Epoch(epoch)}, nil
 }
 
 // LastPosition is the last position in the manifest's files, or 0.
-func (m *Manifest) LastPosition() uint64 {
-	fs, err := m.List()
-	if err != nil || len(fs) == 0 {
+func (m *Manifest) LastPosition() pos.Position {
+	if len(m.Files) == 0 {
 		return 0
 	}
-	return fs[len(fs)-1].Max
+	return m.Files[len(m.Files)-1].Max
 }
 
 func (m *Manifest) clone() *Manifest {
 	c := *m
-	c.Files = append([]string(nil), m.Files...)
+	c.Files = append([]File(nil), m.Files...)
 	return &c
 }
 
@@ -106,21 +112,23 @@ const (
 )
 
 // ManifestKey is the object key of a shard's manifest.
-func ManifestKey(name string) string { return ManifestPrefix + name }
+func ManifestKey(n shard.Name) string { return ManifestPrefix + n.String() }
 
 // ShardPrefix is the key prefix of all of a shard's LTX files.
-func ShardPrefix(name string) string { return FilesPrefix + name + "/" }
+func ShardPrefix(n shard.Name) string { return FilesPrefix + n.String() + "/" }
 
 // GenerationPrefix is the key prefix of the LTX files of one generation of a shard.
-func GenerationPrefix(shard, generation string) string { return ShardPrefix(shard) + generation + "/" }
+func GenerationPrefix(n shard.Name, generation shard.Gen) string {
+	return ShardPrefix(n) + string(generation) + "/"
+}
 
 // FileKey is the object key of one of a shard's LTX files.
-func FileKey(shard, generation string, f File) string {
-	return fmt.Sprintf("%s%s.ltx", GenerationPrefix(shard, generation), f)
+func FileKey(n shard.Name, generation shard.Gen, f File) string {
+	return fmt.Sprintf("%s%s.ltx", GenerationPrefix(n, generation), f)
 }
 
 // NewGeneration returns a random generation name.
-func NewGeneration() string {
+func NewGeneration() shard.Gen {
 	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
 	b := make([]byte, 6)
 	if _, err := rand.Read(b); err != nil {
@@ -129,7 +137,7 @@ func NewGeneration() string {
 	for i := range b {
 		b[i] = alphabet[int(b[i])%len(alphabet)]
 	}
-	return string(b)
+	return shard.Gen(b)
 }
 
 // Version identifies one version of a manifest (its ETag).
@@ -143,15 +151,15 @@ type ManifestStore struct{ store *blob.Store }
 func NewManifestStore(store *blob.Store) ManifestStore { return ManifestStore{store} }
 
 // Get returns a shard's manifest (blob.ErrNotFound if there is none).
-func (b ManifestStore) Get(ctx context.Context, shard string) (*Manifest, Version, error) {
-	rc, etag, err := b.store.Get(ctx, ManifestKey(shard))
+func (b ManifestStore) Get(ctx context.Context, n shard.Name) (*Manifest, Version, error) {
+	rc, etag, err := b.store.Get(ctx, ManifestKey(n))
 	if err != nil {
 		return nil, "", err
 	}
 	defer rc.Close()
 	var m Manifest
 	if err := json.NewDecoder(rc).Decode(&m); err != nil {
-		return nil, "", fmt.Errorf("manifest %s: %w", shard, err)
+		return nil, "", fmt.Errorf("manifest %s: %w", n, err)
 	}
 	return &m, etag, nil
 }
@@ -159,36 +167,46 @@ func (b ManifestStore) Get(ctx context.Context, shard string) (*Manifest, Versio
 // Put creates the manifest when expected is nil (blob.ErrExists if somebody
 // else has) and otherwise replaces the version expected (blob.ErrConflict if
 // somebody else changed it).
-func (b ManifestStore) Put(ctx context.Context, shard string, m *Manifest, expected *Version) (Version, error) {
+func (b ManifestStore) Put(ctx context.Context, n shard.Name, m *Manifest, expected *Version) (Version, error) {
 	if expected == nil {
-		return b.store.Create(ctx, ManifestKey(shard), encode(m))
+		return b.store.Create(ctx, ManifestKey(n), encode(m))
 	}
-	return b.store.Update(ctx, ManifestKey(shard), encode(m), *expected)
+	return b.store.Update(ctx, ManifestKey(n), encode(m), *expected)
 }
 
 // Delete removes the manifest if it is still at expected (blob.ErrConflict if
 // somebody else changed it, blob.ErrNotFound if it is gone). It is a
 // conditional delete, which the startup check requires of the store.
-func (b ManifestStore) Delete(ctx context.Context, shard string, expected Version) error {
-	return b.store.Delete(ctx, ManifestKey(shard), expected)
+func (b ManifestStore) Delete(ctx context.Context, n shard.Name, expected Version) error {
+	return b.store.Delete(ctx, ManifestKey(n), expected)
 }
 
 // Files reads and writes shards' manifests and LTX files in blob storage.
 // Lost responses are handled by blob.Store, which tags every write with a
 // write id and recognises its own earlier attempts.
 type Files struct {
-	Blob   *blob.Store
-	Node   string // the node whose journal new shards write to
-	Leases *coord.Registry
+	Blob *blob.Store
+	// Backend is the blob backend Blob reads and writes through, given to the
+	// per-node journal stores (Journal) instead of Blob, which is one journal's
+	// caller at a time.
+	Backend blob.Backend
+	Node    cluster.Node // the node whose journal new shards write to
+	Leases  *coord.Registry
+	// JournalOptions tune the retries of the journals' stores (Journal). Zero
+	// is the journal store's own defaults.
+	JournalOptions journal.Options
 	// TempDir is where files are built and downloaded that are too large to hold
 	// in memory (deltas, snapshots, the files of a restore). It is in the data
-	// directory, never the scratch directory, which is tmpfs and so memory too.
+	// directory.
 	TempDir string
 	// SpoolLimit is how large a delta gets before it is built in a temporary file,
 	// spool.DefaultLimit if zero.
 	SpoolLimit int
 	// Now is the time adoption records its reminders at, time.Now if nil.
 	Now func() time.Time
+
+	journals   map[cluster.Node]*journal.Store // one store per journal this node has touched
+	journalsMu sync.Mutex
 }
 
 func (f *Files) now() time.Time {
@@ -207,10 +225,32 @@ func (f *Files) spoolLimit() int {
 
 func (f *Files) manifests() ManifestStore { return ManifestStore{f.Blob} }
 
+// Journal returns the store of one node's journal: the record's numbers behind
+// journal.Store, with this writer's write ids, so a lost response is
+// recognised as its own. The journal is the one named by node: this Files' own
+// (f.Node), or a dead one's being adopted or read for a restore.
+//
+// A store is remembered per journal, so every write this node does through
+// these shares one counter: a write id is the node, the epoch and that
+// counter, and a repeated one would name two attempts as one.
+func (f *Files) Journal(node cluster.Node) *journal.Store {
+	f.journalsMu.Lock()
+	defer f.journalsMu.Unlock()
+	if f.journals == nil {
+		f.journals = map[cluster.Node]*journal.Store{}
+	}
+	if s := f.journals[node]; s != nil {
+		return s
+	}
+	s := journal.NewStore(journal.NewBlob(f.Backend, node), node, f.Blob.Epoch(), f.JournalOptions)
+	f.journals[node] = s
+	return s
+}
+
 // GetManifest returns a shard's manifest and its version (blob.ErrNotFound if
 // there is none).
-func (f *Files) GetManifest(ctx context.Context, shard string) (*Manifest, blob.ETag, error) {
-	return f.manifests().Get(ctx, shard)
+func (f *Files) GetManifest(ctx context.Context, n shard.Name) (*Manifest, blob.ETag, error) {
+	return f.manifests().Get(ctx, n)
 }
 
 func encode(m *Manifest) *bytes.Reader {
@@ -224,7 +264,7 @@ func encode(m *Manifest) *bytes.Reader {
 // Handle tracks one shard's manifest and its ETag.
 type Handle struct {
 	F    *Files
-	Name string
+	Name shard.Name
 
 	Manifest *Manifest
 	ETag     blob.ETag
@@ -239,41 +279,41 @@ type Handle struct {
 
 // Open loads a shard's manifest, creating it with a new generation if the
 // shard doesn't exist yet. Created reports which happened.
-func (f *Files) Open(ctx context.Context, shard string) (h *Handle, created bool, err error) {
-	h, err = f.Attach(ctx, shard)
+func (f *Files) Open(ctx context.Context, n shard.Name) (h *Handle, created bool, err error) {
+	h, err = f.Attach(ctx, n)
 	if errors.Is(err, blob.ErrNotFound) {
-		return f.Create(ctx, shard)
+		return f.Create(ctx, n)
 	}
 	return h, false, err
 }
 
 // Attach loads the handle of a shard that must already have a manifest
 // (blob.ErrNotFound otherwise).
-func (f *Files) Attach(ctx context.Context, shard string) (*Handle, error) {
-	m, etag, err := f.GetManifest(ctx, shard)
+func (f *Files) Attach(ctx context.Context, n shard.Name) (*Handle, error) {
+	m, etag, err := f.GetManifest(ctx, n)
 	if err != nil {
 		return nil, err
 	}
-	return &Handle{F: f, Name: shard, Manifest: m, ETag: etag}, nil
+	return &Handle{F: f, Name: n, Manifest: m, ETag: etag}, nil
 }
 
 // Create creates a shard's manifest, owned by this node, for a caller that has
 // just found none. created is false if somebody else created it first: the
 // handle is then theirs, to claim like any other shard.
-func (f *Files) Create(ctx context.Context, shard string) (h *Handle, created bool, err error) {
-	m := &Manifest{Generation: NewGeneration(), Owner: f.Node, NodeEpoch: f.Blob.Epoch(), Files: []string{}, Journal: f.Node}
-	etag, err := f.manifests().Put(ctx, shard, m, nil)
+func (f *Files) Create(ctx context.Context, n shard.Name) (h *Handle, created bool, err error) {
+	m := &Manifest{Generation: NewGeneration(), Owner: f.Node, NodeEpoch: f.Blob.Epoch(), Files: []File{}, Journal: f.Node}
+	etag, err := f.manifests().Put(ctx, n, m, nil)
 	if err == nil {
-		return &Handle{F: f, Name: shard, Manifest: m, ETag: etag}, true, nil
+		return &Handle{F: f, Name: n, Manifest: m, ETag: etag}, true, nil
 	}
 	if !errors.Is(err, blob.ErrExists) {
 		return nil, false, err
 	}
 	// Somebody got there first: the shard is theirs, unless they have deleted
 	// the manifest again since.
-	h, err = f.Attach(ctx, shard)
+	h, err = f.Attach(ctx, n)
 	if errors.Is(err, blob.ErrNotFound) {
-		return f.Create(ctx, shard)
+		return f.Create(ctx, n)
 	}
 	return h, false, err
 }
@@ -283,7 +323,7 @@ func (f *Files) Create(ctx context.Context, shard string) (h *Handle, created bo
 // version the write CASes against, and a failure fails the write. A reminder in
 // the minute the manifest already has (Unix minutes) needs no new entry: the entry that backs
 // the old one backs it too, since an entry is never deleted while it is backed.
-func (h *Handle) setReminder(ctx context.Context, next *Manifest, reminder int64) error {
+func (h *Handle) setReminder(ctx context.Context, next *Manifest, reminder remindex.Minute) error {
 	if reminder > 0 && reminder != h.Manifest.NextReminder {
 		e := remindex.Entry{Minute: reminder, Shard: h.Name, Base: remindex.BaseOf(h.ETag)}
 		if err := remindex.New(h.F.Blob).Create(ctx, e); err != nil {
@@ -300,7 +340,7 @@ func (h *Handle) setReminder(ctx context.Context, next *Manifest, reminder int64
 // stale, or an adoption's, would otherwise leave the manifest naming a time
 // the shard has nothing due at, and the dispatcher waking it for nothing. It
 // writes nothing if the manifest has that already.
-func (h *Handle) SetReminder(ctx context.Context, reminder int64) error {
+func (h *Handle) SetReminder(ctx context.Context, reminder remindex.Minute) error {
 	if err := h.settle(ctx); err != nil {
 		return err
 	}
@@ -374,7 +414,8 @@ var (
 
 // OwnedElsewhereError is ErrOwnedElsewhere with the owner's name.
 type OwnedElsewhereError struct {
-	Shard, Owner string
+	Shard shard.Name
+	Owner cluster.Node
 }
 
 func (e *OwnedElsewhereError) Error() string {
