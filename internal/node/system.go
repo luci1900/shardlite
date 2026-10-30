@@ -124,7 +124,7 @@ func (a *actor) call(ctx context.Context, req *http.Request) (*http.Response, er
 // System apps answer small.
 func (s *Server) serveSystem(w http.ResponseWriter, r *http.Request, info *reqInfo) {
 	stripShardliteHeaders(r.Header)
-	r.Header.Set(hdrTarget, info.name.String())
+	r.Header.Set(hdrOpened, info.name.String())
 	r.Header.Set(hdrHops, strconv.Itoa(info.hops))
 	if info.caller != "" {
 		r.Header.Set(hdrCaller, info.caller)

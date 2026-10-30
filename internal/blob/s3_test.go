@@ -357,6 +357,28 @@ func (f *faults) RoundTrip(r *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
+// A real store sends a time with every response, which is within seconds of the
+// process's, since the emulator runs beside it.
+func TestS3SamplesAgainstTheEmulator(t *testing.T) {
+	t.Parallel()
+	endpoint := os.Getenv("SHARDLITE_TEST_S3_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("SHARDLITE_TEST_S3_ENDPOINT is not set (docker/compose.s3.yaml runs an emulator)")
+	}
+	var got sampled
+	b := s3At(t, endpoint, func(o *blob.S3Options) { o.ClockSink = got.sink })
+	b.Head(context.Background(), "missing") // an error's response carries a time too
+	n, errs := got.counts()
+	if n == 0 || errs != 0 {
+		t.Fatalf("%d samples and %d failures from the store", n, errs)
+	}
+	s := got.samples[len(got.samples)-1]
+	// Date has whole seconds, so the store's time may trail the window by a second.
+	if s.Store.After(s.End) || s.Start.Sub(s.Store) > 2*time.Second {
+		t.Fatalf("store time %v against the window [%v, %v]", s.Store, s.Start, s.End)
+	}
+}
+
 // With the emulator behind a fault-injecting transport: a response lost after
 // the PUT reached the store is ErrUnknown, and Store recognises its own write by
 // its write id; a refused connection is ErrNotApplied.

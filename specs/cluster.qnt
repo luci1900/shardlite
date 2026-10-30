@@ -19,14 +19,6 @@
 // code: a writer writes at its next number and is fenced if anything (a fence, or another incarnation's
 // segment) took that number. An adopter fences at the first free number, which is the end of the list.
 //
-// Mirrors. A journal also lives on the node's mirrors, one per node here (the count and their presence
-// come with the coverage work): the mirror takes every segment the record takes, and it can take one the
-// record never hears of, the writer dying between the two creates (flushMirrorLost). An adoption fetches
-// before it fences (pull): the record's landed run is extended with what the mirror holds, in order, one
-// number per step, and the fence goes above what landed. Fencing first would take the number a mirror's
-// segment sits at and strand it below the fence, which the witness `stranded` shows (and the noPull
-// variant reaches).
-//
 // Compare-and-swap is by contents: a writer's CAS succeeds if the object still holds what the writer last
 // saw. That is S3's behaviour, whose ETags are the contents' MD5 (a store whose ETags change on every write
 // refuses strictly more).
@@ -36,13 +28,12 @@
 // the file set the rest.
 //
 // Tiers. The acknowledgement rides on one store: syncOn names which one the shard's kind said. With it on
-// (storage), the gate holds an answer until the record's journal has everything, as before. With it off (the
-// local tier, the node's own disk, stage 3.2's default), the gate holds until the node's local rows cover the
-// file (flushLocal), and the row whose segment the record never got (a ghost, in tail) survives the process's
-// death on the node's disk. The restart lands its own un-landed tail in the record before it fences (landTail),
-// so the acks of the local tier sit on the record again. The one loss a tier takes is a peer's cut: an adopting
-// node fences the first free number, which can be the ghost's, and the commits in the ghost are then in no
-// one's store: lostTails marks it.
+// (storage, the default), the gate holds an answer until the record's journal has everything, and ackedKept
+// says what that is worth. The answer is also confirmed: `read` takes it from the node's file, and `confirm`
+// lets it go once a read of the node's lease shows its incarnation unmarked, or a segment of its journal has
+// landed since (confirmedFresh says what that is worth). With it off (none and peer) an acknowledgement sits on
+// the node alone and `respond` answers with nothing to confirm it, so the model says nothing about its loss and
+// the exhaustive check fixes sync on.
 //
 // Variants (constants below) switch a rule to a rejected alternative, to show its counterexample. Each has an
 // instance at the end of the file.
@@ -50,26 +41,26 @@
 // Restarts. A restarting node adopts its own journal and starts its writer when the adoption finishes.
 //
 // The lifecycle of one node's shard (activation steps, the durability gate itself, the app holding the file
-// open) is shard.qnt. Here a node is active, cached or idle, and the gate is a guard on `respond`. Also left
-// out: the interior of the database, deletion, messages (messages.qnt), forwarding, rebasing, renewals and
-// sweeping the journal.
+// open) is shard.qnt, and the mirrors and their fetch are mirrors.qnt. Here a node is active, cached or idle,
+// and the gate is a guard on `respond`. Also left out: the interior of the database, deletion, messages,
+// forwarding, rebasing, renewals and sweeping the journal.
 //
 // Run:
 //   quint typecheck specs/cluster.qnt
 //   quint run specs/cluster.qnt --main=protocol --invariant=safe --max-steps=40 --max-samples=50000
 //   quint run specs/cluster.qnt --main=protocol --invariant=liveNeverFenced --max-steps=40 --max-samples=50000
-//   quint run specs/cluster.qnt --main=protocol --invariant=noLoss --max-steps=40 --max-samples=50000
-//   quint run specs/cluster.qnt --main=protocol --invariant=pullBeforeFence --max-steps=40 --max-samples=50000
+//   quint run specs/cluster.qnt --main=protocol --invariant=claimRulesAgree --max-steps=40 --max-samples=50000
+//   quint test specs/cluster.qnt --main=uncheckedConfirm --match=staleConfirm   (the same test fails under protocol)
 //   quint run specs/cluster.qnt --main=claimAfterLease --invariant=ackedKept --max-steps=40   (should fail)
 //   quint run specs/cluster.qnt --main=resumeAfterUnknown --invariant=ackedKept --max-steps=40   (should fail)
 //   quint run specs/cluster.qnt --main=restartOverrides --invariant=liveNeverFenced --max-steps=40   (should fail)
-//   quint run specs/cluster.qnt --main=noPull --invariant=pullBeforeFence --max-steps=40   (should fail)
 //   quint test specs/cluster.qnt --main=protocol
 //   quint test specs/cluster.qnt --main=claimNeedsCleared --match=cachedClaim   (should fail)
 //   quint test specs/cluster.qnt --main=claimNeedsAdopted --match=earlyClaim   (should fail)
 //
-// Simulation is the check. Bounded verification (quint verify) only reaches depth 4 in useful time with three
-// nodes, and an adoption takes at least six steps.
+// Simulation is the check on protocol: three nodes are what makes the interesting traces reachable, and
+// bounded verification (quint verify) doesn't get to an adoption's five steps in useful time at that size.
+// verifySmall, with two nodes and two commits, is the instance to try verification on.
 
 module cluster {
   const NODES: Set[int]
@@ -83,21 +74,25 @@ module cluster {
   const SYNC: Set[bool]
 
   // Variants, each switching one rule to a rejected alternative (false in the protocol). Each is rejected by a
-  // counterexample (see the stage 2.1 report).
-  //   CLAIM_AFTER_LEASE: claim a dead owner's shard as soon as its lease is invalid (the code before stage 2).
+  // counterexample, which its instance at the end of the file reaches.
+  //   CLAIM_AFTER_LEASE: claim a dead owner's shard as soon as its lease is invalid (the code's earlier rule).
   //   RESTART_OVERRIDES: a restarting node takes its lease even while another node is adopting it.
   //   RESUME_AFTER_UNKNOWN: a node whose release's outcome is unknown keeps the shard cached as its own.
   //   CLAIM_NEEDS_ADOPTED: a dead owner's shard is claimed only once its adoption has finished, even if the
   //     adopter has already cleared its journal.
   //   CLAIM_NEEDS_CLEARED: a dead owner's shard is claimed only once its manifest names no journal, whether or
   //     not its adoption has finished.
-  //   NO_PULL: an adoption fences without fetching the mirror first, the rule the fetch replaces.
+  //   CLAIM_ON_EXPIRY: claim a dead owner's shard whose manifest names no journal as soon as its lease has
+  //     expired, without a newer epoch or another incarnation's mark (the rule this model had before it took the
+  //     code's, which Handle.CheckClaimable states as ownerDead).
+  //   UNCHECKED_CONFIRM: a storage answer is confirmed without evidence (the clocks alone, as before).
   const CLAIM_AFTER_LEASE: bool
+  const CLAIM_ON_EXPIRY: bool
+  const UNCHECKED_CONFIRM: bool
   const CLAIM_NEEDS_ADOPTED: bool
   const CLAIM_NEEDS_CLEARED: bool
   const RESTART_OVERRIDES: bool
   const RESUME_AFTER_UNKNOWN: bool
-  const NO_PULL: bool
 
   type Owner =
     | NoOwner
@@ -136,17 +131,20 @@ module cluster {
     pend: int,          // a segment that landed and whose answer hasn't come: its length, -1 if none
     mseen: Manifest,    // the manifest its handle holds
     hasUnk: bool,       // it made an update whose outcome it doesn't know
-    unk: Manifest       // that update
+    unk: Manifest,      // that update
+    rd: bool,           // a storage answer was read and waits for its confirmation
+    ans: List[int],     // that answer: the commits in the node's file when it was read
+    rdseg: int,         // the length of the node's journal then
+    rdacked: Set[int]   // the commits acknowledged then
   }
 
   type Adoption = {
-    phase: int,         // 0 none, 1 marked, 2 pulled, 3 fenced, 4 read, 5 deltas written
+    phase: int,         // 0 none, 1 marked, 2 fenced, 3 read, 4 deltas written
     target: int,        // the node being adopted
     epoch: int,         // the epoch up to which it adopts
     lseen: Lease,       // the target lease as the adopter last wrote it
     landed: bool,       // its finish landed, unheard
     fence: int,         // the fence's number
-    mlen: int,          // how much the mirror held when the mark landed
     tail: List[int]     // what the journal holds for the shard
   }
 
@@ -155,7 +153,6 @@ module cluster {
     manifest: Manifest,
     leases: int -> Lease,          // by node
     journals: int -> List[Segment],  // by node
-    mirrors: int -> List[Segment],   // the mirrors' copy of each journal, by node
     // nodes
     nodes: int -> NodeState,
     adoptions: int -> Adoption,    // by adopting node
@@ -172,9 +169,9 @@ module cluster {
     handedOff: bool,     // a handoff in one write happened
     staleAnswers: bool,  // a node that isn't the manifest's owner responded
     staleReads: bool,    // a response left out a commit some client had seen acknowledged
+    staleConfirms: bool, // a confirmed answer left out a commit acknowledged before it was read
     liveStale: bool,     // a node whose lease is good responded for a shard the manifest says it doesn't own
-    liveFenced: bool,    // an adopter with a good lease fenced the journal of a node with one
-    stranded: bool       // a fence took a number a mirror's segment sits at
+    liveFenced: bool     // an adopter with a good lease fenced the journal of a node with one
   }
 
   var s: State
@@ -233,12 +230,19 @@ module cluster {
   // The claim rule: a shard with no owner, or one whose owner is dead and whose tail is known to be in the
   // snapshot (the manifest names no journal, or the owner's node has had every epoch up to the owner's
   // adopted).
+  // The owner is dead as the code sees it without comparing clocks: its node has a newer epoch, or another
+  // incarnation has marked the lease (ownerDead in internal/shardfile/manifest.go). An expired lease alone is not.
+  def codeDead(st: State, inc: int): bool = {
+    val l = st.leases.get(nodeOf(inc))
+    l.epoch > epochOf(inc) or (l.adoptedBy >= 0 and l.adoptedBy != inc)
+  }
+
   def claimable(st: State): bool =
     if (not(st.manifest.exists)) true
     else match st.manifest.owner {
       | NoOwner => true
       | Held(i) => dead(st, i) and (CLAIM_AFTER_LEASE
-                                    or (not(st.manifest.journal) and not(CLAIM_NEEDS_ADOPTED))
+                                    or (not(st.manifest.journal) and not(CLAIM_NEEDS_ADOPTED) and (CLAIM_ON_EXPIRY or codeDead(st, i)))
                                     or (st.leases.get(nodeOf(i)).adopted >= epochOf(i) and not(CLAIM_NEEDS_CLEARED)))
     }
 
@@ -253,9 +257,10 @@ module cluster {
 
   val noManifest: Manifest = { exists: false, owner: NoOwner, journal: false, snap: List() }
   val noLease: Lease = { epoch: 0, expired: false, released: false, adoptedBy: -1, adopted: -1, jnext: 0 }
-  val noAdoption: Adoption = { phase: 0, target: -1, epoch: -1, lseen: noLease, landed: false, fence: -1, mlen: 0, tail: List() }
+  val noAdoption: Adoption = { phase: 0, target: -1, epoch: -1, lseen: noLease, landed: false, fence: -1, tail: List() }
   val down: NodeState = { ready: false, active: false, cached: false, local: List(), durable: 0, base: 0, next: 0, pend: -1,
-                          mseen: noManifest, hasUnk: false, unk: noManifest }
+                          mseen: noManifest, hasUnk: false, unk: noManifest,
+                          rd: false, ans: List(), rdseg: 0, rdacked: Set() }
 
   def setManifest(st: State, m: Manifest): State = { ...st, manifest: m }
   pure def max(a: int, b: int): int = if (a > b) a else b
@@ -271,7 +276,6 @@ module cluster {
       manifest: noManifest,
       leases: NODES.mapBy(n => noLease),
       journals: NODES.mapBy(n => List()),
-      mirrors: NODES.mapBy(n => List()),
       nodes: NODES.mapBy(n => { ...down, ready: true }),
       adoptions: NODES.mapBy(n => noAdoption),
       acked: Set(),
@@ -286,9 +290,9 @@ module cluster {
       handedOff: false,
       staleAnswers: false,
       staleReads: false,
+      staleConfirms: false,
       liveStale: false,
-      liveFenced: false,
-      stranded: false
+      liveFenced: false
     }
   }
 
@@ -328,14 +332,14 @@ module cluster {
     s' = { ...withNode(s, n, { ...ns, local: ns.local.append(s.next) }), next: s.next + 1 }
   }
 
-  // A client gets a response reflecting everything in the node's file. With sync on the gate holds it until
-  // all of that is in the journal (shard.qnt checks the gate itself).
+  // A client gets a response reflecting everything in the node's file, with nothing to confirm it: the none
+  // and peer tiers, which trust the clocks. (With sync on the answer is read and confirm below.)
   action respond(n) = all {
     val ns = s.nodes.get(n)
     all {
       ns.active,
       ns.local.length() > 0,
-      (not(s.syncOn)) or ns.durable == ns.local.length(),
+      not(s.syncOn),
       s' = { ...s, acked: s.acked.union(listToSet(ns.local)),
              staleAnswers: s.staleAnswers or s.manifest.owner != Held(incOf(s, n)),
              staleReads: s.staleReads or not(s.acked.subseteq(listToSet(ns.local))),
@@ -343,12 +347,61 @@ module cluster {
     }
   }
 
+  // A storage answer is read from the node's file, and leaves once the node knows it still owned the shard
+  // after the read. The gate also holds it until everything it reflects is in the journal (shard.qnt).
+  action read(n) = all {
+    val ns = s.nodes.get(n)
+    all {
+      s.syncOn,
+      ns.active,
+      not(ns.rd),
+      ns.local.length() > 0,
+      s' = withNode(s, n, { ...ns, rd: true, ans: ns.local, rdseg: s.journals.get(n).length(), rdacked: s.acked })
+    }
+  }
+
+  // The node's own lease still shows its incarnation: not released, not marked by another incarnation, not
+  // adopted up to the epoch. Expiry doesn't matter, it is the clocks' business.
+  def leaseHolds(st: State, n: int): bool = {
+    val l = st.leases.get(n)
+    not(l.released) and (l.adoptedBy < 0 or l.adoptedBy == incOf(st, n)) and l.adopted < l.epoch
+  }
+
+  // A segment of the node's journal, from this incarnation, created since the read.
+  def segmentSince(st: State, n: int, from: int): bool = {
+    val segs = st.journals.get(n)
+    segs.indices().exists(k => k >= from and segs[k].has and segs[k].inc == incOf(st, n))
+  }
+
+  // Confirmation by a read of the lease or by a segment landing, whichever comes first. The answer goes out.
+  action confirm(n) = all {
+    val ns = s.nodes.get(n)
+    all {
+      ns.rd,
+      ns.durable >= ns.ans.length(),
+      UNCHECKED_CONFIRM or leaseHolds(s, n) or segmentSince(s, n, ns.rdseg),
+      s' = { ...withNode(s, n, { ...ns, rd: false }),
+             acked: s.acked.union(listToSet(ns.ans)),
+             staleConfirms: s.staleConfirms or not(ns.rdacked.subseteq(listToSet(ns.ans))),
+             liveStale: s.liveStale or (not(dead(s, incOf(s, n))) and s.manifest.owner != Held(incOf(s, n))) }
+    }
+  }
+
+  // The lease read finds the node's lease taken: the node stops and restarts as from a crash.
+  action confirmFail(n) = all {
+    val ns = s.nodes.get(n)
+    all {
+      ns.rd,
+      not(leaseHolds(s, n)),
+      s' = withNode(s, n, down)
+    }
+  }
+
   // -- Shipping
 
-  // The node writes a segment at its next number, and the mirror takes what the record takes. If the number
-  // is taken (a fence) the node has been fenced and its process exits. A segment can land without the writer
-  // hearing: it retries with the same write id until it hears, and the retry finds its own segment
-  // (flushAck).
+  // The node writes a segment at its next number. If the number is taken (a fence) the node has been fenced
+  // and its process exits. A segment can land without the writer hearing: it retries with the same write id
+  // until it hears, and the retry finds its own segment (flushAck).
   action flush(n) = all {
     val ns = s.nodes.get(n)
     val inc = incOf(s, n)
@@ -359,27 +412,9 @@ module cluster {
       ns.next != s.journals.get(n).length() or room(s, n),
       if (ns.next == s.journals.get(n).length())
         s' = { ...withNode(s, n, { ...ns, next: ns.next + 1, pend: ns.local.length() }),
-               journals: s.journals.put(n, s.journals.get(n).append({ inc: inc, has: true, content: ns.local })),
-               mirrors: s.mirrors.put(n, s.mirrors.get(n).append({ inc: inc, has: true, content: ns.local })) }
+               journals: s.journals.put(n, s.journals.get(n).append({ inc: inc, has: true, content: ns.local })) }
       else
         s' = { ...withNode(s, n, down), rejected: true }
-    }
-  }
-
-  // The mirror took the segment the writer built, and the record's create was lost, the writer dying before
-  // its retry: the segment exists on the mirror alone, and the fetch is what brings it back. The writer's
-  // retry of the record's create is what carries the segment in while the process lives, so the record
-  // misses a segment only past a death.
-  action flushMirrorLost(n) = all {
-    val ns = s.nodes.get(n)
-    all {
-      ns.active,
-      ns.pend < 0,
-      ns.local.length() > ns.durable,
-      ns.next == s.journals.get(n).length(),
-      room(s, n),
-      s' = { ...withNode(s, n, down),
-             mirrors: s.mirrors.put(n, s.mirrors.get(n).append({ inc: incOf(s, n), has: true, content: ns.local })) }
     }
   }
 
@@ -442,10 +477,10 @@ module cluster {
       ns.cached,
       if (casOK(s, ns)) {
         val m = { ...s.manifest, owner: NoOwner, journal: false }
-        if (learn or not(RESUME_AFTER_UNKNOWN)) s' = withNode(setManifest(s, m), n, { ...ns, cached: false, local: List(), durable: 0, base: 0, hasUnk: false })
+        if (learn or not(RESUME_AFTER_UNKNOWN)) s' = withNode(setManifest(s, m), n, { ...ns, cached: false, local: List(), durable: 0, base: 0, hasUnk: false, rd: false })
         else s' = withNode(setManifest(s, m), n, { ...ns, hasUnk: true, unk: m })
       } else
-        s' = { ...withNode(s, n, { ...ns, cached: false, local: List(), durable: 0, base: 0 }), rejected: true }
+        s' = { ...withNode(s, n, { ...ns, cached: false, local: List(), durable: 0, base: 0, rd: false }), rejected: true }
     }
   }
 
@@ -460,7 +495,7 @@ module cluster {
       ns.durable == ns.local.length(),
       if (casOK(s, ns))
         s' = withNode({ ...setManifest(s, { ...s.manifest, owner: NoOwner, journal: false, snap: ns.local }), handedOff: true }, n,
-                      { ...ns, active: false, local: List(), durable: 0, base: 0, hasUnk: false })
+                      { ...ns, active: false, local: List(), durable: 0, base: 0, hasUnk: false, rd: false })
       else
         s' = { ...s, rejected: true }
     }
@@ -508,7 +543,7 @@ module cluster {
       val nl = { ...l, epoch: l.epoch + 1, expired: false, released: false, adoptedBy: if (own) inc else -1 }
       val st = withLease(s, n, nl)
       if (own)
-        s' = withAdoption(withNode(st, n, down), n, { ...noAdoption, phase: 1, target: n, epoch: l.epoch, lseen: nl, mlen: s.mirrors.get(n).length() })
+        s' = withAdoption(withNode(st, n, down), n, { ...noAdoption, phase: 1, target: n, epoch: l.epoch, lseen: nl })
       else
         s' = withAdoption(withNode(st, n, { ...down, ready: true, next: l.jnext }), n, noAdoption)
     }
@@ -529,57 +564,25 @@ module cluster {
       dead(s, l.adoptedBy) or l.adoptedBy == a,
       val nl = { ...l, adoptedBy: a }
       val st = { ...withLease(s, x, nl), readopted: s.readopted or (l.adoptedBy >= 0 and l.adoptedBy != a) }
-      if (learn) s' = withAdoption(st, m, { ...noAdoption, phase: 1, target: x, epoch: l.epoch, lseen: nl, mlen: s.mirrors.get(x).length() })
+      if (learn) s' = withAdoption(st, m, { ...noAdoption, phase: 1, target: x, epoch: l.epoch, lseen: nl })
       else s' = st
     }
   }
 
-  // The fetch: the record's landed run is extended with what the mirror held when the mark landed, in order,
-  // one number per step, before the fence goes above it. The run stops where that held does: a number the
-  // mirror did not hold at the mark ends the copy, since a record without its numbers in order would hide
-  // the segments after the gap. The copy keeps the segment as the mirror holds it, which in the code is the
-  // write id the owner's own attempt carried.
-  //
-  // A writer that is slow rather than dead (a zombie) can hand the mirror a new segment after the mark, in
-  // the window between the fetch and the fence, and the fence can take that segment's number. The model lets
-  // it try (flushMirrorLost needs only an active writer), and that segment is one no client saw
-  // acknowledged: the record never landed it, and acknowledgements ride on the record until the coverage
-  // gate, whose loss bound rests on this ordering.
-  //
-  // The mirror's list indexes the writer's segments in order, and the record's may hold fences; with at most
-  // one adoption per journal (one epoch in the instances) the only fence sits above everything the mirror
-  // held at the mark, so the index copy is exact. The count of mirrors and their presence are the coverage
-  // work's.
-  action pull(m) = all {
-    val ad = s.adoptions.get(m)
-    all {
-      ad.phase == 1,
-      not(NO_PULL),
-      if (s.journals.get(ad.target).length() < ad.mlen)
-        s' = withAdoption(
-          { ...s, journals: s.journals.put(ad.target,
-              s.journals.get(ad.target).append(s.mirrors.get(ad.target)[s.journals.get(ad.target).length()])) },
-          m, ad)
-      else
-        s' = withAdoption(s, m, { ...ad, phase: 2 })
-    }
-  }
-
-  // Fence the journal at the first free number, above what the fetch landed. A retry of a fence whose answer
-  // was lost finds its own write id, so the adopter always learns the number. (An adopter that gives up and
-  // starts again fences again, which is harmless.) Without the fetch (NO_PULL) the fence can take a number a
-  // segment the mirror held at the mark sits at, and strands it below the fence: the witness `stranded`.
+  // Fence the journal at the first free number, above everything in it. A retry of a fence whose answer was
+  // lost finds its own write id, so the adopter always learns the number. (An adopter that gives up and starts
+  // again fences again, which is harmless.) The mirrors' copy of the journal, which the fence must not strand
+  // below it, is mirrors.qnt.
   action fence(m) = all {
     val ad = s.adoptions.get(m)
     val j = segsOf(s, ad.target)
     val live = ad.target >= 0 and ad.target != m and not(dead(s, incOf(s, m))) and not(dead(s, ad.target * 10 + leaseOf(s, ad.target).epoch))
     all {
-      ad.phase == 2 or (NO_PULL and ad.phase == 1),
+      ad.phase == 1,
       room(s, ad.target),
       s' = withAdoption({ ...s,
                           journals: s.journals.put(ad.target, j.append({ inc: -1, has: false, content: List() })),
-                          stranded: s.stranded or ad.mlen > j.length(),
-                          liveFenced: s.liveFenced or live }, m, { ...ad, phase: 3, fence: j.length() })
+                          liveFenced: s.liveFenced or live }, m, { ...ad, phase: 2, fence: j.length() })
     }
   }
 
@@ -587,8 +590,8 @@ module cluster {
   action readJournal(m) = all {
     val ad = s.adoptions.get(m)
     all {
-      ad.phase == 3,
-      s' = withAdoption(s, m, { ...ad, phase: 4, tail: latestWhere(s, ad.target, ad.fence, i => i >= 0 and nodeOf(i) == ad.target) })
+      ad.phase == 2,
+      s' = withAdoption(s, m, { ...ad, phase: 3, tail: latestWhere(s, ad.target, ad.fence, i => i >= 0 and nodeOf(i) == ad.target) })
     }
   }
 
@@ -600,12 +603,12 @@ module cluster {
     val names = mf.exists and mf.journal and (match mf.owner { | NoOwner => false | Held(i) => nodeOf(i) == ad.target })
     val more = ad.tail.length() > mf.snap.length()
     all {
-      ad.phase == 4,
+      ad.phase == 3,
       if (names and more and not(isPrefix(mf.snap, ad.tail)))
         s' = withAdoption({ ...s, forks: true }, m, noAdoption)
       else {
         val st = if (names and more) setManifest(s, { ...mf, snap: ad.tail, journal: false }) else s
-        s' = withAdoption(st, m, if (learn) { ...ad, phase: 5 } else ad)
+        s' = withAdoption(st, m, if (learn) { ...ad, phase: 4 } else ad)
       }
     }
   }
@@ -618,7 +621,7 @@ module cluster {
     val ad = s.adoptions.get(m)
     val l = leaseOf(s, ad.target)
     all {
-      ad.phase == 5,
+      ad.phase == 4,
       if (l == ad.lseen) {
         val st = withLease(s, ad.target, { ...l, adopted: ad.epoch, adoptedBy: -1, jnext: ad.fence + 1 })
         if (not(learn)) s' = withAdoption(st, m, { ...ad, landed: true })
@@ -652,8 +655,10 @@ module cluster {
       claim(n, learn),
       commit(n),
       respond(n),
+      read(n),
+      confirm(n),
+      confirmFail(n),
       flush(n),
-      flushMirrorLost(n),
       flushAck(n),
       delta(n, learn),
       deactivate(n, learn),
@@ -664,7 +669,6 @@ module cluster {
       shutdown(n),
       restart(n),
       mark(n, x, learn),
-      pull(n),
       fence(n),
       readJournal(n),
       adoptDelta(n, learn),
@@ -675,25 +679,51 @@ module cluster {
 
   // -- Scenarios
 
-  // A zombie answers a read that leaves out a commit the shard's new owner acknowledged (sync on). Node 0 owns
-  // the shard, commits and flushes, then its lease runs out while it carries on. Node 1 adopts it (fence,
-  // read, delta) and claims the shard, which the cleared journal allows before the adoption finishes, then
-  // commits, flushes and acknowledges commit 2. Node 0 answers from its file, which only has commit 1.
+  // A zombie answers a read that leaves out a commit the shard's new owner acknowledged, on a tier with
+  // nothing to confirm it (sync off: none or peer). Node 0 owns the shard, commits and flushes, then its lease
+  // runs out while it carries on. Node 1 adopts it (fence, read, delta) and claims the shard, which the cleared
+  // journal allows before the adoption finishes, then commits, flushes and acknowledges commit 2. Node 0 answers
+  // from its file, which only has commit 1.
   run staleReadTest =
-    initWith(true)
+    initWith(false)
       .then(claim(0, true)).then(commit(0)).then(flush(0)).then(flushAck(0)).then(respond(0))
       .then(expireLease(0))
-      .then(mark(1, 0, true)).then(pull(1)).then(fence(1)).then(readJournal(1)).then(adoptDelta(1, true))
+      .then(mark(1, 0, true)).then(fence(1)).then(readJournal(1)).then(adoptDelta(1, true))
       .then(claim(1, true)).then(commit(1)).then(flush(1)).then(flushAck(1)).then(respond(1))
       .then(respond(0))
       .expect(s.staleReads and safe)
+
+  // The same on the storage tier. Node 0 reads its answer, but the adopter's mark is on its lease, so no
+  // confirmation is enabled for it: the lease check fails and so does the node. (No segment of node 0's is
+  // created after the read: the journal was fenced.) Under CLAIM_ON_EXPIRY, UNCHECKED_CONFIRM this test fails.
+  run confirmedReadTest =
+    initWith(true)
+      .then(claim(0, true)).then(commit(0)).then(flush(0)).then(flushAck(0)).then(read(0)).then(confirm(0))
+      .then(expireLease(0))
+      .then(mark(1, 0, true)).then(fence(1)).then(readJournal(1)).then(adoptDelta(1, true))
+      .then(claim(1, true)).then(commit(1)).then(flush(1)).then(flushAck(1)).then(read(1)).then(confirm(1))
+      .then(read(0))
+      .expect(not(leaseHolds(s, 0)) and not(segmentSince(s, 0, s.nodes.get(0).rdseg)))
+      .then(confirmFail(0))
+      .expect(not(s.staleConfirms) and s.acked == Set(1, 2) and not(s.nodes.get(0).ready) and safe)
+
+  // The same trace with the confirmation going through, which only UNCHECKED_CONFIRM allows: the stale answer
+  // leaves, and confirmedFresh is violated.
+  run staleConfirmTest =
+    initWith(true)
+      .then(claim(0, true)).then(commit(0)).then(flush(0)).then(flushAck(0)).then(read(0)).then(confirm(0))
+      .then(expireLease(0))
+      .then(mark(1, 0, true)).then(fence(1)).then(readJournal(1)).then(adoptDelta(1, true))
+      .then(claim(1, true)).then(commit(1)).then(flush(1)).then(flushAck(1)).then(read(1)).then(confirm(1))
+      .then(read(0)).then(confirm(0))
+      .expect(s.staleConfirms)
 
   // The same, until the end: node 1's claim needs only the cleared journal, and the adoption finishes later.
   run earlyClaimTest =
     initWith(true)
       .then(claim(0, true)).then(commit(0)).then(flush(0)).then(flushAck(0))
       .then(expireLease(0))
-      .then(mark(1, 0, true)).then(pull(1)).then(fence(1)).then(readJournal(1)).then(adoptDelta(1, true))
+      .then(mark(1, 0, true)).then(fence(1)).then(readJournal(1)).then(adoptDelta(1, true))
       .then(claim(2, true))
       .then(finish(1, true))
       .expect(s.earlyClaims and s.leases.get(0).adopted == 0 and safe)
@@ -705,7 +735,7 @@ module cluster {
     initWith(true)
       .then(claim(0, true)).then(commit(0)).then(flush(0)).then(flushAck(0)).then(deactivate(0, true))
       .then(expireLease(0))
-      .then(mark(1, 0, true)).then(pull(1)).then(fence(1)).then(readJournal(1)).then(adoptDelta(1, true)).then(finish(1, true))
+      .then(mark(1, 0, true)).then(fence(1)).then(readJournal(1)).then(adoptDelta(1, true)).then(finish(1, true))
       .then(claim(2, true))
       .expect(s.namedClaims and s.nodes.get(2).local == List(1) and safe)
 
@@ -714,17 +744,6 @@ module cluster {
   // With sync on, no client has seen a commit acknowledged that a restore would now lose. A fork shows up
   // here: a commit written by a node that wasn't the owner is not in the chain the owner's successor reads.
   val ackedKept = s.syncOn implies s.acked.forall(c => listToSet(truth(s)).contains(c))
-
-  // Nothing acknowledged is lost while the cluster holds it: what a restore reads has the commit, or a
-  // mirror still does, and the fetch puts it back before the fence. With sync off an acknowledgement sits on
-  // the node's disk alone, which the loss of the host takes (that is what the mode means), so the mirror
-  // clause says nothing there either; acknowledgements ride on the record until the coverage gate, whose
-  // loss bound rests on this.
-  pure def holdsSeg(l: List[Segment], c: int): bool =
-    l.indices().filter(i => l[i].has and listToSet(l[i].content).contains(c)).size() > 0
-
-  val noLoss = s.syncOn implies s.acked.forall(c => listToSet(truth(s)).contains(c) or
-    NODES.exists(n => holdsSeg(s.mirrors.get(n), c)))
 
   // The owner's journal and the snapshot are one history: one is a prefix of the other.
   val ownerChain = match s.manifest.owner {
@@ -762,6 +781,9 @@ module cluster {
   // depend on it, since a zombie acknowledges nothing that fencing doesn't keep.)
   val liveOwnerAnswers = not(s.liveStale)
 
+  // A confirmed answer holds every commit acknowledged before it was read.
+  val confirmedFresh = not(s.staleConfirms)
+
   val safe = and {
     ackedKept,
     ownerChain,
@@ -770,7 +792,16 @@ module cluster {
     noRepeats,
     noForks,
     adoptedCovered,
-    liveOwnerAnswers
+    liveOwnerAnswers,
+    confirmedFresh
+  }
+
+  // The looser claim rule (CLAIM_ON_EXPIRY) never differs from the code's here: a manifest names no journal
+  // only after an adopter has cleared it, and the adopter's mark stays on the lease until a newer epoch or the
+  // adoption's end. So no reachable state has an owner dead only by expiry and a journal-less manifest.
+  val claimRulesAgree = match s.manifest.owner {
+    | NoOwner => true
+    | Held(i) => not(s.manifest.exists and not(s.manifest.journal) and dead(s, i)) or codeDead(s, i) or s.leases.get(nodeOf(i)).adopted >= epochOf(i)
   }
 
   // Not safety, but what keeps a restart from being undone: an adopter whose lease is good never fences the
@@ -778,12 +809,8 @@ module cluster {
   // node it fences restarts.)
   val liveNeverFenced = not(s.liveFenced)
 
-  // The fetch precedes the fence: an adoption fences only once the record has everything the mirror held
-  // when the mark landed, so no segment the cluster held at the mark is stranded below the fence. noPull's
-  // counterexample reaches it.
-  val pullBeforeFence = not(s.stranded)
-
   // Witnesses: each should be violated, which shows the state is reachable.
+  val neverReading = NODES.forall(n => not(s.nodes.get(n).rd))
   val neverBActive = not(s.nodes.get(1).active)
   val neverAdopted = NODES.forall(n => s.leases.get(n).adopted < 0)
   val neverAdoptedByOther = NODES.forall(n => not(s.leases.get(n).adopted == s.leases.get(n).epoch and not(s.leases.get(n).released)))
@@ -807,41 +834,64 @@ module cluster {
 module protocol {
   import cluster(NODES = Set(0, 1, 2), MAX_COMMITS = 3, MAX_SEGS = 4, SYNC = Set(true, false),
                  CLAIM_AFTER_LEASE = false, RESTART_OVERRIDES = false, RESUME_AFTER_UNKNOWN = false,
-                 CLAIM_NEEDS_ADOPTED = false, CLAIM_NEEDS_CLEARED = false, NO_PULL = false).*
+                 CLAIM_NEEDS_ADOPTED = false, CLAIM_NEEDS_CLEARED = false,
+                 CLAIM_ON_EXPIRY = false, UNCHECKED_CONFIRM = false).*
+}
+
+// The smallest instance worth verifying: two nodes, sync on (with it off ackedKept says nothing), room for
+// one adoption on each side.
+module verifySmall {
+  import cluster(NODES = Set(0, 1), MAX_COMMITS = 2, MAX_SEGS = 2, SYNC = Set(true),
+                 CLAIM_AFTER_LEASE = false, RESTART_OVERRIDES = false, RESUME_AFTER_UNKNOWN = false,
+                 CLAIM_NEEDS_ADOPTED = false, CLAIM_NEEDS_CLEARED = false,
+                 CLAIM_ON_EXPIRY = false, UNCHECKED_CONFIRM = false).*
 }
 
 module claimAfterLease {
   import cluster(NODES = Set(0, 1, 2), MAX_COMMITS = 3, MAX_SEGS = 4, SYNC = Set(true, false),
                  CLAIM_AFTER_LEASE = true, RESTART_OVERRIDES = false, RESUME_AFTER_UNKNOWN = false,
-                 CLAIM_NEEDS_ADOPTED = false, CLAIM_NEEDS_CLEARED = false, NO_PULL = false).*
+                 CLAIM_NEEDS_ADOPTED = false, CLAIM_NEEDS_CLEARED = false,
+                 CLAIM_ON_EXPIRY = false, UNCHECKED_CONFIRM = false).*
 }
 
 module restartOverrides {
   import cluster(NODES = Set(0, 1, 2), MAX_COMMITS = 3, MAX_SEGS = 4, SYNC = Set(true, false),
                  CLAIM_AFTER_LEASE = false, RESTART_OVERRIDES = true, RESUME_AFTER_UNKNOWN = false,
-                 CLAIM_NEEDS_ADOPTED = false, CLAIM_NEEDS_CLEARED = false, NO_PULL = false).*
+                 CLAIM_NEEDS_ADOPTED = false, CLAIM_NEEDS_CLEARED = false,
+                 CLAIM_ON_EXPIRY = false, UNCHECKED_CONFIRM = false).*
 }
 
 module resumeAfterUnknown {
   import cluster(NODES = Set(0, 1, 2), MAX_COMMITS = 3, MAX_SEGS = 4, SYNC = Set(true, false),
                  CLAIM_AFTER_LEASE = false, RESTART_OVERRIDES = false, RESUME_AFTER_UNKNOWN = true,
-                 CLAIM_NEEDS_ADOPTED = false, CLAIM_NEEDS_CLEARED = false, NO_PULL = false).*
+                 CLAIM_NEEDS_ADOPTED = false, CLAIM_NEEDS_CLEARED = false,
+                 CLAIM_ON_EXPIRY = false, UNCHECKED_CONFIRM = false).*
 }
 
 module claimNeedsAdopted {
   import cluster(NODES = Set(0, 1, 2), MAX_COMMITS = 3, MAX_SEGS = 4, SYNC = Set(true, false),
                  CLAIM_AFTER_LEASE = false, RESTART_OVERRIDES = false, RESUME_AFTER_UNKNOWN = false,
-                 CLAIM_NEEDS_ADOPTED = true, CLAIM_NEEDS_CLEARED = false, NO_PULL = false).*
+                 CLAIM_NEEDS_ADOPTED = true, CLAIM_NEEDS_CLEARED = false,
+                 CLAIM_ON_EXPIRY = false, UNCHECKED_CONFIRM = false).*
 }
 
 module claimNeedsCleared {
   import cluster(NODES = Set(0, 1, 2), MAX_COMMITS = 3, MAX_SEGS = 4, SYNC = Set(true, false),
                  CLAIM_AFTER_LEASE = false, RESTART_OVERRIDES = false, RESUME_AFTER_UNKNOWN = false,
-                 CLAIM_NEEDS_ADOPTED = false, CLAIM_NEEDS_CLEARED = true, NO_PULL = false).*
+                 CLAIM_NEEDS_ADOPTED = false, CLAIM_NEEDS_CLEARED = true,
+                 CLAIM_ON_EXPIRY = false, UNCHECKED_CONFIRM = false).*
 }
 
-module noPull {
+module claimOnExpiry {
   import cluster(NODES = Set(0, 1, 2), MAX_COMMITS = 3, MAX_SEGS = 4, SYNC = Set(true, false),
                  CLAIM_AFTER_LEASE = false, RESTART_OVERRIDES = false, RESUME_AFTER_UNKNOWN = false,
-                 CLAIM_NEEDS_ADOPTED = false, CLAIM_NEEDS_CLEARED = false, NO_PULL = true).*
+                 CLAIM_NEEDS_ADOPTED = false, CLAIM_NEEDS_CLEARED = false,
+                 CLAIM_ON_EXPIRY = true, UNCHECKED_CONFIRM = false).*
+}
+
+module uncheckedConfirm {
+  import cluster(NODES = Set(0, 1, 2), MAX_COMMITS = 3, MAX_SEGS = 4, SYNC = Set(true, false),
+                 CLAIM_AFTER_LEASE = false, RESTART_OVERRIDES = false, RESUME_AFTER_UNKNOWN = false,
+                 CLAIM_NEEDS_ADOPTED = false, CLAIM_NEEDS_CLEARED = false,
+                 CLAIM_ON_EXPIRY = false, UNCHECKED_CONFIRM = true).*
 }

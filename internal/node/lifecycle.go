@@ -187,7 +187,7 @@ func (a *actor) startCapture(ctx context.Context, restored *capture.Restored) er
 	sh, err := capture.New(capture.Config{
 		Name: a.Name, Path: a.Path, Generation: a.h.Manifest.Generation,
 		Writer: d.writer, Restored: restored, Logger: d.log, Durable: d.flush.WaitCycle,
-		TempDir: d.tempDir, SpoolLimit: uint64(d.spool),
+		TempDir:          d.tempDir,
 		ChecksumMismatch: func(_, _ ltx.Checksum) { d.stats.ChecksumMismatches.Add(1) },
 	})
 	if err != nil {
@@ -221,7 +221,7 @@ func (a *actor) resume(ctx context.Context, old *capture.Shard) error {
 	// deadline passed). Capture has to be back whatever happens: a shard left with
 	// a closed database can never be let go of.
 	ctx = context.WithoutCancel(ctx)
-	err := a.startCapture(ctx, &capture.Restored{Position: old.Position(), Tail: old.Tail(), Checksums: old.Checksums()})
+	err := a.startCapture(ctx, &capture.Restored{Position: old.Position(), Tail: old.TakeTail(), Checksums: old.Checksums()})
 	old.Discard() // the new capture holds the tail's files now (or New gave them up)
 	return err
 }

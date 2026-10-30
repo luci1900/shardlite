@@ -39,14 +39,14 @@ func TestDurableSendBetweenNodes(t *testing.T) {
 	var seen []http.Header // the receiver's requests for /work
 
 	n0.serve(func(w http.ResponseWriter, q *http.Request) {
-		path := q.Header.Get("Shardlite-Path")
+		path := q.Header.Get("Shardlite-File")
 		if q.URL.Path != remindersPath {
 			paths <- path
 			return
 		}
 		// The sender's wake handler.
 		wakes.Add(1)
-		self := q.Header.Get("Shardlite-Target")
+		self := q.Header.Get("Shardlite-Opened")
 		out, err := app.Do("query", "q", path, `SELECT group_concat(r.key || '|' || s.target || '|' || s.path || '|' || s.body, ';') FROM _shardlite_reminders r JOIN sends s ON s.key = r.key WHERE r.due <= unixepoch()`)
 		if err != nil {
 			t.Error(err)
@@ -86,7 +86,7 @@ func TestDurableSendBetweenNodes(t *testing.T) {
 	})
 	n1.serve(func(w http.ResponseWriter, q *http.Request) {
 		if q.URL.Path != "/work" {
-			paths <- q.Header.Get("Shardlite-Path")
+			paths <- q.Header.Get("Shardlite-File")
 			return
 		}
 		mu.Lock()
@@ -97,7 +97,7 @@ func TestDurableSendBetweenNodes(t *testing.T) {
 			return
 		}
 		b, _ := io.ReadAll(q.Body)
-		path := q.Header.Get("Shardlite-Path")
+		path := q.Header.Get("Shardlite-File")
 		// The receiver's work and its record of the call, in one transaction.
 		_, err := app.Do("exec", path, `BEGIN; INSERT OR IGNORE INTO seen (caller, key) VALUES ('`+q.Header.Get("Shardlite-Caller")+`', '`+q.Header.Get("Idempotency-Key")+`'); INSERT INTO work (payload) SELECT '`+string(b)+`' WHERE changes() > 0; COMMIT;`)
 		if err != nil {

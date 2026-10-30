@@ -110,11 +110,11 @@ type Deps struct {
 // migrations: the kind has no tables of its own.
 var migrations embed.FS
 
-// New returns the _dispatch kind. Its tier is the node's own disk: nothing
-// acts on its answers, so it waits for the cheapest tier there is.
+// New returns the _dispatch kind. Its tier is none: nothing acts on
+// its answers, and a lost flush only repeats a dispatch.
 func New(d Deps, opts Options) kind.Kind {
 	p := newDispatcher(d, opts)
-	return kind.Kind{Name: kind.SystemKind("dispatch"), Sync: kind.SyncLocal, IDs: []shard.ID{"_cluster"}, Migrations: migrations, Handler: p.handler}
+	return kind.Kind{Name: kind.SystemKind("dispatch"), Sync: kind.SyncNone, IDs: []shard.ID{"_cluster"}, Migrations: migrations, Handler: p.handler}
 }
 
 func newDispatcher(d Deps, opts Options) *dispatcher {

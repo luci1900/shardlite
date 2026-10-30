@@ -65,9 +65,9 @@ func New(store *blob.Store, check func() error, now func() time.Time, log *slog.
 		opts.Every = 24 * time.Hour
 	}
 	sw := &sweeper{store: store, manifests: shardfile.NewManifestStore(store), check: check, now: now, log: log, opts: opts}
-	// The local tier: a cursor a host loss loses only repeats a batch, and nothing acts
-	// on the sweeper's answers.
-	return kind.Kind{Name: kind.SystemKind("sweep"), Sync: kind.SyncLocal, IDs: []shard.ID{"_cluster"}, Migrations: migrations, Handler: sw.handler}
+	// The none tier: a cursor a crash loses only repeats a batch, and nothing acts on the
+	// sweeper's answers.
+	return kind.Kind{Name: kind.SystemKind("sweep"), Sync: kind.SyncNone, IDs: []shard.ID{"_cluster"}, Migrations: migrations, Handler: sw.handler}
 }
 
 type sweeper struct {

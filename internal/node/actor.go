@@ -18,6 +18,7 @@ import (
 	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/system"
+	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
 // LifecycleOptions configure each shard's lifecycle loop: its idle and delta
@@ -52,8 +53,7 @@ type actorDeps struct {
 	rem     *reminders
 	files   *shardfile.Files
 	writer  *segment.Writer
-	tempDir string // the node's temporary files (Config.TempDir)
-	spool   int    // Config.SpoolLimit
+	tempDir *tempfile.Dir // the node's temporary files (Config.TempDir)
 
 	// deletedKinds holds the kinds that have had a shard deleted for holding
 	// nothing since this process started, so only the first of each is logged at
@@ -114,7 +114,7 @@ type actor struct {
 func newActor(d *actorDeps, e *entry) *actor {
 	a := &actor{d: d, e: e, Name: e.name, ops: make(chan func()), ready: make(chan struct{}), ended: make(chan struct{})}
 	if a.sys = d.sys[a.Name.Kind()]; a.sys != nil {
-		a.app = a.sys.Handler(&system.System{Name: a.Name, Tx: a.tx, Call: a.call, Sync: func(ctx context.Context) error { return a.gate(ctx, a.sys.Sync) }})
+		a.app = a.sys.Handler(&system.System{Name: a.Name, Tx: a.tx, Call: a.call, Sync: func(ctx context.Context) error { return a.gate(ctx, kind.SyncStorage, false) }})
 	}
 	return a
 }

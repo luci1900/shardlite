@@ -13,6 +13,7 @@ import (
 	"github.com/luci1900/shardlite/internal/journal"
 	"github.com/luci1900/shardlite/internal/node"
 	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
 // A node whose previous life another node adopted has nothing to adopt: it
@@ -35,7 +36,7 @@ func TestRestartAfterAnotherNodeAdoptedIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	files2 := &shardfile.Files{Blob: blob.NewStore(r.local, "n2", l2.Epoch, blob.Options{Backoff: time.Millisecond}), Backend: r.local, Node: "n2",
-		JournalOptions: journal.Options{Backoff: time.Millisecond}, Leases: reg2, TempDir: t.TempDir()}
+		JournalOptions: journal.Options{Backoff: time.Millisecond}, Leases: reg2, Temp: tempfile.NewDir(t.TempDir())}
 	marked, err := reg2.Adopt(ctx, dead, l2.Incarnation())
 	if err != nil {
 		t.Fatal(err)

@@ -16,6 +16,7 @@ import (
 	"github.com/luci1900/shardlite/internal/coord"
 	"github.com/luci1900/shardlite/internal/notify"
 	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
 // runScan serves a lease scan for node "w" (epoch 1) on b until the test ends.
@@ -25,7 +26,7 @@ func runScan(t *testing.T, b blob.Backend, opts LeaseScanOptions) *leaseScan {
 	reg := coord.NewRegistry(b, "w", coord.RegistryOptions{})
 	store := blob.NewStore(b, "w", 1, blob.Options{})
 	s := &leaseScan{
-		reg: reg, files: &shardfile.Files{Blob: store, Backend: b, Node: "w", Leases: reg, TempDir: t.TempDir()}, store: store,
+		reg: reg, files: &shardfile.Files{Blob: store, Backend: b, Node: "w", Leases: reg, Temp: tempfile.NewDir(t.TempDir())}, store: store,
 		self: func() coord.Incarnation { return coord.Incarnation{Node: "w", Epoch: 1} }, nodeErr: func() error { return nil },
 		clock: realClock{}, opts: opts, log: slog.New(slog.DiscardHandler), scans: &notify.Counter{}, adopted: &notify.Counter{},
 	}

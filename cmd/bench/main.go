@@ -1,5 +1,5 @@
 // Command bench measures the node in front of the e2e app: requests per
-// second and latency for active shards, with sync local (users) and sync
+// second and latency for active shards, with sync none (users) and sync
 // storage (wallet). It starts its own node and app for each kind, activates
 // the shards, then drives closed-loop load. The numbers are relative: the load
 // generator, the node and the app share the machine.
@@ -153,7 +153,7 @@ func main() {
 	fmt.Println("| kind | sync | operation | requests/s | p50 | p95 | p99 | max | errors | node CPU |")
 	fmt.Println("|---|---|---|---|---|---|---|---|---|---|")
 	for _, r := range results {
-		sync := "local"
+		sync := "none"
 		if r.kind == "wallet" {
 			sync = "storage"
 		}
@@ -194,7 +194,7 @@ func run(root, kind string) []result {
 	// What the app declares at its ready route: the file is a stand-in for the
 	// app's own, checked into its repository.
 	df := filepath.Join(d, "declaration.json")
-	os.WriteFile(df, []byte(`{"app": "bench", "kinds": {"users": {"public": true, "sync": "local", "idle_timeout": "1h"}, "wallet": {"public": true, "idle_timeout": "1h"}}}`), 0o644)
+	os.WriteFile(df, []byte(`{"app": "bench", "kinds": {"users": {"public": true, "sync": "none", "idle_timeout": "1h"}, "wallet": {"public": true, "idle_timeout": "1h"}}}`), 0o644)
 	pub, ctl := freeAddr(), freeAddr()
 	// The app keeps each shard's database open (its idle close is long) so the measurement is of serving, not of reopening.
 	app := start(*appBin, nil, "-listen", "127.0.0.1:0", "-control", ctl, "-idle-close", "10m", "-declare", df)
@@ -212,7 +212,7 @@ func run(root, kind string) []result {
 
 	client := &http.Client{Timeout: 60 * time.Second, Transport: &http.Transport{MaxIdleConnsPerHost: *clients * 2, MaxIdleConns: *clients * 2}}
 	do := func(method, path, target, body string) error {
-		q, _ := http.NewRequest(method, "http://"+pub+path, strings.NewReader(body))
+		q, _ := http.NewRequest(method, "http://"+pub+"/"+target+path, strings.NewReader(body))
 		q.Header.Set("Shardlite-Target", target)
 		resp, err := client.Do(q)
 		if err != nil {

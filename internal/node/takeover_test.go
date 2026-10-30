@@ -20,6 +20,7 @@ import (
 	"github.com/luci1900/shardlite/internal/service"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
+	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
 const takeoverTTL = time.Second
@@ -50,7 +51,7 @@ func startCluster(t *testing.T, b blob.Backend, name cluster.Node, live bool) *c
 	c := &cnode{Node: n, tails: &TailSet{}}
 	n.SetTails(c.tails)
 	if live {
-		t.Cleanup(service.Background(slog.Default(), n.Writer, n.Keeper))
+		t.Cleanup(service.Background(slog.Default(), n.Writer, n.Keeper, n.Confirmer))
 	} else {
 		t.Cleanup(service.Background(slog.Default(), n.Writer))
 	}
@@ -89,7 +90,7 @@ func (c *cnode) shard(t *testing.T, name string) *capturedShard {
 	if err != nil || !created {
 		t.Fatalf("open %s: %v", name, err)
 	}
-	if s.sh, err = capture.New(capture.Config{Name: shardName(name), Path: s.path, Generation: h.Manifest.Generation, Writer: c.Writer}); err != nil {
+	if s.sh, err = capture.New(capture.Config{Name: shardName(name), Path: s.path, Generation: h.Manifest.Generation, Writer: c.Writer, TempDir: tempfile.NewDir(t.TempDir())}); err != nil {
 		t.Fatal(err)
 	}
 	c.tails.Track(s.sh)

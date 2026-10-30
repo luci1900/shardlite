@@ -126,12 +126,12 @@ func (d *DB) ClearIndex(ctx context.Context) error {
 }
 
 // Persistent reports whether the database is a file on disk. A database that
-// isn't holds nothing across a restart, so the node has no local tier.
+// isn't holds nothing across a restart, so the node has no local store.
 func (d *DB) Persistent() bool { return d.path != "" }
 
 // Memory returns a database that is not on disk: the cache index's rows live
 // in it and go when the process does. It is what a node falls back to when its
-// local database cannot be opened, which costs the local tier and the cache
+// local database cannot be opened, which costs the local store and the cache
 // and nothing else.
 func Memory() (*DB, error) {
 	db, err := sql.Open("sqlite", "file::memory:?_pragma=busy_timeout(5000)&_pragma=synchronous(FULL)&_txlock=immediate")

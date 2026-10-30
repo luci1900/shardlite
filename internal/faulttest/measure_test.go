@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -120,18 +121,56 @@ func TestMeasureMemory(t *testing.T) {
 	}
 }
 
-// dirSize is the size of every file under dir.
-func dirSize(dir string) int64 {
-	var n int64
-	filepath.WalkDir(dir, func(_ string, d os.DirEntry, err error) error {
-		if err == nil && !d.IsDir() {
-			if fi, err := d.Info(); err == nil {
-				n += fi.Size()
-			}
+// openTemp is the size, and the number, of the files the process holds open
+// under dir: the unnamed temporary files the node keeps tails, deltas and
+// downloads in, which a listing of dir never shows. A file held through several
+// descriptors (a log and its dups) is counted once. Linux only: it reads
+// /proc/<pid>/fd, and is zero elsewhere.
+func openTemp(pid int, dir string) (bytes int64, files int) {
+	ents, err := os.ReadDir(fmt.Sprintf("/proc/%d/fd", pid))
+	if err != nil {
+		return 0, 0
+	}
+	seen := map[uint64]bool{}
+	for _, e := range ents {
+		link := fmt.Sprintf("/proc/%d/fd/%s", pid, e.Name())
+		target, err := os.Readlink(link)
+		if err != nil || !strings.HasPrefix(target, dir+"/") {
+			continue
 		}
-		return nil
-	})
-	return n
+		fi, err := os.Stat(link) // follows to the file, named or not
+		if err != nil {
+			continue
+		}
+		st, ok := fi.Sys().(*syscall.Stat_t)
+		if !ok || seen[uint64(st.Ino)] {
+			continue
+		}
+		seen[uint64(st.Ino)] = true
+		bytes += fi.Size()
+	}
+	return bytes, len(seen)
+}
+
+// writtenBytes is the process's write_bytes from /proc/<pid>/io: what it has
+// caused to be written to storage, or -1 off Linux.
+func writtenBytes(pid int) int64 {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/io", pid))
+	if err != nil {
+		return -1
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if f := strings.Fields(line); len(f) == 2 && f[0] == "write_bytes:" {
+			n, _ := strconv.ParseInt(f[1], 10, 64)
+			return n
+		}
+	}
+	return -1
+}
+
+func tempBytes(n *apptest.App, dir string) int64 {
+	b, _ := openTemp(n.Pid(), dir)
+	return b
 }
 
 // shmem is the Shmem line of /proc/meminfo (tmpfs and shared memory), in bytes,
@@ -150,19 +189,25 @@ func shmem() int64 {
 	return -1
 }
 
-// watch samples the temporary directory and Shmem while something runs, and
-// reports the highest of each.
+// watch samples the node's open temporary files and Shmem while something runs,
+// and reports the highest of each, with the bytes the node wrote meanwhile.
 type watcher struct {
 	stop      chan struct{}
 	done      chan struct{}
 	temp, shm int64
+	files     int
+	pid       int
+	wrote0    int64
+	wrote     int64
 }
 
-func watch(temp string) *watcher {
-	w := &watcher{stop: make(chan struct{}), done: make(chan struct{})}
+func watch(temp string, pid int) *watcher {
+	w := &watcher{stop: make(chan struct{}), done: make(chan struct{}), pid: pid, wrote0: writtenBytes(pid)}
 	base := shmem()
 	sample := func() {
-		w.temp = max(w.temp, dirSize(temp))
+		bytes, files := openTemp(pid, temp)
+		w.temp, w.files = max(w.temp, bytes), max(w.files, files)
+		w.wrote = writtenBytes(pid)
 		if base >= 0 {
 			w.shm = max(w.shm, shmem()-base)
 		}
@@ -185,7 +230,10 @@ func watch(temp string) *watcher {
 func (w *watcher) Stop() *watcher { close(w.stop); <-w.done; return w }
 
 func (w *watcher) String() string {
-	s := fmt.Sprintf("temporary files peak %.0f MB", float64(w.temp)/(1<<20))
+	s := fmt.Sprintf("open temporary files peak %.0f MB in %d files", float64(w.temp)/(1<<20), w.files)
+	if w.wrote0 >= 0 {
+		s += fmt.Sprintf(", node wrote %.0f MB", float64(w.wrote-w.wrote0)/(1<<20))
+	}
 	if w.shm >= 0 && w.shm != 0 {
 		s += fmt.Sprintf(", Shmem peak +%.0f MB", float64(w.shm)/(1<<20))
 	}
@@ -254,7 +302,7 @@ func TestMeasureStage1z(t *testing.T) {
 	os.RemoveAll(tmp)
 
 	n := start()
-	w := watch(tmp)
+	w := watch(tmp, n.Pid())
 	how := n.Must(t, "open", shardName, path)
 	w.Stop()
 	t.Logf("1. restore and activate a %.0f MB shard: %s", float64(fi.Size())/(1<<20), how)
@@ -266,7 +314,7 @@ func TestMeasureStage1z(t *testing.T) {
 		app.Must(t, "insert", "a", "10", "1000")
 		n.Must(t, "sync", shardName)
 	}
-	t.Logf("   after three commits: temporary files %.1f MB, node peak memory %.0f MB", float64(dirSize(tmp))/(1<<20), rss(n))
+	t.Logf("   after three commits: open temporary files %.1f MB, node peak memory %.0f MB", float64(tempBytes(n, tmp))/(1<<20), rss(n))
 	app.Must(t, "close", "a")
 	app.Exit()
 	n.Must(t, "close", shardName)
@@ -281,7 +329,7 @@ func TestMeasureStage1z(t *testing.T) {
 	n.Must(t, "open", name2, path2)
 	n.Must(t, "sync", name2) // the first sync of a new shard is its (empty) first position, as at activation
 	rows := mb               // rows of 1 MB
-	w = watch(tmp)
+	w = watch(tmp, n.Pid())
 	t0 = time.Now()
 	app.Must(t, "insert", "a", strconv.Itoa(rows), "1000000")
 	imported := time.Since(t0)
@@ -290,14 +338,14 @@ func TestMeasureStage1z(t *testing.T) {
 	w.Stop()
 	t.Logf("2a. import of %d MB in one transaction: app %v, through the sync %v", rows, imported.Round(time.Millisecond), synced.Round(time.Millisecond))
 	t.Logf("    node peak memory %.0f MB after the sync; %s", rss(n), w)
-	w = watch(tmp)
+	w = watch(tmp, n.Pid())
 	t0 = time.Now()
 	n.Must(t, "delta", name2)
 	w.Stop()
 	t.Logf("2b. its delta: %v, node peak memory %.0f MB; %s", time.Since(t0).Round(time.Millisecond), rss(n), w)
-	t.Logf("    temporary files now: %.1f MB", float64(dirSize(tmp))/(1<<20))
+	t.Logf("    open temporary files now: %.1f MB", float64(tempBytes(n, tmp))/(1<<20))
 
-	w = watch(tmp)
+	w = watch(tmp, n.Pid())
 	t0 = time.Now()
 	app.Must(t, "exec", "a", "VACUUM")
 	n.Must(t, "sync", name2)
@@ -305,7 +353,7 @@ func TestMeasureStage1z(t *testing.T) {
 	n.Must(t, "delta", name2)
 	w.Stop()
 	t.Logf("2d. VACUUM through its delta: %v, node peak memory %.0f MB; %s", time.Since(t0).Round(time.Millisecond), rss(n), w)
-	t.Logf("    temporary files now: %.1f MB", float64(dirSize(tmp))/(1<<20))
+	t.Logf("    open temporary files now: %.1f MB", float64(tempBytes(n, tmp))/(1<<20))
 	app.Must(t, "close", "a")
 	app.Exit()
 	n.Must(t, "close", name2)

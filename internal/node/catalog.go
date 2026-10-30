@@ -204,7 +204,7 @@ func NewCatalog(n *Node, opts CatalogOptions, newRouting func(*Catalog) routing)
 	}
 	rt = newRouting(m)
 	m.rem = newReminders(opts.Reminders, clk, log, st, rt.wake)
-	m.flush = newFlusher(m.tab, n.Writer, n.Keeper, log, opts.Flush)
+	m.flush = newFlusher(m.tab, n.Writer, n.Keeper, n.Confirmer, n.Clock, log, opts.Flush)
 	m.leases = &leaseScan{
 		reg: n.Registry, files: n.Files, store: n.Store, nodeErr: n.Err,
 		self:  func() coord.Incarnation { l := n.Keeper.Lease(); return l.Incarnation() },
@@ -221,7 +221,7 @@ func NewCatalog(n *Node, opts CatalogOptions, newRouting func(*Catalog) routing)
 	m.deps = &actorDeps{
 		opts: opts.Lifecycle, kinds: opts.Kinds, sys: sys, call: rt.call, clock: clk, log: log, stats: st,
 		tab: m.tab, cache: m.cache, flush: m.flush, rem: m.rem,
-		files: n.Files, writer: n.Writer, tempDir: n.TempDir, spool: n.SpoolLimit,
+		files: n.Files, writer: n.Writer, tempDir: n.Files.Temp,
 		base:          base,
 		deactivations: make(chan struct{}, opts.limits.deactivate),
 		snapshots:     make(chan struct{}, opts.limits.snapshot),
@@ -422,9 +422,14 @@ type Hold struct {
 	m    *Catalog
 	a    *actor
 	once sync.Once
+	// proven is set once a storage chunk has passed the gate: the node then
+	// knew it still owned its shards after that chunk was read, which is after
+	// the request began, and the shard's file only grows. Later chunks of the
+	// request have nothing more to prove, only to wait for their own commits.
+	proven atomic.Bool
 }
 
-// Path is the opaque path of the shard's file, for Shardlite-Path.
+// Path is the opaque path of the shard's file, for Shardlite-File.
 func (h *Hold) Path() string { return h.a.Path }
 
 // Sync is the shard's kind's durability tier: where its output waits for the

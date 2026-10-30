@@ -120,10 +120,10 @@ func (c *testCluster) newNode(name string) *clusterNode {
 }
 
 const clusterKinds = `{"app": "test", "kinds": {
-	"users":  {"public": true, "sync": "local", "idle_timeout": "1h"},
+	"users":  {"public": true, "sync": "none", "idle_timeout": "1h"},
 	"wallet": {"public": true, "idle_timeout": "1h"},
 	"audit":  {"idle_timeout": "1h"},
-	"brief":  {"public": true, "sync": "local", "idle_timeout": "100ms"}
+	"brief":  {"public": true, "sync": "none", "idle_timeout": "100ms"}
 }}`
 
 // create creates a shard on the node, as an app's call would, without asking the

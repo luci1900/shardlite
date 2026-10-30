@@ -286,10 +286,10 @@ func (s *leaseScan) adopt(ctx context.Context, x cluster.Node, w *leaseWatch) {
 		return
 	}
 	s.log.Info("adopting a dead node", "node", x, "epoch", l.Epoch, "readopted", l.AdoptedBy != nil)
-	// The fetch (docs/internals.md, Takeover): the mirrors are asked before
+	// The fetch (docs/internals.md, Takeover): the peer is asked before
 	// the fence is written, inside AdoptJournal, since a fence over a number a
-	// mirror holds would strand what the cluster still has.
-	rep, err := s.files.AdoptJournal(ctx, x, l.JournalFrom, l.JournalNext, s.mirror.stores(ctx, *l, s.log), s.log)
+	// peer holds would strand what the cluster still has.
+	rep, err := s.files.AdoptJournal(ctx, x, l.JournalFrom, l.JournalNext, s.mirror.dial(ctx, x, l.Epoch, l.Peer, s.log), s.log)
 	if err != nil {
 		if ctx.Err() == nil {
 			s.log.Error("adopting a dead node failed, it will be adopted again", "node", x, "epoch", l.Epoch, "err", err)

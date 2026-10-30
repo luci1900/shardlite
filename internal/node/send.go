@@ -11,8 +11,12 @@ import (
 )
 
 // origin says who asked for a request: the public handler (a client) and the
-// control handler (a call by the app) set it from the request. The node's own
-// requests say what they are. A wake of an app for a shard's reminders comes
+// control handler (a call by the app, or a relay of a client's request) set it
+// from the request. The node's own requests say what they are. A relay is
+// served as the client's request it is: with a client's limits (only kinds
+// clients can name, never creating a shard) and no caller, but with hops counted
+// as a call's are, since the app sends it and two apps could relay to each other
+// forever. A wake of an app for a shard's reminders comes
 // from the shard's own file, so it isn't gated on the caller, and a gRPC failure
 // is read from its status rather than turned into a gRPC response. A wake is for
 // the node that owns the shard and is never forwarded. A request of the node's
@@ -21,7 +25,7 @@ import (
 // sends, and keeps that when it is forwarded.
 //
 // A request another node forwarded keeps the kind it had there (a client's, a
-// call or the node's) and is marked forwarded: the node it came from has gated
+// call, a relay or the node's) and is marked forwarded: the node it came from has gated
 // its caller and counted its hops.
 type origin struct {
 	kind      originKind
@@ -33,11 +37,31 @@ type originKind int
 const (
 	fromClient originKind = iota // the public handler
 	fromCall                     // the control handler
+	fromRelay                    // the control handler, for a client's request the app relays (Shardlite-Relay)
 	fromWake                     // the node, waking the app for a shard's reminders
 	fromNode                     // the node, calling a system shard (Server.call)
 )
 
-func (o origin) control() bool  { return o.kind != fromClient }
+// control is true for what came over the control API or from the node itself:
+// it names its target in Shardlite-Target and its hops are read.
+func (o origin) control() bool { return o.kind != fromClient }
+
+// call is true for a request with a caller behind it, which may use the options
+// of a call (Shardlite-If-Active and Shardlite-If-Exists) and may create a shard.
+func (o origin) call() bool {
+	switch o.kind {
+	case fromCall, fromWake, fromNode:
+		return true
+	case fromClient, fromRelay:
+		return false
+	}
+	return false
+}
+
+// client is true for a request held to a client's limits: one from a client or
+// a relay of one.
+func (o origin) client() bool { return !o.call() }
+
 func (o origin) internal() bool { return o.kind == fromWake }
 
 // remindersPath is the path of the wake. The listeners refuse every path under

@@ -26,6 +26,7 @@ import (
 	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
 // Config describes a node.
@@ -35,7 +36,7 @@ type Config struct {
 	Backend blob.Backend
 	// Data is the node's data directory: the shard files, the local database
 	// and the temporary files. Without it the node has no local database, and
-	// so no local tier and no cache index.
+	// so no local store and no cache index.
 	Data string
 
 	Retry  time.Duration         // first wait before a segment upload is retried, see segment.Options
@@ -43,18 +44,22 @@ type Config struct {
 	Lease  coord.RegistryOptions // lease TTL
 	Keeper coord.KeeperOptions   // renewal interval and safety margin (Info is the node's own)
 	Logger *slog.Logger
-	// TempDir is where deltas, snapshots and downloads too large for memory are
-	// built (in the data directory). It is made when it is first needed. The
+	// Clock, if set, checks the node's clock against the store's. The backend
+	// must feed it (blob.S3Options.ClockSink). Start refuses a clock more than a
+	// lease TTL off, and the control API reports the offset.
+	Clock *coord.ClockWatch
+	// TempDir is where tails, deltas, snapshots and downloads are kept (in the
+	// data directory). It is made when it is first needed. The
 	// catalog empties it of what a crash left.
 	TempDir string
-	// SpoolLimit is how large a commit file, segment or delta gets before it is
-	// held in a temporary file in TempDir instead of memory (spool.DefaultLimit if
-	// zero).
-	SpoolLimit int
-	// Standbys is how many mirrors the node names for its journal, 0 for none.
-	// The mirrors are chosen once, at this start, from the lease listing, and
-	// the set is sticky: only a repair names different ones.
+	// Standbys is whether the node stands by for others and names a peer for
+	// its journal: 0 or 1, 0 for none. The peer is chosen once, at this
+	// start, from the lease listing, and the choice is sticky: only a repair
+	// names a different one.
 	Standbys int
+	// Repair is how often the node looks at its journal's peer to name one or
+	// replace a fallen one, 2s if zero.
+	Repair time.Duration
 }
 
 // Node is a started node.
@@ -62,22 +67,26 @@ type Node struct {
 	Config
 	Registry *coord.Registry
 	Keeper   *coord.Keeper
-	Store    *blob.Store
-	Files    *shardfile.Files
-	Journal  *journal.Store
+	// Confirmer reads the lease for the gates (Flusher.confirm). It is served beside the keeper.
+	Confirmer *coord.Confirmer
+	Store     *blob.Store
+	Files     *shardfile.Files
+	Journal   *journal.Store
 	// Local is the node's own disk as a home for its journal: a copy of every
-	// segment, which the local tier acknowledges. It is nil when the node has
+	// segment, which the `peer` tier waits on first. It is nil when the node has
 	// no local database.
 	Local *journal.Store
 	// LocalDB is the node's local database: the journal's segments and the
 	// cache index's rows. It is nil when the node has no data directory.
 	LocalDB *localdb.DB
 	Writer  *segment.Writer
-	// mirrors is the set chosen for this life, published in every renewal. It
-	// is chosen once, at Start, and changed by repair, not by a re-choice at
-	// renewal. A start that could not choose names none, and the record keeps
-	// the acknowledgements (the tiers fall back upward).
-	mirrors []cluster.Node
+	// peer is the peer chosen for this life, published in every renewal. It is
+	// chosen once, at Start, and changed by repair, not by a re-choice at
+	// renewal. A start that could not choose names none, and the `peer` tier's
+	// answers fail until a repair names one. Read and written under peerMu:
+	// the renewals read it while a repair writes it.
+	peer   cluster.Node
+	peerMu sync.Mutex
 	// Adopted is what adopting the previous process's journal did (zero if the node
 	// had no previous lease).
 	Adopted shardfile.AdoptReport
@@ -124,9 +133,25 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 	}
 	reg := coord.NewRegistry(cfg.Backend, cfg.Name, cfg.Lease)
 	info := coord.NodeInfo{Name: cfg.Name, Address: cfg.Address}
+	// A clock too far off refuses the start before the lease is taken, by what the
+	// requests so far showed, and again once the lease's own response has.
+	checkClock := func() error {
+		if cfg.Clock == nil {
+			return nil
+		}
+		return cfg.Clock.CheckStart(reg.TTL())
+	}
+	if err := checkClock(); err != nil {
+		return nil, err
+	}
 	lease, err := reg.Acquire(ctx, info)
 	if err != nil {
 		return nil, fmt.Errorf("acquire lease: %w", err)
+	}
+	// The lease is left to run out, as after any failure past this point: it
+	// carries the previous life's range, which the next start adopts.
+	if err := checkClock(); err != nil {
+		return nil, err
 	}
 	store := blob.NewStore(cfg.Backend, cfg.Name, lease.Epoch, cfg.Blob)
 	n := &Node{
@@ -134,23 +159,26 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		Registry: reg,
 		Store:    store,
 		Files: &shardfile.Files{Blob: store, Backend: cfg.Backend, Node: cfg.Name, Leases: reg,
-			JournalOptions: journal.Options(cfg.Blob), TempDir: cfg.TempDir, SpoolLimit: cfg.SpoolLimit},
+			JournalOptions: journal.Options(cfg.Blob), Temp: tempfile.NewDir(cfg.TempDir)},
 	}
 	// The node's local database: the journal's segments and the cache index's
-	// rows. A database that cannot be opened costs the local tier and the
+	// rows. A database that cannot be opened costs the local store and the
 	// cache and nothing else: the record still holds the data.
 	n.LocalDB = openLocalDB(cfg)
 	if n.LocalDB != nil && n.LocalDB.Persistent() {
 		n.Local = journal.NewStore(journal.NewLocal(n.LocalDB.DB, cfg.Name), cfg.Name, lease.Epoch, journal.Options(cfg.Blob))
 	}
-	// The mirrors of this life, before the writer is built, and what the lease
-	// says of this node beside them: a node whose local database is not
-	// persistent holds no mirrors for others, so none picks it. The choice is
-	// the lease's from its first renewal, and it is sticky: repair changes it,
-	// renewals republish it. A start that cannot read the listing names none
-	// and logs why.
-	n.mirrors = chooseMirrors(ctx, reg, cfg.Name, cfg.Standbys, cfg.Logger)
-	info.Mirrors = n.mirrors
+	// The peer of this life, before the writer is built, and what the lease
+	// says of this node beside it: a node whose local database is not
+	// persistent holds no peer's journal, so none picks it. The choice is the
+	// lease's from its first renewal, and it is sticky: repair changes it,
+	// renewals republish it. A start that cannot read the listing, or that
+	// runs alone, names none, and says so: the repair names one when it can.
+	n.setPeer(choosePeer(ctx, reg, cfg.Name, cfg.Standbys, "", cfg.Logger))
+	if n.currentPeer() == "" {
+		cfg.Logger.Info("this life names no peer for its journal yet, the repair names one when it can")
+	}
+	info.Peer = n.currentPeer()
 	info.Standby = n.LocalDB != nil && n.LocalDB.Persistent()
 	// The store of the node's own journal. One of it: the fence, the writer and
 	// a restore's reads all go through it, so their write ids share a counter
@@ -201,30 +229,34 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		Retry:    cfg.Retry,
 		Logger:   cfg.Logger,
 		Local:    n.Local,
+		Peer:     n.dialPeer(ctx, lease.Epoch),
 	})
 	kopts := cfg.Keeper
 	kopts.Info = n.Info
 	kopts.Logger = cfg.Logger
 	n.Keeper = coord.NewKeeper(reg, lease, kopts)
+	n.Confirmer = coord.NewConfirmer(reg, n.Keeper)
 	return n, nil
 }
 
-// chooseMirrors names the node's mirrors from the lease listing: live nodes
-// that can hold a journal (a persistent local database), least loaded first,
-// this node excluded. Chosen once, at the start of a life: the set changes by
+// choosePeer names the node's peer from the lease listing: a live node that
+// can hold a journal (a persistent local database), the least loaded, this
+// node excluded. Chosen once, at the start of a life: the choice changes by
 // repair, not by a re-choice at renewal, since nothing in correctness depends
-// on who the mirrors are and churn would cost the streams nothing but trouble
+// on who the peer is and churn would cost the stream nothing but trouble
 // (docs/internals.md, Node leases). A listing that cannot be read, or a
-// candidate that cannot, leaves the set short: the acknowledgements fall back
-// upward to the record until a repair names a replacement.
-func chooseMirrors(ctx context.Context, reg *coord.Registry, self cluster.Node, count int, log *slog.Logger) []cluster.Node {
-	if count == 0 {
-		return nil
+// candidate that cannot, leaves the node without a peer: the `peer` tier's
+// answers fail until a repair names one. avoid is excluded — the peer that
+// fell out, whose lease can still look live while its endpoint does not
+// answer.
+func choosePeer(ctx context.Context, reg *coord.Registry, self cluster.Node, standbys int, avoid cluster.Node, log *slog.Logger) cluster.Node {
+	if standbys == 0 {
+		return ""
 	}
 	listed, err := reg.List(ctx)
 	if err != nil {
-		log.Warn("could not list the leases to choose the mirrors, this life names none", "err", err)
-		return nil
+		log.Warn("could not list the leases to choose the peer, this life names none", "err", err)
+		return ""
 	}
 	type candidate struct {
 		node   cluster.Node
@@ -232,17 +264,25 @@ func chooseMirrors(ctx context.Context, reg *coord.Registry, self cluster.Node, 
 	}
 	var candidates []candidate
 	for _, e := range listed {
-		if e.Name == self {
+		if e.Name == self || e.Name == avoid {
 			continue
 		}
 		l, err := reg.Get(ctx, e.Name)
 		if err != nil {
-			continue // not nameable now; a repair names replacements later
+			continue // not nameable now; a repair names one later
 		}
 		if !l.Standby || l.Released || l.ExpiresAt().Before(time.Now()) {
 			continue
 		}
 		candidates = append(candidates, candidate{l.Name, l.Shards})
+	}
+	if len(candidates) == 0 {
+		if avoid != "" {
+			log.Debug("the cluster has no node that can hold the journal's peer but the one that fell out", "avoid", avoid)
+		} else {
+			log.Debug("the cluster has no node that can hold the journal's peer", "standbys", standbys)
+		}
+		return ""
 	}
 	sort.Slice(candidates, func(i, j int) bool {
 		if candidates[i].shards != candidates[j].shards {
@@ -250,23 +290,32 @@ func chooseMirrors(ctx context.Context, reg *coord.Registry, self cluster.Node, 
 		}
 		return candidates[i].node < candidates[j].node
 	})
-	out := make([]cluster.Node, 0, min(count, len(candidates)))
-	for _, c := range candidates[:min(count, len(candidates))] {
-		out = append(out, c.node)
+	if candidates[0].node != "" {
+		log.Info("chose the peer of this node's journal", "peer", candidates[0].node)
 	}
-	if len(out) < count {
-		log.Warn("the cluster has fewer nodes that can hold mirrors than the standbys setting names", "standbys", count, "chosen", len(out))
+	return candidates[0].node
+}
+
+// dialPeer opens the store the writer's fan-out sends this journal's segments
+// through, over the protocol to the peer's peer listener. A peer whose lease
+// cannot be read, or that has no address yet, leaves the node without one:
+// the acknowledgements stay on the record until a repair names the peer whole.
+func (n *Node) dialPeer(ctx context.Context, epoch pos.Epoch) *segment.Mirror {
+	peer := n.currentPeer()
+	if peer == "" {
+		return nil
 	}
-	if len(out) > 0 {
-		log.Info("chose the mirrors of this node's journal", "mirrors", out)
+	d := newMirrorDialer(n.Registry, n.Files.JournalOptions)
+	if s := d.dial(ctx, n.Name, epoch, peer, n.Logger); s != nil {
+		return &segment.Mirror{Node: peer, Journal: s}
 	}
-	return out
+	return nil
 }
 
 // openLocalDB opens the node's local database. Without a data directory there
-// is none, and the node has no local tier and no cache index. A database that
+// is none, and the node has no local store and no cache index. A database that
 // cannot be opened is given up on: the cache index then lives in memory and
-// the local tier is empty, and the record still holds the data.
+// the local store is empty, and the record still holds the data.
 func openLocalDB(cfg Config) *localdb.DB {
 	if cfg.Data == "" {
 		return nil
@@ -278,11 +327,12 @@ func openLocalDB(cfg Config) *localdb.DB {
 	if errors.Is(err, migrate.ErrNewer) {
 		// The file was written by a node whose schema is newer. This node
 		// cannot read its chunks, so the local store is treated as empty and
-		// the file is left alone: a newer node's tail may be in it. The local
-		// tier's answers fall back to the record.
-		cfg.Logger.Error("the local database is of a newer schema, the local tier is empty and the cache index is not kept", "err", err)
+		// the file is left alone: a newer node's tail may be in it. There is
+		// no local store on this life: `peer` answers fail, and
+		// the record still holds the data.
+		cfg.Logger.Error("the local database is of a newer schema, the local store is empty and the cache index is not kept", "err", err)
 	} else {
-		cfg.Logger.Error("the local database could not be opened, the local tier is empty and the cache index is not kept", "err", err)
+		cfg.Logger.Error("the local database could not be opened, the local store is empty and the cache index is not kept", "err", err)
 	}
 	db, err = localdb.Memory()
 	if err != nil {
@@ -295,7 +345,7 @@ func openLocalDB(cfg Config) *localdb.DB {
 // landTail lands the previous life's un-landed segments in the record (Start),
 // checked as the bytes leave (internal/segment, Land), before the fence the
 // start writes next: the adoption reads up to the fence, and a fence over an
-// un-landed tail would lose what the node's local tier sits on. Each row
+// un-landed tail would lose what the node's local store holds. Each row
 // decides by the record's head against its own, and a landing's error fails
 // the start, whose next life retries it with the row as it is.
 func (n *Node) landTail(ctx context.Context, lease coord.NodeLease) error {
@@ -340,7 +390,7 @@ func (n *Node) landTail(ctx context.Context, lease coord.NodeLease) error {
 				n.Logger.Warn("a segment missing from the middle of the record's range keeps its local copy out of the landing", "segment", seq)
 				continue
 			}
-			if err := segment.Land(ctx, n.Journal, n.Local, seq, lhead.WriteID, n.TempDir, n.SpoolLimit); err != nil {
+			if err := segment.Land(ctx, n.Journal, n.Local, seq, lhead.WriteID, n.Files.Temp); err != nil {
 				return fmt.Errorf("land the previous life's segment %d: %w", seq, err)
 			}
 			landed++
@@ -389,15 +439,15 @@ func (n *Node) adoptOwn(ctx context.Context, lease coord.NodeLease) (shardfile.A
 		k.Serve(actx)
 		return k.Check() // nil unless the lease was lost or ran out
 	})
-	// The previous life's mirrors are asked before the fence, inside
-	// AdoptJournal: they may hold segments the process died before landing,
+	// The previous life's peer is asked before the fence, inside
+	// AdoptJournal: it may hold segments the process died before landing,
 	// beside the local rows the landing above put in the record
 	// (docs/internals.md, Takeover).
-	var mirrors []*journal.Store
-	if prev := lease.Previous; prev != nil && len(prev.Mirrors) > 0 {
-		mirrors = newMirrorDialer(n.Registry, journal.Options(n.Blob)).stores(actx, *prev, n.Logger)
+	var peer *journal.Store
+	if prev := lease.Previous; prev != nil && prev.Peer != "" {
+		peer = newMirrorDialer(n.Registry, journal.Options(n.Blob)).dial(actx, n.Name, prev.Epoch, prev.Peer, n.Logger)
 	}
-	rep, err := n.Files.AdoptJournal(actx, n.Name, lease.JournalFrom, lease.JournalNext, mirrors, n.Logger)
+	rep, err := n.Files.AdoptJournal(actx, n.Name, lease.JournalFrom, lease.JournalNext, peer, n.Logger)
 	stop()
 	if kerr := g.Wait(); kerr != nil {
 		return rep, lease, 0, fmt.Errorf("adopting the journal: %w", kerr)
@@ -434,7 +484,23 @@ func (n *Node) Info() coord.NodeInfo {
 		}
 	}
 	return coord.NodeInfo{Name: n.Name, Address: n.Address, Shards: shards, JournalFrom: from, JournalNext: next,
-		Mirrors: n.mirrors, Standby: n.LocalDB != nil && n.LocalDB.Persistent()}
+		Peer: n.currentPeer(), Standby: n.LocalDB != nil && n.LocalDB.Persistent()}
+}
+
+// currentPeer is the peer of this life, as renewals publish it and the repair
+// replaces it.
+func (n *Node) currentPeer() cluster.Node {
+	n.peerMu.Lock()
+	defer n.peerMu.Unlock()
+	return n.peer
+}
+
+// setPeer names the peer of this life, as the start's choice and a repair's
+// replacement do.
+func (n *Node) setPeer(name cluster.Node) {
+	n.peerMu.Lock()
+	defer n.peerMu.Unlock()
+	n.peer = name
 }
 
 // TailSet is a set of captured shards as Tails, for programs that capture

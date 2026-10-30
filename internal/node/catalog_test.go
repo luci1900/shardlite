@@ -32,15 +32,17 @@ import (
 	"github.com/luci1900/shardlite/internal/notify"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
+	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
 const testKinds = `{"app": "test", "kinds": {
-	"users":  {"public": true, "sync": "local", "idle_timeout": "300ms"},
+	"users":  {"public": true, "sync": "none", "idle_timeout": "300ms"},
 	"wallet": {"public": true, "idle_timeout": "300ms"},
-	"slow":   {"public": true, "sync": "local", "idle_timeout": "1h"},
+	"slow":   {"public": true, "sync": "none", "idle_timeout": "1h"},
 	"audit":  {},
 	"lobby":  {"public": true, "idle_timeout": "300ms"},
-	"arena":  {"public": true, "sync": "local", "idle_timeout": "300ms"}
+	"arena":  {"public": true, "sync": "none", "idle_timeout": "300ms"},
+	"vault":  {"public": true, "sync": "peer", "idle_timeout": "300ms"}
 }}`
 
 type mrig struct {
@@ -52,6 +54,8 @@ type mrig struct {
 	data        string
 	kinds       *Kinds
 	app         *apptest.App
+	standbys    int               // the node names a peer for its journal when 1
+	clock       *coord.ClockWatch // the node's clock check, nil for none
 	n           *Node
 	m           *Catalog
 	stopM       func() error // stops the shards' Serve and returns what it returned
@@ -120,6 +124,8 @@ func (r *mrig) tryStartNode() (*Node, error) {
 		Lease: coord.RegistryOptions{TTL: time.Hour, Blob: blob.Options{Backoff: time.Millisecond}},
 		Keeper: coord.KeeperOptions{Interval: 100 * time.Millisecond, Margin: time.Minute,
 			Now: func() time.Time { return time.Now().Add(time.Duration(r.leaseAhead.Load())) }},
+		Standbys: r.standbys,
+		Clock:    r.clock,
 	})
 }
 
@@ -489,8 +495,10 @@ func TestGates(t *testing.T) {
 	ctx := context.Background()
 	ref := r.acquire("test.wallet/1")
 	defer ref.Release()
+	// The kind names no sync, so it parses to the record; the gate below
+	// names storage explicitly.
 	if ref.Sync() != kind.SyncStorage {
-		t.Fatal("wallet should have sync on")
+		t.Fatal("wallet should default to the record")
 	}
 	r.write(ref, "a")
 
@@ -525,7 +533,7 @@ func TestGates(t *testing.T) {
 
 	// Sync off never waits, even with new frames.
 	r.app.Must(t, "insert", "a", "2", "100")
-	if err := r.m.Gate(quick, ref, kind.SyncLocal); err != nil {
+	if err := r.m.Gate(quick, ref, kind.SyncNone); err != nil {
 		t.Fatalf("sync off waited for a flush: %v", err)
 	}
 	close(stall)
@@ -1273,7 +1281,7 @@ func TestActivationAfterAFailedOneStartsANewGeneration(t *testing.T) {
 	if err := os.WriteFile(path, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	sh, err := capture.New(capture.Config{Name: shardName("test.slow/f"), Path: path, Generation: failed, Writer: r.n.Writer, TempDir: t.TempDir()})
+	sh, err := capture.New(capture.Config{Name: shardName("test.slow/f"), Path: path, Generation: failed, Writer: r.n.Writer, TempDir: tempfile.NewDir(t.TempDir())})
 	if err != nil {
 		t.Fatal(err)
 	}

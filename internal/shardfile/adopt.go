@@ -25,7 +25,8 @@ type AdoptReport struct {
 	From    pos.Seg // the first segment read (later than asked if the segments before it had expired)
 	Shards  int     // shards with entries in the range
 	Deltas  int     // deltas written
-	Fetched int     // segments the mirrors held above the record's landed run, copied into it before the fence
+	Fetched int     // segments the peer held above the record's landed run, copied into it before the fence
+	AtFence int     // entries the peer held at fence numbers in the range, read into the tail: a dead writer's last segment, the window the fetch cannot see
 	Expired bool    // the range began with segments that no longer exist
 	// Lost lists shards whose tail has a hole, which is only tolerated when the
 	// journal's first segments had expired (Expired). Their history up to the hole is
@@ -45,10 +46,10 @@ const adoptWorkers = 64
 // its own, left by the process it replaces (docs/internals.md, Takeover: Restart), or a dead
 // node's.
 //
-//  0. It fetches the node's mirrors: the segments they hold above the run the
+//  0. It fetches the node's peer: the segments it holds above the run the
 //     record landed are copied into the record first, since a fence written
 //     over their numbers would strand them (docs/internals.md, Takeover). The
-//     mirrors are the caller's: stores over the mirror protocol, empty when the
+//     peer is the caller's: a store over the mirror protocol, nil when the
 //     node named none.
 //  1. It fences the journal: an empty segment at the first free number from next,
 //     the next segment number the lease recorded, so the old writer can't add
@@ -63,8 +64,8 @@ const adoptWorkers = 64
 //     Takeover). A failed entry leaves the delta unwritten.
 //
 // It is FetchTail (step 0), ReadJournal (steps 1 and 2) and Adopt (step 3).
-func (f *Files) AdoptJournal(ctx context.Context, node cluster.Node, from, next pos.Seg, mirrors []*journal.Store, logger *slog.Logger) (AdoptReport, error) {
-	a, err := f.ReadJournal(ctx, node, from, next, mirrors, logger)
+func (f *Files) AdoptJournal(ctx context.Context, node cluster.Node, from, next pos.Seg, peer *journal.Store, logger *slog.Logger) (AdoptReport, error) {
+	a, err := f.ReadJournal(ctx, node, from, next, peer, logger)
 	if err != nil {
 		return a.Report, err
 	}
@@ -82,22 +83,22 @@ type Adoption struct {
 	Report AdoptReport
 }
 
-// ReadJournal fetches the mirrors (step 0) and fences the journal and reads
+// ReadJournal fetches the peer (step 0) and fences the journal and reads
 // its footers: steps 0 to 2 of AdoptJournal. On an error the Adoption still
 // has the Report so far. The fetch comes first, since the fence decides what
-// may be read at all: a number the mirrors hold that the record lacks has to
+// may be read at all: a number the peer holds that the record lacks has to
 // be in the record before the fence takes the first free number above it. A
 // fetch that fails is logged and carried past (the window is the ensemble's
 // documented bound), never a failed adoption.
-func (f *Files) ReadJournal(ctx context.Context, node cluster.Node, from, next pos.Seg, mirrors []*journal.Store, logger *slog.Logger) (*Adoption, error) {
+func (f *Files) ReadJournal(ctx context.Context, node cluster.Node, from, next pos.Seg, peer *journal.Store, logger *slog.Logger) (*Adoption, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	a := &Adoption{f: f, node: node, log: logger}
-	fetched, err := f.FetchTail(ctx, node, from, next, mirrors, logger)
+	fetched, err := f.FetchTail(ctx, node, from, next, peer, logger)
 	a.Report.Fetched = fetched
 	if err != nil && ctx.Err() == nil {
-		logger.Warn("the fetch of the mirrors failed, what they hold is lost", "node", node, "err", err)
+		logger.Warn("the fetch of the peer failed, what it holds is lost", "node", node, "err", err)
 	}
 	from, next = max(from, 1), max(next, 1)
 	js := f.Journal(node)
@@ -128,6 +129,44 @@ func (f *Files) ReadJournal(ctx context.Context, node cluster.Node, from, next p
 	idx, err := f.LoadJournal(ctx, node, from, fence)
 	if err != nil {
 		return a, fmt.Errorf("adopt %s: reading the journal: %w", node, err)
+	}
+	// The journal read asks the peer at the numbers the record holds as
+	// fences. A zombie parked at one unresolved create has handed the peer a
+	// segment that a fence then took the number of — this adoption's fence,
+	// or an earlier one's if an earlier adoption of the node failed — and the
+	// segment's commits are part of the dead writer's history. The fetch
+	// stops below the fence's number, so only here can they be found. They
+	// join the tail from the peer's copy; nothing lands (the numbers are
+	// fences'), and their files are read from the peer when the deltas are
+	// built. A peer that does not answer is logged and carried past, as a
+	// failed fetch is: the dead peer must not hold up the takeover.
+	// (docs/internals.md, Takeover; specs/mirrors.qnt's noLoss over peerAcks
+	// shows the window closing.)
+	if peer != nil {
+		for _, seq := range idx.fences {
+			info, err := peer.Head(ctx, seq)
+			if err == nil && info.Size == 0 {
+				continue // never a fence on the peer: a peer gone wrong
+			}
+			if errors.Is(err, blob.ErrNotFound) {
+				continue // the peer holds nothing there
+			}
+			if err != nil {
+				logger.Warn("could not ask the peer for a segment at a fence, what it held is lost", "node", node, "segment", seq, "err", err)
+				continue
+			}
+			entries, err := segment.ReadFooter(ctx, peer, seq)
+			if err != nil {
+				logger.Warn("could not read the peer's segment at a fence, what it held is lost", "node", node, "segment", seq, "err", err)
+				continue
+			}
+			for _, e := range entries {
+				idx.byShard[e.Shard] = append(idx.byShard[e.Shard], journalRef{seq: seq, entry: e, store: peer})
+			}
+			a.Report.AtFence += len(entries)
+			logger.Info("the peer held a segment at a fence, its entries joined the tail",
+				"node", node, "segment", seq, "entries", len(entries))
+		}
 	}
 	a.idx = idx
 	a.Report.Shards = len(idx.byShard)
@@ -213,7 +252,7 @@ func (f *Files) adoptShard(ctx context.Context, node cluster.Node, n shard.Name,
 		if err != nil {
 			return false, err
 		}
-		if len(tail) == 0 {
+		if len(tail.Files) == 0 {
 			return false, nil
 		}
 		// The entry comes first: journal expiry checks no lease, so once the delta
@@ -228,7 +267,7 @@ func (f *Files) adoptShard(ctx context.Context, node cluster.Node, n shard.Name,
 			now := remindex.MinuteAt(f.now())
 			hooks.BeforeUpdate = func(context.Context, pos.Position) (remindex.Minute, error) { return now, nil }
 		}
-		err = h.putTail(ctx, tail, hooks, func(n *Manifest) { n.Journal = "" })
+		err = h.putTail(ctx, tail.Files, hooks, func(n *Manifest) { n.Journal = "" })
 		tail.Close()
 		if errors.Is(err, blob.ErrConflict) {
 			continue // somebody changed the manifest: look again

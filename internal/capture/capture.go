@@ -32,7 +32,7 @@ import (
 	"github.com/luci1900/shardlite/internal/kill"
 	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/shard"
-	"github.com/luci1900/shardlite/internal/spool"
+	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
 // Restored describes a shard that was restored from its files before this
@@ -40,8 +40,8 @@ import (
 type Restored struct {
 	Position pos.Position // the shard's position as restored: its manifest files plus Tail
 	// Tail is the commits already in the node journal but not yet in a delta.
-	// New takes it over: the files' references are closed when the tail is
-	// dropped or discarded, or at once if New fails. A Restored reused after
+	// New takes it over: its logs are closed when the tail is dropped or
+	// discarded, or at once if New fails. A Restored reused after
 	// New holds no files.
 	Tail TailFiles
 	// Checksums is the CRC of each page of the restored database, which the
@@ -54,7 +54,7 @@ type Restored struct {
 // Writer is what a shard needs of the node's journal (segment.Writer).
 type Writer interface {
 	NextSeq() pos.Seg
-	AppendFile(name shard.Name, generation shard.Gen, position pos.Position, ltxFile *spool.File) error
+	AppendFile(name shard.Name, generation shard.Gen, position pos.Position, ltxFile tempfile.File) error
 	Flush(ctx context.Context) error
 }
 
@@ -69,12 +69,9 @@ type Config struct {
 	Generation shard.Gen
 	Writer     Writer
 	Restored   *Restored // set for a shard restored from its files, nil for a new one
-	// A commit file is held in memory up to SpoolLimit bytes (spool.DefaultLimit
-	// if zero) and in a temporary file in TempDir beyond that: a single commit
-	// can be as large as the database. Without a TempDir a commit larger than
-	// SpoolLimit fails.
-	TempDir    string
-	SpoolLimit uint64
+	// TempDir is where the shard's tail is kept: a commit is appended to a log
+	// there, and a single commit can be as large as the database. It is required.
+	TempDir *tempfile.Dir
 	// RestartFrames is the size of the WAL, in frames, above which a sync
 	// restarts it (DefaultRestartFrames if zero).
 	RestartFrames Frame
@@ -95,13 +92,6 @@ type Config struct {
 	// for its next flush cycle, so deactivations share segments with the rest;
 	// by default the shard flushes the writer itself.
 	Durable func(ctx context.Context) error
-}
-
-func (c Config) spoolLimit() int {
-	if c.SpoolLimit > 0 {
-		return int(c.SpoolLimit)
-	}
-	return spool.DefaultLimit
 }
 
 func (c Config) restartFrames() Frame {
@@ -181,6 +171,9 @@ func New(cfg Config) (sh *Shard, err error) {
 	}()
 	if cfg.Writer == nil {
 		return nil, fmt.Errorf("capture: writer required")
+	}
+	if cfg.TempDir == nil {
+		return nil, fmt.Errorf("capture: temporary directory required")
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.DiscardHandler)
@@ -557,7 +550,14 @@ func (s *Shard) sync() error {
 // seen are in memory, so no page is read for this.
 func (s *Shard) queueFile(count pos.Count, commit Pages, pf pageFrames, h walHeader, all bool) error {
 	pos := s.tail.nextPos
-	w := spool.NewWriter(s.cfg.TempDir, s.cfg.spoolLimit())
+	log, err := s.tail.log(s.cfg.TempDir)
+	if err != nil {
+		return err
+	}
+	w, err := log.Append()
+	if err != nil {
+		return err
+	}
 	pg := pages{wal: s.walF, db: s.dbF, pageSize: s.pageSize, h: h, pf: pf}
 	hdr := ltx.Header{
 		Version:   ltx.Version,
@@ -581,7 +581,6 @@ func (s *Shard) queueFile(count pos.Count, commit Pages, pf pageFrames, h walHea
 	if err != nil {
 		return err
 	}
-	defer body.Close()
 	// The file is queued in the writer and recorded in the tail at once, without
 	// waiting for its segment. The writer never drops a queued file: it retries
 	// until the segment is written, or the node is fenced and has to stop. Whoever
@@ -1274,22 +1273,31 @@ func (s *Shard) Checksums() *Checksums {
 func (s *Shard) TailFrom() pos.Seg { return s.tail.view.Load().from }
 
 // Tail returns the commits captured since the shard's last delta, in position
-// order (earlier activations first, then this one). The caller holds a
-// reference to each file and closes them (TailFiles.Close) when done.
-func (s *Shard) Tail() (files TailFiles) {
-	s.call(func() { files = s.tail.files.Retained() })
+// order (earlier activations first, then this one). The caller holds a dup of
+// each log the files are in, and closes them (TailFiles.Close) when done. It
+// fails if a log cannot be duplicated.
+func (s *Shard) Tail() (files TailFiles, err error) {
+	s.call(func() { files, err = s.tail.files.Retained() })
+	return files, err
+}
+
+// TakeTail hands the shard's tail itself to the caller, who closes it or gives
+// it to a new Shard (Restored.Tail). The shard holds no files afterwards. Unlike
+// Tail it duplicates nothing, so it cannot fail: it is how a resume carries the
+// tail over.
+func (s *Shard) TakeTail() (files TailFiles) {
+	s.call(func() { files = s.tail.take() })
 	return files
 }
 
 // TailInfo is how many files the tail has and the age of the oldest, without
-// taking references to them.
+// duplicating its logs.
 func (s *Shard) TailInfo() (n int, oldest time.Time) {
 	v := s.tail.view.Load()
 	return v.files, v.oldest
 }
 
-// TailBytes is how many bytes the tail's files hold (in memory, or in temporary
-// files when they are large).
+// TailBytes is how many bytes the tail's files hold.
 func (s *Shard) TailBytes() int64 { return s.tail.view.Load().bytes }
 
 // Discard gives up the shard's tail without writing it anywhere: for a shard

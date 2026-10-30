@@ -255,7 +255,7 @@ func TestAdoptedOwnersShardIsClaimed(t *testing.T) {
 	n0, n1 := c.nodes[0], c.nodes[1]
 	app := apptest.Start(t)
 	paths := make(chan string, 1)
-	n0.serve(func(w http.ResponseWriter, q *http.Request) { paths <- q.Header.Get("Shardlite-Path") })
+	n0.serve(func(w http.ResponseWriter, q *http.Request) { paths <- q.Header.Get("Shardlite-File") })
 	n0.create("test.wallet/a")
 	ask(t, n0, "test.wallet/a")
 	path := <-paths
@@ -282,7 +282,7 @@ func TestAdoptedOwnersShardIsClaimed(t *testing.T) {
 	}
 	n1.serve(func(w http.ResponseWriter, q *http.Request) {
 		w.Header().Set("X-Served-By", "n1")
-		paths <- q.Header.Get("Shardlite-Path")
+		paths <- q.Header.Get("Shardlite-File")
 	})
 	// The lease scan forgot n0's entries when it found n0 dead. One put back by a
 	// request that raced it gets 503 to try again, and goes.

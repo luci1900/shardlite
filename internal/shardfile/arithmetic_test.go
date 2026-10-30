@@ -17,7 +17,6 @@ import (
 
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/pos"
-	"github.com/luci1900/shardlite/internal/spool"
 )
 
 // Property tests of the delta arithmetic: reencode (tail files into one file
@@ -182,7 +181,7 @@ func genRun(t *rapid.T) run {
 		}
 		count := pos.Count(rapid.IntRange(1, 3).Draw(t, "commits"))
 		data := encodeSpec(t, r.pageSize, spec, txid, txid+ltx.TXID(count)-1, int64(i+1))
-		r.tails = append(r.tails, capture.TailFile{Position: at, Count: count, Body: spool.Bytes(data)})
+		r.tails = append(r.tails, capture.TailFile{Position: at, Count: count, Body: bodyOf(data)})
 		r.specs = append(r.specs, spec)
 		at += pos.Position(count)
 		txid += ltx.TXID(count)

@@ -19,7 +19,7 @@ import (
 	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/remindex"
 	"github.com/luci1900/shardlite/internal/shard"
-	"github.com/luci1900/shardlite/internal/spool"
+	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
 // Manifest is the per-shard record in blob storage (see docs/internals.md,
@@ -195,13 +195,10 @@ type Files struct {
 	// JournalOptions tune the retries of the journals' stores (Journal). Zero
 	// is the journal store's own defaults.
 	JournalOptions journal.Options
-	// TempDir is where files are built and downloaded that are too large to hold
-	// in memory (deltas, snapshots, the files of a restore). It is in the data
-	// directory.
-	TempDir string
-	// SpoolLimit is how large a delta gets before it is built in a temporary file,
-	// spool.DefaultLimit if zero.
-	SpoolLimit int
+	// Temp is where files are built and downloaded (deltas, snapshots, the
+	// files of a restore, the commits of a restored tail). It is in the data
+	// directory, and required.
+	Temp *tempfile.Dir
 	// Now is the time adoption records its reminders at, time.Now if nil.
 	Now func() time.Time
 
@@ -214,13 +211,6 @@ func (f *Files) now() time.Time {
 		return f.Now()
 	}
 	return time.Now()
-}
-
-func (f *Files) spoolLimit() int {
-	if f.SpoolLimit > 0 {
-		return f.SpoolLimit
-	}
-	return spool.DefaultLimit
 }
 
 func (f *Files) manifests() ManifestStore { return ManifestStore{f.Blob} }

@@ -28,7 +28,22 @@ import (
 	shardpkg "github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
+	"github.com/luci1900/shardlite/internal/tempfile"
 )
+
+// tempDir is a new temporary directory for a shard's tail.
+func tempDir(t testing.TB) *tempfile.Dir { return tempfile.NewDir(t.TempDir()) }
+
+// tailOf is the shard's tail, closed when the test ends.
+func tailOf(t testing.TB, sh *capture.Shard) capture.TailFiles {
+	t.Helper()
+	tail, err := sh.Tail()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(tail.Close)
+	return tail
+}
 
 // shardName is a shard's name in the tests that need the parsed type.
 func shardName(s string) shardpkg.Name { return shardpkg.MustParse(s) }
@@ -102,7 +117,7 @@ func TestCommitsAppearAsEntries(t *testing.T) {
 	path := filepath.Join(e.dir, "users-1.db")
 	app.Must(t, "open", "a", path)
 
-	sh, err := capture.New(capture.Config{Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w})
+	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +150,7 @@ func TestReplayEqualsApp(t *testing.T) {
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
 	app.Must(t, "open", "a", path)
-	sh, err := capture.New(capture.Config{Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w})
+	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +196,7 @@ func TestManyShardsOneSegmentPerFlush(t *testing.T) {
 	for i := range shards {
 		path := filepath.Join(e.dir, fmt.Sprintf("s%d.db", i))
 		apps[i%len(apps)].Must(t, "open", fmt.Sprint(i), path)
-		sh, err := capture.New(capture.Config{Name: shardName(fmt.Sprintf("test.users/%d", i)), Path: path, Generation: "g", Writer: e.w})
+		sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName(fmt.Sprintf("test.users/%d", i)), Path: path, Generation: "g", Writer: e.w})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -304,7 +319,7 @@ func TestSyncOutlivesItsCaller(t *testing.T) {
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
 	app.Must(t, "open", "a", path)
-	sh, err := capture.New(capture.Config{Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w})
+	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -335,7 +350,7 @@ func TestSyncOutlivesItsCaller(t *testing.T) {
 		t.Fatal("a file in the writer's queue is not counted in the shard's tail range")
 	}
 	// The file is in the tail as soon as it is queued.
-	if len(sh.Tail()) == 0 {
+	if len(tailOf(t, sh).Files) == 0 {
 		t.Fatal("a queued file is not in the tail")
 	}
 	close(up)
@@ -343,7 +358,7 @@ func TestSyncOutlivesItsCaller(t *testing.T) {
 	// Nothing asks again, yet the commit arrives: the writer never drops a queued file.
 	apptest.Eventually(t, 5*time.Second, "the commit to reach the journal after the caller left", func() bool {
 		entries, _ := e.entriesFor(t, "test.users/1")
-		return len(entries) == len(sh.Tail())
+		return len(entries) == len(tailOf(t, sh).Files)
 	})
 	if err := sh.Sync(ctx); err != nil {
 		t.Fatal(err)
@@ -356,7 +371,7 @@ func TestSyncOutlivesItsCaller(t *testing.T) {
 		}
 		last = en.Last()
 	}
-	if got := len(sh.Tail()); got != len(entries) {
+	if got := len(tailOf(t, sh).Files); got != len(entries) {
 		t.Fatalf("tail has %d files, journal %d entries", got, len(entries))
 	}
 	sh.Close(ctx)
@@ -370,7 +385,7 @@ func TestTailFromFollowsTheTail(t *testing.T) {
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
 	app.Must(t, "open", "a", path)
-	sh, err := capture.New(capture.Config{Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w})
+	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -386,7 +401,7 @@ func TestTailFromFollowsTheTail(t *testing.T) {
 		}
 		apptest.Eventually(t, 5*time.Second, "the commit to reach the journal", func() bool {
 			entries, _ := e.entriesFor(t, "test.users/1")
-			return len(entries) == len(sh.Tail())
+			return len(entries) == len(tailOf(t, sh).Files)
 		})
 		if i == 0 {
 			_, seqs := e.entriesFor(t, "test.users/1")
@@ -421,7 +436,7 @@ func TestCommitsInOneWindowKeepOnlyTheLatestPages(t *testing.T) {
 	for i := range 40 {
 		app.Must(t, "exec", "a", fmt.Sprintf("INSERT INTO t (id, v) VALUES (%d, randomblob(1000))", i))
 	}
-	sh, err := capture.New(capture.Config{Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w})
+	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w})
 	if err != nil {
 		t.Fatal(err)
 	}

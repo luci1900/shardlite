@@ -27,7 +27,7 @@ import (
 	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/service"
 	"github.com/luci1900/shardlite/internal/shard"
-	"github.com/luci1900/shardlite/internal/spool"
+	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
 // serve serves w until the test ends, or until stop is called.
@@ -77,14 +77,41 @@ func newStore(t *testing.T) testStore {
 	}
 }
 
-// appendBytes queues one LTX file held in memory.
+// logOf makes a log holding b, and returns it with the range b is in. The caller
+// closes the log.
+func logOf(dir *tempfile.Dir, b []byte) (*tempfile.Log, tempfile.File, error) {
+	l, err := dir.Create()
+	if err != nil {
+		return nil, tempfile.File{}, err
+	}
+	a, err := l.Append()
+	if err != nil {
+		l.Close()
+		return nil, tempfile.File{}, err
+	}
+	a.Write(b)
+	f, err := a.Finish()
+	if err != nil {
+		l.Close()
+		return nil, tempfile.File{}, err
+	}
+	return l, f, nil
+}
+
+var testDir = tempfile.NewDir(filepath.Join(os.TempDir(), "shardlite-segment-test"))
+
+// appendBytes queues one LTX file, held in a log of its own that is closed at
+// once: the writer reads it through a dup.
 func appendBytes(w *Writer, name, generation string, position pos.Position, ltxBytes []byte) error {
 	n, err := shard.ParseName(name)
 	if err != nil {
 		return err
 	}
-	f := spool.Bytes(ltxBytes)
-	defer f.Close()
+	l, f, err := logOf(testDir, ltxBytes)
+	if err != nil {
+		return err
+	}
+	defer l.Close()
 	return w.AppendFile(n, shard.Gen(generation), position, f)
 }
 
@@ -704,39 +731,44 @@ func TestTransientTroubleIsNotLoggedAsUnfixable(t *testing.T) {
 	}
 }
 
-// The segment's bytes are composed, not spooled: the queued files are read
-// where they are, and nothing is left behind when the segment is written, or
-// when the writer is closed with files pending.
-func TestLargeSegmentsGoThroughTemporaryFiles(t *testing.T) {
+// The segment's bytes are composed, not copied: the queued files are read where
+// they are, through one dup of each log however many files it holds, which the
+// writer closes once the segment is written or the writer is closed. The caller
+// closes its own logs whenever it likes.
+func TestQueuedFilesAreReadThroughDupsOfTheirLogs(t *testing.T) {
 	t.Parallel()
 	store, ctx := newStore(t), context.Background()
-	dir := t.TempDir()
-	left := func() int {
-		ents, err := os.ReadDir(dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return len(ents)
-	}
-	w := NewWriter(store.Store, Options{})
-	stop := serve(t, w)
-
-	var seen atomic.Int32
-	store.SetHook(func(_ context.Context, op blobtest.Op, key string, after bool) error {
-		if op == blobtest.OpCreate && !after {
-			seen.Store(int32(left()))
+	dir := tempfile.NewDir(t.TempDir())
+	var dups atomic.Int32
+	dir.SetHook(func(op tempfile.Op) error {
+		if op == tempfile.OpDup {
+			dups.Add(1)
 		}
 		return nil
 	})
-	// Two files, each larger than the limit and held in a file of their own.
-	var files []*spool.File
-	for i := range 2 {
-		f, err := spool.Collect(dir, 100, bytes.NewReader(testLTX(t, ltx.TXID(i+1), byte(i+1))))
+	w := NewWriter(store.Store, Options{})
+	stop := serve(t, w)
+
+	// Three files in two logs: a log with two files of the same segment is
+	// duplicated once.
+	l1, err := dir.Create()
+	if err != nil {
+		t.Fatal(err)
+	}
+	l2, err := dir.Create()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var files []tempfile.File
+	for i, l := range []*tempfile.Log{l1, l1, l2} {
+		a, err := l.Append()
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !f.InFile() {
-			t.Fatal("test file is small")
+		a.Write(testLTX(t, ltx.TXID(i+1), byte(i+1)))
+		f, err := a.Finish()
+		if err != nil {
+			t.Fatal(err)
 		}
 		files = append(files, f)
 	}
@@ -744,28 +776,36 @@ func TestLargeSegmentsGoThroughTemporaryFiles(t *testing.T) {
 		if err := w.AppendFile(shard.MustParse(fmt.Sprintf("test.users/%d", i+1)), "g", 1, f); err != nil {
 			t.Fatal(err)
 		}
-		f.Close() // the writer holds its own reference
 	}
-	if left() != 2 {
-		t.Fatalf("%d temporary files with two queued, want 2", left())
+	l1.Close()
+	l2.Close() // the writer holds dups of its own
+	if got := dups.Load(); got != 2 {
+		t.Fatalf("%d dups for two logs, want 2", got)
 	}
+	w.mu.Lock()
+	queued := w.pending[0].body
+	w.mu.Unlock()
 	if err := w.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
-	// While the upload ran, the segment had no file of its own: the queued
-	// files were read where they were.
-	if seen.Load() != 2 {
-		t.Fatalf("%d temporary files during the upload, want the queued ones", seen.Load())
-	}
-	if left() != 0 {
-		t.Fatalf("%d temporary files after the segment was written", left())
+	apptest.Eventually(t, 5*time.Second, "the batch to be dropped", func() bool {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		return len(w.batches) == 0
+	})
+	if _, err := queued.Bytes(); err == nil {
+		t.Fatal("the batch's descriptors are still open after the segment was written")
 	}
 	entries, err := ReadFooter(ctx, store.Store, 1)
-	if err != nil || len(entries) != 2 {
+	if err != nil || len(entries) != 3 {
 		t.Fatalf("%v %v", entries, err)
 	}
 	for i, e := range entries {
-		got, err := ReadEntryFile(ctx, store.Store, 1, e, dir, 100)
+		out, err := dir.Create()
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := ReadEntryInto(ctx, store.Store, 1, e, out)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -773,21 +813,56 @@ func TestLargeSegmentsGoThroughTemporaryFiles(t *testing.T) {
 		if !bytes.Equal(b, testLTX(t, ltx.TXID(i+1), byte(i+1))) {
 			t.Fatalf("entry %d read back differently", i)
 		}
-		got.Close()
+		out.Close()
 	}
 
 	// Closed with a file still queued.
-	f, _ := spool.Collect(dir, 100, bytes.NewReader(testLTX(t, 3, 3)))
-	if err := w.AppendFile(shard.MustParse("test.users/3"), "g", 1, f); err != nil {
+	l3, f3, err := logOf(dir, testLTX(t, 4, 4))
+	if err != nil {
 		t.Fatal(err)
 	}
-	f.Close()
+	if err := w.AppendFile(shard.MustParse("test.users/4"), "g", 1, f3); err != nil {
+		t.Fatal(err)
+	}
+	l3.Close()
+	w.mu.Lock()
+	queued = w.pending[0].body
+	w.mu.Unlock()
 	stop()
 	if err := w.Flush(ctx); !errors.Is(err, ErrClosed) {
 		t.Fatalf("got %v, want ErrClosed", err)
 	}
-	if left() != 0 {
-		t.Fatalf("%d temporary files after the writer was closed", left())
+	if _, err := queued.Bytes(); err == nil {
+		t.Fatal("the descriptors of a file never written are still open after the writer was closed")
+	}
+}
+
+// A log that cannot be duplicated fails the append, and nothing is queued.
+func TestAppendFailsWhenTheLogCannotBeDuplicated(t *testing.T) {
+	t.Parallel()
+	store := newStore(t)
+	dir := tempfile.NewDir(t.TempDir())
+	w := NewWriter(store.Store, Options{})
+	serve(t, w)
+	l, f, err := logOf(dir, testLTX(t, 1, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	boom := errors.New("too many open files")
+	dir.SetHook(func(op tempfile.Op) error {
+		if op == tempfile.OpDup {
+			return boom
+		}
+		return nil
+	})
+	if err := w.AppendFile(shard.MustParse("test.users/1"), "g", 1, f); !errors.Is(err, boom) {
+		t.Fatalf("got %v, want the dup's error", err)
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.pending) != 0 || w.appended != 0 {
+		t.Fatalf("%d entries queued after a failed append", len(w.pending))
 	}
 }
 
@@ -904,4 +979,41 @@ func readRange(ctx context.Context, store *journal.Store, seq pos.Seg, off, n in
 	}
 	defer rc.Close()
 	return io.ReadAll(rc)
+}
+
+// A local store that refuses a segment takes the tier down: the counter the
+// gate waits for counts nothing the store did not take, LocalDown closes, and
+// the record's copy lands all the same.
+func TestARefusingLocalStoreTakesTheTierDown(t *testing.T) {
+	t.Parallel()
+	store, ctx := newStore(t), context.Background()
+	local := localStore(t)
+	// The local store's first number is taken by a create of another writer's:
+	// a segment this life can never put there, whatever it tries.
+	if err := local.Create(ctx, 1, bytes.NewReader([]byte("somebody else's"))); err != nil {
+		t.Fatal(err)
+	}
+	w := NewWriter(store.Store, Options{Local: local})
+	serve(t, w)
+	mustAppend(t, w, "test.users/1", 1, testLTX(t, 1, 1))
+	if err := w.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if w.Written(StoreRecord) != 1 {
+		t.Fatalf("the record has %d entries, want 1", w.Written(StoreRecord))
+	}
+	apptest.Eventually(t, 5*time.Second, "the local tier to go down", func() bool {
+		select {
+		case <-w.LocalDown():
+			return true
+		default:
+			return false
+		}
+	})
+	if w.Written(StoreLocal) != 0 {
+		t.Fatalf("the local store counts %d entries, want none of the refused segment", w.Written(StoreLocal))
+	}
+	if w.LocalReady() {
+		t.Fatal("the local tier is ready after a refusal")
+	}
 }

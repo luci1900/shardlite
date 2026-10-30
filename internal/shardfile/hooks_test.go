@@ -95,7 +95,7 @@ func TestBeforeUpdateErrorLeavesTheManifest(t *testing.T) {
 	if files := storedFiles(t, e); len(files) != 1 {
 		t.Fatalf("manifest changed: files %v", files)
 	}
-	if h.ETag != etag || len(h.Manifest.Files) != 1 || len(sh.Tail()) == 0 {
+	if h.ETag != etag || len(h.Manifest.Files) != 1 || len(tailOf(t, sh).Files) == 0 {
 		t.Fatal("handle or tail changed by a failed hook")
 	}
 	// The same tail goes through once the hook works.

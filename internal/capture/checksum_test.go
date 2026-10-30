@@ -71,7 +71,7 @@ func TestCaptureChecksumMatchesTheDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A small restart threshold, so the WAL is restarted during the test.
-	sh, err := capture.New(capture.Config{Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W, RestartFrames: 20})
+	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W, RestartFrames: 20})
 	if err != nil {
 		t.Fatal(err)
 	}

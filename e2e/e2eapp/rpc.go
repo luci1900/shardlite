@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,7 +31,15 @@ import (
 //	Fail     unary: "code message"; ends with that status and a trailer
 //	Hold     unary: waits until the call is cancelled (or "ms" passes) and records what it saw
 //	Relay    unary: "to token"; debits this shard, then calls Add on another shard through the control API
-//	Who      unary: reports the target, caller and hops the app was called with
+//	Who      unary: reports the opened shard, caller and hops the app was called with
+//
+// gRPC has no path to put an id in, so a call says which shard it is for in
+// x-shard metadata, which is this app's own key and sits beside the
+// shardlite-target hint. (A real gRPC app would more likely put the id in its
+// messages. Reading it would mean looking at the first message before relaying
+// a stream, which a server SDK would do and this sketch leaves out.) The shard
+// is worked out and relayed by the same wrapper as the HTTP routes, in front of
+// the gRPC server.
 
 type rawHeadersKey struct{}
 
@@ -45,18 +54,27 @@ func rawHeaders(ctx context.Context) http.Header {
 type HoldRecord struct {
 	GRPCTimeout string `json:"grpc_timeout"` // the raw grpc-timeout header
 	DeadlineMS  int64  `json:"deadline_ms"`  // time left on the handler's context when it started, -1 if none
-	Target      string `json:"target"`
+	Opened      string `json:"opened"`       // the shard the node opened
 }
 
 // Debug is the app's counters, served at GET /debug on the app's own address.
 type Debug struct {
 	mu          sync.Mutex
-	HoldStarted int          `json:"hold_started"`
-	HoldCancel  int          `json:"hold_cancelled"`
-	LastHold    HoldRecord   `json:"last_hold"`
-	WSEnded     int          `json:"ws_ended"`
-	WSClose     []WSCloseRec `json:"ws_closes"` // how each connection ended, in order
-	OpenDBs     int          `json:"open_dbs"`  // shard databases the app has open right now
+	HoldStarted int            `json:"hold_started"`
+	HoldCancel  int            `json:"hold_cancelled"`
+	LastHold    HoldRecord     `json:"last_hold"`
+	WSEnded     int            `json:"ws_ended"`
+	WSClose     []WSCloseRec   `json:"ws_closes"` // how each connection ended, in order
+	OpenDBs     int            `json:"open_dbs"`  // shard databases the app has open right now
+	Relays      []RelayRec     `json:"relays"`    // the requests the app relayed to another shard, in order
+	Served      map[string]int `json:"served"`    // how many requests the app has served on each shard, by the shard the node opened
+}
+
+// RelayRec is a request the app relayed: the node opened Opened for it (empty if
+// it opened nothing), and it was for For.
+type RelayRec struct {
+	Opened string `json:"opened"`
+	For    string `json:"for"`
 }
 
 // WSCloseRec is how a WebSocket connection of the app ended.
@@ -66,44 +84,60 @@ type WSCloseRec struct {
 	Reason string `json:"reason"`
 }
 
-func (a *App) rpcShard(ctx context.Context) (*shardReq, error) {
-	md, _ := metadata.FromIncomingContext(ctx)
-	one := func(k string) string {
-		if v := md.Get(k); len(v) > 0 {
-			return v[0]
-		}
-		return ""
+type shardKey struct{}
+
+// grpcShard is the shard a gRPC call is for. Fail, Hold and Who touch no shard
+// data and answer for whichever shard the node opened.
+func grpcShard(r *http.Request) string {
+	switch r.URL.Path {
+	case "/e2e.Shards/Fail", "/e2e.Shards/Hold", "/e2e.Shards/Who":
+		return r.Header.Get("Shardlite-Opened")
 	}
-	name, path := one("shardlite-target"), one("shardlite-path")
-	if name == "" || path == "" {
-		return nil, status.Error(codes.InvalidArgument, "this method is for a shard: name one with shardlite-target")
-	}
-	db, err := a.pool.get(path)
-	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-	return &shardReq{name: name, path: path, db: db}, nil
+	return r.Header.Get("X-Shard")
 }
+
+// serveGRPC runs the gRPC server on a call for the shard the node opened. The
+// handlers find the shard in the context.
+func (a *App) serveGRPC(w http.ResponseWriter, r *http.Request, s *shardReq) {
+	ctx := context.WithValue(r.Context(), rawHeadersKey{}, r.Header.Clone())
+	ctx = context.WithValue(ctx, shardKey{}, s)
+	a.grpc.ServeHTTP(w, r.WithContext(ctx))
+}
+
+func isGRPC(r *http.Request) bool {
+	return r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc")
+}
+
+// refuse answers a request the app won't serve: a gRPC status for a gRPC call,
+// an HTTP error otherwise.
+func refuse(w http.ResponseWriter, r *http.Request, httpStatus int, msg string) {
+	if !isGRPC(r) {
+		http.Error(w, msg, httpStatus)
+		return
+	}
+	code := codes.Internal
+	if httpStatus == http.StatusBadRequest {
+		code = codes.InvalidArgument
+	}
+	w.Header().Set("Content-Type", "application/grpc")
+	w.Header().Set("Grpc-Status", strconv.Itoa(int(code)))
+	w.Header().Set("Grpc-Message", url.PathEscape(msg))
+	w.WriteHeader(http.StatusOK)
+}
+
+func shardOf(ctx context.Context) *shardReq { return ctx.Value(shardKey{}).(*shardReq) }
 
 func str(v any) string { return v.(*wrapperspb.StringValue).GetValue() }
 
 func (a *App) newGRPC() *grpc.Server {
 	srv := grpc.NewServer()
-	unary := func(name string, h func(ctx context.Context, s *shardReq, in string) (string, error), needShard bool) grpc.MethodDesc {
+	unary := func(name string, h func(ctx context.Context, s *shardReq, in string) (string, error)) grpc.MethodDesc {
 		return grpc.MethodDesc{MethodName: name, Handler: func(_ any, ctx context.Context, dec func(any) error, _ grpc.UnaryServerInterceptor) (any, error) {
 			in := new(wrapperspb.StringValue)
 			if err := dec(in); err != nil {
 				return nil, err
 			}
-			var s *shardReq
-			if needShard {
-				var err error
-				if s, err = a.rpcShard(ctx); err != nil {
-					return nil, err
-				}
-				defer s.db.release()
-			}
-			out, err := h(ctx, s, in.Value)
+			out, err := h(ctx, shardOf(ctx), in.Value)
 			if err != nil {
 				return nil, err
 			}
@@ -112,23 +146,18 @@ func (a *App) newGRPC() *grpc.Server {
 	}
 	stream := func(name string, server, client bool, h func(st grpc.ServerStream, s *shardReq) error) grpc.StreamDesc {
 		return grpc.StreamDesc{StreamName: name, ServerStreams: server, ClientStreams: client, Handler: func(_ any, st grpc.ServerStream) error {
-			s, err := a.rpcShard(st.Context())
-			if err != nil {
-				return err
-			}
-			defer s.db.release()
-			return h(st, s)
+			return h(st, shardOf(st.Context()))
 		}}
 	}
 	srv.RegisterService(&grpc.ServiceDesc{
 		ServiceName: "e2e.Shards",
 		HandlerType: (*any)(nil),
 		Methods: []grpc.MethodDesc{
-			unary("Add", a.rpcAdd, true),
-			unary("Fail", a.rpcFail, false),
-			unary("Hold", a.rpcHold, false),
-			unary("Relay", a.rpcRelay, true),
-			unary("Who", a.rpcWho, false),
+			unary("Add", a.rpcAdd),
+			unary("Fail", a.rpcFail),
+			unary("Hold", a.rpcHold),
+			unary("Relay", a.rpcRelay),
+			unary("Who", a.rpcWho),
 		},
 		Streams: []grpc.StreamDesc{
 			stream("Watch", true, false, a.rpcWatch),
@@ -160,8 +189,8 @@ func (a *App) rpcFail(ctx context.Context, _ *shardReq, in string) (string, erro
 func (a *App) rpcHold(ctx context.Context, _ *shardReq, in string) (string, error) {
 	md, _ := metadata.FromIncomingContext(ctx)
 	rec := HoldRecord{DeadlineMS: -1}
-	if v := md.Get("shardlite-target"); len(v) > 0 {
-		rec.Target = v[0]
+	if v := md.Get("shardlite-opened"); len(v) > 0 {
+		rec.Opened = v[0]
 	}
 	if h := rawHeaders(ctx); h != nil {
 		rec.GRPCTimeout = h.Get("Grpc-Timeout")
@@ -199,7 +228,7 @@ func (a *App) rpcRelay(ctx context.Context, s *shardReq, in string) (string, err
 		return "", status.Error(codes.Internal, err.Error())
 	}
 	md, _ := metadata.FromIncomingContext(ctx)
-	out := metadata.Pairs("shardlite-target", to, "shardlite-caller", s.name)
+	out := metadata.Pairs("shardlite-target", to, "x-shard", to, "shardlite-caller", s.name)
 	if v := md.Get("shardlite-hops"); len(v) > 0 {
 		out.Set("shardlite-hops", v[0])
 	}
@@ -223,7 +252,7 @@ func (a *App) rpcWho(ctx context.Context, _ *shardReq, _ string) (string, error)
 		}
 		return ""
 	}
-	return fmt.Sprintf("target=%s caller=%s hops=%s", get("shardlite-target"), get("shardlite-caller"), get("shardlite-hops")), nil
+	return fmt.Sprintf("opened=%s caller=%s hops=%s", get("shardlite-opened"), get("shardlite-caller"), get("shardlite-hops")), nil
 }
 
 func (a *App) controlConn() (*grpc.ClientConn, error) {

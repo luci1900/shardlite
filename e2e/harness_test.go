@@ -30,6 +30,7 @@ import (
 	"github.com/luci1900/shardlite/internal/s3test"
 	shardpkg "github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
 // declarationJSON is the declaration the app serves at its ready route
@@ -197,17 +198,21 @@ func (s *stack) blobEnv() []string {
 	return append([]string{"SHARDLITE_BLOB=s3://" + s.store.Bucket, "SHARDLITE_S3_ENDPOINT=" + s.store.Endpoint, "SHARDLITE_PREFIX=" + s.store.Prefix}, s3test.Env()...)
 }
 
-// startNode starts (or restarts) the node and waits until it is ready.
-func (s *stack) startNode() {
-	s.t.Helper()
+// nodeEnv is the node's environment: later entries (the stack's own extras) win.
+func (s *stack) nodeEnv() []string {
 	env := append(s.blobEnv(), []string{
 		"SHARDLITE_NODE=n1",
 		"SHARDLITE_DATA=" + filepath.Join(s.dir, "data"),
 		"SHARDLITE_APP=http://" + s.appAddr, "SHARDLITE_LISTEN_PUBLIC=" + s.pub, "SHARDLITE_LISTEN_CONTROL=" + s.ctl, "SHARDLITE_LISTEN_PEER=127.0.0.1:0",
 		"SHARDLITE_FLUSH=50ms", "SHARDLITE_LEASE_TTL=5s",
 	}...)
-	env = append(env, s.env...)
-	s.node = startProc(s.t, "shardlite", s.nodeBin, env)
+	return append(env, s.env...)
+}
+
+// startNode starts (or restarts) the node and waits until it is ready.
+func (s *stack) startNode() {
+	s.t.Helper()
+	s.node = startProc(s.t, "shardlite", s.nodeBin, s.nodeEnv())
 	s.node.waitFor(s.t, `shardlite is up`, 30*time.Second)
 	defer func() {
 		if s.t.Failed() {
@@ -229,12 +234,22 @@ func (s *stack) request(method, path, target, body string) (int, string, error) 
 	return doRequest(http.DefaultClient, method, "http://"+s.pub+path, target, body)
 }
 
+// at is the path of an app route that belongs to shard: the app works out which
+// shard a request is for from it.
+func at(shard, route string) string { return "/" + shard + route }
+
+// shardRequest is request as a client SDK for the app makes it: the shard is in
+// the path, and Shardlite-Target names the same shard to save a hop.
+func (s *stack) shardRequest(method, shard, route, body string) (int, string, error) {
+	return s.request(method, at(shard, route), shard, body)
+}
+
 // create creates shards as the app does, with a call to its create route:
 // clients can only reach shards that exist.
 func (s *stack) create(t testing.TB, shards ...string) {
 	t.Helper()
 	for _, shard := range shards {
-		if st, body, err := s.control("POST", "/create", shard, ""); err != nil || st != 204 {
+		if st, body, err := s.control("POST", at(shard, "/create"), shard, ""); err != nil || st != 204 {
 			t.Fatalf("creating %s: %d %q %v", shard, st, body, err)
 		}
 	}
@@ -272,7 +287,7 @@ func newVerifier(t testing.TB, s *stack) *verifier {
 	return &verifier{t, &shardfile.Files{
 		Blob: blob.NewStore(l, "verifier", 1, blob.Options{}), Backend: l, Node: "verifier",
 		JournalOptions: journal.Options(blob.Options{}),
-		Leases:         coord.NewRegistry(l, "verifier", coord.RegistryOptions{}), TempDir: t.TempDir(),
+		Leases:         coord.NewRegistry(l, "verifier", coord.RegistryOptions{}), Temp: tempfile.NewDir(t.TempDir()),
 	}}
 }
 

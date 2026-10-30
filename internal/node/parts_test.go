@@ -23,7 +23,7 @@ import (
 // serveJournal serves n's writer and keeper, as Run's journal stage does, until
 // stop is called or the test ends.
 func serveJournal(t *testing.T, n *Node) (stop func()) {
-	stop = service.Background(slog.Default(), n.Writer, n.Keeper)
+	stop = service.Background(slog.Default(), n.Writer, n.Keeper, n.Confirmer)
 	t.Cleanup(stop)
 	return stop
 }

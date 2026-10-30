@@ -16,7 +16,7 @@ import (
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/remindex"
-	"github.com/luci1900/shardlite/internal/spool"
+	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
 // DefaultMaxFiles is how many files a manifest may list before the next
@@ -268,15 +268,18 @@ func (h *Handle) putFile(ctx context.Context, f File, body blob.Body) error {
 // SQLite file. The delta's range continues from the manifest's last position.
 // It does nothing if the tail is empty.
 func (h *Handle) WriteDelta(ctx context.Context, sh *capture.Shard, hooks Hooks) error {
-	tail := sh.Tail()
+	tail, err := sh.Tail()
+	if err != nil {
+		return fmt.Errorf("delta for %s: %w", h.Name, err)
+	}
 	defer tail.Close()
-	if len(tail) == 0 {
+	if len(tail.Files) == 0 {
 		return nil
 	}
-	if err := h.putTail(ctx, tail, hooks, nil); err != nil {
+	if err := h.putTail(ctx, tail.Files, hooks, nil); err != nil {
 		return err
 	}
-	sh.DropTail(tail[len(tail)-1].Last())
+	sh.DropTail(tail.Files[len(tail.Files)-1].Last())
 	return nil
 }
 
@@ -300,19 +303,11 @@ func (h *Handle) putTail(ctx context.Context, tail []capture.TailFile, hooks Hoo
 			return fmt.Errorf("tail of %s has a gap before position %d", h.Name, tail[i].Position)
 		}
 	}
-	w, err := h.F.newSpool(h.F.spoolLimit())
-	if err != nil {
-		return err
-	}
-	if err := reencode(w, tail, r); err != nil {
-		w.Abort()
-		return fmt.Errorf("delta for %s: %w", h.Name, err)
-	}
-	delta, err := w.Finish()
+	log, delta, err := h.F.build(func(w io.Writer) error { return reencode(w, tail, r) })
 	if err != nil {
 		return fmt.Errorf("delta for %s: %w", h.Name, err)
 	}
-	defer delta.Close()
+	defer log.Close()
 	// The reminder and its entry come before the file, so a failed entry leaves no
 	// file behind that a retry with a new handle (an adoption's) would find.
 	next := h.Manifest.clone()
@@ -407,7 +402,7 @@ func (h *Handle) rebase(ctx context.Context, sh *capture.Shard, hooks Hooks) (Sn
 //
 // The snapshot covers the shard's positions up to the one capture says it is
 // at (see capture.Shard.Snapshot), so the base is 1-{position}, and the commits
-// after it are the tail, still in the node's memory and journal. The manifest
+// after it are the tail, still in the node's logs and journal. The manifest
 // is pointed at the base alone by compare-and-swap before the old files are
 // deleted, as a crash in between leaves the old files in use and the new base
 // unreferenced. It reports whether it wrote a base: there is nothing to do for a
@@ -416,21 +411,16 @@ func (h *Handle) Rebase(ctx context.Context, sh *capture.Shard, hooks Hooks) (bo
 	if err := h.settle(ctx); err != nil {
 		return false, err
 	}
-	// The snapshot goes to a file, whatever its size: it is the whole database.
-	w, err := h.F.newSpool(0)
-	if err != nil {
-		return false, err
-	}
-	position, err := h.snapshotTo(ctx, sh, w)
-	if err != nil {
-		w.Abort()
-		return false, fmt.Errorf("rebase %s: %w", h.Name, err)
-	}
-	snap, err := w.Finish()
+	// The snapshot goes to a file of its own: it is the whole database.
+	var position pos.Position
+	log, snap, err := h.F.build(func(w io.Writer) (err error) {
+		position, err = h.snapshotTo(ctx, sh, w)
+		return err
+	})
 	if err != nil {
 		return false, fmt.Errorf("rebase %s: %w", h.Name, err)
 	}
-	defer snap.Close()
+	defer log.Close()
 	if position == 0 {
 		return false, nil // nothing has been written
 	}
@@ -559,15 +549,15 @@ func encodeSnapshot(w io.Writer, r io.Reader, position pos.Position) error {
 }
 
 // getFile downloads one of the shard's LTX files to a temporary file.
-func (h *Handle) getFile(ctx context.Context, f File) (*spool.File, error) {
+func (h *Handle) getFile(ctx context.Context, f File) (*tempfile.Log, error) {
 	rc, _, err := h.F.Blob.Get(ctx, FileKey(h.Name, h.Manifest.Generation, f))
 	if err != nil {
 		return nil, err
 	}
 	defer rc.Close()
-	dir, err := h.F.tempDir()
+	dir, err := h.F.dir()
 	if err != nil {
 		return nil, err
 	}
-	return spool.Collect(dir, 0, rc) // whatever its size
+	return dir.Collect(rc)
 }

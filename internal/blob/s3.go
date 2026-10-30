@@ -39,6 +39,9 @@ type S3Options struct {
 	// HTTPClient, if set, replaces the default client (tests put a fault-injecting
 	// transport behind it).
 	HTTPClient *http.Client
+	// ClockSink, if set, receives a sample of the store's clock from every
+	// response (ClockSample).
+	ClockSink ClockSink
 }
 
 // S3 is a Backend over the S3 API (AWS, and stores that speak it with conditional
@@ -84,6 +87,9 @@ func NewS3(ctx context.Context, o S3Options) (*S3, error) {
 		so.UsePathStyle = true
 		if o.Endpoint != "" {
 			so.BaseEndpoint = aws.String(o.Endpoint)
+		}
+		if o.ClockSink != nil {
+			so.APIOptions = append(so.APIOptions, addClockSampler(o.ClockSink))
 		}
 	})
 	return &S3{c: c, bucket: o.Bucket, region: cfg.Region}, nil

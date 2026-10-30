@@ -75,7 +75,7 @@ func TestGateOnResponses(t *testing.T) {
 	r := newSRigWith(t, manualFlush)
 	r.create("test.wallet/g1", "test.users/g2", "test.users/g3")
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
-		r.commit(q.Header.Get("Shardlite-Path"))
+		r.commit(q.Header.Get("Shardlite-File"))
 		if v := q.URL.Query().Get("sync"); v != "" {
 			w.Header().Set("Shardlite-Sync", v)
 		}
@@ -90,15 +90,14 @@ func TestGateOnResponses(t *testing.T) {
 	if resp.StatusCode != 200 || r.rows("test.wallet/g1") != 1 {
 		t.Fatalf("status %d, rows in blob storage: %d", resp.StatusCode, r.rows("test.wallet/g1"))
 	}
-	// A local-tier kind: the answer waits for the node's own disk, which is
-	// before the record has it.
-	r.withCycles(func() {
+	// A none-tier kind: the answer waits for nothing, so no cycle has run.
+	r.withoutCycle(func() {
 		resp, _ = r.req("POST", r.pub, "/w", map[string]string{"Shardlite-Target": "test.users/g2"}, "")
 	})
 	if resp.StatusCode != 200 {
 		t.Fatalf("status %d", resp.StatusCode)
 	}
-	// Shardlite-Sync: storage on a local kind waits for the record.
+	// Shardlite-Sync: storage on a none kind waits for the record.
 	r.withCycles(func() {
 		r.req("POST", r.pub, "/w?sync=storage", map[string]string{"Shardlite-Target": "test.users/g2"}, "")
 	})
@@ -106,7 +105,7 @@ func TestGateOnResponses(t *testing.T) {
 		t.Fatalf("sync storage by header: %d rows in blob storage", r.rows("test.users/g2"))
 	}
 	// The shard is created before the answer, whatever the tier.
-	r.withCycles(func() {
+	r.withoutCycle(func() {
 		r.req("POST", r.pub, "/w", map[string]string{"Shardlite-Target": "test.users/g3"}, "")
 	})
 	if _, err := r.manifest("test.users/g3"); err != nil {
@@ -129,19 +128,17 @@ func TestGateOnResponses(t *testing.T) {
 	}
 }
 
-// The local tier: the answer waits for the node's own disk, not for the
-// record. The record's write waits for the answer here, so an answer that
-// waited for the record would never come.
-func TestLocalTierDoesNotWaitForTheRecord(t *testing.T) {
+// The none tier: the answer waits for nothing, not for a cycle and not for the
+// record. The record's write is held back here, and no cycle runs, so an
+// answer that waited for either would never come.
+func TestNoneTierWaitsForNothing(t *testing.T) {
 	t.Parallel()
 	r := newSRigWith(t, manualFlush)
-	r.create("test.users/local")
+	r.create("test.users/none")
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
-		r.commit(q.Header.Get("Shardlite-Path"))
+		r.commit(q.Header.Get("Shardlite-File"))
 		io.WriteString(w, "done")
 	})
-	// The record's write waits for the test to release it: an answer that
-	// waited for the record would never come.
 	release := make(chan struct{})
 	var freed sync.Once
 	letGo := func() { freed.Do(func() { close(release) }) }
@@ -156,51 +153,19 @@ func TestLocalTierDoesNotWaitForTheRecord(t *testing.T) {
 		}
 		return nil
 	})
-	type arrived struct {
-		resp *http.Response
-		err  error
-	}
-	arrivals := make(chan arrived, 1)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		q, err := http.NewRequest("POST", r.pub+"/w", nil)
-		if err != nil {
-			r.t.Fatal(err)
+	r.withoutCycle(func() {
+		resp, _ := r.req("POST", r.pub, "/w", map[string]string{"Shardlite-Target": "test.users/none"}, "")
+		if resp.StatusCode != 200 {
+			t.Errorf("status %d", resp.StatusCode)
 		}
-		q.Header.Set("Shardlite-Target", "test.users/local")
-		resp, err := r.client.Do(q)
-		if resp != nil {
-			defer resp.Body.Close()
-		}
-		arrivals <- arrived{resp, err}
-	}()
-	// The gate is waiting: the chunk has been read and the mark is taken, so
-	// the cycle this test runs next is the one the gate waits for.
-	eventually(r.t, "the gate to wait", func() bool { return r.m.flush.waiting.Load() > 0 })
-	// The cycle captures the commit and writes it to the node's own disk; the
-	// record's write waits.
-	go r.cycle()
-	select { // the headers are gated, and they came while the record's write was held
-	case got := <-arrivals:
-		if got.err != nil {
-			t.Fatalf("after the node's disk: %v", got.err)
-		}
-		if got.resp.StatusCode != 200 {
-			t.Fatalf("status %d", got.resp.StatusCode)
-		}
-	case <-time.After(20 * time.Second):
-		t.Fatal("the answer did not come while the record's write was held back")
-	}
-	if rows := r.rows("test.users/local"); rows != 0 {
+	})
+	if rows := r.rows("test.users/none"); rows != 0 {
 		t.Fatalf("the record had %d rows: the write was not held back", rows)
 	}
-	// The record is released and a cycle catches up, so the body's gate (its
-	// mark is the cycle above) is answered and the request ends.
+	// The commit still reaches the record once a cycle runs.
 	letGo()
-	eventually(r.t, "the first cycle to complete", func() bool { return r.m.Flusher().Completed() >= 1 })
 	r.cycle()
-	<-done
+	eventually(r.t, "the record to hold the commit", func() bool { return r.rows("test.users/none") == 1 })
 }
 
 func TestGateOnStreams(t *testing.T) {
@@ -210,7 +175,7 @@ func TestGateOnStreams(t *testing.T) {
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		for i := 1; i <= 3; i++ {
-			r.commit(q.Header.Get("Shardlite-Path"))
+			r.commit(q.Header.Get("Shardlite-File"))
 			fmt.Fprintf(w, "data: %d\n\n", i)
 			w.(http.Flusher).Flush()
 		}
@@ -241,7 +206,7 @@ func TestGateOnUpgradedConnections(t *testing.T) {
 	r := newSRigWith(t, slowFlush)
 	r.create("test.wallet/ws")
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
-		path := q.Header.Get("Shardlite-Path")
+		path := q.Header.Get("Shardlite-File")
 		conn, rw, err := w.(http.Hijacker).Hijack()
 		if err != nil {
 			return
@@ -291,10 +256,10 @@ func TestGateOnCalls(t *testing.T) {
 			caller := q.Header.Get("Shardlite-Caller")
 			seen.Store(int64(r.rows(caller)))
 		default: // the caller commits, then calls another shard through the control API
-			r.commit(q.Header.Get("Shardlite-Path"))
+			r.commit(q.Header.Get("Shardlite-File"))
 			c, _ := http.NewRequest("POST", r.ctl+"/callee", nil)
 			c.Header.Set("Shardlite-Target", "test.slow/callee")
-			c.Header.Set("Shardlite-Caller", q.Header.Get("Shardlite-Target"))
+			c.Header.Set("Shardlite-Caller", q.Header.Get("Shardlite-Opened"))
 			if v := q.URL.Query().Get("callsync"); v != "" {
 				c.Header.Set("Shardlite-Sync", v)
 			}
@@ -317,8 +282,8 @@ func TestGateOnCalls(t *testing.T) {
 	if seen.Load() != 1 {
 		t.Fatalf("the callee got the call when blob storage had %d of the caller's rows", seen.Load())
 	}
-	// A local-tier caller: the call waits for the node's own disk, and the
-	// header can ask for the record.
+	// A none-tier caller: the call waits for nothing, and the header can ask
+	// for the record.
 	seen.Store(0)
 	r.withCycles(func() {
 		r.req("POST", r.pub, "/go?callsync=storage", map[string]string{"Shardlite-Target": "test.users/call"}, "")
@@ -333,7 +298,7 @@ func TestSyncEndpointAndLeaseLoss(t *testing.T) {
 	r := newSRigWith(t, slowFlush)
 	r.create("test.users/s1", "test.wallet/s2")
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
-		r.commit(q.Header.Get("Shardlite-Path"))
+		r.commit(q.Header.Get("Shardlite-File"))
 	})
 	// A write to a sync-off shard, then POST /_shardlite/sync: durable on return.
 	r.req("POST", r.pub, "/w", map[string]string{"Shardlite-Target": "test.users/s1"}, "")
@@ -366,7 +331,7 @@ func TestCreationOverHTTP(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
-		path := q.Header.Get("Shardlite-Path")
+		path := q.Header.Get("Shardlite-File")
 		if q.URL.Path == "/write" {
 			r.app.Must(t, "open", path, path) // creates its tables
 			r.app.Must(t, "insert", path, "1", "64")

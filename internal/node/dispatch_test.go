@@ -21,7 +21,7 @@ import (
 func ringer(t *testing.T, n *clusterNode, app *apptest.App) (paths chan string, rung *atomic.Int32) {
 	paths, rung = make(chan string, 1), &atomic.Int32{}
 	n.serve(func(w http.ResponseWriter, q *http.Request) {
-		path := q.Header.Get("Shardlite-Path")
+		path := q.Header.Get("Shardlite-File")
 		if q.URL.Path != remindersPath {
 			paths <- remindIn(t, app, q)
 			return
@@ -38,7 +38,7 @@ func ringer(t *testing.T, n *clusterNode, app *apptest.App) (paths chan string, 
 // Remind-Due header puts a timer row due then into its shard, while the request
 // holds the shard (so it can't go idle first). It returns the shard's path.
 func remindIn(t *testing.T, app *apptest.App, q *http.Request) string {
-	path := q.Header.Get("Shardlite-Path")
+	path := q.Header.Get("Shardlite-File")
 	if due := q.Header.Get("Remind-Due"); due != "" {
 		app.Must(t, "open", path, path)
 		app.Must(t, "exec", path, `INSERT INTO _shardlite_reminders (key, due) VALUES ('k', `+due+`)`)

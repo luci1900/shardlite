@@ -21,6 +21,9 @@ import (
 //	close:CODE:why closes the connection with that code and reason
 //
 // A binary message is echoed back as it is, without a commit.
+//
+// A connection that arrives at the wrong shard is relayed for its whole life
+// (see App.shard), with the app in the data path.
 func (a *App) ws(w http.ResponseWriter, r *http.Request, s *shardReq) {
 	c, err := websocket.Accept(w, r, nil)
 	if err != nil {

@@ -15,6 +15,7 @@ import (
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/harness"
 	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
 // shardWithDeltas is a shard with a base and a few deltas, and the manifest
@@ -378,7 +379,7 @@ func TestDeltaCarriesTheChecksums(t *testing.T) {
 	for i := range 3 {
 		write(t, e, app, func() error { return sh.Sync(ctx) }, i)
 	}
-	tail := sh.Tail()
+	tail := tailOf(t, sh).Files
 	if len(tail) < 2 {
 		t.Fatalf("%d files in the tail", len(tail))
 	}
@@ -436,7 +437,7 @@ func TestRebaseWithASkewedChecksum(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelError}))
 	app := e.StartApp(shard)
 	sh, err := capture.New(capture.Config{
-		Name: shardName(shard), Path: e.Path(shard), Generation: "g1", Writer: e.W,
+		Name: shardName(shard), Path: e.Path(shard), Generation: "g1", Writer: e.W, TempDir: tempfile.NewDir(t.TempDir()),
 		Logger: logger, SkewChecksum: true,
 		ChecksumMismatch: func(want, got ltx.Checksum) { mismatches++ },
 	})

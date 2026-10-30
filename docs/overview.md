@@ -15,7 +15,7 @@ This is the Orleans / Durable Objects model, with SQLite as the state and with t
 - Apps can be written in any language or framework, even Unreal dedicated servers.
 - Clients can connect directly to the process holding a shard over UDP or WebRTC, not only through an HTTP proxy.
 
-As virtual actors, any shard id can be called and the first call creates the shard, with no create step. The app creates shards and clients reach the ones that exist, so a random id from a client finds nothing and creates nothing.
+As virtual actors, any shard id can be called and the first call creates the shard, with no create step. The app creates shards and clients reach the ones that exist, so a random id from a client finds nothing and creates nothing. Clients name the shard they want as a routing hint that saves a hop, and the app confirms it from the request itself, relaying to the right shard when the hint is wrong (see [Serving](guide.md#serving)).
 
 Shardlite keeps Orleans' operational trade-offs. Blob storage (S3 or compatible) is the system of record, run by someone else. Nodes keep shards on local disk only as a cache, so they are disposable; the node's own database there holds the journal's copy its `local` tier acknowledges, which answers for the node's crash and not the host's. Durability comes from shipping changes to blob storage, and the storage is the final check against duplicate owners (as Orleans' storage ETags are). Shardlite is a router and a cache in front of blob storage, not a database to operate.
 
@@ -36,7 +36,7 @@ A shardlite app should be no more exposed to abuse than any web app. Clients can
 ## Non-goals
 
 - **No queries or transactions across shards.** Reading two shards means two separate reads, at your own risk. Anything that needs agreement between shards goes through one shard that owns that agreement (see [Consistency model](#consistency-model)). Unlike Orleans, there are no opt-in distributed transactions.
-- No replication between nodes. Each shard has one writer, and blob storage provides durability. Reads that may be stale, from any node, come from snapshot reads instead (later, see the [roadmap](roadmap.md#later)).
+- No consensus or replication between nodes. Each shard has one writer and blob storage is the record, with one peer mirroring each node's journal so an acknowledgement need not wait for it (see [Node journals and snapshots](internals.md#node-journals-and-snapshots)). Reads that may be stale, from any node, come from snapshot reads instead (later, see the [roadmap](roadmap.md#later)).
 - No general-purpose distributed database features (cross-shard indexes, query planning).
 
 ## Concepts
@@ -51,7 +51,7 @@ A shardlite app should be no more exposed to abuse than any web app. Clients can
 | **Active shard** | A shard that is open on its owner and shipping changes. Costs memory and CPU. |
 | **Local cache** | Shard files kept on a node's disk after deactivation. Evictable. Costs disk only. |
 | **Pin** | A process's hold on a shard: the node proxies the shard to that process and never hands it off until the process lets go. The process serves its own clients over any protocol. |
-| **Gate** | The node holds a shard's output (responses, streams and calls) until the writes before it meet the kind's tier: the node's own database for `local`, blob storage for `storage` (the default), as Durable Objects' output gates do and as Orleans code does by awaiting `WriteStateAsync` before returning. |
+| **Gate** | The node holds a shard's output (responses, streams and calls) until the writes before it meet the kind's tier: nothing for `none`, the node's own database and the journal's peer for `peer`, blob storage for `storage` (the default), as Durable Objects' output gates do and as Orleans code does by awaiting `WriteStateAsync` before returning. A tier the node cannot meet fails the answer; no weaker tier is given instead. |
 
 ## Architecture
 
@@ -82,7 +82,7 @@ The node does all of the distributed work: leases, ownership, routing, shipping 
 
 ## Consistency model
 
-- One shard, one writer. Within a shard, transactions are SQLite's (serializable), and on the storage tier (the default) every read and write of the shard is linearizable: the guarantee CockroachDB gives for a key, for a whole database. It assumes working clocks (their rates, not their synchronisation), and a request can ask for reads that hold under any clocks and pauses. The levels and their conditions are in [Consistency](guide.md#consistency).
+- One shard, one writer. Within a shard, transactions are SQLite's (serializable), and every read and write of the shard is linearizable while its owner holds it: the guarantee etcd gives for its linearizable reads, for a whole database. The `storage` tier keeps it across the loss of the owner's host and under any clocks and pauses, because each answer confirms that the node still owns the shard; `peer` while one of the two copies stands, and given working clocks (their rates, not their synchronisation), as `none` does (see [Consistency](guide.md#consistency)).
 - Across shards, consistency is the app's problem.
 - Anything needing agreement goes through a shard that owns it:
   - A trade is a `trade/{id}` shard running a saga: reserve on both player shards, then commit or release, with idempotent steps and resumable state.

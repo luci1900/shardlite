@@ -15,7 +15,7 @@ import (
 	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/shard"
-	"github.com/luci1900/shardlite/internal/spool"
+	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
 func shmIdent(t *testing.T, path string) (ino uint64, size int64) {
@@ -29,7 +29,7 @@ func shmIdent(t *testing.T, path string) (ino uint64, size int64) {
 
 func newShard(t *testing.T, e *env, path string) *capture.Shard {
 	t.Helper()
-	sh, err := capture.New(capture.Config{Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w})
+	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,7 +297,8 @@ func TestWALIndexSeesEveryCommit(t *testing.T) {
 	}
 	defer w.Close()
 	sh, err := capture.New(capture.Config{
-		Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w,
+		TempDir: tempDir(t),
+		Name:    shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w,
 		RestartFrames: 3,
 	})
 	if err != nil {
@@ -361,7 +362,7 @@ type appendHook struct {
 	before func()
 }
 
-func (w appendHook) AppendFile(name shard.Name, generation shard.Gen, position pos.Position, ltxFile *spool.File) error {
+func (w appendHook) AppendFile(name shard.Name, generation shard.Gen, position pos.Position, ltxFile tempfile.File) error {
 	w.before()
 	return w.Writer.AppendFile(name, generation, position, ltxFile)
 }
@@ -378,7 +379,7 @@ func TestHeaderDuringASlowSyncAnswers(t *testing.T) {
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
 	app.Must(t, "open", "a", path)
-	sh, err := capture.New(capture.Config{Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: appendHook{e.w, func() {
+	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: appendHook{e.w, func() {
 		if armed.CompareAndSwap(true, false) {
 			close(entered)
 			<-release
@@ -436,7 +437,7 @@ func TestHeaderAfterCloseIsClosed(t *testing.T) {
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
 	app.Must(t, "open", "a", path)
-	sh, err := capture.New(capture.Config{Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w})
+	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w})
 	if err != nil {
 		t.Fatal(err)
 	}

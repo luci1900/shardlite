@@ -56,6 +56,7 @@ import (
 	"github.com/luci1900/shardlite/internal/service"
 	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
 type actor struct {
@@ -78,6 +79,8 @@ type testNode struct {
 	faultMode atomic.Pointer[string]
 	faultPm   atomic.Int64
 	faultMs   atomic.Int64
+	tempOp    atomic.Pointer[tempfile.Op] // the temporary-file operation made to fail, nil for none
+	tempPm    atomic.Int64                // how many in a thousand of them fail
 }
 
 // leased is the node's writer as its shards see it. This node has no flusher,
@@ -104,6 +107,15 @@ func (n *testNode) at(point kill.Point) {
 	if p := n.armed.Load(); p != nil && *p == point {
 		die()
 	}
+}
+
+// tempHook fails the temporary-file operation that "tempfault" names, at the
+// rate it names.
+func (n *testNode) tempHook(op tempfile.Op) error {
+	if want := n.tempOp.Load(); want != nil && *want == op && rand.Int64N(1000) < n.tempPm.Load() {
+		return errors.New("injected: temporary file " + string(op))
+	}
+	return nil
 }
 
 func (n *testNode) hook(ctx context.Context, op blobtest.Op, key string, after bool) error {
@@ -169,9 +181,10 @@ func main() {
 	}
 	n := &testNode{nd: nd, files: nd.Files, w: nd.Writer, shards: map[string]*actor{}, released: map[string]*capture.Shard{}}
 	nd.SetTails(&n.tails)
+	nd.Files.Temp.SetHook(n.tempHook)
 	// Run serves the writer and the keeper in the real node; this one serves them
 	// while main runs.
-	defer service.Background(slog.Default(), nd.Writer, nd.Keeper)()
+	defer service.Background(slog.Default(), nd.Writer, nd.Keeper, nd.Confirmer)()
 	// The writer flushes only when asked: this node does it on a timer.
 	flushCtx, stopFlushing := context.WithCancel(context.Background())
 	defer stopFlushing()
@@ -218,7 +231,7 @@ func removeLocal(path string) {
 // continuing from the restored position, and synced before any app opens the
 // file.
 func (n *testNode) activate(ctx context.Context, name shard.Name, path string, h *shardfile.Handle, restored *capture.Restored) error {
-	sh, err := capture.New(capture.Config{Name: name, Path: path, Generation: h.Manifest.Generation, Writer: leased{n.w, n.nd}, Restored: restored, TempDir: n.nd.TempDir, SpoolLimit: uint64(n.nd.SpoolLimit), At: n.at})
+	sh, err := capture.New(capture.Config{Name: name, Path: path, Generation: h.Manifest.Generation, Writer: leased{n.w, n.nd}, Restored: restored, TempDir: n.nd.Files.Temp, At: n.at})
 	if err != nil {
 		return err
 	}
@@ -282,6 +295,23 @@ func (n *testNode) do(f []string) (string, error) {
 		n.faultMode.Store(&mode)
 		n.faultPm.Store(p)
 		n.faultMs.Store(ms)
+		return "", nil
+	case "tempfault":
+		// tempfault create|append|dup|none PERMILLE: fail that operation on the
+		// node's temporary files (a tail's log, a delta, a download) at that rate.
+		var p int64
+		fmt.Sscan(f[2], &p)
+		op := tempfile.Op(name)
+		switch op {
+		case tempfile.OpCreate, tempfile.OpAppend, tempfile.OpDup:
+			n.tempOp.Store(&op)
+		default:
+			if name != "none" {
+				return "", fmt.Errorf("unknown temporary-file operation %q", name)
+			}
+			n.tempOp.Store(nil)
+		}
+		n.tempPm.Store(p)
 		return "", nil
 	case "open":
 		path := f[2]

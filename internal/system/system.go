@@ -29,8 +29,8 @@ type System struct {
 	// it is never made inside Tx. A path under /_shardlite/ is one only the node
 	// may send.
 	Call func(ctx context.Context, req *http.Request) (*http.Response, error)
-	// Sync waits until what this shard has committed so far is durable, and
-	// fails if the node has lost its lease, as the control API's sync does for
+	// Sync waits until what this shard has committed so far is in the record,
+	// whatever the kind's tier, and fails if the node has lost its lease, as the control API's sync does for
 	// an app, but for this shard's commits only: it returns at once when the
 	// shard has nothing new. A system app commits with Tx, then calls Sync before
 	// anything outside the shard depends on the commit (a blob storage write, or
@@ -39,5 +39,10 @@ type System struct {
 	Sync func(ctx context.Context) error
 }
 
-// Target is the header that names the shard a request is for.
+// Target is the header that names the shard a call is for, which a system app
+// sets on the requests it sends with System.Call.
 const Target = "Shardlite-Target"
+
+// Opened is the header that tells a system app which shard the node opened for
+// the request, as it tells an app.
+const Opened = "Shardlite-Opened"

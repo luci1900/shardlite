@@ -32,6 +32,7 @@ type Memory struct {
 	mu      sync.Mutex
 	objects map[string]memObject
 	now     func() time.Time
+	sink    ClockSink
 }
 
 type memObject struct {
@@ -48,6 +49,26 @@ type MemoryOption func(*Memory)
 // tests can age objects. The function is called with the backend's lock held.
 func WithClock(now func() time.Time) MemoryOption {
 	return func(m *Memory) { m.now = now }
+}
+
+// WithClockSink gives the backend a sink to sample, on every call, the clock
+// that stamps LastModified (WithClock) as the store's time, in whole seconds as
+// a real store sends it, against the process's own clock, so a test can skew the
+// store's clock from the node's.
+func WithClockSink(sink ClockSink) MemoryOption {
+	return func(m *Memory) { m.sink = sink }
+}
+
+// sample reports the store's clock to the sink, for a call that began at start.
+// Callers defer it first, so it runs after the call has let go of the lock.
+func (m *Memory) sample(start time.Time) {
+	if m.sink == nil {
+		return
+	}
+	m.mu.Lock()
+	store := m.now()
+	m.mu.Unlock()
+	m.sink(ClockSample{Store: store.Truncate(time.Second), Start: start, End: time.Now()}, nil)
 }
 
 // NewMemory returns an empty in-memory backend.
@@ -91,6 +112,7 @@ func ended(ctx context.Context) error {
 }
 
 func (m *Memory) Create(ctx context.Context, key string, body io.ReadSeeker, id WriteID) (ETag, error) {
+	defer m.sample(time.Now())
 	if err := checkKey(key); err != nil {
 		return "", err
 	}
@@ -106,6 +128,7 @@ func (m *Memory) Create(ctx context.Context, key string, body io.ReadSeeker, id 
 }
 
 func (m *Memory) Update(ctx context.Context, key string, body io.ReadSeeker, expected ETag, id WriteID) (ETag, error) {
+	defer m.sample(time.Now())
 	if err := checkKey(key); err != nil {
 		return "", err
 	}
@@ -125,6 +148,7 @@ func (m *Memory) Update(ctx context.Context, key string, body io.ReadSeeker, exp
 }
 
 func (m *Memory) Get(ctx context.Context, key string) (io.ReadCloser, ETag, error) {
+	defer m.sample(time.Now())
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	o, ok := m.objects[key]
@@ -138,6 +162,7 @@ func (m *Memory) Get(ctx context.Context, key string) (io.ReadCloser, ETag, erro
 // is not positive or reaches past it). A negative offset asks for the last
 // -offset bytes. An offset past the end is a plain error.
 func (m *Memory) GetRange(ctx context.Context, key string, offset, length int64) (io.ReadCloser, error) {
+	defer m.sample(time.Now())
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	o, ok := m.objects[key]
@@ -163,6 +188,7 @@ func (m *Memory) GetRange(ctx context.Context, key string, offset, length int64)
 }
 
 func (m *Memory) Head(ctx context.Context, key string) (ObjectInfo, error) {
+	defer m.sample(time.Now())
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	o, ok := m.objects[key]
@@ -176,6 +202,7 @@ func (m *Memory) Head(ctx context.Context, key string) (ObjectInfo, error) {
 // is ErrNotFound and a changed object ErrConflict. Without it, a missing key is
 // success.
 func (m *Memory) Delete(ctx context.Context, key string, expected ETag) error {
+	defer m.sample(time.Now())
 	if err := ended(ctx); err != nil {
 		return err
 	}
@@ -196,6 +223,7 @@ func (m *Memory) Delete(ctx context.Context, key string, expected ETag) error {
 
 func (m *Memory) List(ctx context.Context, prefix, after string) iter.Seq2[ObjectInfo, error] {
 	return func(yield func(ObjectInfo, error) bool) {
+		start := time.Now()
 		m.mu.Lock()
 		var infos []ObjectInfo
 		for k, o := range m.objects {
@@ -204,6 +232,7 @@ func (m *Memory) List(ctx context.Context, prefix, after string) iter.Seq2[Objec
 			}
 		}
 		m.mu.Unlock()
+		m.sample(start) // before the caller's loop body runs, which is not the store's time
 		slices.SortFunc(infos, func(a, b ObjectInfo) int { return strings.Compare(a.Key, b.Key) })
 		for _, info := range infos {
 			if !yield(info, nil) {

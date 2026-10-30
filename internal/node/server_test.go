@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
+	"net/http/httputil"
 	"net/textproto"
 	"net/url"
 	"os"
@@ -193,24 +194,26 @@ func TestServerRouting(t *testing.T) {
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		last.Store(q.Clone(context.Background()))
 		w.Header().Set("Shardlite-Secret", "x")
-		w.Header().Set("Shardlite-Sync", "local")
+		w.Header().Set("Shardlite-Sync", "none")
 		w.Header().Set("X-Plain", "y")
 		io.WriteString(w, "hello")
 	})
 
 	// The query parameter routes and is stripped; client-sent Shardlite-* headers never reach the app.
 	resp, body := r.req("GET", r.pub, "/hello?a=1&shardlite-target=test.slow/r1&b=2", map[string]string{
-		"Shardlite-Caller": "test.users/9", "Shardlite-Path": "/etc/passwd", "Shardlite-Foo": "1", "Shardlite-If-Active": "true", "Shardlite-Sync": "local",
+		"Shardlite-Caller": "test.users/9", "Shardlite-File": "/etc/passwd", "Shardlite-Foo": "1", "Shardlite-If-Active": "true", "Shardlite-Sync": "none",
+		"Shardlite-Opened": "test.users/evil",
 	}, "")
 	q := last.Load()
 	if resp.StatusCode != 200 || body != "hello" || q == nil {
 		t.Fatalf("%d %q", resp.StatusCode, body)
 	}
-	if q.Header.Get("Shardlite-Target") != "test.slow/r1" || q.URL.RawQuery != "a=1&b=2" || q.URL.Path != "/hello" {
+	// The app is told what the node opened, not what the client named, and a client's own Shardlite-Opened gave way to it.
+	if q.Header.Get("Shardlite-Opened") != "test.slow/r1" || q.Header.Get("Shardlite-Target") != "" || q.URL.RawQuery != "a=1&b=2" || q.URL.Path != "/hello" {
 		t.Fatalf("app saw %s %v", q.URL, q.Header)
 	}
-	if p := q.Header.Get("Shardlite-Path"); p == "/etc/passwd" || !strings.Contains(p, "slow") || !strings.HasSuffix(p, ".db") {
-		t.Fatalf("Shardlite-Path = %q", p)
+	if p := q.Header.Get("Shardlite-File"); p == "/etc/passwd" || !strings.Contains(p, "slow") || !strings.HasSuffix(p, ".db") {
+		t.Fatalf("Shardlite-File = %q", p)
 	}
 	for _, h := range []string{"Shardlite-Caller", "Shardlite-Foo", "Shardlite-If-Active", "Shardlite-Sync"} {
 		if q.Header.Get(h) != "" {
@@ -231,13 +234,13 @@ func TestServerRouting(t *testing.T) {
 
 	// The header wins over the query parameter, which is stripped anyway.
 	r.req("GET", r.pub, "/p?shardlite-target=test.slow/q", map[string]string{"Shardlite-Target": "test.slow/h"}, "")
-	if q := last.Load(); q.Header.Get("Shardlite-Target") != "test.slow/h" || q.URL.RawQuery != "" {
+	if q := last.Load(); q.Header.Get("Shardlite-Opened") != "test.slow/h" || q.Header.Get("Shardlite-Target") != "" || q.URL.RawQuery != "" {
 		t.Fatalf("%v %q", q.Header, q.URL.RawQuery)
 	}
 
 	// No shard: a plain reverse proxy.
-	r.req("GET", r.pub, "/news", map[string]string{"Shardlite-Target": ""}, "")
-	if q := last.Load(); q.Header.Get("Shardlite-Target") != "" || q.Header.Get("Shardlite-Path") != "" || q.URL.Path != "/news" {
+	r.req("GET", r.pub, "/news", map[string]string{"Shardlite-Target": "", "Shardlite-Opened": "test.users/evil"}, "")
+	if q := last.Load(); q.Header.Get("Shardlite-Target") != "" || q.Header.Get("Shardlite-Opened") != "" || q.Header.Get("Shardlite-File") != "" || q.URL.Path != "/news" {
 		t.Fatalf("shardless request: %v", q.Header)
 	}
 
@@ -361,16 +364,19 @@ func TestServerStripsUnderscoreHeaders(t *testing.T) {
 	})
 
 	resp, _ := r.req("GET", r.pub, "/x", map[string]string{
-		"Shardlite-Target": "test.slow/u1", "Shardlite_Caller": "test.users/9", "SHARDLITE_FOO": "1", "X-Plain": "z",
+		"Shardlite-Target": "test.slow/u1", "Shardlite-Opened": "test.users/evil", "Shardlite_Opened": "test.users/evil", "Shardlite_Caller": "test.users/9", "SHARDLITE_FOO": "1", "X-Plain": "z",
 	}, "")
 	q := last.Load()
 	if resp.StatusCode != 200 || q == nil {
 		t.Fatalf("%d", resp.StatusCode)
 	}
 	for k, v := range q.Header {
-		if strings.HasPrefix(strings.ToLower(k), "shardlite") && k != "Shardlite-Target" && k != "Shardlite-Path" && k != "Shardlite-Hops" {
+		if strings.HasPrefix(strings.ToLower(k), "shardlite") && k != "Shardlite-Opened" && k != "Shardlite-File" && k != "Shardlite-Hops" {
 			t.Fatalf("%s: %v reached the app", k, v)
 		}
+	}
+	if q.Header.Get("Shardlite-Opened") != "test.slow/u1" || q.Header.Get("Shardlite-Target") != "" {
+		t.Fatalf("app saw Shardlite-Opened %q and Shardlite-Target %q", q.Header.Get("Shardlite-Opened"), q.Header.Get("Shardlite-Target"))
 	}
 	if q.Header.Get("X-Plain") != "z" {
 		t.Fatal("ordinary headers must pass")
@@ -385,6 +391,32 @@ func TestServerStripsUnderscoreHeaders(t *testing.T) {
 	}
 }
 
+// The shard a request is for is told differently depending on who gets it: the
+// app is told what the node opened (with its file), and the owner's node, which
+// a forward goes to, is told the target to route by.
+func TestRewriteNamesTheShardByWhereItGoes(t *testing.T) {
+	t.Parallel()
+	s := &Server{opts: ServerOptions{App: &url.URL{Scheme: "http", Host: "app.invalid"}}}
+	rewrite := func(peer string) http.Header {
+		in := httptest.NewRequest("GET", "/x", nil)
+		in.Header.Set("Shardlite-Opened", "test.users/evil")
+		in.Header.Set("Shardlite-File", "/etc/passwd")
+		info := &reqInfo{name: shardName("test.slow/w1"), path: "/data/w1.db", peer: peer}
+		in = in.WithContext(context.WithValue(in.Context(), ctxKey{}, info))
+		pr := &httputil.ProxyRequest{In: in, Out: in.Clone(in.Context())}
+		s.rewrite(pr)
+		return pr.Out.Header
+	}
+	app := rewrite("")
+	if app.Get("Shardlite-Opened") != "test.slow/w1" || app.Get("Shardlite-File") != "/data/w1.db" || app.Get("Shardlite-Target") != "" {
+		t.Fatalf("the app was sent %v", app)
+	}
+	fwd := rewrite("n1.invalid:1")
+	if fwd.Get("Shardlite-Target") != "test.slow/w1" || fwd.Get("Shardlite-Opened") != "" || fwd.Get("Shardlite-File") != "" {
+		t.Fatalf("the owner's node was sent %v", fwd)
+	}
+}
+
 func TestServerControlAPI(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
@@ -394,10 +426,10 @@ func TestServerControlAPI(t *testing.T) {
 		io.WriteString(w, "ok")
 	})
 
-	// A call: the target, the caller (passed on), no X-Forwarded-For.
+	// A call: the opened shard, the caller (passed on), no X-Forwarded-For.
 	resp, body := r.req("POST", r.ctl, "/invite?x=1", map[string]string{"Shardlite-Target": "test.slow/c1", "Shardlite-Caller": "test.users/5", "Shardlite-Foo": "1"}, "payload")
 	q := last.Load()
-	if resp.StatusCode != 200 || body != "ok" || q.Header.Get("Shardlite-Target") != "test.slow/c1" || q.Header.Get("Shardlite-Caller") != "test.users/5" ||
+	if resp.StatusCode != 200 || body != "ok" || q.Header.Get("Shardlite-Opened") != "test.slow/c1" || q.Header.Get("Shardlite-Target") != "" || q.Header.Get("Shardlite-Caller") != "test.users/5" ||
 		q.Header.Get("Shardlite-Foo") != "" || q.Header.Get("X-Forwarded-For") != "" || q.URL.Path != "/invite" || q.Method != "POST" {
 		t.Fatalf("%d %q %v", resp.StatusCode, body, q.Header)
 	}
@@ -509,7 +541,7 @@ func TestServerUpgrade(t *testing.T) {
 	r := newSRig(t)
 	r.create("test.slow/ws")
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
-		if q.Header.Get("Upgrade") != "websocket" || q.Header.Get("Shardlite-Target") != "test.slow/ws" {
+		if q.Header.Get("Upgrade") != "websocket" || q.Header.Get("Shardlite-Opened") != "test.slow/ws" {
 			http.Error(w, "bad", 400)
 			return
 		}
@@ -713,7 +745,7 @@ func TestServerGRPC(t *testing.T) {
 	defer safety.Stop()
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		proto.Store(int32(q.ProtoMajor))
-		if q.Header.Get("Te") != "trailers" || q.Header.Get("Shardlite-Target") != "test.slow/rpc" {
+		if q.Header.Get("Te") != "trailers" || q.Header.Get("Shardlite-Opened") != "test.slow/rpc" {
 			http.Error(w, "bad", 400)
 			return
 		}
@@ -823,7 +855,7 @@ func TestOnlyPublicKindsForClients(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
 	r.create("test.users/1")
-	r.declare(`{"app": "test", "kinds": {"users": {"public": true, "sync": "local"}, "secret": {"sync": "local"}}}`)
+	r.declare(`{"app": "test", "kinds": {"users": {"public": true, "sync": "none"}, "secret": {"sync": "none"}}}`)
 	eventually(t, "the new declaration", func() bool { _, err := r.kinds.Lookup("test.secret"); return err == nil })
 	r.app_(func(w http.ResponseWriter, q *http.Request) { io.WriteString(w, "ok") })
 

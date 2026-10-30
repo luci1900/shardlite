@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+
+	"github.com/luci1900/shardlite/e2e/e2eapp"
 )
 
 // WebSocket through the node with the reference client and server.
@@ -32,7 +34,7 @@ func TestWebSocketThroughTheNode(t *testing.T) {
 		return c
 	}
 
-	s.create(t, "e2e.wallet/s1", "e2e.wallet/s2", "e2e.wallet/s3", "e2e.wallet/s4", "e2e.wallet/s5", "e2e.arena/s7")
+	s.create(t, "e2e.wallet/s1", "e2e.wallet/s2", "e2e.wallet/s3", "e2e.wallet/s4", "e2e.wallet/s5", "e2e.wallet/s8", "e2e.wallet/s9", "e2e.arena/s7")
 
 	t.Run("text and binary both ways", func(t *testing.T) {
 		c := dial(t, "e2e.wallet/s1")
@@ -178,6 +180,38 @@ func TestWebSocketThroughTheNode(t *testing.T) {
 		if rec := cl[len(cl)-1]; rec.Shard != "e2e.wallet/s5" || rec.Code != -1 {
 			t.Fatalf("the app saw %+v, want an end without a close frame", rec)
 		}
+	})
+
+	t.Run("a mismatched target is relayed", func(t *testing.T) {
+		// The path says the connection is for s8. The hint names s9, so the node
+		// opens s9 and the app relays the connection to s8, for its whole life.
+		const s8, s9 = "e2e.wallet/s8", "e2e.wallet/s9"
+		n, before := s.relayCount(), len(s.appDebug().WSClose)
+		c := dial(t, s8, func(o *websocket.DialOptions) { o.HTTPHeader.Set("Shardlite-Target", s9) })
+		if echo, err := wsEcho(ctx, c, "hello"); err != nil || echo != "ok:hello" {
+			t.Fatalf("%q %v", echo, err)
+		}
+		if !v.has(s8, "hello") || v.has(s9, "hello") {
+			t.Fatal("the message did not land in the shard the path names")
+		}
+		// Close frames pass through the relay: the app that serves s8 sees the code.
+		if err := c.Close(websocket.StatusCode(4003), "bye through the relay"); err != nil {
+			t.Logf("close: %v", err) // the handshake may report the peer's reply
+		}
+		eventually(t, "the app to see the close", func() bool {
+			for _, rec := range s.appDebug().WSClose[before:] {
+				if rec.Shard == s8 && rec.Code == 4003 && rec.Reason == "bye through the relay" {
+					return true
+				}
+			}
+			return false
+		})
+		// No hint at all.
+		c = dial(t, s8, func(o *websocket.DialOptions) { o.HTTPHeader.Del("Shardlite-Target") })
+		if echo, err := wsEcho(ctx, c, "again"); err != nil || echo != "ok:again" || !v.has(s8, "again") {
+			t.Fatalf("no hint: %q %v", echo, err)
+		}
+		s.checkRelays(t, n, e2eapp.RelayRec{Opened: s9, For: s8}, e2eapp.RelayRec{For: s8})
 	})
 
 	t.Run("an open connection keeps its shard active", func(t *testing.T) {

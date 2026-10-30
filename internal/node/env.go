@@ -37,7 +37,7 @@ type Env struct {
 	Socket      string        // SHARDLITE_LISTEN_CONTROL_SOCKET: the control API on a Unix socket, if set
 	MaxHops     int           // SHARDLITE_MAX_HOPS: calls chained past this many hops are refused with 508, 32
 	Pprof       string        // SHARDLITE_LISTEN_PPROF: address for Go's pprof handlers, for diagnosis (off if unset)
-	Standbys    int           // SHARDLITE_STANDBYS: how many mirrors a node names for its journal, 0 or 1 for now (2 comes with the coverage gate), 0
+	Standbys    int           // SHARDLITE_STANDBYS: whether the node stands by for others and names a peer for its journal, 0 or 1, 1
 }
 
 // ParseEnv reads the configuration from getenv (os.Getenv in the binary).
@@ -84,10 +84,11 @@ func ParseEnv(getenv func(string) string) (Env, error) {
 		}
 		e.MaxHops = n
 	}
+	e.Standbys = 1
 	if v := getenv("SHARDLITE_STANDBYS"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 0 || n > 1 {
-			return e, fmt.Errorf("SHARDLITE_STANDBYS is %q, want 0 or 1 (2 comes with the coverage gate)", v)
+			return e, fmt.Errorf("SHARDLITE_STANDBYS is %q, want 0 or 1", v)
 		}
 		e.Standbys = n
 	}

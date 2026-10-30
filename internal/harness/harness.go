@@ -5,6 +5,7 @@ package harness
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"path/filepath"
 	"testing"
@@ -22,16 +23,24 @@ import (
 	"github.com/luci1900/shardlite/internal/service"
 	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
 // ReadEntry returns the LTX file bytes of one journal entry.
 func ReadEntry(ctx context.Context, js *journal.Store, seq pos.Seg, e segment.Entry) ([]byte, error) {
-	f, err := segment.ReadEntryFile(ctx, js, seq, e, "", int(e.Length))
+	rc, err := js.GetRange(ctx, seq, e.Offset, e.Length)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-	return f.Bytes()
+	defer rc.Close()
+	b, err := io.ReadAll(rc)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) != e.Length {
+		return nil, fmt.Errorf("short range read of segment %d: %d of %d bytes", seq, len(b), e.Length)
+	}
+	return b, nil
 }
 
 // Env is one node's worth of storage.
@@ -61,7 +70,7 @@ func New(t testing.TB) *Env {
 	store := blob.NewStore(local, "n1", lease.Epoch, blob.Options{Backoff: time.Millisecond})
 	jopts := journal.Options{Backoff: time.Millisecond}
 	e := &Env{T: t, Dir: t.TempDir(), Blob: local, Store: store, Node: "n1", Reg: reg, Lease: lease,
-		Files: &shardfile.Files{Blob: store, Backend: local, Node: "n1", Leases: reg, JournalOptions: jopts, TempDir: t.TempDir()}}
+		Files: &shardfile.Files{Blob: store, Backend: local, Node: "n1", Leases: reg, JournalOptions: jopts, Temp: tempfile.NewDir(t.TempDir())}}
 	e.Journal = e.Files.Journal(e.Node)
 	e.W = segment.NewWriter(e.Journal, segment.Options{})
 	t.Cleanup(service.Background(slog.Default(), e.W))
@@ -115,7 +124,7 @@ func (e *Env) NewShard(name string) (*shardfile.Handle, *capture.Shard) {
 // to the manifest) and starts capturing its file. restored is nil for a new shard.
 func (e *Env) Activate(h *shardfile.Handle, restored *capture.Restored) *capture.Shard {
 	e.T.Helper()
-	sh, err := capture.New(capture.Config{Name: h.Name, Path: e.Path(h.Name.String()), Generation: h.Manifest.Generation, Writer: e.W, Restored: restored, TempDir: e.Files.TempDir, SpoolLimit: uint64(e.Files.SpoolLimit)})
+	sh, err := capture.New(capture.Config{Name: h.Name, Path: e.Path(h.Name.String()), Generation: h.Manifest.Generation, Writer: e.W, Restored: restored, TempDir: e.Files.Temp})
 	if err != nil {
 		e.T.Fatal(err)
 	}

@@ -321,7 +321,7 @@ func TestSweepToleratesAFileAlreadyGone(t *testing.T) {
 // batch.
 func TestKindHasTheLocalTier(t *testing.T) {
 	k := New(nil, nil, time.Now, slog.New(slog.DiscardHandler), Options{})
-	if k.Sync != kind.SyncLocal {
+	if k.Sync != kind.SyncNone {
 		t.Fatalf("sync %v, want local", k.Sync)
 	}
 }

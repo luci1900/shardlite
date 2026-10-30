@@ -3,10 +3,15 @@
 // wallet (sync on), over plain HTTP, server-sent events, WebSocket (github.com/coder/websocket) and
 // gRPC (google.golang.org/grpc),
 // with a shardless login and a handler that calls another shard through the
-// node's control API. It follows the app contract in docs/guide.md: the shard's
-// identity comes from Shardlite-Target only, the file from Shardlite-Path, it
-// uses WAL mode with default locking, migrates lazily on the first write and
-// closes shards that have been idle for a while.
+// node's control API. It follows the app contract in docs/guide.md: a route
+// that belongs to a shard works out which shard a request is for from the
+// request itself (the path, or x-shard metadata for gRPC) and uses the file the
+// node opened (Shardlite-File) only if that is the shard the node opened
+// (Shardlite-Opened). Otherwise it relays the request to the right shard
+// through the control API, marked Shardlite-Relay so that the node serves it as
+// the client's request it is. Routes that only take calls, and the reminder
+// wake, take their identity from Shardlite-Opened. The app uses WAL mode with default locking, migrates
+// lazily on the first write and closes shards that have been idle for a while.
 package e2eapp
 
 import (
@@ -20,6 +25,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"strconv"
@@ -45,7 +51,7 @@ type Options struct {
 }
 
 const DefaultDeclaration = `{"app": "e2e", "version": "1", "kinds": {
-	"users":  {"public": true, "sync": "local", "idle_timeout": "2s"},
+	"users":  {"public": true, "sync": "none", "idle_timeout": "2s"},
 	"wallet": {"public": true, "idle_timeout": "2s"},
 	"lobby":  {"public": true, "idle_timeout": "2s"},
 	"arena":  {"public": true, "idle_timeout": "300ms"},
@@ -60,6 +66,7 @@ type App struct {
 	opts  Options
 	pool  *pool
 	http  *http.Client
+	h2c   *http.Transport // to the control API over HTTP/2 without TLS, for relayed gRPC
 	grpc  *grpc.Server
 	debug Debug
 
@@ -76,6 +83,8 @@ func New(opts Options) *App {
 		opts.IdleClose = 500 * time.Millisecond
 	}
 	a := &App{opts: opts, pool: newPool(opts.IdleClose), http: &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{MaxIdleConnsPerHost: 64}}}
+	a.h2c = &http.Transport{Protocols: new(http.Protocols)}
+	a.h2c.Protocols.SetUnencryptedHTTP2(true)
 	a.grpc = a.newGRPC()
 	return a
 }
@@ -97,26 +106,30 @@ func (a *App) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /_shardlite/ready", a.ready)
 	mux.HandleFunc("POST /login", a.login)
-	mux.HandleFunc("POST /create", a.shard(a.create))
-	mux.HandleFunc("POST /add", a.shard(a.add))
-	mux.HandleFunc("GET /count", a.shard(a.count))
-	mux.HandleFunc("GET /tokens", a.shard(a.tokens))
-	mux.HandleFunc("GET /events", a.shard(a.events))
-	mux.HandleFunc("GET /ws", a.shard(a.ws))
-	mux.HandleFunc("POST /transfer", a.shard(a.transfer))
-	mux.HandleFunc("POST /notify", a.shard(a.notify))
-	mux.HandleFunc("POST /receive", a.shard(a.receive))
-	mux.HandleFunc("POST /remind", a.shard(a.remind))
-	mux.HandleFunc("POST /_shardlite/reminders", a.shard(a.reminders))
-	mux.HandleFunc("POST /credit", a.shard(a.credit))
-	mux.HandleFunc("GET /me", a.shard(a.me))
+	// Routes that belong to a shard have its name in the path, and clients can
+	// reach them.
+	mux.HandleFunc("POST /{kind}/{id}/create", a.shard(pathShard, a.create))
+	mux.HandleFunc("POST /{kind}/{id}/add", a.shard(pathShard, a.add))
+	mux.HandleFunc("GET /{kind}/{id}/count", a.shard(pathShard, a.count))
+	mux.HandleFunc("GET /{kind}/{id}/tokens", a.shard(pathShard, a.tokens))
+	mux.HandleFunc("GET /{kind}/{id}/events", a.shard(pathShard, a.events))
+	mux.HandleFunc("GET /{kind}/{id}/ws", a.shard(pathShard, a.ws))
+	mux.HandleFunc("POST /{kind}/{id}/transfer", a.shard(pathShard, a.transfer))
+	mux.HandleFunc("POST /{kind}/{id}/notify", a.shard(pathShard, a.notify))
+	mux.HandleFunc("POST /{kind}/{id}/remind", a.shard(pathShard, a.remind))
+	mux.HandleFunc("GET /{kind}/{id}/me", a.shard(pathShard, a.me))
+	// Routes that only take calls, and the reminder wake, take the shard from
+	// what the node opened.
+	mux.HandleFunc("POST /credit", a.internal(a.credit))
+	mux.HandleFunc("POST /receive", a.internal(a.receive))
+	mux.HandleFunc("POST /_shardlite/reminders", a.internal(a.reminders))
 	mux.HandleFunc("GET /debug", a.serveDebug)
 	// gRPC shares the listener: HTTP/2 requests with a gRPC content type go to
 	// the gRPC server (which is an http.Handler), the rest to the mux.
+	rpc := a.shard(grpcShard, a.serveGRPC)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc") {
-			ctx := context.WithValue(r.Context(), rawHeadersKey{}, r.Header.Clone())
-			a.grpc.ServeHTTP(w, r.WithContext(ctx))
+		if isGRPC(r) {
+			rpc.ServeHTTP(w, r)
 			return
 		}
 		mux.ServeHTTP(w, r)
@@ -148,31 +161,119 @@ func (a *App) ready(w http.ResponseWriter, r *http.Request) {
 	w.Write(data)
 }
 
-// shardReq is a request for a shard.
+// shardReq is a request for a shard, with the shard's database open.
 type shardReq struct {
-	name string // kind/id, from Shardlite-Target
-	path string
+	name string // kind/id
+	file string // Shardlite-File
 	db   *handle
 }
 
-// shard wraps a handler that needs a shard: the node's headers name it. A
-// request without them did not come through the node.
-func (a *App) shard(h func(w http.ResponseWriter, r *http.Request, s *shardReq)) http.HandlerFunc {
+type shardHandler func(w http.ResponseWriter, r *http.Request, s *shardReq)
+
+// shard wraps a handler for a route that belongs to a shard and that clients can
+// reach. of works out which shard the request is for from the request itself.
+// If that is the shard the node opened, h gets its open file. Otherwise (the
+// client's Shardlite-Target was missing or wrong) the request is relayed to the
+// right shard, so a wrong hint costs a hop and never correctness.
+//
+// This app has no authentication. One that did would authenticate before this
+// decision, and the same way for a relayed request, which arrives with no
+// Shardlite-Caller as a client's does: Shardlite-Caller is never a reason to
+// skip it on a route clients can reach.
+func (a *App) shard(of func(*http.Request) string, h shardHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		name, path := r.Header.Get("Shardlite-Target"), r.Header.Get("Shardlite-Path")
-		if name == "" || path == "" {
-			http.Error(w, "this endpoint is for a shard: name one with Shardlite-Target", http.StatusBadRequest)
+		name := of(r)
+		if name == "" {
+			refuse(w, r, http.StatusBadRequest, "the request does not say which shard it is for")
 			return
 		}
-		db, err := a.pool.get(path)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		if name != r.Header.Get("Shardlite-Opened") {
+			a.relay(w, r, name)
 			return
 		}
-		defer db.release()
-		h(w, r, &shardReq{name: name, path: path, db: db})
+		a.serveOpened(w, r, h)
 	}
 }
+
+// internal wraps a handler for a route that only takes calls: it needs
+// Shardlite-Caller, and the shard is the one the node opened, because app code
+// chose the target and the node strips Shardlite-* headers from clients. The
+// reminder wake is the same, with the node as its caller.
+func (a *App) internal(h shardHandler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Shardlite-Caller") == "" {
+			refuse(w, r, http.StatusForbidden, "internal")
+			return
+		}
+		a.serveOpened(w, r, h)
+	}
+}
+
+// serveOpened runs h on the shard the node opened. A request without the node's
+// headers did not come through the node.
+func (a *App) serveOpened(w http.ResponseWriter, r *http.Request, h shardHandler) {
+	name, file := r.Header.Get("Shardlite-Opened"), r.Header.Get("Shardlite-File")
+	if name == "" || file == "" {
+		refuse(w, r, http.StatusBadRequest, "this endpoint is for a shard: send it through the node, which sets Shardlite-Opened")
+		return
+	}
+	a.debug.mu.Lock()
+	if a.debug.Served == nil {
+		a.debug.Served = map[string]int{}
+	}
+	a.debug.Served[name]++
+	a.debug.mu.Unlock()
+	db, err := a.pool.get(file)
+	if err != nil {
+		refuse(w, r, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer db.release()
+	h(w, r, &shardReq{name: name, file: file, db: db})
+}
+
+// relay sends r to the shard it is for through the node's control API and
+// streams the answer back. It is marked Shardlite-Relay: true, so the node
+// serves it as the client's request it is (only kinds clients can name, never
+// creating a shard) with no Shardlite-Caller, and not as a call, which would
+// widen what the client can reach. HTTP, server-sent events, WebSocket and gRPC
+// all go through it, since a reverse proxy passes upgrades, streams and trailers
+// on. The client's headers (credentials, traceparent) go on as they are,
+// Shardlite-Hops is passed on as the guide asks and so are the X-Forwarded-*
+// headers the node gave the request, which the reverse proxy would drop.
+func (a *App) relay(w http.ResponseWriter, r *http.Request, name string) {
+	a.debug.mu.Lock()
+	a.debug.Relays = append(a.debug.Relays, RelayRec{Opened: r.Header.Get("Shardlite-Opened"), For: name})
+	a.debug.mu.Unlock()
+	control := &url.URL{Scheme: "http", Host: a.opts.Control}
+	transport := a.http.Transport
+	if r.ProtoMajor == 2 {
+		transport = a.h2c
+	}
+	proxy := &httputil.ReverseProxy{
+		Transport:     transport,
+		FlushInterval: -1,
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(control)
+			for k := range pr.Out.Header {
+				if strings.HasPrefix(k, "Shardlite-") && k != "Shardlite-Hops" {
+					delete(pr.Out.Header, k) // the node's own: the file and what it opened
+				}
+			}
+			for _, h := range []string{"X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto"} {
+				if v := pr.In.Header.Values(h); len(v) > 0 {
+					pr.Out.Header[h] = v
+				}
+			}
+			pr.Out.Header.Set("Shardlite-Target", name)
+			pr.Out.Header.Set("Shardlite-Relay", "true")
+		},
+	}
+	proxy.ServeHTTP(w, r)
+}
+
+// pathShard is the shard of a route whose path is /{kind}/{id}/...
+func pathShard(r *http.Request) string { return r.PathValue("kind") + "/" + r.PathValue("id") }
 
 // Schema. Migrations happen in create and on the first write, not on open: a
 // request that only reads a shard that was never written leaves nothing behind.
@@ -303,7 +404,7 @@ func (a *App) tokens(w http.ResponseWriter, r *http.Request, s *shardReq) {
 }
 
 func (a *App) me(w http.ResponseWriter, r *http.Request, s *shardReq) {
-	writeJSON(w, map[string]any{"shard": s.name, "caller": r.Header.Get("Shardlite-Caller")})
+	writeJSON(w, map[string]any{"shard": s.name, "caller": r.Header.Get("Shardlite-Caller"), "hops": r.Header.Get("Shardlite-Hops")})
 }
 
 // events streams n server-sent events, each after a commit: ?n=3&prefix=x.
@@ -332,7 +433,7 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 	}
 	shard := "e2e.users/" + name
 	// The client can only reach a shard that exists, so create it first.
-	q, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, "http://"+a.opts.Control+"/create", nil)
+	q, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, "http://"+a.opts.Control+"/"+shard+"/create", nil)
 	q.Header.Set("Shardlite-Target", shard)
 	q.Header.Set("Shardlite-Caller", "app")
 	resp, err := a.http.Do(q)
@@ -345,7 +446,7 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "creating the user's shard: "+resp.Status, http.StatusBadGateway)
 		return
 	}
-	writeJSON(w, map[string]string{"shard": shard, "url": "/me?shardlite-target=" + url.QueryEscape(shard)})
+	writeJSON(w, map[string]string{"shard": shard, "url": "/" + shard + "/me?shardlite-target=" + url.QueryEscape(shard)})
 }
 
 // transfer debits this shard, then credits another one by calling it through
@@ -381,10 +482,6 @@ func (a *App) transfer(w http.ResponseWriter, r *http.Request, s *shardReq) {
 
 // credit is internal: it only answers calls from another shard.
 func (a *App) credit(w http.ResponseWriter, r *http.Request, s *shardReq) {
-	if r.Header.Get("Shardlite-Caller") == "" {
-		http.Error(w, "internal", http.StatusForbidden)
-		return
-	}
 	b, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if _, _, err := s.insert(r.Context(), "credit:"+string(b)); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -425,10 +522,6 @@ var errSeen = errors.New("seen before")
 // key (the sender can call twice), in the same transaction as the work.
 func (a *App) receive(w http.ResponseWriter, r *http.Request, s *shardReq) {
 	caller, key := r.Header.Get("Shardlite-Caller"), r.Header.Get("Idempotency-Key")
-	if caller == "" {
-		http.Error(w, "internal", http.StatusForbidden)
-		return
-	}
 	if key == "" {
 		http.Error(w, "an Idempotency-Key is required", http.StatusBadRequest)
 		return
@@ -479,7 +572,7 @@ func (a *App) remind(w http.ResponseWriter, r *http.Request, s *shardReq) {
 // rows are deleted once the call answered 2xx. It answers 503 if a send failed,
 // so the node wakes it again with backoff.
 func (a *App) reminders(w http.ResponseWriter, r *http.Request, s *shardReq) {
-	if r.Header.Get("Shardlite-Caller") != s.name {
+	if r.Header.Get("Shardlite-Caller") != s.name { // from the node, about this shard
 		http.Error(w, "internal", http.StatusForbidden)
 		return
 	}

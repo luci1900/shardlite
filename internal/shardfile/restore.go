@@ -19,19 +19,26 @@ import (
 	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/shard"
-	"github.com/luci1900/shardlite/internal/spool"
+	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
 type journalRef struct {
 	seq   pos.Seg
 	entry segment.Entry
+	// store is where the entry's file is read from, nil for the index's own:
+	// the entries the journal read took from the peer's copy of a segment the
+	// record never had are read there.
+	store *journal.Store
 }
 
 // JournalIndex lists which segment entries belong to which shard. It carries
-// the store of the journal it read, so its tail is read from the same place.
+// the store of the journal it read, so its tail is read from the same place,
+// and the numbers the journal holds as fences, where a peer may hold the
+// segment a fence took the number of (ReadJournal).
 type JournalIndex struct {
 	store   *journal.Store
 	byShard map[shard.Name][]journalRef
+	fences  []pos.Seg
 }
 
 // LoadLeasedJournal reads the footers of a node's segments from the start of the
@@ -55,11 +62,24 @@ func (f *Files) LoadLeasedJournal(ctx context.Context, node cluster.Node) (*Jour
 // (segment.Scan).
 func (f *Files) LoadJournal(ctx context.Context, node cluster.Node, from, to pos.Seg) (*JournalIndex, error) {
 	idx := &JournalIndex{store: f.Journal(node), byShard: map[shard.Name][]journalRef{}}
+	read := map[pos.Seg]bool{} // numbers that had entries
 	err := segment.Scan(ctx, idx.store, from, to, func(seq pos.Seg, e segment.Entry) error {
-		idx.byShard[e.Shard] = append(idx.byShard[e.Shard], journalRef{seq, e})
+		read[seq] = true
+		idx.byShard[e.Shard] = append(idx.byShard[e.Shard], journalRef{seq: seq, entry: e})
 		return nil
 	})
-	return idx, err
+	if err != nil || to == 0 {
+		return idx, err
+	}
+	// A bounded scan fails on a missing number, so a number in the range
+	// without entries is a fence: the numbers where a takeover of this journal
+	// happened, and where its dead writer's last segment may sit on the peer.
+	for seq := from; seq <= to; seq++ {
+		if !read[seq] {
+			idx.fences = append(idx.fences, seq)
+		}
+	}
+	return idx, nil
 }
 
 // tail reads the shard's entries of generation that follow position from, in
@@ -84,16 +104,31 @@ func (idx *JournalIndex) tail(ctx context.Context, f *Files, n shard.Name, gener
 		}
 		if e.Position != pos+1 {
 			tail.Close()
-			return nil, &gapError{from: pos + 1, to: e.Position - 1}
+			return capture.TailFiles{}, &gapError{from: pos + 1, to: e.Position - 1}
 		}
-		// An entry can be as large as the database, so it is read into a temporary
-		// file when it is large.
-		body, err := segment.ReadEntryFile(ctx, idx.store, ref.seq, e, f.TempDir, f.spoolLimit())
+		// An entry can be as large as the database, so the tail is read into a log
+		// of its own, which the restored shard goes on to append to.
+		if tail.Logs == nil {
+			dir, err := f.dir()
+			if err != nil {
+				return capture.TailFiles{}, err
+			}
+			log, err := dir.Create()
+			if err != nil {
+				return capture.TailFiles{}, err
+			}
+			tail.Logs = []*tempfile.Log{log}
+		}
+		store := idx.store
+		if ref.store != nil {
+			store = ref.store
+		}
+		body, err := segment.ReadEntryInto(ctx, store, ref.seq, e, tail.Logs[0])
 		if err != nil {
 			tail.Close()
-			return nil, err
+			return capture.TailFiles{}, err
 		}
-		tail = append(tail, capture.TailFile{Position: e.Position, Count: e.Count, Body: body, At: at, Seg: ref.seq})
+		tail.Files = append(tail.Files, capture.TailFile{Position: e.Position, Count: e.Count, Body: body, At: at, Seg: ref.seq})
 		pos = e.Last()
 	}
 	return tail, nil
@@ -131,11 +166,11 @@ func (f *Files) Restore(ctx context.Context, n shard.Name, dst string, opt Resto
 
 	// Download the manifest's files in parallel, each to a temporary file: a
 	// shard's files can add up to far more than the node has memory for.
-	spools := make([]*spool.File, len(m.Files))
+	downloads := make([]*tempfile.Log, len(m.Files))
 	defer func() {
-		for _, sp := range spools {
-			if sp != nil {
-				sp.Close()
+		for _, l := range downloads {
+			if l != nil {
+				l.Close()
 			}
 		}
 	}()
@@ -143,7 +178,7 @@ func (f *Files) Restore(ctx context.Context, n shard.Name, dst string, opt Resto
 	var g errgroup.Group
 	for i, mf := range m.Files {
 		g.Go(func() error {
-			spools[i], errs[i] = h.getFile(ctx, mf)
+			downloads[i], errs[i] = h.getFile(ctx, mf)
 			return nil // each file keeps its own error, reported in order below
 		})
 	}
@@ -166,12 +201,12 @@ func (f *Files) Restore(ctx context.Context, n shard.Name, dst string, opt Resto
 		tail.Close()
 		return nil, fmt.Errorf("restore %s: %w", n, err)
 	}
-	for i, sp := range spools {
-		if err := ap.Apply(bufio.NewReaderSize(sp.Reader(), 1<<20), m.Files[i].Range); err != nil {
+	for i, l := range downloads {
+		if err := ap.Apply(bufio.NewReaderSize(l.File().Reader(), 1<<20), m.Files[i].Range); err != nil {
 			return fail(err)
 		}
-		sp.Close() // applied: its disk is free again
-		spools[i] = nil
+		l.Close() // applied: its disk is free again
+		downloads[i] = nil
 	}
 
 	// Then the commits that only reached the node journal.
@@ -192,7 +227,7 @@ func (f *Files) Restore(ctx context.Context, n shard.Name, dst string, opt Resto
 	if tail, err = journal.tail(ctx, f, n, m.Generation, ap.State().Position, at); err != nil {
 		return fail(err)
 	}
-	for _, tf := range tail {
+	for _, tf := range tail.Files {
 		if err := ap.Apply(bufio.NewReaderSize(tf.Body.Reader(), 1<<20), Range{tf.Position, tf.Position.Add(tf.Count)}); err != nil {
 			return fail(err)
 		}

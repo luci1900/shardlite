@@ -36,7 +36,7 @@ func TestSnapshotWhileTheAppCommits(t *testing.T) {
 	app.Must(t, "open", "a", e.Path(name))
 	app.Must(t, "open", "c", e.Path(name), "20")
 	h, _, _ := e.Files.Open(ctx, shardName(name))
-	sh, err := capture.New(capture.Config{Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W, RestartFrames: 10})
+	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W, RestartFrames: 10})
 	if err != nil {
 		t.Fatal(err)
 	}

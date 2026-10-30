@@ -49,6 +49,7 @@ func TestKindsUpdate(t *testing.T) {
 		t.Fatal(err)
 	}
 	k.Update(a)
+	// A kind that names no sync parses to the record, the conservative tier.
 	if got, _ := k.Lookup("test.users"); got.IdleTimeout != DefaultIdleTimeout || got.Sync != kind.SyncStorage {
 		t.Fatalf("%+v", got)
 	}
@@ -58,7 +59,7 @@ func TestKindsUpdate(t *testing.T) {
 
 	// A later declaration replaces the kinds: a kind that dropped out is
 	// unknown, and a changed setting is seen.
-	a, err = k.Parse([]byte(`{"app": "test", "kinds": {"users": {"sync": "local"}, "wallet": {}}}`))
+	a, err = k.Parse([]byte(`{"app": "test", "kinds": {"users": {"sync": "none"}, "wallet": {}}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +67,7 @@ func TestKindsUpdate(t *testing.T) {
 	if got, err := k.Lookup("test.wallet"); err != nil || got.Sync != kind.SyncStorage || got.Name != "test.wallet" {
 		t.Fatalf("%+v %v", got, err)
 	}
-	if got, _ := k.Lookup("test.users"); got.Sync != kind.SyncLocal {
+	if got, _ := k.Lookup("test.users"); got.Sync != kind.SyncNone {
 		t.Fatal("new setting not seen")
 	}
 	a, err = k.Parse([]byte(`{"app": "test", "kinds": {"wallet": {}}}`))

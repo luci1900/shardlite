@@ -13,13 +13,17 @@ import (
 // (TestMeasurePerShardCost, run with -v on Linux): the descriptors and memory
 // mappings the node holds for a shard (capture's connection, its read
 // transaction, its -shm mapping, our read-only mapping of it and SQLite's
-// per-connection memory), and what the node holds before it has any (mostly OS
+// per-connection memory, and the log of its tail), and what the node holds before it has any (mostly OS
 // thread stacks, two mappings each, a few hundred threads under load). The
 // app's own descriptors are in the app's process.
 //
-// Measured on Linux with 300 shards: 7.00 descriptors and 6.8 mappings each.
+// Measured on Linux with 300 shards: 8.00 descriptors and 6.8 mappings each. A
+// shard holds one more while a delta reads its tail (a dup of its log), and the
+// segment writer holds a dup of a log for each segment queued but not yet
+// written, which a slow store or peer lets pile up, so the constant has more
+// than the margin the mappings have.
 const (
-	descriptorsPerShard = 8
+	descriptorsPerShard = 10
 	mappingsPerShard    = 8
 	baseDescriptors     = 64
 	baseMappings        = 1000

@@ -266,7 +266,7 @@ func TestHandlerSettingRemindersDueNowIsWokenWithBackoff(t *testing.T) {
 	inner := *r.handler.Load()
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		if q.URL.Path == remindersPath {
-			r.sql(q.Header.Get("Shardlite-Target"), fmt.Sprintf(`INSERT OR REPLACE INTO _shardlite_reminders (key, due) VALUES ('again', %d)`, time.Now().Unix()))
+			r.sql(q.Header.Get("Shardlite-Opened"), fmt.Sprintf(`INSERT OR REPLACE INTO _shardlite_reminders (key, due) VALUES ('again', %d)`, time.Now().Unix()))
 		}
 		inner(w, q)
 	})
@@ -429,7 +429,12 @@ func TestReminderAnHourAwayWakesTheShard(t *testing.T) {
 func TestReminderDueNowKeepsTheShardActive(t *testing.T) {
 	t.Parallel()
 	clk := newFakeClock()
-	r := newSRigWith(t, both(quick, withClock(clk)))
+	// A wake counts as a use of the shard, so the backoff has to be longer than the
+	// idle timeout: with a shorter one a loaded machine wakes the shard at every
+	// step of the clock, the last use never goes stale and the idle timer never
+	// looks at the shard.
+	slow := func(o *CatalogOptions) { o.Reminders.Backoff, o.Reminders.MaxBackoff = time.Second, 2*time.Second }
+	r := newSRigWith(t, both(slow, withClock(clk)))
 	var up atomic.Bool
 	rec := &recorder{answer: downUntil(&up)}
 	r.record(rec, "")

@@ -83,7 +83,7 @@ func startedSince(before, now []string) []string {
 // runKinds is what the test's app declares: long idle timeouts, so the shards
 // the test activates stay active while it counts goroutines, and sync off for
 // users, so a flush is not what the writes wait for.
-const runKinds = `{"app": "test", "kinds": {"users": {"public": true, "sync": "local", "idle_timeout": "1h"}, "wallet": {"public": true, "idle_timeout": "1h"}}}`
+const runKinds = `{"app": "test", "kinds": {"users": {"public": true, "sync": "none", "idle_timeout": "1h"}, "wallet": {"public": true, "idle_timeout": "1h"}}}`
 
 // Run returns only after every goroutine it started has ended: the loops, the
 // servers, the ready poll, the flush cycle's syncs, the segment writer and
@@ -97,7 +97,7 @@ func TestRunLeavesNoGoroutines(t *testing.T) {
 			io.WriteString(w, runKinds)
 			return
 		}
-		path := q.Header.Get("Shardlite-Path")
+		path := q.Header.Get("Shardlite-File")
 		mu.Lock()
 		if !opened[path] {
 			app.Must(t, "open", path, path)
@@ -254,7 +254,7 @@ func TestRunJoinsRequestsBeforeLettingGo(t *testing.T) {
 	var started apptest.Log[string]
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
 		if q.URL.Path == appReadyPath {
-			io.WriteString(w, `{"app": "test", "kinds": {"users": {"public": true, "sync": "local", "idle_timeout": "1h"}}}`)
+			io.WriteString(w, `{"app": "test", "kinds": {"users": {"public": true, "sync": "none", "idle_timeout": "1h"}}}`)
 			return
 		}
 		switch q.URL.Path {
@@ -694,6 +694,24 @@ func TestPeerListenerSaysWhoTheNodeIs(t *testing.T) {
 	}
 	if resp.ProtoMajor != 2 || got.Name != "peer-test" || got.Epoch != r.lease().Epoch {
 		t.Fatalf("proto %d, reply %+v, lease %+v", resp.ProtoMajor, got, r.lease())
+	}
+	// The control API answers the same for whoever runs the node, and says
+	// that this node names no peer: it is alone.
+	cresp, err := http.Get("http://" + r.control + "/_shardlite/node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cresp.Body.Close()
+	var who NodeInfoReply
+	if err := json.NewDecoder(cresp.Body).Decode(&who); err != nil {
+		t.Fatal(err)
+	}
+	if cresp.StatusCode != http.StatusOK || who.Name != "peer-test" || who.Peer != nil {
+		t.Fatalf("control reply %d %+v, want this node and no peer", cresp.StatusCode, who)
+	}
+	// It reports the clock watch (the memory backend takes no samples).
+	if who.Clock == nil || who.Clock.Warning || who.Clock.Blind {
+		t.Fatalf("control reply's clock is %+v, want a quiet report", who.Clock)
 	}
 	for _, path := range []string{"/", "/_shardlite/ready", "/x?shardlite-target=test.users/o1"} {
 		resp, err := client.Get("http://" + r.peer + path)

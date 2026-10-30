@@ -11,9 +11,9 @@ import (
 // case in String or Valid fails make lint, and a change of policy fails here.
 func TestZeroValues(t *testing.T) {
 	t.Parallel()
-	// The zero is the record: the tier a kind that names none waits on, and
-	// the conservative one.
-	testZero(t, "Sync", Sync(0), true, []Sync{SyncStorage, SyncLocal})
+	// The zero is the record: the conservative tier, and the declaration's
+	// default for a kind that names none.
+	testZero(t, "Sync", Sync(0), true, []Sync{SyncStorage, SyncNone, SyncPeer})
 }
 
 // TestParseSyncRejectsUnknown holds the one decoder of a closed set to the
@@ -24,10 +24,7 @@ func TestParseSyncRejectsUnknown(t *testing.T) {
 	if s, err := ParseSync("fast"); err == nil {
 		t.Fatalf("ParseSync(\"fast\") = %v, want an error", s)
 	}
-	if _, err := ParseSync("peer"); err == nil {
-		t.Fatal("ParseSync(\"peer\") parsed, want an error until a mirror tier exists")
-	}
-	for name, want := range map[string]Sync{"": SyncStorage, "storage": SyncStorage, "local": SyncLocal} {
+	for name, want := range map[string]Sync{"": SyncStorage, "peer": SyncPeer, "none": SyncNone, "storage": SyncStorage} {
 		if s, err := ParseSync(name); err != nil || s != want {
 			t.Errorf("ParseSync(%q) = %v, %v, want %v", name, s, err, want)
 		}

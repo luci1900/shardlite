@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,17 +19,17 @@ import (
 	"github.com/luci1900/shardlite/internal/cluster"
 	"github.com/luci1900/shardlite/internal/localdb"
 	"github.com/luci1900/shardlite/internal/pos"
+	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
 // The mirror protocol: the client against the handler, over real HTTP, held to
 // the conformance suite like any other store, with the protocol's own rules
-// beside it (the statuses, the write id on the wire, the epoch check, the
+// beside it (the statuses, the write id on the wire, the
 // listing's end mark).
 
-// testSource is a MirrorSource of one backend, with an epoch the test sets.
+// testSource is a MirrorSource of one backend.
 type testSource struct {
-	b     Backend
-	epoch pos.Epoch
+	b Backend
 }
 
 func (s *testSource) Journal(node cluster.Node) Backend {
@@ -37,8 +38,6 @@ func (s *testSource) Journal(node cluster.Node) Backend {
 	}
 	return s.b
 }
-
-func (s *testSource) Epoch(ctx context.Context, node cluster.Node) pos.Epoch { return s.epoch }
 
 // mirrorFactory returns a journal mirrored over HTTP: the node's own local
 // store behind the handler, the Mirror client in front of it.
@@ -50,7 +49,13 @@ func mirrorFactory(t *testing.T) (*Store, record) {
 	}
 	t.Cleanup(func() { db.Close() })
 	back := NewLocal(db.DB, "n1")
-	srv := httptest.NewServer(NewMirrorHandler(&testSource{b: back}, t.TempDir(), 0))
+	dir := tempfile.NewDir(t.TempDir())
+	t.Cleanup(func() { // after the server is closed: every request's body log is closed
+		if n := dir.Open(); n != 0 {
+			t.Errorf("%d descriptors left open by the handler", n)
+		}
+	})
+	srv := httptest.NewServer(NewMirrorHandler(&testSource{b: back}, dir))
 	t.Cleanup(srv.Close)
 	m := NewMirror(srv.Client(), srv.URL, "n1")
 	rec := record{}
@@ -72,11 +77,34 @@ type mirrorTest struct {
 	srv    *httptest.Server
 	url    string
 	client *http.Client
-	m      *Mirror // the client backend of node n1's journal
-	back   *Local  // the store behind it
+	m      *Mirror       // the client backend of node n1's journal
+	back   *Local        // the store behind it
+	reads  *atomic.Int32 // every read the handler made of that store
 }
 
-func newMirrorTest(t *testing.T, epoch pos.Epoch) *mirrorTest {
+// readCounter counts the reads the handler makes of the store behind it, so a
+// test can say a request read nothing.
+type readCounter struct {
+	Backend
+	reads *atomic.Int32
+}
+
+func (b *readCounter) Get(ctx context.Context, seq pos.Seg) (io.ReadCloser, error) {
+	b.reads.Add(1)
+	return b.Backend.Get(ctx, seq)
+}
+
+func (b *readCounter) GetRange(ctx context.Context, seq pos.Seg, offset, length int64) (io.ReadCloser, error) {
+	b.reads.Add(1)
+	return b.Backend.GetRange(ctx, seq, offset, length)
+}
+
+func (b *readCounter) Head(ctx context.Context, seq pos.Seg) (SegmentInfo, error) {
+	b.reads.Add(1)
+	return b.Backend.Head(ctx, seq)
+}
+
+func newMirrorTest(t *testing.T) *mirrorTest {
 	t.Helper()
 	db, err := localdb.Open(filepath.Join(t.TempDir(), localdb.Name))
 	if err != nil {
@@ -84,9 +112,12 @@ func newMirrorTest(t *testing.T, epoch pos.Epoch) *mirrorTest {
 	}
 	t.Cleanup(func() { db.Close() })
 	back := NewLocal(db.DB, "n1")
-	srv := httptest.NewServer(NewMirrorHandler(&testSource{b: back, epoch: epoch}, t.TempDir(), 0))
+	var reads atomic.Int32
+	src := &testSource{b: &readCounter{Backend: back, reads: &reads}}
+	srv := httptest.NewServer(NewMirrorHandler(src, tempfile.NewDir(t.TempDir())))
 	t.Cleanup(srv.Close)
-	return &mirrorTest{srv: srv, url: srv.URL, client: srv.Client(), m: NewMirror(srv.Client(), srv.URL, "n1"), back: back}
+	return &mirrorTest{srv: srv, url: srv.URL, client: srv.Client(), m: NewMirror(srv.Client(), srv.URL, "n1"),
+		back: back, reads: &reads}
 }
 
 // put sends the create the test writes by hand, with the headers it names.
@@ -116,42 +147,28 @@ func mustJSON(t *testing.T, v any) string {
 	return string(b)
 }
 
-// The epoch check: a create whose write id names a strictly older epoch than
-// the mirror's view of the writer's lease is refused; one that names the same
-// epoch, a newer one, or anything at all when the mirror has no view, is not.
-func TestMirrorEpochCheck(t *testing.T) {
+// The mirror checks no epoch: a create is taken or refused on its number
+// alone, whatever epoch the write id names.
+func TestMirrorTakesAnyEpoch(t *testing.T) {
 	ctx := context.Background()
-	for _, tc := range []struct {
-		view, epoch pos.Epoch
-		ok          bool
-	}{{5, 4, false}, {5, 5, true}, {5, 6, true}, {0, 1, true}, {0, 0, true}} {
-		x := newMirrorTest(t, tc.view)
-		err := x.m.Create(ctx, 1, body("v"), blob.WriteID{Node: "n1", Epoch: tc.epoch, N: 1})
-		if tc.ok != (err == nil) {
-			t.Fatalf("view %d, write id epoch %d: got %v, ok %v", tc.view, tc.epoch, err, tc.ok)
-		}
-		if tc.ok {
-			continue
-		}
-		if !errors.Is(err, blob.ErrExists) {
-			t.Fatalf("a refusal is blob.ErrExists to the client, got %v", err)
-		}
-		// Nothing was written: the number is free, and the store that retries
-		// reads nothing back to mistake for its own attempt.
-		if _, err := x.back.Head(ctx, 1); !errors.Is(err, blob.ErrNotFound) {
-			t.Fatalf("a refused create wrote %v", err)
+	x := newMirrorTest(t)
+	for seq, epoch := range []pos.Epoch{5, 4, 6, 0} {
+		if err := x.m.Create(ctx, pos.Seg(seq+1), body("v"), blob.WriteID{Node: "n1", Epoch: epoch, N: 1}); err != nil {
+			t.Fatalf("epoch %d: %v", epoch, err)
 		}
 	}
 }
 
-// A number already taken answers 412 with the write id it holds in a header,
-// which is what the client's read-back reads.
-func TestMirrorTakenAnswersWithTheHeldWriteID(t *testing.T) {
-	x := newMirrorTest(t, 0)
+// A number already taken answers 412 and nothing else: the handler reads
+// nothing behind the number, since no client reads a write id from a 412.
+func TestMirrorTakenNumberAnswers412Alone(t *testing.T) {
+	ctx := context.Background()
+	x := newMirrorTest(t)
 	held := blob.WriteID{Node: "n1", Epoch: 1, N: 7}
-	if err := x.m.Create(context.Background(), 1, body("one"), held); err != nil {
+	if err := x.m.Create(ctx, 1, body("one"), held); err != nil {
 		t.Fatal(err)
 	}
+	x.reads.Store(0)
 	resp := x.put(t, MirrorPath+"n1/1", map[string]string{
 		"If-None-Match": "*",
 		WriteIDHeader:   mustJSON(t, blob.WriteID{Node: "n1", Epoch: 1, N: 9}),
@@ -159,18 +176,56 @@ func TestMirrorTakenAnswersWithTheHeldWriteID(t *testing.T) {
 	if resp.StatusCode != http.StatusPreconditionFailed {
 		t.Fatalf("status %d, want 412", resp.StatusCode)
 	}
-	if got := resp.Header.Get(WriteIDHeader); got != mustJSON(t, held) {
-		t.Fatalf("the 412 names %q, want the held write id %q", got, mustJSON(t, held))
+	if got := x.reads.Load(); got != 0 {
+		t.Fatalf("the 412 read the number %d times, want no read behind it", got)
 	}
-	if got, err := allOf(context.Background(), NewStore(x.m, "n1", 1, Options{}), 1); err != nil || got != "one" {
+	if got := resp.Header.Get(WriteIDHeader); got != "" {
+		t.Fatalf("the 412 names the held write id %q, want nothing", got)
+	}
+	if got, err := allOf(ctx, NewStore(x.m, "n1", 1, Options{}), 1); err != nil || got != "one" {
 		t.Fatalf("the segment changed: %q %v", got, err)
+	}
+}
+
+// A head carries the write id, which is how a create that meets its own
+// segment behind the number is settled: journal.Store reads it back through
+// the head and takes the retry as its own attempt.
+func TestMirrorHeadCarriesTheWriteIDForTheReadBack(t *testing.T) {
+	ctx := context.Background()
+	x := newMirrorTest(t)
+	id := blob.WriteID{Node: "n1", Epoch: 1, N: 7}
+	if err := x.m.Create(ctx, 1, body("one"), id); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := x.client.Head(x.url + MirrorPath + "n1/1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get(WriteIDHeader); got != mustJSON(t, id) {
+		t.Fatalf("the head names %q, want %q", got, mustJSON(t, id))
+	}
+	if resp.ContentLength != int64(len("one")) {
+		t.Fatalf("the head's length is %d, want %d", resp.ContentLength, len("one"))
+	}
+	// The retry of the same create is the caller's own attempt: the store
+	// reads the number back and succeeds rather than fence itself.
+	store := NewStore(x.m, "n1", 1, Options{Backoff: time.Millisecond})
+	if err := store.CreateWithID(ctx, 1, body("one"), id); err != nil {
+		t.Fatalf("the retry of our own create: %v", err)
+	}
+	if got, err := allOf(ctx, store, 1); err != nil || got != "one" {
+		t.Fatalf("the retry rewrote the segment: %q %v", got, err)
 	}
 }
 
 // A create is conditional and carries a write id: anything else is refused
 // before the body is read.
 func TestMirrorRefusesAnUnconditionalOrUnnamedCreate(t *testing.T) {
-	x := newMirrorTest(t, 0)
+	x := newMirrorTest(t)
 	id := mustJSON(t, blob.WriteID{Node: "n1", Epoch: 1, N: 1})
 	if resp := x.put(t, MirrorPath+"n1/1", map[string]string{WriteIDHeader: id}, "v"); resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("a PUT without If-None-Match: status %d, want 400", resp.StatusCode)
@@ -190,7 +245,7 @@ func TestMirrorRefusesAnUnconditionalOrUnnamedCreate(t *testing.T) {
 // the end is an empty listing.
 func TestMirrorListing(t *testing.T) {
 	ctx := context.Background()
-	x := newMirrorTest(t, 0)
+	x := newMirrorTest(t)
 	for _, seq := range []pos.Seg{2, 3, 10} {
 		if err := x.m.Create(ctx, seq, body(fmt.Sprint(seq)), blob.WriteID{Node: "n1", Epoch: 1, N: uint64(seq)}); err != nil {
 			t.Fatal(err)
@@ -225,7 +280,7 @@ func TestMirrorListing(t *testing.T) {
 
 // A node that mirrors nothing answers 503, not a silent empty journal.
 func TestMirrorRefusesAJournalItDoesNotMirror(t *testing.T) {
-	x := newMirrorTest(t, 0)
+	x := newMirrorTest(t)
 	resp := x.put(t, MirrorPath+"n9/1", map[string]string{
 		"If-None-Match": "*",
 		WriteIDHeader:   mustJSON(t, blob.WriteID{Node: "n9", Epoch: 1, N: 1}),
@@ -239,7 +294,7 @@ func TestMirrorRefusesAJournalItDoesNotMirror(t *testing.T) {
 // 404 to a get or a head.
 func TestMirrorDeleteAndMissing(t *testing.T) {
 	ctx := context.Background()
-	x := newMirrorTest(t, 0)
+	x := newMirrorTest(t)
 	if err := x.m.Create(ctx, 1, body("v"), blob.WriteID{Node: "n1", Epoch: 1, N: 1}); err != nil {
 		t.Fatal(err)
 	}

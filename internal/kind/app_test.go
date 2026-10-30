@@ -7,7 +7,7 @@ import (
 
 func TestParseApp(t *testing.T) {
 	t.Parallel()
-	a, err := ParseApp([]byte(`{"app": "test", "version": "2026.10.0", "kinds": {"users": {"public": true, "sync": "local", "idle_timeout": "10m"}, "wallet": {}, "chat": {"sync": "storage"}, "audit": {}}}`), 3*time.Minute)
+	a, err := ParseApp([]byte(`{"app": "test", "version": "2026.10.0", "kinds": {"users": {"public": true, "sync": "none", "idle_timeout": "10m"}, "wallet": {}, "chat": {"sync": "storage"}, "audit": {}}}`), 3*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -15,13 +15,14 @@ func TestParseApp(t *testing.T) {
 		t.Fatalf("%+v", a)
 	}
 	// The kinds are qualified by the app the declaration names.
-	if a.Kinds["test.users"].IdleTimeout != 10*time.Minute || a.Kinds["test.users"].Sync != SyncLocal || !a.Kinds["test.users"].Public || a.Kinds["test.chat"].Sync != SyncStorage || a.Kinds["test.audit"].Public {
+	if a.Kinds["test.users"].IdleTimeout != 10*time.Minute || a.Kinds["test.users"].Sync != SyncNone || !a.Kinds["test.users"].Public || a.Kinds["test.chat"].Sync != SyncStorage || a.Kinds["test.audit"].Public {
 		t.Fatalf("%+v", a.Kinds)
 	}
 	if a.Kinds["test.users"].Name != "test.users" {
 		t.Fatalf("%+v", a.Kinds["test.users"])
 	}
-	// Leaving settings out gives the safe ones: the record, not public.
+	// Leaving sync out gives the record, the conservative tier; the other
+	// defaults are the safe ones: not public. The peer tier is opt-in.
 	if w := a.Kinds["test.wallet"]; w.Sync != SyncStorage || w.Public || w.IdleTimeout != 3*time.Minute {
 		t.Fatalf("defaults: %+v", w)
 	}

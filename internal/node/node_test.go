@@ -21,6 +21,7 @@ import (
 	"github.com/luci1900/shardlite/internal/service"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
+	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
 type rig struct {
@@ -39,8 +40,8 @@ func newRig(t *testing.T) *rig {
 
 // start is a node whose lease is never renewed by itself (the tests decide
 // what the lease says), with an hour of validity.
-func (r *rig) start() (*node.Node, error) {
-	n, err := node.Start(context.Background(), node.Config{
+func (r *rig) start(opts ...func(*node.Config)) (*node.Node, error) {
+	cfg := node.Config{
 		Name:    "n1",
 		Data:    r.dir,
 		TempDir: r.t.TempDir(),
@@ -48,7 +49,11 @@ func (r *rig) start() (*node.Node, error) {
 		Blob:    blob.Options{Backoff: time.Millisecond},
 		Lease:   coord.RegistryOptions{TTL: time.Hour, Blob: blob.Options{Backoff: time.Millisecond}},
 		Keeper:  coord.KeeperOptions{Interval: 30 * time.Minute, Margin: time.Minute},
-	})
+	}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	n, err := node.Start(context.Background(), cfg)
 	if err == nil {
 		if r.tails == nil {
 			r.tails = map[*node.Node]*node.TailSet{}
@@ -57,6 +62,53 @@ func (r *rig) start() (*node.Node, error) {
 		n.SetTails(r.tails[n])
 	}
 	return n, err
+}
+
+// A clock more than a lease TTL from the store's refuses the start, and a clock
+// within it starts. The store here keeps its own time, ahead of the process's.
+func TestStartRefusesAClockFarFromTheStores(t *testing.T) {
+	t.Parallel()
+	for name, c := range map[string]struct {
+		skew    time.Duration
+		refused bool
+	}{
+		"within the TTL": {skew: time.Minute, refused: false},
+		"past the TTL":   {skew: 3 * time.Hour, refused: true},
+		"behind":         {skew: -3 * time.Hour, refused: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			clock := coord.NewClockWatch(nil)
+			store := blob.NewMemory(blob.WithClock(func() time.Time { return time.Now().Add(c.skew) }), blob.WithClockSink(clock.Sink))
+			r := newRig(t)
+			r.local = blobtest.WithHook(store)
+			n, err := r.start(func(cfg *node.Config) { cfg.Clock = clock })
+			if c.refused != (err != nil) {
+				t.Fatalf("a clock %v from the store's: err %v, want refused %v", c.skew, err, c.refused)
+			}
+			if err == nil {
+				t.Cleanup(func() { n.Close() })
+			}
+		})
+	}
+}
+
+// What the requests before the lease showed refuses the start before the lease
+// is taken.
+func TestStartRefusesBeforeTakingTheLease(t *testing.T) {
+	t.Parallel()
+	clock := coord.NewClockWatch(nil)
+	for range 5 {
+		start := time.Now()
+		clock.Sink(blob.ClockSample{Store: start.Add(3 * time.Hour).Truncate(time.Second), Start: start, End: start.Add(time.Millisecond)}, nil)
+	}
+	r := newRig(t)
+	if _, err := r.start(func(cfg *node.Config) { cfg.Clock = clock }); err == nil {
+		t.Fatal("started")
+	}
+	if _, err := coord.NewRegistry(r.local, "n1", coord.RegistryOptions{}).Get(context.Background(), "n1"); !errors.Is(err, blob.ErrNotFound) {
+		t.Fatalf("a refused start left a lease behind: %v", err)
+	}
 }
 
 func (r *rig) mustStart() *node.Node {
@@ -68,7 +120,7 @@ func (r *rig) mustStart() *node.Node {
 	if r.stops == nil {
 		r.stops = map[*node.Node]func(){}
 	}
-	r.stops[n] = service.Background(slog.Default(), n.Writer, n.Keeper)
+	r.stops[n] = service.Background(slog.Default(), n.Writer, n.Keeper, n.Confirmer)
 	r.t.Cleanup(r.stops[n])
 	return n
 }
@@ -91,7 +143,7 @@ func (r *rig) create(n *node.Node, name string) *liveShard {
 	if err != nil || !created {
 		r.t.Fatalf("open %s: created=%v err=%v", name, created, err)
 	}
-	sh, err := capture.New(capture.Config{Name: shardName(name), Path: s.path, Generation: h.Manifest.Generation, Writer: n.Writer})
+	sh, err := capture.New(capture.Config{Name: shardName(name), Path: s.path, Generation: h.Manifest.Generation, Writer: n.Writer, TempDir: tempfile.NewDir(r.t.TempDir())})
 	if err != nil {
 		r.t.Fatal(err)
 	}
@@ -177,7 +229,9 @@ func TestRestartAdoptsItsOwnJournal(t *testing.T) {
 			}
 			lastSeg := n1.Writer.NextSeq() - 1
 
-			// The process dies (its writer lives on here, as a zombie would).
+			// The process dies (its writer lives on here, as a zombie would), once the
+			// local store has every segment queued so far.
+			waitLocalCopy(t, n1, n1.Writer.Queued())
 			n2 := r.mustStart()
 			if got := n2.Keeper.Lease().Epoch; got != 2 {
 				t.Fatalf("epoch %d, want 2", got)
@@ -253,6 +307,7 @@ func TestFailedAdoptionKeepsTheRange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	waitLocalCopy(t, n1, n1.Writer.Queued())
 	want := apptest.Dump(t, s.path)
 
 	r.local.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {

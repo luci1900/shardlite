@@ -136,6 +136,35 @@ func TestAppReconnectsConstantly(t *testing.T) {
 	sh.Close(context.Background())
 }
 
+// Failing temporary files: a tail's log that cannot be created, a write to it
+// that fails, a descriptor that cannot be duplicated. Syncs and deltas fail and
+// are retried, acknowledged commits are never lost, and the node goes on.
+func TestTemporaryFileFaults(t *testing.T) {
+	t.Parallel()
+	for _, op := range []string{"create", "append", "dup"} {
+		t.Run(op, func(t *testing.T) {
+			t.Parallel()
+			rng := newRand(t)
+			r := newRig(t)
+			r.node.Must(t, "tempfault", op, "300") // 30% of them
+			for range 40 {
+				if rng.IntN(5) == 0 {
+					r.node.Do("delta", shardName) // may fail too
+				}
+				r.n++
+				r.app.Must(t, "ack", "a", itoa(r.n))
+				r.retrySync()
+			}
+			r.node.Must(t, "tempfault", "none", "0")
+			r.verify("with " + op + " faults")
+			if err := r.commit(true); err != nil {
+				t.Fatalf("node stopped working after faults: %v", err)
+			}
+			r.verify("after faults")
+		})
+	}
+}
+
 // Failing and slow blob storage: syncs fail and are retried, acknowledged commits are never lost.
 func TestStorageFaults(t *testing.T) {
 	t.Parallel()

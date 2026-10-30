@@ -13,6 +13,7 @@ import (
 	"github.com/luci1900/shardlite/internal/coord"
 	"github.com/luci1900/shardlite/internal/harness"
 	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
 func TestManifestStoreCompareAndSwap(t *testing.T) {
@@ -78,7 +79,7 @@ func TestClaim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	n2files := &shardfile.Files{Blob: blob.NewStore(e.Blob, "n2", l2.Epoch, blob.Options{}), Backend: e.Blob, Node: "n2", Leases: other, TempDir: t.TempDir()}
+	n2files := &shardfile.Files{Blob: blob.NewStore(e.Blob, "n2", l2.Epoch, blob.Options{}), Backend: e.Blob, Node: "n2", Leases: other, Temp: tempfile.NewDir(t.TempDir())}
 	h2, _, err := n2files.Open(ctx, shardName("test.users/2"))
 	if err != nil {
 		t.Fatal(err)
@@ -112,7 +113,7 @@ func TestCreatorsRacing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	n2 := &shardfile.Files{Blob: blob.NewStore(e.Blob, "n2", l2.Epoch, blob.Options{}), Backend: e.Blob, Node: "n2", Leases: other, TempDir: t.TempDir()}
+	n2 := &shardfile.Files{Blob: blob.NewStore(e.Blob, "n2", l2.Epoch, blob.Options{}), Backend: e.Blob, Node: "n2", Leases: other, Temp: tempfile.NewDir(t.TempDir())}
 
 	for round := range 20 {
 		shard := fmt.Sprintf("test.users/race%d", round)

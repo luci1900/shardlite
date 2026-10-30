@@ -3,14 +3,16 @@ package shardfile
 import (
 	"bytes"
 	"maps"
+	"os"
 	"slices"
+	"sync"
 	"testing"
 
 	"github.com/superfly/ltx"
 
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/pos"
-	"github.com/luci1900/shardlite/internal/spool"
+	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
 // encoded is an LTX file with the checksum of the database before it, the one
@@ -45,13 +47,42 @@ func encoded(t *testing.T, pageSize, commit uint32, pre, post ltx.Checksum, page
 	return buf.Bytes()
 }
 
+var (
+	bodiesMu  sync.Mutex
+	bodiesLog *tempfile.Log
+)
+
+// bodyOf is b as a range of a log shared by the whole test process (appended to
+// under a lock, read by anyone), the way a tail file is one of its shard's log.
+func bodyOf(b []byte) tempfile.File {
+	bodiesMu.Lock()
+	defer bodiesMu.Unlock()
+	if bodiesLog == nil {
+		l, err := tempfile.NewDir(os.TempDir()).Create()
+		if err != nil {
+			panic(err)
+		}
+		bodiesLog = l
+	}
+	a, err := bodiesLog.Append()
+	if err != nil {
+		panic(err)
+	}
+	a.Write(b)
+	f, err := a.Finish()
+	if err != nil {
+		panic(err)
+	}
+	return f
+}
+
 // tailFiles are the captured files a delta is built from.
 func tailFiles(t *testing.T, bodies ...[]byte) []capture.TailFile {
 	t.Helper()
 	out := make([]capture.TailFile, len(bodies))
 	at := pos.Position(1)
 	for i, b := range bodies {
-		out[i] = capture.TailFile{Position: at, Count: 1, Body: spool.Bytes(b)}
+		out[i] = capture.TailFile{Position: at, Count: 1, Body: bodyOf(b)}
 		at++
 	}
 	return out

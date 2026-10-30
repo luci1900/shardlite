@@ -90,10 +90,11 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 	if err := checks.refuse(env.Data); err != nil {
 		return err
 	}
+	clock := coord.NewClockWatch(log)
 	raw := ro.backend
 	if raw == nil {
 		var err error
-		if raw, err = blob.NewS3(ctx, blob.S3Options{Bucket: bucket, Endpoint: env.S3Endpoint}); err != nil {
+		if raw, err = blob.NewS3(ctx, blob.S3Options{Bucket: bucket, Endpoint: env.S3Endpoint, ClockSink: clock.Sink}); err != nil {
 			return err
 		}
 	}
@@ -124,6 +125,7 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 		Lease:   coord.RegistryOptions{TTL: env.LeaseTTL},
 		Keeper:  coord.KeeperOptions{Interval: env.LeaseTTL / 3, Margin: env.LeaseTTL / 5},
 		Logger:  log,
+		Clock:   clock,
 		TempDir: tempDir,
 		// The standbys setting: how many mirrors this node names for its
 		// journal (docs/guide.md, Environment variables).
@@ -142,6 +144,10 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 	journal := service.New(context.Background(), log)
 	journal.Add(n.Writer)
 	journal.Add(n.Keeper)
+	journal.Add(n.Confirmer)
+	// The repair's cadence is Config.Repair, defaulting to its own; Run sets
+	// nothing, so a deployment tunes it where it builds its Config.
+	journal.Add(n.repairLoop(0))
 	stopJournal := func() { stopStage(log, "the journal", journal) } // a failure before the other stages run
 	// Every listener is bound before the shards are built, since binding is quick
 	// and fails fast while opening the cache can take a while. A listener only
@@ -204,7 +210,7 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 		ro.shards(&so, nil)
 	}
 	m, err := NewCatalog(n, so, func(m *Catalog) routing {
-		srv = NewServer(m, kinds, n.Keeper, ServerOptions{App: appURL, MaxHops: env.MaxHops, Grace: ro.grace, Logger: log})
+		srv = NewServer(m, kinds, n.Keeper, ServerOptions{App: appURL, MaxHops: env.MaxHops, Grace: ro.grace, Clock: clock, Logger: log})
 		return routing{wake: srv.wakeApp, dispatch: srv.dispatch, call: srv.call}
 	})
 	if err != nil {

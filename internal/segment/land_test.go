@@ -17,7 +17,7 @@ import (
 	"github.com/luci1900/shardlite/internal/journal"
 	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/shard"
-	"github.com/luci1900/shardlite/internal/spool"
+	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
 // bytesBody is bytes as a body, re-readable as many times as a create retries.
@@ -180,6 +180,13 @@ func refused(t *testing.T, err error, record *journal.Store) {
 func TestLand(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
+	// Every landing closes its log, whether the segment passed or not.
+	dir := tempfile.NewDir(t.TempDir())
+	t.Cleanup(func() {
+		if n := dir.Open(); n != 0 {
+			t.Errorf("%d descriptors left open by the landings", n)
+		}
+	})
 
 	// One shard's two files chained, and another shard's file resting beside
 	// them. Two pages in each file, so a mid-file byte is page bytes and not
@@ -194,7 +201,7 @@ func TestLand(t *testing.T) {
 	t.Run("lands a segment of chained files", func(t *testing.T) {
 		record := newLandRecord(t)
 		src := segSource(t, chain, nil)
-		if err := Land(ctx, record, src.store, 1, src.id, "", spool.DefaultLimit); err != nil {
+		if err := Land(ctx, record, src.store, 1, src.id, dir); err != nil {
 			t.Fatal(err)
 		}
 		if got, want := readAll(t, record, 1), src.body; !bytes.Equal(got, want) {
@@ -212,7 +219,7 @@ func TestLand(t *testing.T) {
 		}
 		record := newLandRecord(t)
 		src := segSource(t, files, nil)
-		if err := Land(ctx, record, src.store, 1, src.id, "", spool.DefaultLimit); err != nil {
+		if err := Land(ctx, record, src.store, 1, src.id, dir); err != nil {
 			t.Fatal(err)
 		}
 		if got, want := readAll(t, record, 1), src.body; !bytes.Equal(got, want) {
@@ -226,7 +233,7 @@ func TestLand(t *testing.T) {
 		body[mid] ^= 0x5a
 		record := newLandRecord(t)
 		src := segHeld(t, body)
-		if err := Land(ctx, record, src.store, 1, src.id, "", spool.DefaultLimit); err != nil {
+		if err := Land(ctx, record, src.store, 1, src.id, dir); err != nil {
 			refused(t, err, record)
 			return
 		}
@@ -238,7 +245,7 @@ func TestLand(t *testing.T) {
 		entries[1].Offset = 1 // the first file's bytes do not end at the second's
 		record := newLandRecord(t)
 		src := segSource(t, chain, entries)
-		refused(t, Land(ctx, record, src.store, 1, src.id, "", spool.DefaultLimit), record)
+		refused(t, Land(ctx, record, src.store, 1, src.id, dir), record)
 	})
 
 	t.Run("a chain that does not follow is refused", func(t *testing.T) {
@@ -246,12 +253,12 @@ func TestLand(t *testing.T) {
 		files[1].pre = csum(99) // not what the one before left
 		record := newLandRecord(t)
 		src := segSource(t, files, nil)
-		refused(t, Land(ctx, record, src.store, 1, src.id, "", spool.DefaultLimit), record)
+		refused(t, Land(ctx, record, src.store, 1, src.id, dir), record)
 	})
 
 	t.Run("an empty segment is refused", func(t *testing.T) {
 		record := newLandRecord(t)
 		src := segHeld(t, []byte{})
-		refused(t, Land(ctx, record, src.store, 1, src.id, "", spool.DefaultLimit), record)
+		refused(t, Land(ctx, record, src.store, 1, src.id, dir), record)
 	})
 }

@@ -5,12 +5,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"slices"
-	"strings"
-	"sync"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/cluster"
 	"github.com/luci1900/shardlite/internal/coord"
 	"github.com/luci1900/shardlite/internal/journal"
@@ -19,8 +15,7 @@ import (
 )
 
 // The mirror's node side: what the peer listener serves the journals it
-// mirrors from, the view of the cluster's leases a mirror checks a write id's
-// epoch against, and how an adoption dials a dead node's mirrors for the fetch
+// mirrors from, and how an adoption dials a dead node's peer for the fetch
 // (docs/internals.md, Node journals and snapshots).
 
 // newPeerTransport is the transport of the node's requests to other nodes'
@@ -42,72 +37,11 @@ func newPeerTransport() *http.Transport {
 // newPeerClient is a client for other nodes' peer listeners.
 func newPeerClient() *http.Client { return &http.Client{Transport: newPeerTransport()} }
 
-// epochReadTimeout bounds one read of a lease on a mirror's create path: a
-// slow read leaves the view as it was, and a view that is behind never
-// refuses.
-const epochReadTimeout = 500 * time.Millisecond
-
-// mirrorEpochs is a mirror's view of the cluster's leases: the epoch of each
-// node's lease as of this node's last read of it. A create on a mirrored
-// journal carries the writer's epoch in its write id, and the mirror refuses
-// only what names a strictly older epoch than its view, so a view that is
-// expired, or not yet caught up with a renewal, costs latency and never drops
-// a mirror out of the ensemble.
-//
-// The view follows the lease scan's listing: a lease is read when the listing
-// shows an etag the view has not seen, which is a renewal or a new epoch, so
-// the reads are a few per renewal and not one per segment. A lease that cannot
-// be read leaves the view as it was.
-type mirrorEpochs struct {
-	reg   *coord.Registry
-	nodes func() *NodeList // the lease scan's last listing, nil before its first
-
-	mu   sync.Mutex
-	seen map[cluster.Node]mirrorSeen
-}
-
-type mirrorSeen struct {
-	etag  blob.ETag
-	epoch pos.Epoch
-}
-
-// Epoch is the view of node's lease epoch, 0 if it has none.
-func (v *mirrorEpochs) Epoch(ctx context.Context, node cluster.Node) pos.Epoch {
-	var etag blob.ETag
-	if list := v.nodes(); list != nil {
-		if i, found := slices.BinarySearchFunc(list.Nodes, node, func(view NodeView, name cluster.Node) int {
-			return strings.Compare(string(view.Name), string(name))
-		}); found {
-			etag = list.Nodes[i].ETag
-		}
-	}
-	v.mu.Lock()
-	seen := v.seen[node]
-	v.mu.Unlock()
-	if seen.etag == etag {
-		return seen.epoch
-	}
-	rctx, cancel := context.WithTimeout(ctx, epochReadTimeout)
-	l, err := v.reg.Get(rctx, node)
-	cancel()
-	if err != nil {
-		return seen.epoch // not caught up: the old view stands, and it never refuses
-	}
-	v.mu.Lock()
-	if v.seen == nil {
-		v.seen = map[cluster.Node]mirrorSeen{}
-	}
-	v.seen[node] = mirrorSeen{etag: etag, epoch: l.Epoch}
-	v.mu.Unlock()
-	return l.Epoch
-}
-
 // mirrorSource is what this node serves the mirror protocol from: the journals
 // in its local database, which holds a mirrored journal beside its own under
-// the journal's node name, and the view of the owners' leases.
+// the journal's node name.
 type mirrorSource struct {
-	db     *localdb.DB
-	epochs *mirrorEpochs
+	db *localdb.DB
 }
 
 // Journal is the backend of node's mirrored journal, nil if this node has no
@@ -117,11 +51,6 @@ func (s *mirrorSource) Journal(node cluster.Node) journal.Backend {
 		return nil
 	}
 	return journal.NewLocal(s.db.DB, node)
-}
-
-// Epoch is the view of node's lease epoch.
-func (s *mirrorSource) Epoch(ctx context.Context, node cluster.Node) pos.Epoch {
-	return s.epochs.Epoch(ctx, node)
 }
 
 // mirrorDialer dials other nodes' mirror endpoints: the stores an adoption's
@@ -139,24 +68,26 @@ func newMirrorDialer(reg *coord.Registry, opts journal.Options) *mirrorDialer {
 	return &mirrorDialer{client: newPeerClient(), reg: reg, opts: opts}
 }
 
-// stores dials the mirrors of the journal whose lease is dead, in the order
-// the lease names them. A mirror's lease is read once, here: the fetch asks
-// each store a bounded number of questions and the adoption carries on past
-// one that cannot be reached.
-func (d *mirrorDialer) stores(ctx context.Context, dead coord.NodeLease, log *slog.Logger) []*journal.Store {
-	var out []*journal.Store
-	for _, name := range dead.Mirrors {
-		l, err := d.reg.Get(ctx, name)
-		if err != nil {
-			if log != nil && ctx.Err() == nil {
-				log.Warn("could not read a mirror's lease for the fetch", "node", dead.Name, "mirror", name, "err", err)
-			}
-			continue
-		}
-		if l.Address == "" {
-			continue
-		}
-		out = append(out, journal.NewStore(journal.NewMirror(d.client, "http://"+l.Address, dead.Name), dead.Name, dead.Epoch, d.opts))
+// dial dials one node's mirror endpoint for the journal whose writer is node
+// at epoch: the store a fan-out sends segments through, or an adoption's fetch
+// reads a dead journal's tail from. The journal is not necessarily this
+// node's: an adopter dials a dead node's peer for that node's journal. A peer
+// whose lease cannot be read, or that has no address yet, is nil, and the
+// caller says what that cost: the writer has no peer, and a fetch's window is
+// lost.
+func (d *mirrorDialer) dial(ctx context.Context, node cluster.Node, epoch pos.Epoch, peer cluster.Node, log *slog.Logger) *journal.Store {
+	if d == nil || peer == "" {
+		return nil // a scan that dials nothing, or a journal that named none
 	}
-	return out
+	l, err := d.reg.Get(ctx, peer)
+	if err != nil {
+		if log != nil && ctx.Err() == nil {
+			log.Warn("could not read the peer's lease", "node", node, "peer", peer, "err", err)
+		}
+		return nil
+	}
+	if l.Address == "" {
+		return nil
+	}
+	return journal.NewStore(journal.NewMirror(d.client, "http://"+l.Address, node), node, epoch, d.opts)
 }

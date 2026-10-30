@@ -72,9 +72,10 @@ func (b *body) ReadAt(p []byte, off int64) (int, error) {
 }
 
 // batchQueue is an unbounded queue of batches: the record's uploader hands a
-// batch to the local store's uploader and goes on, so a slow disk never holds
-// the record's writes. It is unbounded because the alternative (a bounded queue)
-// would make the record wait for the local disk once it filled.
+// batch to the local store's and the peer's uploaders and goes on, so a slow
+// disk or peer never holds the record's writes. It is unbounded because the
+// alternative (a bounded queue) would make the record wait for the slow side
+// once it filled.
 type batchQueue struct {
 	mu     sync.Mutex
 	list   []*batch
@@ -117,6 +118,16 @@ func (q *batchQueue) pop(ctx context.Context) *batch {
 			return nil
 		}
 	}
+}
+
+// drain takes every batch waiting and returns them, so a hand-off can finish
+// them without holding the queue.
+func (q *batchQueue) drain() []*batch {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	held := q.list
+	q.list = nil
+	return held
 }
 
 // close empties the queue and wakes the waiter.

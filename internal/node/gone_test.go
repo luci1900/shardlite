@@ -256,8 +256,10 @@ func TestMarkedShardIsCapturedAndGated(t *testing.T) {
 	if m, err := r.manifest("test.lobby/l1"); err != nil || m.Journal != "n1" || m.Owner != "n1" {
 		t.Fatalf("manifest %+v (%v), want one with a journal", m, err)
 	}
+	// The kind names no sync, so it parses to the record; the gate below
+	// names storage explicitly.
 	if ref.Sync() != kind.SyncStorage {
-		t.Fatal("the kind's sync setting is ignored")
+		t.Fatal("the kind's sync default is ignored")
 	}
 	r.write(ref, "a")
 	r.markForDeletion()

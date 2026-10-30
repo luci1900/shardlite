@@ -244,7 +244,7 @@ func (r *srig) record(rec *recorder, shardRows string) {
 		}
 		b := new(bytes.Buffer)
 		b.ReadFrom(q.Body)
-		d := wakeSeen{target: q.Header.Get("Shardlite-Target"), method: q.Method, body: b.String(), hdr: q.Header.Clone()}
+		d := wakeSeen{target: q.Header.Get("Shardlite-Opened"), method: q.Method, body: b.String(), hdr: q.Header.Clone()}
 		if shardRows != "" {
 			d.shardRows = r.rows(shardRows)
 		}
@@ -468,7 +468,7 @@ func TestWakeIsAPostWithNoBody(t *testing.T) {
 	r.remind("test.users/ia1", "a", time.Now().Unix())
 	eventually(t, "the wake", func() bool { return rec.count() == 1 })
 	d := rec.all()[0]
-	if d.method != "POST" || d.body != "" || d.target != "test.users/ia1" || d.hdr.Get("Shardlite-Caller") != "test.users/ia1" || d.hdr.Get("Shardlite-Path") == "" {
+	if d.method != "POST" || d.body != "" || d.target != "test.users/ia1" || d.hdr.Get("Shardlite-Caller") != "test.users/ia1" || d.hdr.Get("Shardlite-File") == "" || d.hdr.Get("Shardlite-Target") != "" {
 		t.Fatalf("wake %+v", d)
 	}
 	for _, h := range []string{"Idempotency-Key", "Shardlite-Sync", "Shardlite-If-Active", "Shardlite-Reminder-Id", "Content-Type"} {

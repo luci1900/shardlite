@@ -23,6 +23,7 @@ import (
 	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/service"
 	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
 // logSink is a slog writer that the tests read at the end.
@@ -63,7 +64,7 @@ func (r *rig) mustStartLogged(t *testing.T) (*node.Node, string) {
 	}
 	r.tails[n] = &node.TailSet{}
 	n.SetTails(r.tails[n])
-	r.stops[n] = service.Background(slog.Default(), n.Writer, n.Keeper)
+	r.stops[n] = service.Background(slog.Default(), n.Writer, n.Keeper, n.Confirmer)
 	r.t.Cleanup(r.stops[n])
 	return n, logs.String()
 }
@@ -382,7 +383,7 @@ func TestACutoffBeforeTheRestartLosesTheRow(t *testing.T) {
 		Backend:        r.local,
 		Node:           "n2",
 		Leases:         reg2,
-		TempDir:        t.TempDir(),
+		Temp:           tempfile.NewDir(t.TempDir()),
 		JournalOptions: journal.Options{Backoff: time.Millisecond},
 	}
 	marked, err := reg2.Adopt(context.Background(), dead, l2.Incarnation())

@@ -1,7 +1,6 @@
 package journal
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,7 +12,7 @@ import (
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/cluster"
 	"github.com/luci1900/shardlite/internal/pos"
-	"github.com/luci1900/shardlite/internal/spool"
+	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
 // The receiving side of the mirror protocol: the handler a node mounts on its
@@ -21,39 +20,27 @@ import (
 // is Mirror, in mirror_client.go.
 
 // MirrorSource is what a node serves the mirror protocol from: the backends
-// holding the journals it mirrors, and its view of the journals' owners'
-// leases (every node scans leases).
+// holding the journals it mirrors.
 type MirrorSource interface {
 	// Journal is the backend holding node's mirrored segments, nil if this
 	// node holds none (a node that mirrors nothing, asked anyway).
 	Journal(node cluster.Node) Backend
-	// Epoch is this node's view of node's lease epoch, 0 if it has none. A
-	// create whose write id names a strictly older epoch is refused: a stale
-	// life of a node name is a fence to the mirror, not a duplicate. A view
-	// that is merely expired, or not yet caught up with the owner's renewal,
-	// never refuses.
-	Epoch(ctx context.Context, node cluster.Node) pos.Epoch
 }
 
-// NewMirrorHandler serves the mirror protocol on a peer listener. spoolDir and
-// spoolLimit are where a request's body is held while its create reads it at
-// any offset (spool.DefaultLimit if the limit is zero).
+// NewMirrorHandler serves the mirror protocol on a peer listener. dir is where
+// a request's body is held while its create reads it at any offset.
 //
 // The handler answers after the backend has committed the segment, so a 2xx
 // means the bytes are on this node's disk. A create whose number is taken
-// answers 412 with the write id held under the number in a header; one whose
-// write id names a stale epoch answers 412 with nothing under the number.
-func NewMirrorHandler(src MirrorSource, spoolDir string, spoolLimit int) http.Handler {
-	if spoolLimit <= 0 {
-		spoolLimit = spool.DefaultLimit
-	}
-	return &mirrorHandler{src: src, dir: spoolDir, limit: spoolLimit}
+// answers 412 without reading the segment; one whose write id names a stale
+// epoch answers 412 before the body is read.
+func NewMirrorHandler(src MirrorSource, dir *tempfile.Dir) http.Handler {
+	return &mirrorHandler{src: src, dir: dir}
 }
 
 type mirrorHandler struct {
-	src   MirrorSource
-	dir   string
-	limit int
+	src MirrorSource
+	dir *tempfile.Dir
 }
 
 func (h *mirrorHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -111,8 +98,7 @@ func cutMirrorPath(p string) (node cluster.Node, seq pos.Seg, ok bool) {
 	return cluster.Node(name), pos.Seg(n), true
 }
 
-// create is a PUT: create once, durable before the answer, and refused when
-// the write id names a stale life of the journal's node.
+// create is a PUT: create once, durable before the answer.
 func (h *mirrorHandler) create(w http.ResponseWriter, r *http.Request, b Backend, node cluster.Node, seq pos.Seg) {
 	if r.Header.Get("If-None-Match") != "*" {
 		writeMirrorError(w, http.StatusBadRequest, "a create is a PUT with If-None-Match: *")
@@ -123,28 +109,15 @@ func (h *mirrorHandler) create(w http.ResponseWriter, r *http.Request, b Backend
 		writeMirrorError(w, http.StatusBadRequest, "the write id is missing or bad")
 		return
 	}
-	// The epoch check before the body is read, so a refused write costs no IO.
-	if view := h.src.Epoch(r.Context(), node); view > id.Epoch {
-		writeMirrorErrorf(w, http.StatusPreconditionFailed,
-			"the write id names epoch %d of %s and this node's view of its lease is %d", uint64(id.Epoch), node, uint64(view))
-		return
-	}
-	body, err := spool.Collect(h.dir, h.limit, r.Body)
+	body, err := h.dir.Collect(r.Body)
 	if err != nil {
 		writeMirrorError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	defer body.Close()
-	if err := b.Create(r.Context(), seq, body.Reader(), id); err != nil {
+	if err := b.Create(r.Context(), seq, body.File().Reader(), id); err != nil {
 		switch {
 		case errors.Is(err, blob.ErrExists):
-			// Whose segment holds the number goes back in a header, so the
-			// client's read-back is one head and not two requests.
-			if held, herr := b.Head(r.Context(), seq); herr == nil {
-				if wire, merr := json.Marshal(held.WriteID); merr == nil {
-					w.Header().Set(WriteIDHeader, string(wire))
-				}
-			}
 			writeMirrorError(w, http.StatusPreconditionFailed, "the number is taken")
 		case errors.Is(err, blob.ErrNotApplied):
 			writeMirrorError(w, http.StatusConflict, err.Error())

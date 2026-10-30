@@ -10,15 +10,12 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/luci1900/shardlite/internal/apptest"
-	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/harness"
-	"github.com/luci1900/shardlite/internal/journal"
 	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/shardfile"
@@ -286,7 +283,7 @@ func TestReactivationFoldsTheWALItLeft(t *testing.T) {
 		t.Fatalf("expected a WAL left behind: %v", err)
 	}
 	// The next activation continues from the position the last one reached.
-	sh2 := e.Activate(res.Handle, &capture.Restored{Position: sh.Position(), Tail: sh.Tail()})
+	sh2 := e.Activate(res.Handle, &capture.Restored{Position: sh.Position(), Tail: sh.TakeTail()})
 	sh.Discard()
 	if err := sh2.Sync(ctx); err != nil {
 		t.Fatal(err)
@@ -304,10 +301,10 @@ func TestReactivationFoldsTheWALItLeft(t *testing.T) {
 	sh2.Close(ctx)
 }
 
-// A commit larger than the spool limit is held in a temporary file in the
-// temporary directory (also what the segment writer builds from it), reaches the
-// journal intact, and the file is gone when the tail is dropped.
-func TestLargeCommitSpillsAndLeavesNothingBehind(t *testing.T) {
+// A commit as large as a database is appended to the tail's log like any other,
+// reaches the journal intact, and leaves no name in the temporary directory at
+// any point (the log never had one).
+func TestLargeCommitIsOneFileInTheTailsLog(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name string
@@ -317,8 +314,7 @@ func TestLargeCommitSpillsAndLeavesNothingBehind(t *testing.T) {
 			e := harness.New(t)
 			res := stored(t, e, 1)
 			ctx := context.Background()
-			e.Files.SpoolLimit = 64 << 10
-			tmp := e.Files.TempDir
+			tmp := e.Files.Temp.Path()
 			inTemp := func() int {
 				ents, err := os.ReadDir(tmp)
 				if err != nil {
@@ -331,60 +327,41 @@ func TestLargeCommitSpillsAndLeavesNothingBehind(t *testing.T) {
 				t.Fatal(err)
 			}
 			app := e.StartApp(name)
-			if got := inTemp(); got != 0 {
-				t.Fatalf("%d temporary files before any commit", got)
-			}
-			// While the segment is uploaded there is the commit's file: the
-			// segment is composed from the tail's files rather than spooled.
-			var atUpload atomic.Int32
-			e.Blob.SetHook(func(_ context.Context, op blobtest.Op, key string, after bool) error {
-				if op == blobtest.OpCreate && !after && strings.HasPrefix(key, journal.Root) {
-					// The most there were at any upload: a later, smaller segment (the writer
-					// cuts one every few milliseconds) finds the commit's file already gone.
-					n := int32(inTemp())
-					for old := atUpload.Load(); n > old && !atUpload.CompareAndSwap(old, n); old = atUpload.Load() {
-					}
-				}
-				return nil
-			})
 
 			// One transaction.
 			app.Must(t, "insert", "a", strconv.Itoa(tc.mb), "1000000")
 			if err := sh.Sync(ctx); err != nil {
 				t.Fatal(err)
 			}
-			tail := sh.Tail()
-			if len(tail) == 0 || !tail[0].Body.InFile() || tail[0].Body.Size() < int64(tc.mb)*1_000_000 {
-				t.Fatalf("tail %+v: want a first file of %d MB in a temporary file", tail, tc.mb)
+			tail := tailOf(t, sh)
+			if len(tail.Files) == 0 || tail.Files[0].Body.Size() < int64(tc.mb)*1_000_000 {
+				t.Fatalf("tail %+v: want a first file of %d MB", tail, tc.mb)
 			}
-			tail.Close()
-			if inTemp() == 0 {
-				t.Fatalf("no temporary file for a %d MB commit", tc.mb)
+			if sh.TailBytes() < int64(tc.mb)*1_000_000 {
+				t.Fatalf("the tail holds %d bytes for a %d MB commit", sh.TailBytes(), tc.mb)
+			}
+			if got := inTemp(); got != 0 {
+				t.Fatalf("%d names in the temporary directory with a %d MB commit in the tail", got, tc.mb)
 			}
 			// It reaches the journal, becomes a delta and restores to the same database.
 			if err := e.W.Flush(ctx); err != nil {
 				t.Fatal(err)
 			}
-			if tc.mb*1_000_000 > 4<<20 && atUpload.Load() < 1 {
-				t.Fatalf("%d temporary files while a segment of over %d MB was uploaded, want the commit's", atUpload.Load(), tc.mb)
-			}
 			if err := res.Handle.WriteDelta(ctx, sh, shardfile.Hooks{}); err != nil {
 				t.Fatal(err)
 			}
-			if got := inTemp(); got != 0 {
-				ents, _ := os.ReadDir(tmp)
-				t.Fatalf("%d temporary files after the delta: %v", got, ents)
+			if n, _ := sh.TailInfo(); n != 0 || sh.TailBytes() != 0 {
+				t.Fatalf("the tail holds %d files and %d bytes after the delta", n, sh.TailBytes())
 			}
 			// Capture goes on incrementally.
 			app.Must(t, "insert", "a", "1", "200")
 			if err := sh.Sync(ctx); err != nil {
 				t.Fatal(err)
 			}
-			tail = sh.Tail()
-			if len(tail) == 0 || tail[0].Body.Size() > 64<<10 {
-				t.Fatalf("the commit after the large one made %d files, the first of %d bytes: capture snapshotted", len(tail), tail[0].Body.Size())
+			tail = tailOf(t, sh)
+			if len(tail.Files) == 0 || tail.Files[0].Body.Size() > 64<<10 {
+				t.Fatalf("the commit after the large one made %d files, the first of %d bytes: capture snapshotted", len(tail.Files), tail.Files[0].Body.Size())
 			}
-			tail.Close()
 			if err := res.Handle.WriteDelta(ctx, sh, shardfile.Hooks{}); err != nil {
 				t.Fatal(err)
 			}
@@ -400,9 +377,6 @@ func TestLargeCommitSpillsAndLeavesNothingBehind(t *testing.T) {
 			}
 			if want, got := apptest.Dump(t, e.Path(name)), sqlitetest.Dump(t, dst); want != got {
 				t.Fatalf("the restored database differs from the app's (%d and %d bytes of dump)", len(want), len(got))
-			}
-			if got := inTemp(); got != 0 {
-				t.Fatalf("%d temporary files after the restore", got)
 			}
 		})
 	}
@@ -503,10 +477,9 @@ func TestSeedAnyPageSize(t *testing.T) {
 			if n, _ := sh.TailInfo(); n != 1 {
 				t.Fatalf("%d tail files", n)
 			}
-			tail := sh.Tail()
-			defer tail.Close()
-			if tail[0].Body.Size() > 2*60000+8*int64(size) {
-				t.Fatalf("the first commit after the seed made a %d byte file: a snapshot", tail[0].Body.Size())
+			tail := tailOf(t, sh)
+			if tail.Files[0].Body.Size() > 2*60000+8*int64(size) {
+				t.Fatalf("the first commit after the seed made a %d byte file: a snapshot", tail.Files[0].Body.Size())
 			}
 			sh.Close(ctx)
 		})

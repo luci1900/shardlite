@@ -14,6 +14,7 @@ import (
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/blobtest"
+	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/harness"
 	shardpkg "github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
@@ -23,6 +24,17 @@ import (
 const shard = "test.users/42"
 
 // shardName is a shard's name in the tests that need the parsed type.
+// tailOf is the shard's tail, closed when the test ends.
+func tailOf(t testing.TB, sh *capture.Shard) capture.TailFiles {
+	t.Helper()
+	tail, err := sh.Tail()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(tail.Close)
+	return tail
+}
+
 func shardName(s string) shardpkg.Name { return shardpkg.MustParse(s) }
 
 // write runs a few app commits and syncs them.
@@ -64,11 +76,11 @@ func TestDeltaEqualsReplayingTail(t *testing.T) {
 	for i := range 5 {
 		write(t, e, app, func() error { return sh.Sync(ctx) }, i)
 	}
-	tail := sh.Tail()
+	tail := tailOf(t, sh).Files
 	if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); err != nil {
 		t.Fatal(err)
 	}
-	if len(sh.Tail()) != 0 {
+	if len(tailOf(t, sh).Files) != 0 {
 		t.Fatal("tail not dropped")
 	}
 	if got := h.Manifest.Files; len(got) != 1 || got[0].String() != fmt.Sprintf("1-%d.%d", tail[len(tail)-1].Last(), h.F.Blob.Epoch()) {
@@ -158,7 +170,7 @@ func TestCrashBetweenFileAndManifest(t *testing.T) {
 		t.Fatal("restore after crash differs")
 	}
 	// The tail was kept, so the retry writes the same delta again and succeeds.
-	if len(sh.Tail()) == 0 {
+	if len(tailOf(t, sh).Files) == 0 {
 		t.Fatal("tail dropped by a failed delta")
 	}
 	if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); err != nil {
@@ -188,7 +200,7 @@ func TestManifestUpdateFails(t *testing.T) {
 		t.Fatal("want error")
 	}
 	e.Blob.SetHook(nil)
-	if len(h.Manifest.Files) != 0 || len(sh.Tail()) == 0 {
+	if len(h.Manifest.Files) != 0 || len(tailOf(t, sh).Files) == 0 {
 		t.Fatal("state changed by a failed update")
 	}
 	if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); err != nil {
@@ -282,8 +294,8 @@ func TestLostResponses(t *testing.T) {
 			t.Fatalf("fired=%v err=%v", fired.Load(), err)
 		}
 		e.Blob.SetHook(nil)
-		if len(h.Manifest.Files) != 1 || len(sh.Tail()) != 0 {
-			t.Fatalf("files %v, tail %d", h.Manifest.Files, len(sh.Tail()))
+		if len(h.Manifest.Files) != 1 || len(tailOf(t, sh).Files) != 0 {
+			t.Fatalf("files %v, tail %d", h.Manifest.Files, len(tailOf(t, sh).Files))
 		}
 		if err := h.Touch(ctx); err != nil { // the ETag kept is current
 			t.Fatal(err)
@@ -321,7 +333,7 @@ func TestLostResponses(t *testing.T) {
 		app := e.StartApp(shard)
 		h, sh := e.NewShard(shard)
 		write(t, e, app, func() error { return sh.Sync(ctx) }, 0)
-		tail := sh.Tail()
+		tail := tailOf(t, sh).Files
 		key := shardfile.FileKey(shardName(shard), h.Manifest.Generation, shardfile.File{Range: shardfile.Range{Min: tail[0].Position, Max: tail[len(tail)-1].Last()}, Epoch: h.F.Blob.Epoch()})
 		e.Store.Create(ctx, key, strings.NewReader("someone else's bytes"))
 		if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); !errors.Is(err, blob.ErrExists) {

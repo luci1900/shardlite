@@ -73,7 +73,7 @@ func TestCheckpointsNeverLoseFrames(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			sh, err := capture.New(capture.Config{Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W, RestartFrames: tc.restart})
+			sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W, RestartFrames: tc.restart})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -182,7 +182,7 @@ func TestSyncAfterARestartReadsTheWALFromItsFirstFrame(t *testing.T) {
 	ctx := context.Background()
 	app := e.StartApp(name)
 	h, _, _ := e.Files.Open(ctx, shardName(name))
-	sh, err := capture.New(capture.Config{Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W, RestartFrames: 20})
+	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W, RestartFrames: 20})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +225,7 @@ func TestUnthrottledWriterKeepsTheWALBounded(t *testing.T) {
 	app := e.StartApp(name)
 	h, _, _ := e.Files.Open(ctx, shardName(name))
 	const restartFrames = 400
-	sh, err := capture.New(capture.Config{Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W, RestartFrames: restartFrames})
+	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W, RestartFrames: restartFrames})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -300,7 +300,7 @@ func TestReleaseChecksShm(t *testing.T) {
 	ctx := context.Background()
 	app := e.StartApp(name)
 	h, _, _ := e.Files.Open(ctx, shardName(name))
-	sh, err := capture.New(capture.Config{Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W})
+	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -353,7 +353,7 @@ func TestCheckAfterClosingKeepsAppLocks(t *testing.T) {
 	ctx := context.Background()
 	app := e.StartApp(name)
 	h, _, _ := e.Files.Open(ctx, shardName(name))
-	sh, err := capture.New(capture.Config{Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W})
+	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -387,7 +387,7 @@ func TestThrowawayProbeDropsLocks(t *testing.T) {
 	ctx := context.Background()
 	app := e.StartApp(name)
 	h, _, _ := e.Files.Open(ctx, shardName(name))
-	sh, err := capture.New(capture.Config{Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W})
+	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,7 +417,7 @@ func TestReleaseSeesACommitAfterTheFinalSync(t *testing.T) {
 	app := e.StartApp(name)
 	h, _, _ := e.Files.Open(ctx, shardName(name))
 	late := false
-	sh, err := capture.New(capture.Config{Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W,
+	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W,
 		Durable: func(ctx context.Context) error {
 			if late {
 				// Between the connections closing and the -shm check.
@@ -493,7 +493,7 @@ func TestReleaseWhoseWaitFailsReopensCapture(t *testing.T) {
 	h, _, _ := e.Files.Open(ctx, shardName(name))
 	errStorage := errors.New("storage down")
 	fail := true
-	sh, err := capture.New(capture.Config{Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W,
+	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W,
 		Durable: func(ctx context.Context) error {
 			if fail {
 				fail = false

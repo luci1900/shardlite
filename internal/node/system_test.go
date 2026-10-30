@@ -33,9 +33,10 @@ import (
 // then waits for System.Sync, and POST /call calls the shard its ?to names with
 // POST /write, through System.Call.
 type probe struct {
-	wakes notify.Counter // wakes the system app answered
-	runs  atomic.Int64   // the count of runs the last wake read, which the shard's file keeps
-	wrote notify.Counter // writes committed
+	wakes notify.Counter              // wakes the system app answered
+	runs  atomic.Int64                // the count of runs the last wake read, which the shard's file keeps
+	wrote notify.Counter              // writes committed
+	seen  atomic.Pointer[http.Header] // the headers of the last POST /write
 }
 
 const probeShard = "_system.probe/_cluster"
@@ -86,6 +87,8 @@ func (p *probe) kindAs(name string, sync kind.Sync, migrations fstest.MapFS) kin
 				p.wakes.Inc()
 			})
 			mux.HandleFunc("POST /write", func(w http.ResponseWriter, r *http.Request) {
+				hdr := r.Header.Clone()
+				p.seen.Store(&hdr)
 				err := s.Tx(r.Context(), func(tx *sql.Tx) error {
 					_, err := tx.Exec(`INSERT INTO writes VALUES (1)`)
 					return err
@@ -379,7 +382,7 @@ func TestSystemSyncOff(t *testing.T) {
 	p := &probe{}
 	const shard = "_system.lazy/_cluster"
 	r := newSRigWith(t, func(o *CatalogOptions) {
-		o.System = []kind.Kind{p.kindAs("_system.lazy", kind.SyncLocal, probeV1)}
+		o.System = []kind.Kind{p.kindAs("_system.lazy", kind.SyncNone, probeV1)}
 		o.Claims = ClaimOptions{Every: time.Hour}
 	})
 	waitRuns(t, p, 1, 1)
@@ -428,7 +431,7 @@ func TestSystemSyncOff(t *testing.T) {
 	}
 	eventually(t, "the lease to be lost", func() bool { return r.n.Keeper.Check() != nil })
 	sh := r.m.tab.load(shardName(shard)).a
-	if err := sh.gate(context.Background(), kind.SyncStorage); err == nil {
+	if err := sh.gate(context.Background(), kind.SyncStorage, false); err == nil {
 		t.Fatal("System.Sync passed after the lease was lost")
 	}
 }
@@ -451,6 +454,11 @@ func TestSystemCallReachesAnotherSystemShard(t *testing.T) {
 	}
 	if n := caller.wrote.Load(); n != 0 {
 		t.Fatalf("the caller took %d writes, want 0", n)
+	}
+	// The system app is told which shard the node opened, not a target.
+	hdr := callee.seen.Load()
+	if hdr == nil || hdr.Get(system.Opened) != "_system.callee/_cluster" || hdr.Get(system.Target) != "" || hdr.Get(hdrCaller) != probeShard {
+		t.Fatalf("the callee's system app saw %v, want Shardlite-Opened _system.callee/_cluster, no Shardlite-Target and Shardlite-Caller %s", hdr, probeShard)
 	}
 }
 

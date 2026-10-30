@@ -23,7 +23,7 @@ func TestClientDisconnectWhileHeldAtTheGate(t *testing.T) {
 	r.slowJournal(5 * time.Second) // every flush takes 5 s
 	var appCancelled, appAnswered atomic.Bool
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
-		r.commit(q.Header.Get("Shardlite-Path"))
+		r.commit(q.Header.Get("Shardlite-File"))
 		w.WriteHeader(200)
 		w.(http.Flusher).Flush() // the response starts, and now waits at the gate
 		appAnswered.Store(true)
@@ -66,7 +66,7 @@ func TestCallerCancelsAtTheCalleesGate(t *testing.T) {
 			return
 		}
 		calleeEntered.Store(true)
-		r.commit(q.Header.Get("Shardlite-Path")) // the callee is a wallet: its response is gated
+		r.commit(q.Header.Get("Shardlite-File")) // the callee is a wallet: its response is gated
 		w.WriteHeader(200)
 		w.(http.Flusher).Flush()
 		<-q.Context().Done()

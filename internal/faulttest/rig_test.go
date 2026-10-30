@@ -34,6 +34,7 @@ import (
 	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
+	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
 const shardName = "fault.users/1"
@@ -224,7 +225,7 @@ func (r *rig) readFiles() *shardfile.Files {
 	r.t.Helper()
 	l := r.store.Backend(r.t)
 	return &shardfile.Files{Blob: blob.NewStore(l, "verifier", 1, blob.Options{}), Backend: l, Node: "verifier",
-		JournalOptions: journal.Options(blob.Options{}), Leases: coord.NewRegistry(l, "verifier", coord.RegistryOptions{}), TempDir: r.t.TempDir()}
+		JournalOptions: journal.Options(blob.Options{}), Leases: coord.NewRegistry(l, "verifier", coord.RegistryOptions{}), Temp: tempfile.NewDir(r.t.TempDir())}
 }
 
 func acksIn(t *testing.T, path string) map[int]bool {

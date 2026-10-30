@@ -29,7 +29,7 @@ type appJSON struct {
 }
 
 type kindJSON struct {
-	Sync        string `json:"sync"` // "storage" (the default) or "local": a string, like Shardlite-Sync, so more tiers can follow
+	Sync        string `json:"sync"` // "none", "peer" or "storage" (the default): a string, like Shardlite-Sync, so more tiers can follow
 	IdleTimeout string `json:"idle_timeout"`
 	Public      bool   `json:"public"`
 }

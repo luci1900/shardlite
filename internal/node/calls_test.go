@@ -212,7 +212,7 @@ func TestCallsThatAreNotGated(t *testing.T) {
 		io.Copy(io.Discard, q.Body)
 		io.WriteString(w, "ok")
 	})
-	r.commitTo("test.users/ng1")  // the local tier: the call waits for the node's own disk
+	r.commitTo("test.users/ng1")  // the none tier: the call waits for nothing
 	r.commitTo("test.wallet/ng2") // the record's, and the header can name the record's again
 	do := func(caller string, hdr map[string]string) {
 		h := map[string]string{"Shardlite-Target": "test.slow/ng", "Shardlite-Caller": caller}
@@ -248,14 +248,14 @@ func TestCallsThatAreNotGated(t *testing.T) {
 	if calls.Load() != 2 {
 		t.Fatalf("%d calls reached the callee", calls.Load())
 	}
-	r.withCycles(func() {
+	r.withoutCycle(func() {
 		do("test.users/ng1", nil)
-		do("test.wallet/ng2", map[string]string{"Shardlite-Sync": "local"})
+		do("test.wallet/ng2", map[string]string{"Shardlite-Sync": "none"})
 	})
 	if calls.Load() != 4 {
 		t.Fatalf("%d calls reached the callee", calls.Load())
 	}
-	// ...and a local-tier caller can ask for the record on the call.
+	// ...and a none-tier caller can ask for the record on the call.
 	done := make(chan struct{})
 	go func() { do("test.users/ng1", map[string]string{"Shardlite-Sync": "storage"}); close(done) }()
 	cyclesUntil(r, done)
@@ -413,7 +413,7 @@ func TestCallLoopStopsAtTheHopLimit(t *testing.T) {
 		invocations.Add(1)
 		d, _ := strconv.Atoi(q.Header.Get("Shardlite-Hops"))
 		maxSeen.Store(max(maxSeen.Load(), int64(d)))
-		self := q.Header.Get("Shardlite-Target")
+		self := q.Header.Get("Shardlite-Opened")
 		other := map[string]string{"test.slow/la": "test.slow/lb", "test.slow/lb": "test.slow/la"}[self]
 		next := "/ping"
 		if q.URL.Query().Has("left") { // the bounded variant counts down

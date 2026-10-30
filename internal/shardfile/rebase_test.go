@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -20,6 +19,7 @@ import (
 	"github.com/luci1900/shardlite/internal/harness"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
+	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
 // ack commits one row to the acks table and captures it: one commit, so one
@@ -304,7 +304,7 @@ func TestRebaseOfAnActiveShardWhileTheAppWrites(t *testing.T) {
 	if err := sh.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if tail := sh.Tail(); len(tail) > 0 && tail[0].Position != pos+1 {
+	if tail := tailOf(t, sh).Files; len(tail) > 0 && tail[0].Position != pos+1 {
 		t.Fatalf("the tail starts at position %d, the base ends at %d", tail[0].Position, pos)
 	}
 	want := apptest.Dump(t, e.Path(shard))
@@ -356,7 +356,7 @@ func TestCrashBetweenBaseAndManifest(t *testing.T) {
 	if got := acksOf(t, restoreTo(t, e, "r")); !slices.Equal(got, upTo(4)) {
 		t.Fatalf("restored acks %v", got)
 	}
-	if len(sh.Tail()) == 0 {
+	if len(tailOf(t, sh).Files) == 0 {
 		t.Fatal("the tail was dropped though the manifest does not cover it")
 	}
 	// A later rebase works, whatever the orphan.
@@ -377,11 +377,6 @@ func restoreTo(t *testing.T, e *harness.Env, name string) string {
 	return dst
 }
 
-func tailFiles(sh *capture.Shard) int32 {
-	n, _ := sh.TailInfo()
-	return int32(n)
-}
-
 func countFiles(t *testing.T, e *harness.Env) int {
 	t.Helper()
 	n := 0
@@ -394,84 +389,74 @@ func countFiles(t *testing.T, e *harness.Env) int {
 	return n
 }
 
-// Deltas, bases and the files of a restore go through temporary files in the
-// temporary directory (with the limit set low enough that even a small delta
-// does), which are gone once the operation is done.
-func TestLargeFilesGoThroughTemporaryFiles(t *testing.T) {
+// Deltas, bases and the files of a restore are built and downloaded in logs of
+// their own, which are closed once the operation is done, whether it worked or
+// not. The logs have no names, so what is checked is the count of descriptors the
+// directory has open.
+func TestDeltasBasesAndRestoresCloseTheirLogs(t *testing.T) {
 	t.Parallel()
 	e := harness.New(t)
 	ctx := context.Background()
-	e.Files.SpoolLimit = 1
-	tmp := e.Files.TempDir
+	temp := e.Files.Temp
 	app := e.StartApp(shard)
 	h, sh := e.NewShard(shard)
 	defer sh.Close(ctx)
 
-	inTemp := func() int {
-		entries, err := os.ReadDir(tmp)
-		if err != nil {
-			t.Fatal(err)
+	// The shard's tail holds a log while it has files, and the segment writer a dup
+	// of it until the segment is written, so what is checked for is the count
+	// with the tail discarded and the writer flushed.
+	var creates, gets atomic.Int32
+	temp.SetHook(func(op tempfile.Op) error {
+		if op == tempfile.OpCreate {
+			creates.Add(1)
 		}
-		return len(entries)
-	}
-	// A commit file is a temporary file until its delta is written and its segment
-	// has been uploaded (the segment writer holds it until then), so a check for
-	// what is left flushes the writer first.
-	leftInTemp := func() int {
-		t.Helper()
-		if err := e.W.Flush(ctx); err != nil {
-			t.Fatal(err)
-		}
-		return inTemp()
-	}
-	// The shard's own tail files are temporary files too (the limit is low enough
-	// for that), so an upload is a file of its own if there are more than there
-	// were before the operation started.
-	var seen, gets, base atomic.Int32
+		return nil
+	})
 	e.Blob.SetHook(func(_ context.Context, op blobtest.Op, key string, after bool) error {
-		if after {
-			return nil
-		}
-		switch {
-		case op == blobtest.OpCreate && strings.HasPrefix(key, shardfile.FilesPrefix):
-			if int32(inTemp()) > base.Load() { // the body being uploaded is a file
-				seen.Add(1)
-			}
-		case op == blobtest.OpGet && strings.HasPrefix(key, shardfile.FilesPrefix):
+		if !after && op == blobtest.OpGet && strings.HasPrefix(key, shardfile.FilesPrefix) {
 			gets.Add(1)
 		}
 		return nil
 	})
 	for i := 1; i <= 3; i++ {
 		ack(t, app, sh, i)
-		base.Store(tailFiles(sh))
 		if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	ack(t, app, sh, 4)
-	base.Store(tailFiles(sh))
 	if _, err := h.Rebase(ctx, sh, shardfile.Hooks{}); err != nil {
 		t.Fatal(err)
-	}
-	if seen.Load() != 4 {
-		t.Fatalf("%d of 4 uploads were temporary files", seen.Load())
-	}
-	if n := leftInTemp(); n != 0 {
-		t.Fatalf("%d files left in the temporary directory", n)
 	}
 	ack(t, app, sh, 5)
 	if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); err != nil {
 		t.Fatal(err)
 	}
+	// Three deltas, a base and a delta are built in a log each, besides the
+	// tail's own logs.
+	if got := creates.Load(); got < 5 {
+		t.Fatalf("%d logs created for three deltas, a base and a delta", got)
+	}
+	sh.Discard()
+	leftOpen := func() int64 {
+		t.Helper()
+		if err := e.W.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		return temp.Open()
+	}
+	if n := leftOpen(); n != 0 {
+		t.Fatalf("%d descriptors left open after the deltas and the rebase", n)
+	}
+	gets.Store(0)
 	if got := acksOf(t, restoreTo(t, e, "r")); !slices.Equal(got, upTo(5)) {
 		t.Fatalf("restored acks %v", got)
 	}
 	if gets.Load() != 2 {
 		t.Fatalf("%d downloads, want the base and the delta", gets.Load())
 	}
-	if n := leftInTemp(); n != 0 {
-		t.Fatalf("%d files left after the restore", n)
+	if n := leftOpen(); n != 0 {
+		t.Fatalf("%d descriptors left open after the restore", n)
 	}
 
 	// A failed restore cleans up too. The shard's last file is the delta, which
@@ -486,7 +471,7 @@ func TestLargeFilesGoThroughTemporaryFiles(t *testing.T) {
 	if _, err := e.Files.Restore(ctx, shardName(shard), filepath.Join(t.TempDir(), "x.db"), shardfile.RestoreOptions{}); err == nil {
 		t.Fatal("restore succeeded")
 	}
-	if n := leftInTemp(); n != 0 {
-		t.Fatalf("%d files left after a failed restore", n)
+	if n := leftOpen(); n != 0 {
+		t.Fatalf("%d descriptors left open after a failed restore", n)
 	}
 }

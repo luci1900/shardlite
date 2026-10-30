@@ -133,7 +133,7 @@ func TestKillNodeUnderLoad(t *testing.T) {
 				wallet, user := wallets[rng.IntN(nShards)], users[rng.IntN(nShards)]
 				switch op := rng.IntN(10); {
 				case op < 3: // sync on, plain HTTP
-					if post("/add", wallet, tok) {
+					if post(at(wallet, "/add"), wallet, tok) {
 						led.add("http", wallet, tok)
 					}
 				case op < 4: // sync on, WebSocket: the echo is the acknowledgement
@@ -157,7 +157,7 @@ func TestKillNodeUnderLoad(t *testing.T) {
 					cancel()
 				case op < 5: // sync on, gRPC unary
 					c, cancel := context.WithTimeout(ctx, 5*time.Second)
-					out, err := unary(withMD(c, "shardlite-target", wallet), cc, "Add", tok)
+					out, err := unary(onShard(c, wallet), cc, "Add", tok)
 					cancel()
 					if err == nil && out == "ok:"+tok {
 						led.add("grpc", wallet, tok)
@@ -166,13 +166,13 @@ func TestKillNodeUnderLoad(t *testing.T) {
 					}
 				case op < 6: // sync on, a call to another sync-on shard: both writes are durable when it returns
 					to := wallets[rng.IntN(nShards)]
-					if post("/transfer?to="+to+"&token="+tok, wallet, "") {
+					if post(at(wallet, "/transfer")+"?to="+to+"&token="+tok, wallet, "") {
 						led.add("transfer", wallet, "debit:"+tok)
 						led.add("transfer", to, "credit:"+tok)
 					}
 				default: // sync off: durable once a later sync call completes
 					l0 := life.Load()
-					if post("/add", user, tok) && life.Load() == l0 {
+					if post(at(user, "/add"), user, tok) && life.Load() == l0 {
 						led.mu.Lock()
 						led.pending = append(led.pending, ack{user, tok, l0})
 						led.mu.Unlock()

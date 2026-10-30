@@ -23,10 +23,10 @@ import (
 // node's journal mirrored onto another node's disk, spoken over the peer
 // listener the node already runs. The verbs and the statuses are the blob
 // backend's, so a create is a PUT with If-None-Match: * (a number already
-// taken answers 412 with the write id it holds, 409 a racing conditional
-// write, 404 a missing segment), and the client reads back and retries in
-// exactly the code it uses against a bucket. HTTP semantics, so HTTP/3 is
-// possible later without changing the protocol.
+// taken answers 412, 409 a racing conditional write, 404 a missing segment),
+// and the client reads back and retries in exactly the code it uses against a
+// bucket. HTTP semantics, so HTTP/3 is possible later without changing the
+// protocol.
 const (
 	// MirrorPath is where the peer listener serves the journals it mirrors.
 	MirrorPath = "/_shardlite/journal/"

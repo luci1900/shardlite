@@ -81,7 +81,7 @@ func TestForwardIsServedByTheOwner(t *testing.T) {
 	if fwd.node != "n0" {
 		t.Fatalf("the forward was served by %s", fwd.node)
 	}
-	if local.uri != "/items?x=1&y=2" || local.body != "hello" || local.hdr.Get("Shardlite-Target") != "test.users/f1" ||
+	if local.uri != "/items?x=1&y=2" || local.body != "hello" || local.hdr.Get("Shardlite-Opened") != "test.users/f1" ||
 		local.hdr.Get("Shardlite-Hops") != "0" || local.hdr.Get("Shardlite-Foo") != "" || local.hdr.Get("Shardlite-Caller") != "" ||
 		local.hdr.Get("Shardlite-Deadline") != "" || local.hdr.Get("X-Forwarded-For") != "203.0.113.9, 127.0.0.1" {
 		t.Fatalf("the local request: %+v", local)
@@ -196,10 +196,10 @@ func TestForwardedCallIsGatedOnBothNodes(t *testing.T) {
 	type arrival struct{ callerCycles, calleeCycles uint64 }
 	arrived := make(chan arrival, 1)
 	commit := func(path string) { app.Must(t, "insert", path, "1", "64") }
-	n0.serve(func(w http.ResponseWriter, q *http.Request) { paths <- q.Header.Get("Shardlite-Path") })
+	n0.serve(func(w http.ResponseWriter, q *http.Request) { paths <- q.Header.Get("Shardlite-File") })
 	n1.serve(func(w http.ResponseWriter, q *http.Request) {
 		if q.URL.Path != "/call" {
-			paths <- q.Header.Get("Shardlite-Path")
+			paths <- q.Header.Get("Shardlite-File")
 			return
 		}
 		a := arrival{callerCycles: n0.cycles()}
@@ -207,7 +207,7 @@ func TestForwardedCallIsGatedOnBothNodes(t *testing.T) {
 			http.Error(w, "bad call", 400)
 			return
 		}
-		commit(q.Header.Get("Shardlite-Path"))
+		commit(q.Header.Get("Shardlite-File"))
 		a.calleeCycles = n1.cycles()
 		arrived <- a
 		io.WriteString(w, "answer")
@@ -383,7 +383,7 @@ func TestForwardIfActive(t *testing.T) {
 	paths := make(chan string, 1)
 	n0.serve(func(w http.ResponseWriter, q *http.Request) {
 		if q.URL.Path == "/" {
-			paths <- q.Header.Get("Shardlite-Path")
+			paths <- q.Header.Get("Shardlite-File")
 		}
 		w.Header().Set("X-Served-By", "n0")
 	})
@@ -447,14 +447,14 @@ func echoWS(closed chan<- string) http.HandlerFunc {
 		}
 		defer conn.Close()
 		rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
-		rw.WriteString("hello " + q.Header.Get("Shardlite-Target") + "\n")
+		rw.WriteString("hello " + q.Header.Get("Shardlite-Opened") + "\n")
 		rw.Flush()
 		sc := bufio.NewScanner(rw)
 		for sc.Scan() {
 			rw.WriteString("echo " + sc.Text() + "\n")
 			rw.Flush()
 		}
-		closed <- q.Header.Get("Shardlite-Target")
+		closed <- q.Header.Get("Shardlite-Opened")
 	}
 }
 

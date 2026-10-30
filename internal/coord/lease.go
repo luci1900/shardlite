@@ -45,12 +45,12 @@ type NodeInfo struct {
 	// forward from JournalNext, so a JournalNext that is a little stale only costs probes.
 	JournalFrom pos.Seg `json:"journal_from"`
 	JournalNext pos.Seg `json:"journal_next"`
-	// Mirrors are the nodes whose disks hold a copy of this node's journal:
-	// chosen once, at acquire, from the lease listing, least loaded first.
-	// The set is sticky: repair changes it, a renewal republishes it
-	// unchanged. Nothing depends on who the mirrors are, so the relation
-	// needs no symmetry and no coordination.
-	Mirrors []cluster.Node `json:"mirrors,omitempty"`
+	// Peer is the node whose disk holds a mirror of this node's journal:
+	// chosen once, at acquire, from the lease listing, least loaded. The
+	// choice is sticky: repair changes it, a renewal republishes it
+	// unchanged. Nothing depends on who the peer is, so the relation needs
+	// no symmetry and no coordination.
+	Peer cluster.Node `json:"peer,omitempty"`
 	// Standby says this node can hold another node's journal: its local
 	// database is persistent. Selection picks standbys only.
 	Standby bool `json:"standby,omitempty"`
@@ -97,6 +97,16 @@ func (l *NodeLease) ValidAt(t time.Time) bool {
 	return !l.Released && !l.adoptedByOther() && l.Adopted < l.Epoch && t.Before(l.ExpiresAt())
 }
 
+// Holds reports whether the lease still shows inc as the node's live life:
+// the epoch is its own, the lease is not released and not marked by another
+// incarnation, and no adoption has reached its epoch. It leaves the expiry
+// out. Every way another node takes shards from a live owner writes the lease
+// first (an adoption marks it, a restart takes a new epoch, a release marks it
+// adopted), so a lease that Holds means nobody has begun a takeover.
+func (l *NodeLease) Holds(inc Incarnation) bool {
+	return l.Incarnation() == inc && !l.Released && !l.adoptedByOther() && l.Adopted < l.Epoch
+}
+
 // adoptedByOther reports whether another incarnation is adopting the journal.
 func (l *NodeLease) adoptedByOther() bool {
 	return l.AdoptedBy != nil && *l.AdoptedBy != l.Incarnation()
@@ -141,6 +151,9 @@ func NewRegistry(b blob.Backend, node cluster.Node, opts RegistryOptions) *Regis
 	_, _ = rand.Read(r[:])
 	return &Registry{store: blob.NewStore(b, node, pos.Epoch(binary.BigEndian.Uint64(r[:])), opts.Blob), opts: opts}
 }
+
+// TTL is the lease TTL the registry grants (DefaultTTL if none was set).
+func (r *Registry) TTL() time.Duration { return r.opts.TTL }
 
 func encodeLease(l *NodeLease) *bytes.Reader {
 	b, err := json.Marshal(l)
