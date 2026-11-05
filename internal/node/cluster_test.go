@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/luci1900/shardlite/internal/apptest"
 	"io"
 	"log/slog"
 	"maps"
@@ -187,7 +188,7 @@ func (n *clusterNode) Start() {
 	}
 	// The kinds come from the app's declaration now, not a file read at
 	// startup: the first tests to touch a shard wait for the poll to land.
-	eventually(n.t, "the app's declaration", func() bool {
+	apptest.Eventually(n.t, apptest.Timeout, "the app's declaration", func() bool {
 		m := n.m.Load()
 		if m == nil {
 			return false

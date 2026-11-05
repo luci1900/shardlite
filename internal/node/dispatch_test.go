@@ -200,11 +200,11 @@ func TestAdopterEntryWakesAKilledOwnersActiveShard(t *testing.T) {
 	})
 	_, rung1 := ringer(t, n1, app)
 	remind(t, n0, paths, "test.users/k", time.Now().Unix())
-	eventually(t, "the reminder's commit to be in the journal", func() bool {
+	apptest.Eventually(t, apptest.Timeout, "the reminder's commit to be in the journal", func() bool {
 		a := n0.m.Load().tab.load(shardName("test.users/k"))
 		return a != nil && a.a != nil && !a.a.cap.hasNewFrames()
 	})
 	n0.Kill()
 	waitCounter(t, "the adoption of n0", &n1.m.Load().Stats.Adoptions, 1)
-	eventually(t, "the row to be delivered on n1", func() bool { return rung1.Load() == 1 })
+	apptest.Eventually(t, apptest.Timeout, "the row to be delivered on n1", func() bool { return rung1.Load() == 1 })
 }

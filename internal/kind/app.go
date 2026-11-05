@@ -11,7 +11,7 @@ import (
 )
 
 // App is an app's declaration of itself: its name, its version and the kinds
-// it serves (docs/guide.md, The ready route). The node parses one from the
+// it serves (docs/guide.md, Shard kinds). The node parses one from the
 // app's ready route, and the node's own app is constructed as one in code
 // (docs/internals.md, System kinds), so both kinds tables are the same
 // structure. The kinds are keyed by their qualified names (game.users), as
@@ -29,7 +29,7 @@ type appJSON struct {
 }
 
 type kindJSON struct {
-	Sync        string `json:"sync"` // "none", "peer" or "storage" (the default): a string, like Shardlite-Sync, so more tiers can follow
+	Sync        string `json:"sync"` // "none" or "storage" (the default): a string, like Shardlite-Sync, so more tiers can follow
 	IdleTimeout string `json:"idle_timeout"`
 	Public      bool   `json:"public"`
 }

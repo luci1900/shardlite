@@ -37,7 +37,7 @@ func (r *mrig) journalPuts() (times func() []time.Time) {
 	return at.All
 }
 
-// With sync on, a response after a write waits for one cycle that starts at
+// On the `storage` tier, a response after a write waits for one cycle that starts at
 // once (after the coalescing delay), not for the interval to come round.
 func TestGatedResponseDoesNotWaitForTheInterval(t *testing.T) {
 	t.Parallel()
@@ -131,7 +131,7 @@ func TestNothingWaitingRunsCyclesOnTheTick(t *testing.T) {
 	r.write(ref, "a") // nobody waits for it
 	cycles := r.m.Flusher().Completed()
 	start := time.Now()
-	eventually(t, "the tick to flush the write", func() bool { return len(times()) > 0 })
+	apptest.Eventually(t, apptest.Timeout, "the tick to flush the write", func() bool { return len(times()) > 0 })
 	if time.Since(start) > 3*interval {
 		t.Fatalf("flushed after %v with an interval of %v", time.Since(start), interval)
 	}
@@ -160,7 +160,7 @@ func TestOutputWithNoNewFramesTriggersNoCycle(t *testing.T) {
 	}
 	// The capture can lag the gate that just returned: wait for it, or a later
 	// gate rightly asks for a cycle.
-	eventually(t, "the shard to be captured", func() bool { return !ref.a.cap.hasNewFrames() })
+	apptest.Eventually(t, apptest.Timeout, "the shard to be captured", func() bool { return !ref.a.cap.hasNewFrames() })
 	before := r.m.Flusher().Completed()
 	for range 20 {
 		// A gate that wants a cycle waits for it, so one asked for has completed
@@ -219,14 +219,14 @@ func TestWaiterGivingUpInACycleDoesNotCancelIt(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- r.m.Gate(ctx, ref, kind.SyncStorage) }()
-	eventually(t, "the cycle to start", func() bool { return r.m.Flusher().started.Load() > 0 })
+	apptest.Eventually(t, apptest.Timeout, "the cycle to start", func() bool { return r.m.Flusher().started.Load() > 0 })
 	cancel()
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("gate: %v", err)
 	}
 	stall.Store(false)
 	close(release)
-	eventually(t, "the cycle to complete anyway", func() bool { return r.m.Flusher().Completed() > 0 })
+	apptest.Eventually(t, apptest.Timeout, "the cycle to complete anyway", func() bool { return r.m.Flusher().Completed() > 0 })
 	if got := strings.Count(r.dumpBlob("test.wallet/f6"), "kv: "); got != 2 {
 		t.Fatalf("%d rows durable after the cycle", got)
 	}
@@ -259,7 +259,7 @@ func TestDeactivationDoesNotWaitForTheInterval(t *testing.T) {
 	r.write(ref, "a")
 	r.app.Must(t, "close", "a")
 	ref.Release()
-	eventually(t, "deactivation", func() bool { return r.cached("test.users/f8") })
+	apptest.Eventually(t, apptest.Timeout, "deactivation", func() bool { return r.cached("test.users/f8") })
 }
 
 // A tail that passes DeltaSize gets a delta long before it is DeltaAge old.
@@ -283,14 +283,14 @@ func TestTailPassingTheSizeGetsADeltaBeforeTheAge(t *testing.T) {
 	if err := r.m.Gate(ctx, ref, kind.SyncStorage); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, "a delta for the large tail", func() bool {
+	apptest.Eventually(t, apptest.Timeout, "a delta for the large tail", func() bool {
 		m, err := r.manifest("test.wallet/d1")
 		return err == nil && len(m.Files) == 1
 	})
 	if r.m.Stats.TailBytesMax.Load() < 8<<10 {
 		t.Fatalf("the highest tail held was %d bytes, want at least the size that made the delta", r.m.Stats.TailBytesMax.Load())
 	}
-	eventually(t, "the tail to be dropped", func() bool { return r.m.Stats.TailBytes.Load() < 8<<10 })
+	apptest.Eventually(t, apptest.Timeout, "the tail to be dropped", func() bool { return r.m.Stats.TailBytes.Load() < 8<<10 })
 	r.app.Must(t, "close", "a")
 }
 
@@ -315,7 +315,7 @@ func TestSmallTailGetsADeltaAtTheAge(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	eventually(t, "the delta at the age", func() bool {
+	apptest.Eventually(t, apptest.Timeout, "the delta at the age", func() bool {
 		m, err := r.manifest("test.wallet/d2")
 		return err == nil && len(m.Files) == 1
 	})

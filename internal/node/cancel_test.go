@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"github.com/luci1900/shardlite/internal/apptest"
 	"io"
 	"net/http"
 	"strings"
@@ -41,14 +42,14 @@ func TestClientDisconnectWhileHeldAtTheGate(t *testing.T) {
 		}
 		done <- err
 	}()
-	eventually(t, "the request to be held at the gate", func() bool {
+	apptest.Eventually(t, apptest.Timeout, "the request to be held at the gate", func() bool {
 		return r.refs("test.wallet/cx1") == 1 && r.m.flush.Mark() > r.m.flush.Completed() && appAnswered.Load()
 	})
 	start := time.Now()
 	cancel()
 	<-done
-	eventually(t, "the request to the app to be cancelled", appCancelled.Load)
-	eventually(t, "the shard to be released", func() bool { return r.refs("test.wallet/cx1") == 0 })
+	apptest.Eventually(t, apptest.Timeout, "the request to the app to be cancelled", appCancelled.Load)
+	apptest.Eventually(t, apptest.Timeout, "the shard to be released", func() bool { return r.refs("test.wallet/cx1") == 0 })
 	if d := time.Since(start); d > 3*time.Second {
 		t.Fatalf("cancelling took %v: the node waited for the flush", d)
 	}
@@ -84,14 +85,14 @@ func TestCallerCancelsAtTheCalleesGate(t *testing.T) {
 		}
 		done <- err
 	}()
-	eventually(t, "the call to be held at the callee's gate", func() bool { return r.refs("test.wallet/cx2") == 1 && r.m.flush.Mark() > r.m.flush.Completed() })
+	apptest.Eventually(t, apptest.Timeout, "the call to be held at the callee's gate", func() bool { return r.refs("test.wallet/cx2") == 1 && r.m.flush.Mark() > r.m.flush.Completed() })
 	// Cancel only once the request has reached the app: a cancel before that
 	// means the app never sees it, and there is nothing for the node to cancel.
-	eventually(t, "the callee's request to reach the app", calleeEntered.Load)
+	apptest.Eventually(t, apptest.Timeout, "the callee's request to reach the app", calleeEntered.Load)
 	cancel()
 	<-done
-	eventually(t, "the callee's request to be cancelled", calleeCancelled.Load)
-	eventually(t, "the callee to be released", func() bool { return r.refs("test.wallet/cx2") == 0 })
+	apptest.Eventually(t, apptest.Timeout, "the callee's request to be cancelled", calleeCancelled.Load)
+	apptest.Eventually(t, apptest.Timeout, "the callee to be released", func() bool { return r.refs("test.wallet/cx2") == 0 })
 }
 
 // ...and held at the caller's gate, before the callee is activated or even asked.
@@ -104,7 +105,7 @@ func TestCallerCancelsAtItsOwnGate(t *testing.T) {
 			reached.Add(1)
 		}
 	})
-	r.commitTo("test.wallet/cx3") // sync on, and no flush cycle will ever run
+	r.commitTo("test.wallet/cx3") // a `storage` kind, and no flush cycle will ever run
 	ctx, cancel := context.WithCancel(context.Background())
 	req, _ := http.NewRequestWithContext(ctx, "POST", r.ctl+"/x", nil)
 	req.Header.Set("Shardlite-Target", "test.slow/cx3callee")
@@ -117,10 +118,10 @@ func TestCallerCancelsAtItsOwnGate(t *testing.T) {
 		}
 		done <- err
 	}()
-	eventually(t, "the call to be held at the caller's gate", func() bool { return r.refs("test.wallet/cx3") == 1 })
+	apptest.Eventually(t, apptest.Timeout, "the call to be held at the caller's gate", func() bool { return r.refs("test.wallet/cx3") == 1 })
 	cancel()
 	<-done
-	eventually(t, "the caller to be released", func() bool { return r.refs("test.wallet/cx3") == 0 })
+	apptest.Eventually(t, apptest.Timeout, "the caller to be released", func() bool { return r.refs("test.wallet/cx3") == 0 })
 	if reached.Load() != 0 || r.m.IsActive(shardName("test.slow/cx3callee")) {
 		t.Fatalf("the callee was reached (%d) or activated (%v) by a call that was cancelled", reached.Load(), r.m.IsActive(shardName("test.slow/cx3callee")))
 	}
@@ -167,7 +168,7 @@ func TestCallerCancelsDuringActivation(t *testing.T) {
 	}
 	close(release)
 	// The activation is not the caller's to cancel (others may be waiting for it): it ends.
-	eventually(t, "the activation to finish", func() bool { return r.m.IsActive(shardName("test.slow/cx4")) })
+	apptest.Eventually(t, apptest.Timeout, "the activation to finish", func() bool { return r.m.IsActive(shardName("test.slow/cx4")) })
 	if r.refs("test.slow/cx4") != 0 {
 		t.Fatalf("the cancelled call holds the shard: %d", r.refs("test.slow/cx4"))
 	}
@@ -261,7 +262,7 @@ func TestCancelledStreamingCall(t *testing.T) {
 			if e, _ := calleeErr.Load().(string); e == "EOF" {
 				t.Fatalf("the callee saw a clean end of the body: %q", e)
 			}
-			eventually(t, "the caller and the callee to be released", func() bool { return r.refs("test.wallet/cx5") == 0 && r.refs("test.slow/cx5callee") == 0 })
+			apptest.Eventually(t, apptest.Timeout, "the caller and the callee to be released", func() bool { return r.refs("test.wallet/cx5") == 0 && r.refs("test.slow/cx5callee") == 0 })
 			// Over HTTP/2 nothing the cancelled call held goes on to the callee. Over
 			// HTTP/1.1 the chunk held at the gate is let through by the cycle that
 			// makes its commit durable, and then the callee's read fails.

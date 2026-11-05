@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/capture"
+	"github.com/luci1900/shardlite/internal/kill"
 	"github.com/luci1900/shardlite/internal/kind"
 	"github.com/luci1900/shardlite/internal/notify"
 	"github.com/luci1900/shardlite/internal/segment"
@@ -33,7 +34,9 @@ type LifecycleOptions struct {
 	MaxFiles      int           // files a manifest may list before the next snapshot rebases the shard, shardfile.DefaultMaxFiles if zero
 	SnapshotEvery time.Duration // how often each active shard looks whether it needs a snapshot (a delta or a rebase), and the tail alert is checked, 2 s if zero
 	HoldOff       time.Duration // how long to leave a shard alone after it couldn't be deactivated, 5 s if zero
-	IdleRecheck   time.Duration // the first wait before an idle shard that its reminders keep active is looked at again (it doubles up to 10 s), 1 s if zero
+	// At is called at each kill point (see Faults), nil in production.
+	At          func(kill.Point)
+	IdleRecheck time.Duration // the first wait before an idle shard that its reminders keep active is looked at again (it doubles up to 10 s), 1 s if zero
 }
 
 // actorDeps is what the shards' loops use, shared by every shard: the parts of
@@ -394,7 +397,7 @@ func (a *actor) snapshot(ctx context.Context) {
 		}
 		defer func() { <-d.rebases }()
 	}
-	hooks := shardfile.Hooks{BeforeUpdate: a.reminderAtDelta}
+	hooks := shardfile.Hooks{BeforeUpdate: a.reminderAtDelta, At: d.opts.At}
 	if _, err := a.h.MaybeSnapshot(ctx, sh, d.opts.DeltaAge, policy, hooks); err != nil && ctx.Err() == nil {
 		d.log.Warn("snapshot failed", "shard", a.Name, "err", err)
 	}
@@ -529,5 +532,12 @@ func (a *actor) waitEnded(ctx context.Context) error {
 		return nil
 	case <-ctx.Done():
 		return context.Cause(ctx)
+	}
+}
+
+// at calls the fault hook for a kill point, if there is one.
+func (d *actorDeps) at(p kill.Point) {
+	if d.opts.At != nil {
+		d.opts.At(p)
 	}
 }

@@ -107,7 +107,7 @@ func (r *mrig) evicted(target, path string) {
 	}
 }
 
-// An active shard with sync on is evicted: every acknowledged commit is in
+// An active shard on the `storage` tier is evicted: every acknowledged commit is in
 // blob storage, the manifest is released and nothing is left on the node. The
 // next request claims and restores it.
 func TestEvictAnActiveShard(t *testing.T) {

@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/superfly/ltx"
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/capture"
+	"github.com/luci1900/shardlite/internal/kill"
 	"github.com/luci1900/shardlite/internal/migrate"
 	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/remindex"
@@ -72,7 +74,7 @@ func (a *actor) activate(ctx context.Context) error {
 		// own tails become deltas before a shard stops being active here, or are
 		// adopted at its next start. So its files are all of it, and the journal
 		// the claim names (this node's own) isn't read.
-		res, err := d.files.Restore(ctx, target, a.Path, shardfile.RestoreOptions{NoJournal: true})
+		res, err := d.files.Restore(ctx, target, a.Path, shardfile.RestoreOptions{NoJournal: true, BeforeRename: func() error { d.at(kill.RestoreBeforeRename); return nil }})
 		switch {
 		case errors.Is(err, shardfile.ErrNothingToRestore):
 			// A manifest with nothing durable behind it (its node died before the
@@ -89,6 +91,7 @@ func (a *actor) activate(ctx context.Context) error {
 		default:
 			a.h, restored = res.Handle, res.Capture
 		}
+		d.at(kill.Restored)
 		d.stats.Restores.Add(1)
 	}
 	// The row goes in before capture starts, so that an activation that fails
@@ -143,16 +146,11 @@ func (a *actor) activateCached(ctx context.Context, row indexRow) (done bool, er
 	if err := json.Unmarshal([]byte(row.Manifest), &man); err != nil {
 		return false, d.cache.discard(row)
 	}
-	// The CRCs of the pages, so the capture reads no page to continue. A row
-	// without them (one written before the checksums existed) is read once, at
-	// the activation.
-	var cks *capture.Checksums
-	if len(row.CRCs) > 0 {
-		cks = capture.NewChecksums()
-		if err := cks.UnmarshalBinary(row.CRCs); err != nil {
-			d.log.Error("a cached shard's checksums are unreadable, discarding the file", "shard", a.Name, "err", err)
-			return false, d.cache.discard(row)
-		}
+	// The CRCs of the pages, so the capture reads no page to continue.
+	cks := capture.NewChecksums()
+	if err := cks.UnmarshalBinary(row.CRCs); err != nil {
+		d.log.Error("a cached shard's checksums are unreadable, discarding the file", "shard", a.Name, "err", err)
+		return false, d.cache.discard(row)
 	}
 	h := &shardfile.Handle{F: d.files, Name: a.Name, Manifest: &man, ETag: blob.ETag(row.ETag)}
 	a.h, a.Gen, a.Path = h, row.Generation, row.Path
@@ -188,6 +186,8 @@ func (a *actor) startCapture(ctx context.Context, restored *capture.Restored) er
 		Name: a.Name, Path: a.Path, Generation: a.h.Manifest.Generation,
 		Writer: d.writer, Restored: restored, Logger: d.log, Durable: d.flush.WaitCycle,
 		TempDir:          d.tempDir,
+		At:               d.opts.At,
+		Now:              time.Now,
 		ChecksumMismatch: func(_, _ ltx.Checksum) { d.stats.ChecksumMismatches.Add(1) },
 	})
 	if err != nil {
@@ -201,6 +201,9 @@ func (a *actor) startCapture(ctx context.Context, restored *capture.Restored) er
 		sh.Close(ctx)
 		sh.Discard()
 		return err
+	}
+	if restored != nil {
+		d.at(kill.FirstSyncDone)
 	}
 	// The reserved table (and a system kind's schema and seed) go in after the
 	// first sync, before the app has the shard.
@@ -339,7 +342,7 @@ func (a *actor) deactivate(ctx context.Context) (bool, error) {
 		recorded = true
 		return reminder(end), nil
 	}
-	err = a.h.WriteDelta(ctx, sh, shardfile.Hooks{BeforeUpdate: record})
+	err = a.h.WriteDelta(ctx, sh, shardfile.Hooks{BeforeUpdate: record, At: d.opts.At})
 	if err == nil && !recorded {
 		err = a.h.SetReminder(ctx, reminder(sh.Position()))
 	}

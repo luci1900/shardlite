@@ -97,7 +97,7 @@ func TestClockWatchWarnsOnTheOffset(t *testing.T) {
 }
 
 // The median of the latest samples decides the offset, so one odd response does
-// not move it or warn (it is a disagreement, which the steadiness check reports).
+// not move it or warn.
 func TestClockWatchIgnoresOneOutlier(t *testing.T) {
 	t.Parallel()
 	w, log := newWatch()
@@ -199,15 +199,15 @@ func TestClockWatchNoiseIsNotAProblem(t *testing.T) {
 		w, log := newWatch()
 		// Samples a few ms apart cross the second boundary at every phase.
 		run(w, t0, 0, 5*time.Second, 37*time.Millisecond, func(d time.Duration) time.Time { return t0.Add(d + skew) })
-		if err := w.Check(); err != nil || w.Report().Unsteady || log.String() != "" {
-			t.Fatalf("skew %v: noise was reported: %v %+v\n%s", skew, err, w.Report(), log)
+		if w.Report().Warning || log.String() != "" {
+			t.Fatalf("skew %v: noise was reported: %+v\n%s", skew, w.Report(), log)
 		}
 	}
 }
 
-// A store whose clock steps, as the node's would, is a problem that fails Check
-// and is logged once, however many samples show it.
-func TestClockWatchReportsAStep(t *testing.T) {
+// A step in the offset warns once the offset passes a second and fails
+// nothing: the watch reports and the node's answers go on.
+func TestClockWatchStepOnlyWarns(t *testing.T) {
 	t.Parallel()
 	w, log := newWatch()
 	t0 := time.Now()
@@ -219,104 +219,14 @@ func TestClockWatchReportsAStep(t *testing.T) {
 		return t0.Add(d)
 	}
 	run(w, t0, 0, step, time.Second, clock)
-	if err := w.Check(); err != nil {
-		t.Fatalf("before the step: %v", err)
+	if w.Report().Warning {
+		t.Fatalf("a warning before the step: %+v", w.Report())
 	}
-	run(w, t0, step, 3*time.Second, time.Second, clock)
-	if err := w.Check(); !errors.Is(err, coord.ErrClockUnsteady) || !w.Report().Unsteady {
-		t.Fatalf("after the step: %v %+v", err, w.Report())
+	run(w, t0, step, 10*time.Second, time.Second, clock)
+	if r := w.Report(); !r.Warning || !near(r.Offset, 10*time.Second) {
+		t.Fatalf("after the step: %+v, want a warning with the offset of the step", r)
 	}
-	if n := strings.Count(log.String(), "clocks fail until"); n != 1 || !strings.Contains(log.String(), "moved") {
-		t.Fatalf("want one warning that says what moved:\n%s", log)
-	}
-}
-
-// A rate more than 20% off is a problem, and one inside the margin is not
-// (though its offset warns once it grows past a second).
-func TestClockWatchReportsARate(t *testing.T) {
-	t.Parallel()
-	ratio := func(r float64) func(t0 time.Time) func(time.Duration) time.Time {
-		return func(t0 time.Time) func(time.Duration) time.Time {
-			return func(d time.Duration) time.Time { return t0.Add(time.Duration(float64(d) * r)) }
-		}
-	}
-	for name, c := range map[string]struct {
-		rate     float64
-		unsteady bool
-	}{
-		"half speed":   {0.5, true},
-		"double":       {2, true},
-		"a quarter":    {1.25, true},
-		"a tenth":      {1.1, false},
-		"a tenth slow": {0.9, false},
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			w, _ := newWatch()
-			t0 := time.Now()
-			run(w, t0, 0, 2*time.Minute, time.Second, ratio(c.rate)(t0))
-			if got := w.Report().Unsteady; got != c.unsteady {
-				t.Fatalf("rate %v: unsteady %v, want %v (%+v)", c.rate, got, c.unsteady, w.Report())
-			}
-		})
-	}
-}
-
-// The problem clears once the samples since show a steady offset for a while,
-// and a new disagreement before then starts the wait again.
-func TestClockWatchRecovers(t *testing.T) {
-	t.Parallel()
-	w, log := newWatch()
-	t0 := time.Now()
-	stepped := func(extra time.Duration) func(time.Duration) time.Time {
-		return func(d time.Duration) time.Time { return t0.Add(d + extra) }
-	}
-	run(w, t0, 0, 10*time.Second, time.Second, stepped(0))
-	run(w, t0, 10*time.Second, time.Second, time.Second, stepped(30*time.Second))
-	if !w.Report().Unsteady {
-		t.Fatal("the step was not reported")
-	}
-	// Steady at the new offset, but not for long enough yet.
-	run(w, t0, 11*time.Second, 3*time.Second, time.Second, stepped(30*time.Second))
-	if !w.Report().Unsteady {
-		t.Fatal("cleared after three samples")
-	}
-	// A second step starts the wait again.
-	run(w, t0, 14*time.Second, 1*time.Second, time.Second, stepped(60*time.Second))
-	run(w, t0, 15*time.Second, 4*time.Second, time.Second, stepped(60*time.Second))
-	if !w.Report().Unsteady {
-		t.Fatal("cleared in under the time it takes after the second step")
-	}
-	run(w, t0, 19*time.Second, 6*time.Second, time.Second, stepped(60*time.Second))
-	if r := w.Report(); r.Unsteady || w.Check() != nil {
-		t.Fatalf("not cleared after a steady while: %+v", r)
-	}
-	if got := log.String(); strings.Count(got, "clocks fail until") != 1 || strings.Count(got, "agree again") != 1 {
-		t.Fatalf("want one warning and one all-clear for the problem:\n%s", got)
-	}
-}
-
-// Many samples in a burst, as a busy node takes them, do not make a steady
-// clock look unsteady, and do not clear a problem faster than time passes.
-func TestClockWatchBurstsDoNotClear(t *testing.T) {
-	t.Parallel()
-	w, _ := newWatch()
-	t0 := time.Now()
-	clock := func(extra time.Duration) func(time.Duration) time.Time {
-		return func(d time.Duration) time.Time { return t0.Add(d + extra) }
-	}
-	run(w, t0, 0, 10*time.Second, time.Second, clock(0))
-	run(w, t0, 10*time.Second, time.Millisecond, time.Second, clock(30*time.Second))
-	run(w, t0, 10*time.Second+time.Millisecond, 100*time.Millisecond, time.Millisecond, clock(30*time.Second))
-	if !w.Report().Unsteady {
-		t.Fatal("a burst of a hundred milliseconds cleared the problem")
-	}
-}
-
-func TestClockWatchNilChecksNothing(t *testing.T) {
-	t.Parallel()
-	var w *coord.ClockWatch
-	if err := w.Check(); err != nil {
-		t.Fatal(err)
+	if n := strings.Count(log.String(), "more than a second from the store's"); n != 1 {
+		t.Fatalf("want one warning:\n%s", log)
 	}
 }

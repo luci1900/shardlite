@@ -177,7 +177,7 @@ func TestAdoptionRecordsAnEntryDueNow(t *testing.T) {
 	var log opLog
 	e.Blob.SetHook(log.hook)
 
-	rep, err := e.Files.AdoptJournal(ctx, e.Node, 1, e.W.NextSeq(), nil, nil)
+	rep, err := e.Files.AdoptJournal(ctx, e.Node, 1, e.W.NextSeq(), nil)
 	if err != nil || rep.Deltas != 1 {
 		t.Fatalf("adoption: %+v %v", rep, err)
 	}
@@ -211,7 +211,7 @@ func TestAdoptionWithAFailedEntryWritesNoDelta(t *testing.T) {
 		}
 		return nil
 	})
-	rep, err := e.Files.AdoptJournal(ctx, e.Node, 1, e.W.NextSeq(), nil, nil)
+	rep, err := e.Files.AdoptJournal(ctx, e.Node, 1, e.W.NextSeq(), nil)
 	if err == nil || rep.Deltas != 0 {
 		t.Fatalf("adoption with a failing entry: %+v %v", rep, err)
 	}
@@ -219,7 +219,7 @@ func TestAdoptionWithAFailedEntryWritesNoDelta(t *testing.T) {
 		t.Fatalf("a delta was written: %v", files)
 	}
 	e.Blob.SetHook(nil)
-	if rep, err := e.Files.AdoptJournal(ctx, e.Node, 1, e.W.NextSeq(), nil, nil); err != nil || rep.Deltas != 1 {
+	if rep, err := e.Files.AdoptJournal(ctx, e.Node, 1, e.W.NextSeq(), nil); err != nil || rep.Deltas != 1 {
 		t.Fatalf("adoption: %+v %v", rep, err)
 	}
 }

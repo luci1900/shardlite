@@ -63,9 +63,7 @@ func (a *Applier) Checksums() *capture.Checksums { return a.crcs.Clone() }
 // is taken to cover, and the file's own header is checked against it. The
 // first file must start at position 1.
 //
-// A file written before the checksums existed has none, and is applied
-// unchecked: the CRCs of the pages it writes are kept all the same, so the
-// first file with checksums is checked from there on.
+// A file without checksums is an error, like any other broken file.
 func (a *Applier) Apply(r io.Reader, rg Range) error {
 	err := decodeFile(func() error { return a.apply(r, rg) })
 	if err != nil {
@@ -80,6 +78,9 @@ func (a *Applier) apply(r io.Reader, rg Range) error {
 		return fmt.Errorf("decode header: %w", err)
 	}
 	hdr := dec.Header()
+	if hdr.NoChecksum() {
+		return fmt.Errorf("file %s has no checksums", rg)
+	}
 	// The file's own range is checked against the caller's: the header carries
 	// the positions the file covers, and a file that says another is not the
 	// file the caller asked for.
@@ -101,7 +102,7 @@ func (a *Applier) apply(r io.Reader, rg Range) error {
 	}
 	// The checksum of the database before this file. A snapshot has no database
 	// before it, and says so with no checksum.
-	if !hdr.NoChecksum() && !hdr.IsSnapshot() && hdr.PreApplyChecksum != a.crcs.Checksum() {
+	if !hdr.IsSnapshot() && hdr.PreApplyChecksum != a.crcs.Checksum() {
 		return fmt.Errorf("file %s: the database's checksum is %s before it, the file says %s",
 			rg, a.crcs.Checksum(), hdr.PreApplyChecksum)
 	}
@@ -130,10 +131,8 @@ func (a *Applier) apply(r io.Reader, rg Range) error {
 	}
 	a.crcs.Truncate(capture.Pages(hdr.Commit))
 	// The checksum of the database after this file.
-	if !hdr.NoChecksum() {
-		if got, want := a.crcs.Checksum(), dec.Trailer().PostApplyChecksum; got != want {
-			return fmt.Errorf("file %s: the database's checksum is %s after it, the file says %s", rg, got, want)
-		}
+	if got, want := a.crcs.Checksum(), dec.Trailer().PostApplyChecksum; got != want {
+		return fmt.Errorf("file %s: the database's checksum is %s after it, the file says %s", rg, got, want)
 	}
 	a.state.Position, a.state.Pages = rg.Max, capture.Pages(hdr.Commit)
 	return nil

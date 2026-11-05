@@ -58,21 +58,30 @@ func model(specs []commitSpec) (size uint32, pages map[uint32][]byte) {
 	return size, pages
 }
 
-func encodeSpec(t fataler, pageSize int, s commitSpec, minTXID, maxTXID ltx.TXID, ts int64) []byte {
+// encodeSpec encodes s as the file after the database crcs holds (none for a
+// snapshot), and leaves crcs holding the database after it.
+func encodeSpec(t fataler, pageSize int, s commitSpec, minTXID, maxTXID ltx.TXID, ts int64, crcs *capture.Checksums, snapshot bool) []byte {
 	t.Helper()
 	var buf bytes.Buffer
 	enc, err := ltx.NewEncoder(&buf)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := enc.EncodeHeader(ltx.Header{Version: ltx.Version, Flags: ltx.HeaderFlagNoChecksum, PageSize: uint32(pageSize), Commit: s.size, MinTXID: minTXID, MaxTXID: maxTXID, Timestamp: ts}); err != nil {
+	hdr := ltx.Header{Version: ltx.Version, PageSize: uint32(pageSize), Commit: s.size, MinTXID: minTXID, MaxTXID: maxTXID, Timestamp: ts}
+	if !snapshot {
+		hdr.PreApplyChecksum = crcs.Checksum()
+	}
+	if err := enc.EncodeHeader(hdr); err != nil {
 		t.Fatal(err)
 	}
 	for _, pgno := range slices.Sorted(maps.Keys(s.pages)) {
 		if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, s.pages[pgno]); err != nil {
 			t.Fatal(err)
 		}
+		crcs.Set(capture.Pgno(pgno), ltx.ChecksumPage(pgno, s.pages[pgno]))
 	}
+	crcs.Truncate(capture.Pages(s.size))
+	enc.SetPostApplyChecksum(crcs.Checksum())
 	if err := enc.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -152,8 +161,12 @@ func genRun(t *rapid.T) run {
 	r.start = pos.Position(rapid.SampledFrom([]uint64{1, 1, 1, 2, 17}).Draw(t, "startPosition"))
 	n := rapid.IntRange(1, 10).Draw(t, "files")
 	var prev uint32
+	crcs := capture.NewChecksums()
 	if r.start > 1 { // a delta run after a restore: the database already has pages
 		prev = uint32(rapid.IntRange(1, 12).Draw(t, "sizeBefore"))
+		for pgno := uint32(1); pgno <= prev; pgno++ {
+			crcs.Set(capture.Pgno(pgno), ltx.ChecksumPage(pgno, []byte{byte(pgno)}))
+		}
 	}
 	// A file that starts at position 1 is a snapshot, so its numbers start
 	// at 1; a delta run's start elsewhere.
@@ -180,7 +193,7 @@ func genRun(t *rapid.T) run {
 			}
 		}
 		count := pos.Count(rapid.IntRange(1, 3).Draw(t, "commits"))
-		data := encodeSpec(t, r.pageSize, spec, txid, txid+ltx.TXID(count)-1, int64(i+1))
+		data := encodeSpec(t, r.pageSize, spec, txid, txid+ltx.TXID(count)-1, int64(i+1), crcs, snapshot)
 		r.tails = append(r.tails, capture.TailFile{Position: at, Count: count, Body: bodyOf(data)})
 		r.specs = append(r.specs, spec)
 		at += pos.Position(count)

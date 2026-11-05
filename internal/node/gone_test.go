@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/luci1900/shardlite/internal/apptest"
 	"os"
 	"strings"
 	"sync"
@@ -44,7 +45,7 @@ func TestReadOnlyShardLeavesNothing(t *testing.T) {
 	r.app.Must(t, "openro", "a", ref.Path())
 	r.app.Must(t, "close", "a")
 	ref.Release()
-	eventually(t, "idle deactivation", r.inactive("test.users/e1"))
+	apptest.Eventually(t, apptest.Timeout, "idle deactivation", r.inactive("test.users/e1"))
 	if _, err := r.rawManifest("test.users/e1"); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("manifest: %v, want none", err)
 	}
@@ -105,7 +106,7 @@ func TestDeleteRacingWithAWrite(t *testing.T) {
 	}
 	r.app.Must(t, "close", "a")
 	ref.Release()
-	eventually(t, "deactivation", func() bool { return r.cached("test.users/e6") })
+	apptest.Eventually(t, apptest.Timeout, "deactivation", func() bool { return r.cached("test.users/e6") })
 	live, _ := r.manifest("test.users/e6")
 	raced := false
 	r.local.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
@@ -166,7 +167,7 @@ func TestNeverWrittenShardIsKeptWhenItsManifestChanged(t *testing.T) {
 		return nil
 	})
 	ref.Release()
-	eventually(t, "the delete to lose", changed.Load)
+	apptest.Eventually(t, apptest.Timeout, "the delete to lose", changed.Load)
 	r.afterLooks(1, "test.users/e7") // the idle timer has looked again and kept the shard
 	if !r.m.IsActive(shardName("test.users/e7")) {
 		t.Fatal("the shard was deactivated although its manifest could not be deleted")
@@ -189,7 +190,7 @@ func TestEmptiedShardLeavesNothing(t *testing.T) {
 	}
 	r.app.Must(t, "close", "a")
 	ref.Release()
-	eventually(t, "idle deactivation", r.inactive("test.users/e8"))
+	apptest.Eventually(t, apptest.Timeout, "idle deactivation", r.inactive("test.users/e8"))
 	if len(r.leftInBlob("test.users/e8")) == 0 {
 		t.Fatal("no delta at deactivation")
 	}
@@ -200,7 +201,7 @@ func TestEmptiedShardLeavesNothing(t *testing.T) {
 	r.app.Must(t, "exec", "a", "DROP TABLE acks")
 	r.app.Must(t, "close", "a")
 	ref.Release()
-	eventually(t, "idle deactivation", r.inactive("test.users/e8"))
+	apptest.Eventually(t, apptest.Timeout, "idle deactivation", r.inactive("test.users/e8"))
 	r.mustBeGone("test.users/e8", path)
 }
 
@@ -256,7 +257,7 @@ func TestMarkedShardIsCapturedAndGated(t *testing.T) {
 	if m, err := r.manifest("test.lobby/l1"); err != nil || m.Journal != "n1" || m.Owner != "n1" {
 		t.Fatalf("manifest %+v (%v), want one with a journal", m, err)
 	}
-	// The kind names no sync, so it parses to the record; the gate below
+	// The kind names no sync, so it parses to storage; the gate below
 	// names storage explicitly.
 	if ref.Sync() != kind.SyncStorage {
 		t.Fatal("the kind's sync default is ignored")
@@ -291,7 +292,7 @@ func TestMarkedShardLeavesNothingAfterDeactivation(t *testing.T) {
 	path := ref.Path()
 	r.app.Must(t, "close", "a")
 	ref.Release()
-	eventually(t, "idle deactivation", r.inactive("test.lobby/l2"))
+	apptest.Eventually(t, apptest.Timeout, "idle deactivation", r.inactive("test.lobby/l2"))
 	r.mustBeGone("test.lobby/l2", path)
 	if r.m.Stats.Deletes.Load() != 1 {
 		t.Fatalf("deletes %d", r.m.Stats.Deletes.Load())
@@ -318,7 +319,7 @@ func TestMarkedShardDeletesItsBackgroundDelta(t *testing.T) {
 	if err := r.m.Gate(ctx, ref, kind.SyncStorage); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, "a delta", func() bool {
+	apptest.Eventually(t, apptest.Timeout, "a delta", func() bool {
 		m, err := r.manifest("test.lobby/l3")
 		return err == nil && len(m.Files) > 0
 	})
@@ -328,15 +329,15 @@ func TestMarkedShardDeletesItsBackgroundDelta(t *testing.T) {
 	path := ref.Path()
 	r.app.Must(t, "close", "a")
 	ref.Release()
-	eventually(t, "idle deactivation", r.inactive("test.lobby/l3"))
+	apptest.Eventually(t, apptest.Timeout, "idle deactivation", r.inactive("test.lobby/l3"))
 	r.mustBeGone("test.lobby/l3", path)
 }
 
-// A crash keeps the state of a marked shard: all of it with sync on, and what
-// reached a flush with sync off. It is deleted at a later deactivation.
+// A crash keeps the state of a marked shard: all of it on the `storage` tier, and what
+// reached a flush on the `none` tier. It is deleted at a later deactivation.
 func TestMarkedShardSurvivesACrash(t *testing.T) {
 	t.Parallel()
-	for _, tc := range []struct{ kind, name string }{{"test.lobby", "sync on"}, {"test.arena", "sync off"}} {
+	for _, tc := range []struct{ kind, name string }{{"test.lobby", "storage"}, {"test.arena", "none"}} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			r := newMRig(t)
@@ -371,7 +372,7 @@ func TestMarkedShardSurvivesACrash(t *testing.T) {
 			}
 			path := ref.Path()
 			ref.Release()
-			eventually(t, "idle deactivation", r.inactive(target))
+			apptest.Eventually(t, apptest.Timeout, "idle deactivation", r.inactive(target))
 			r.mustBeGone(target, path)
 		})
 	}
@@ -387,7 +388,7 @@ func (r *mrig) writeAndRelease(target string) (path, generation string) {
 	if err := r.m.Gate(context.Background(), ref, kind.SyncStorage); err != nil {
 		r.t.Fatal(err)
 	}
-	eventually(r.t, "a delta", func() bool {
+	apptest.Eventually(r.t, apptest.Timeout, "a delta", func() bool {
 		m, err := r.manifest(target)
 		return err == nil && len(m.Files) > 0
 	})
@@ -423,13 +424,13 @@ func TestMarkedShardWithAFailingManifestDeleteIsKept(t *testing.T) {
 	if err := r.m.Gate(context.Background(), ref, kind.SyncStorage); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, "a delta", func() bool {
+	apptest.Eventually(t, apptest.Timeout, "a delta", func() bool {
 		m, err := r.manifest("test.lobby/f1")
 		return err == nil && len(m.Files) > 0
 	})
 	r.app.Must(t, "close", "a")
 	ref.Release()
-	eventually(t, "a failed delete", func() bool { return tries.Load() >= 1 })
+	apptest.Eventually(t, apptest.Timeout, "a failed delete", func() bool { return tries.Load() >= 1 })
 	r.afterLooks(1, "test.lobby/f1")
 	if !r.m.IsActive(shardName("test.lobby/f1")) {
 		t.Fatal("the shard was deactivated although its manifest could not be deleted")
@@ -443,7 +444,7 @@ func TestMarkedShardWithAFailingManifestDeleteIsKept(t *testing.T) {
 	}
 	ref.Release()
 	fail.Store(false)
-	eventually(t, "the delete to go through", r.inactive("test.lobby/f1"))
+	apptest.Eventually(t, apptest.Timeout, "the delete to go through", r.inactive("test.lobby/f1"))
 	r.mustBeGone("test.lobby/f1", path)
 }
 
@@ -460,7 +461,7 @@ func TestMarkedShardWithAFailingFileDeleteLeavesOrphans(t *testing.T) {
 		return nil
 	})
 	path, old := r.writeAndRelease("test.lobby/f2")
-	eventually(t, "idle deactivation", r.inactive("test.lobby/f2"))
+	apptest.Eventually(t, apptest.Timeout, "idle deactivation", r.inactive("test.lobby/f2"))
 	if _, err := r.rawManifest("test.lobby/f2"); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("manifest: %v, want none", err)
 	}
@@ -499,7 +500,7 @@ func TestMarkedShardCrashAfterTheManifestDelete(t *testing.T) {
 	if err := r.m.Gate(context.Background(), ref, kind.SyncStorage); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, "a delta", func() bool {
+	apptest.Eventually(t, apptest.Timeout, "a delta", func() bool {
 		m, err := r.manifest("test.lobby/f3")
 		return err == nil && len(m.Files) > 0
 	})

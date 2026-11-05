@@ -3,6 +3,7 @@ package shardfile_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -303,37 +304,24 @@ func TestRestoreOfATruncatedFileFails(t *testing.T) {
 	}
 }
 
-// A shard whose files were written before the checksums existed restores, and
-// the first file with checksums is checked from there on.
-func TestRestoreOfFilesWithoutChecksums(t *testing.T) {
+// A restore over a file without checksums fails, naming the file.
+func TestRestoreOfAFileWithoutChecksumsFails(t *testing.T) {
 	t.Parallel()
 	e := harness.New(t)
 	ctx := context.Background()
 	h, sh := shardWithDeltas(t, e)
 	defer sh.Close(ctx)
 	files := filesOf(t, e, h)
-	// The first two files are written as they were before the checksums: no
-	// checksum in the header and none in the trailer.
-	for i := range 2 {
-		putFile(t, e, h, i, withoutChecksums(t, files[i]))
-	}
-	// The restore still works: the files without checksums are applied
-	// unchecked, and the third file's checksum is checked against them.
+	putFile(t, e, h, 1, withoutChecksums(t, files[1]))
 	dst := filepath.Join(t.TempDir(), "restored.db")
-	if _, err := e.Files.Restore(ctx, shardName(shard), dst, shardfile.RestoreOptions{}); err != nil {
-		t.Fatalf("restore of files without checksums: %v", err)
-	}
-	// A file with checksums that does not follow the ones without them fails.
-	bad := append([]byte(nil), files[2]...)
-	bad[len(bad)/3] ^= 0xff
-	putFile(t, e, h, 2, bad)
-	if _, err := e.Files.Restore(ctx, shardName(shard), dst, shardfile.RestoreOptions{}); err == nil {
-		t.Fatal("the restore of a file with a wrong page succeeded")
+	_, err := e.Files.Restore(ctx, shardName(shard), dst, shardfile.RestoreOptions{})
+	if !errors.Is(err, shardfile.ErrBadFile) || !strings.Contains(err.Error(), "has no checksums") {
+		t.Fatalf("restore over a file without checksums: %v, want ErrBadFile naming the file", err)
 	}
 }
 
-// withoutChecksums is an LTX file with no checksums in it, as the files
-// written before this stage were.
+// withoutChecksums is an LTX file with no checksums in it, for a test of
+// the refusal.
 func withoutChecksums(t *testing.T, b []byte) []byte {
 	t.Helper()
 	dec := ltx.NewDecoder(bytes.NewReader(b))

@@ -42,7 +42,7 @@ func (s *Server) readyRoute(w http.ResponseWriter, r *http.Request) {
 
 // ready polls the app's ready route, which is both the health check and the
 // source of the app's kinds: a 2xx answer parsed as a declaration
-// (docs/guide.md, The ready route) marks the app healthy and makes its kinds
+// (docs/guide.md, Shard kinds) marks the app healthy and makes its kinds
 // current. A poll that fails marks the app unhealthy and keeps the last
 // declaration that was good.
 type ready struct {

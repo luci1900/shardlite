@@ -3,6 +3,7 @@ package node
 import (
 	"errors"
 	"fmt"
+	"github.com/luci1900/shardlite/internal/apptest"
 	"net/http"
 	"os"
 	"sync"
@@ -126,15 +127,15 @@ func TestReminderWakesOnceAfterItsCommitIsDurable(t *testing.T) {
 	r.record(rec, "test.wallet/rm1")
 	due := clk.Now().Unix() + 2
 	r.sql("test.wallet/rm1", fmt.Sprintf(`BEGIN; INSERT INTO kv (payload) VALUES (x'01'); INSERT INTO _shardlite_reminders (key, due) VALUES ('upgrade:barracks', %d); COMMIT;`, due))
-	eventually(t, "the timer for the reminder", r.armed("test.wallet/rm1"))
+	apptest.Eventually(t, apptest.Timeout, "the timer for the reminder", r.armed("test.wallet/rm1"))
 	clk.Advance(time.Second)
 	r.settle("test.wallet/rm1")
 	if rec.count() != 0 {
 		t.Fatal("woken early")
 	}
 	clk.Advance(time.Second)
-	eventually(t, "the wake", func() bool { return rec.count() >= 1 })
-	eventually(t, "the handler's delete", func() bool { return r.reminderRows("test.wallet/rm1") == 0 })
+	apptest.Eventually(t, apptest.Timeout, "the wake", func() bool { return rec.count() >= 1 })
+	apptest.Eventually(t, apptest.Timeout, "the handler's delete", func() bool { return r.reminderRows("test.wallet/rm1") == 0 })
 	r.settle("test.wallet/rm1") // a second wake would come in these cycles
 	if rec.count() != 1 {
 		t.Fatalf("%d wakes", rec.count())
@@ -197,12 +198,12 @@ func TestSoonerReminderMovesTheWakeEarlier(t *testing.T) {
 	r.record(rec, "")
 	now := clk.Now().Unix()
 	r.remind("test.users/sm1", "late", now+100)
-	eventually(t, "the timer", r.armed("test.users/sm1"))
+	apptest.Eventually(t, apptest.Timeout, "the timer", r.armed("test.users/sm1"))
 	r.remind("test.users/sm1", "soon", now+10)
 	r.settle("test.users/sm1")
 	clk.Advance(20 * time.Second)
-	eventually(t, "the wake at the sooner time", func() bool { return rec.count() == 1 })
-	eventually(t, "the sooner reminder to be handled", func() bool { return r.reminderRows("test.users/sm1") == 1 })
+	apptest.Eventually(t, apptest.Timeout, "the wake at the sooner time", func() bool { return rec.count() == 1 })
+	apptest.Eventually(t, apptest.Timeout, "the sooner reminder to be handled", func() bool { return r.reminderRows("test.users/sm1") == 1 })
 	r.settle("test.users/sm1")
 	if rec.count() != 1 {
 		t.Fatalf("%d wakes", rec.count())
@@ -227,8 +228,8 @@ func TestFailingWakeIsRetriedWithBackoff(t *testing.T) {
 	}}
 	r.record(rec, "")
 	r.remind("test.users/fw1", "k", clk.Now().Unix()-1)
-	eventually(t, "the first wake", func() bool { return rec.count() == 1 })
-	eventually(t, "the failure", func() bool { return r.m.Stats.ReminderWakeFailures.Load() == 1 })
+	apptest.Eventually(t, apptest.Timeout, "the first wake", func() bool { return rec.count() == 1 })
+	apptest.Eventually(t, apptest.Timeout, "the failure", func() bool { return r.m.Stats.ReminderWakeFailures.Load() == 1 })
 	r.settle("test.users/fw1")
 	clk.Advance(4 * time.Second) // under the first backoff (5 to 10 s)
 	r.settle("test.users/fw1")
@@ -237,7 +238,7 @@ func TestFailingWakeIsRetriedWithBackoff(t *testing.T) {
 	}
 	mode.Store(1)
 	advanceUntil(t, clk, time.Second, "the second wake", func() bool { return rec.count() == 2 })
-	eventually(t, "the second failure (a 2xx that left a reminder due)", func() bool { return r.m.Stats.ReminderWakeFailures.Load() == 2 })
+	apptest.Eventually(t, apptest.Timeout, "the second failure (a 2xx that left a reminder due)", func() bool { return r.m.Stats.ReminderWakeFailures.Load() == 2 })
 	// The second wait is 10 to 20 s: never sooner than the first one's cap.
 	r.settle("test.users/fw1")
 	clk.Advance(9 * time.Second)
@@ -247,7 +248,7 @@ func TestFailingWakeIsRetriedWithBackoff(t *testing.T) {
 	}
 	rec.keep = false // the handler handles the reminder now
 	advanceUntil(t, clk, time.Second, "the third wake", func() bool { return rec.count() == 3 })
-	eventually(t, "the reminder to be handled", func() bool { return r.reminderRows("test.users/fw1") == 0 })
+	apptest.Eventually(t, apptest.Timeout, "the reminder to be handled", func() bool { return r.reminderRows("test.users/fw1") == 0 })
 	r.settle("test.users/fw1")
 	if rec.count() != 3 || r.m.Stats.ReminderWakeFailures.Load() != 2 {
 		t.Fatalf("%d wakes and %d failures", rec.count(), r.m.Stats.ReminderWakeFailures.Load())
@@ -271,7 +272,7 @@ func TestHandlerSettingRemindersDueNowIsWokenWithBackoff(t *testing.T) {
 		inner(w, q)
 	})
 	r.remind("test.users/hl1", "again", time.Now().Unix())
-	eventually(t, "five wakes", func() bool { return rec.count() >= 5 })
+	apptest.Eventually(t, apptest.Timeout, "five wakes", func() bool { return rec.count() >= 5 })
 	if f := r.m.Stats.ReminderWakeFailures.Load(); f < 4 {
 		t.Fatalf("%d failures for %d wakes", f, rec.count())
 	}
@@ -300,7 +301,7 @@ func TestRecurringReminder(t *testing.T) {
 	first := clk.Now().Unix() - 1
 	r.remind("test.users/rc1", "daily", first)
 	ticks := func() int { return rec.count() }
-	eventually(t, "the first wake", func() bool { return ticks() >= 1 })
+	apptest.Eventually(t, apptest.Timeout, "the first wake", func() bool { return ticks() >= 1 })
 	// The times are first, first+2 and first+4, and the clock is at first+1: a
 	// wake comes only when the clock reaches the reminder's new time.
 	notYet := func(n int) {
@@ -312,13 +313,13 @@ func TestRecurringReminder(t *testing.T) {
 	}
 	notYet(1)
 	clk.Advance(time.Second)
-	eventually(t, "the second wake", func() bool { return ticks() >= 2 })
+	apptest.Eventually(t, apptest.Timeout, "the second wake", func() bool { return ticks() >= 2 })
 	notYet(2)
 	clk.Advance(time.Second)
 	notYet(2)
 	clk.Advance(time.Second)
-	eventually(t, "the third wake", func() bool { return ticks() >= 3 })
-	eventually(t, "the last reminder to go", func() bool { return r.reminderRows("test.users/rc1") == 0 })
+	apptest.Eventually(t, apptest.Timeout, "the third wake", func() bool { return ticks() >= 3 })
+	apptest.Eventually(t, apptest.Timeout, "the last reminder to go", func() bool { return r.reminderRows("test.users/rc1") == 0 })
 	r.settle("test.users/rc1")
 	if got := ticks(); got != 3 {
 		t.Fatalf("%d wakes, want 3", got)
@@ -335,7 +336,7 @@ func TestNodeMakesNoCommitsForReminders(t *testing.T) {
 	rec := &recorder{keep: true}
 	r.record(rec, "")
 	r.sql("test.users/nc1", fmt.Sprintf(`INSERT INTO _shardlite_reminders (key, due) VALUES ('k', %d)`, time.Now().Unix()-1))
-	eventually(t, "the wake", func() bool { return rec.count() >= 1 })
+	apptest.Eventually(t, apptest.Timeout, "the wake", func() bool { return rec.count() >= 1 })
 	sh := r.shard("test.users/nc1").cap.load()
 	before := header(t, sh)
 	pos := sh.Position()
@@ -364,8 +365,8 @@ func TestReplacingAndCancellingReminders(t *testing.T) {
 		t.Fatalf("woken: %+v", rec.all())
 	}
 	clk.Advance(100 * time.Second)
-	eventually(t, "the wake", func() bool { return rec.count() == 1 })
-	eventually(t, "the handler's delete", func() bool { return r.reminderRows("test.users/rp1") == 0 })
+	apptest.Eventually(t, apptest.Timeout, "the wake", func() bool { return rec.count() == 1 })
+	apptest.Eventually(t, apptest.Timeout, "the handler's delete", func() bool { return r.reminderRows("test.users/rp1") == 0 })
 	r.settle("test.users/rp1")
 	if rec.count() != 1 {
 		t.Fatalf("%d wakes", rec.count())
@@ -396,7 +397,7 @@ func TestReminderAnHourAwayWakesTheShard(t *testing.T) {
 			case "after a crash":
 				// The reminder's commit is in the journal, so the restart's adoption
 				// records a reminder due now.
-				eventually(t, "the reminder's commit to be durable", func() bool { return r.durableReminders("test.users/wh1") == 1 })
+				apptest.Eventually(t, apptest.Timeout, "the reminder's commit to be durable", func() bool { return r.durableReminders("test.users/wh1") == 1 })
 				if got := r.nextReminder("test.users/wh1"); got != 0 {
 					t.Fatalf("next_reminder %d while the reminder is in the tail", got)
 				}
@@ -419,7 +420,7 @@ func TestReminderAnHourAwayWakesTheShard(t *testing.T) {
 			advanceUntil(t, clk, 100*time.Millisecond, "the wake", func() bool { return rec.count() >= 1 })
 			// The next_reminder goes at the shard's next manifest write, its
 			// deactivation, which finds no reminder.
-			eventually(t, "the handler's delete", func() bool { return r.reminderRows("test.users/wh1") == 0 })
+			apptest.Eventually(t, apptest.Timeout, "the handler's delete", func() bool { return r.reminderRows("test.users/wh1") == 0 })
 			r.closeInApp("test.users/wh1")
 			advanceUntil(t, clk, 100*time.Millisecond, "the next_reminder to go", func() bool { return r.cached("test.users/wh1") && r.nextReminder("test.users/wh1") == 0 })
 		})
@@ -486,8 +487,8 @@ func TestMarkedShardWithAReminderDueIsDeletedAfterItIsHandled(t *testing.T) {
 	r.record(rec, "")
 	r.sql("test.lobby/rm2", markSQL)
 	r.remind("test.lobby/rm2", "now", clk.Now().Unix())
-	eventually(t, "the wake", func() bool { return rec.count() == 1 })
-	eventually(t, "the handler's delete", func() bool { return r.reminderRows("test.lobby/rm2") == 0 })
+	apptest.Eventually(t, apptest.Timeout, "the wake", func() bool { return rec.count() == 1 })
+	apptest.Eventually(t, apptest.Timeout, "the handler's delete", func() bool { return r.reminderRows("test.lobby/rm2") == 0 })
 	r.closeInApp("test.lobby/rm2") // the handler's delete opened the shard in the app again
 	advanceUntil(t, clk, time.Second, "deletion", func() bool { return r.m.Stats.Deletes.Load() == 1 && r.inactive("test.lobby/rm2")() })
 	if _, err := r.rawManifest("test.lobby/rm2"); !errors.Is(err, blob.ErrNotFound) {

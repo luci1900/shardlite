@@ -86,8 +86,3 @@ func (s Store) Backend(t testing.TB) blob.Backend {
 	}
 	return blob.WithPrefix(b, s.Prefix)
 }
-
-// Args are the flags testnode takes for this store.
-func (s Store) Args() []string {
-	return []string{"-s3-bucket", s.Bucket, "-s3-endpoint", s.Endpoint, "-prefix", s.Prefix}
-}

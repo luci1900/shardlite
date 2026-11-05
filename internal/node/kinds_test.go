@@ -49,7 +49,7 @@ func TestKindsUpdate(t *testing.T) {
 		t.Fatal(err)
 	}
 	k.Update(a)
-	// A kind that names no sync parses to the record, the conservative tier.
+	// A kind that names no sync parses to storage, the conservative tier.
 	if got, _ := k.Lookup("test.users"); got.IdleTimeout != DefaultIdleTimeout || got.Sync != kind.SyncStorage {
 		t.Fatalf("%+v", got)
 	}
@@ -113,7 +113,7 @@ func TestParseEnv(t *testing.T) {
 }
 
 // A system kind built into the declaration gets the safe ones, as a kind of an
-// app's declaration does: sync on, not public and the node's idle timeout.
+// app's declaration does: the `storage` tier, not public and the node's idle timeout.
 func TestSystemKindDefaults(t *testing.T) {
 	t.Parallel()
 	k := NewKinds(3 * time.Minute)

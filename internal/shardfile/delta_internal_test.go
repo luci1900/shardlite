@@ -5,6 +5,7 @@ import (
 	"maps"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 
@@ -16,8 +17,7 @@ import (
 )
 
 // encoded is an LTX file with the checksum of the database before it, the one
-// after it, and the pages it holds. A file with neither checksum is one
-// written before the checksums existed.
+// after it, and the pages it holds. A file with neither checksum has none.
 func encoded(t *testing.T, pageSize, commit uint32, pre, post ltx.Checksum, pages map[uint32][]byte, minTXID, maxTXID ltx.TXID) []byte {
 	t.Helper()
 	var buf bytes.Buffer
@@ -148,24 +148,17 @@ func TestDeltaOfAChainCarriesItsChecksums(t *testing.T) {
 	}
 }
 
-// A delta built from tail files written before the checksums existed has none
-// either, as it did before.
-func TestDeltaOfFilesWithoutChecksumsHasNone(t *testing.T) {
+// A delta over a tail file without checksums fails, naming the file.
+func TestDeltaOfFilesWithoutChecksumsFails(t *testing.T) {
 	t.Parallel()
 	const pageSize = 4096
 	page := make([]byte, pageSize)
-	first := encoded(t, pageSize, 1, 0, 0, map[uint32][]byte{1: page}, 2, 2)
+	first := encoded(t, pageSize, 1, ltx.ChecksumFlag|1, ltx.ChecksumFlag|2, map[uint32][]byte{1: page}, 2, 2)
 	second := encoded(t, pageSize, 1, 0, 0, map[uint32][]byte{1: page}, 3, 3)
 	files := tailFiles(t, first, second)
 	var out bytes.Buffer
-	if err := reencode(&out, files, Range{2, 3}); err != nil {
-		t.Fatal(err)
-	}
-	dec := ltx.NewDecoder(bytes.NewReader(out.Bytes()))
-	if err := dec.DecodeHeader(); err != nil {
-		t.Fatal(err)
-	}
-	if !dec.Header().NoChecksum() {
-		t.Fatal("the delta has checksums, want none")
+	err := reencode(&out, files, Range{2, 3})
+	if err == nil || !strings.Contains(err.Error(), "position 2 has no checksums") {
+		t.Fatalf("reencode of files without checksums: %v, want it to name the file at position 2", err)
 	}
 }

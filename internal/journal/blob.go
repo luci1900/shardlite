@@ -11,8 +11,8 @@ import (
 	"github.com/luci1900/shardlite/internal/pos"
 )
 
-// Blob is a blob backend seen as the record of one node's journal (the fences,
-// docs/internals.md, Fencing). It maps a number onto the record's key, which is
+// Blob is a blob backend seen as blob storage for one node's journal (the fences,
+// docs/internals.md, Fencing). It maps a number onto the blob key, which is
 // the layout journal expiry composes keys with, so a Store over it and a
 // caller that goes through the blob package alone see the same keys.
 type Blob struct {
@@ -20,7 +20,7 @@ type Blob struct {
 	node cluster.Node // whose journal this is, for the error messages
 }
 
-// NewBlob returns the record of node's journal: blob b's objects under the
+// NewBlob returns node's journal in blob storage: blob b's objects under the
 // journal's prefix, keyed by segment number.
 func NewBlob(b blob.Backend, node cluster.Node) *Blob {
 	return &Blob{b: blob.WithPrefix(b, Prefix(node)), node: node}
@@ -47,7 +47,7 @@ func (x *Blob) GetRange(ctx context.Context, seq pos.Seg, offset, length int64) 
 	return x.b.GetRange(ctx, padded(seq), offset, length)
 }
 
-// Head says the segment's size and write id. The record's own key and
+// Head says the segment's size and write id. The blob's own key and
 // modification time are of no use to a reader of a journal, so they are left
 // behind.
 func (x *Blob) Head(ctx context.Context, seq pos.Seg) (SegmentInfo, error) {
@@ -62,7 +62,7 @@ func (x *Blob) Delete(ctx context.Context, seq pos.Seg) error {
 	return x.b.Delete(ctx, padded(seq), "")
 }
 
-// List lists the journal's numbers from from on. The record is asked from the
+// List lists the journal's numbers from from on. Blob storage is asked from the
 // key before from, which the zero-padding puts before from's own, so a listing
 // begins the segment from asks for. A key that is not a segment's is skipped,
 // as a plain listing of the prefix would skip it too.

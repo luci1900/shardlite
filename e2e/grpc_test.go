@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"fmt"
+	"github.com/luci1900/shardlite/internal/apptest"
 	"io"
 	"strings"
 	"testing"
@@ -173,7 +174,7 @@ func TestGRPCThroughTheNode(t *testing.T) {
 			_, err := unary(onShard(c, "e2e.wallet/g7"), pub, "Hold", "", grpc.WaitForReady(false))
 			hold <- err
 		}()
-		eventually(t, "the call to reach the app", func() bool { return s.appDebug().HoldStarted > before.HoldStarted })
+		apptest.Eventually(t, apptest.Timeout, "the call to reach the app", func() bool { return s.appDebug().HoldStarted > before.HoldStarted })
 		// The client's grpc-timeout passes through as it sent it (the client enforces
 		// its own deadline).
 		rec := s.appDebug().LastHold
@@ -186,7 +187,7 @@ func TestGRPCThroughTheNode(t *testing.T) {
 		if err := <-hold; status.Code(err) != codes.DeadlineExceeded {
 			t.Errorf("the call ended with %v, want DeadlineExceeded", err)
 		}
-		eventually(t, "the app's handler to see the deadline", func() bool { return s.appDebug().HoldCancel > before.HoldCancel })
+		apptest.Eventually(t, apptest.Timeout, "the app's handler to see the deadline", func() bool { return s.appDebug().HoldCancel > before.HoldCancel })
 	})
 
 	t.Run("cancelling a call cancels the handler", func(t *testing.T) {
@@ -197,12 +198,12 @@ func TestGRPCThroughTheNode(t *testing.T) {
 			_, err := unary(onShard(c, "e2e.wallet/g8"), pub, "Hold", "")
 			done <- err
 		}()
-		eventually(t, "the call to reach the app", func() bool { return s.appDebug().HoldStarted > before.HoldStarted })
+		apptest.Eventually(t, apptest.Timeout, "the call to reach the app", func() bool { return s.appDebug().HoldStarted > before.HoldStarted })
 		cancel()
 		if err := <-done; status.Code(err) != codes.Canceled {
 			t.Errorf("the client saw %v, want Canceled", err)
 		}
-		eventually(t, "the app's handler to be cancelled", func() bool { return s.appDebug().HoldCancel > before.HoldCancel })
+		apptest.Eventually(t, apptest.Timeout, "the app's handler to be cancelled", func() bool { return s.appDebug().HoldCancel > before.HoldCancel })
 	})
 
 	t.Run("a hint naming another shard, or none, is relayed", func(t *testing.T) {

@@ -14,6 +14,7 @@ import (
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/capture"
+	"github.com/luci1900/shardlite/internal/kill"
 	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/remindex"
 	"github.com/luci1900/shardlite/internal/tempfile"
@@ -36,6 +37,8 @@ const DefaultDeltaSize = 256 << 10
 // Hooks let tests stop between steps. A returned error aborts the operation
 // at that point, as a crash would.
 type Hooks struct {
+	// At is called at the kill points of a delta and a rebase (nil in production).
+	At              func(kill.Point)
 	AfterFileWrite  func() error // delta or base written, manifest not yet updated
 	AfterRebaseSwap func() error // rebase's manifest update done, superseded files not yet deleted
 	// BeforeUpdate is called once the tail is taken, before the file is written
@@ -46,6 +49,12 @@ type Hooks struct {
 	// (docs/internals.md, Reminder index). Without the hook the manifest keeps its
 	// own.
 	BeforeUpdate func(ctx context.Context, end pos.Position) (nextReminder remindex.Minute, err error)
+}
+
+func (hk Hooks) at(p kill.Point) {
+	if hk.At != nil {
+		hk.At(p)
+	}
 }
 
 // reminder calls the BeforeUpdate hook, if there is one, for files that reach end,
@@ -142,8 +151,7 @@ func (h *pageHeap) Pop() any {
 // gap in the positions does.
 //
 // The delta carries the checksums of the chain: the first file's before and
-// the last file's after. A file written before the checksums existed has none,
-// and the delta has none either, as it did before.
+// the last file's after. A file without checksums fails the delta.
 func reencode(w io.Writer, files []capture.TailFile, rg Range) error {
 	return decodeFile(func() error { return merge(w, files, rg) })
 }
@@ -156,7 +164,6 @@ func merge(w io.Writer, files []capture.TailFile, rg Range) error {
 	var pageSize capture.PageSize
 	var pages capture.Pages
 	var ts int64
-	checksums := true // whether every file has checksums
 	for i, f := range files {
 		dec := ltx.NewDecoder(bufio.NewReaderSize(f.Body.Reader(), 64<<10))
 		if err := dec.DecodeHeader(); err != nil {
@@ -168,7 +175,7 @@ func merge(w io.Writer, files []capture.TailFile, rg Range) error {
 		}
 		pageSize, pages, ts = capture.PageSize(hdr.PageSize), capture.Pages(hdr.Commit), hdr.Timestamp
 		if hdr.NoChecksum() {
-			checksums = false
+			return fmt.Errorf("the file at position %d has no checksums", f.Position)
 		}
 		srcs[i] = &source{dec: dec, buf: make([]byte, hdr.PageSize), idx: i, pre: hdr.PreApplyChecksum}
 	}
@@ -184,15 +191,11 @@ func merge(w io.Writer, files []capture.TailFile, rg Range) error {
 		MaxTXID:   ltx.TXID(rg.Max),
 		Timestamp: ts,
 	}
-	if checksums {
-		// The checksum of the database before the delta. A snapshot has no
-		// database before it, and says so with no checksum.
-		hdr.PreApplyChecksum = srcs[0].pre
-		if hdr.MinTXID == 1 && hdr.PreApplyChecksum != 0 {
-			return fmt.Errorf("the file at position 1 has a checksum before it, which a snapshot cannot have")
-		}
-	} else {
-		hdr.Flags = ltx.HeaderFlagNoChecksum
+	// The checksum of the database before the delta. A snapshot has no database
+	// before it, and says so with no checksum.
+	hdr.PreApplyChecksum = srcs[0].pre
+	if hdr.MinTXID == 1 && hdr.PreApplyChecksum != 0 {
+		return fmt.Errorf("the file at position 1 has a checksum before it, which a snapshot cannot have")
 	}
 	if err := enc.EncodeHeader(hdr); err != nil {
 		return err
@@ -228,16 +231,14 @@ func merge(w io.Writer, files []capture.TailFile, rg Range) error {
 		}
 	}
 	// Every file has been read to its end, so every trailer has been read.
-	if checksums {
-		for i := 1; i < len(srcs); i++ {
-			if got, want := srcs[i].pre, srcs[i-1].post; got != want {
-				return fmt.Errorf("the file at position %d does not follow the one before it: the checksum before it is %s, the one before says %s",
-					files[i].Position, got, want)
-			}
+	for i := 1; i < len(srcs); i++ {
+		if got, want := srcs[i].pre, srcs[i-1].post; got != want {
+			return fmt.Errorf("the file at position %d does not follow the one before it: the checksum before it is %s, the one before says %s",
+				files[i].Position, got, want)
 		}
-		// The checksum of the database after the delta: the last file's.
-		enc.SetPostApplyChecksum(srcs[len(srcs)-1].post)
 	}
+	// The checksum of the database after the delta: the last file's.
+	enc.SetPostApplyChecksum(srcs[len(srcs)-1].post)
 	return enc.Close()
 }
 
@@ -321,6 +322,7 @@ func (h *Handle) putTail(ctx context.Context, tail []capture.TailFile, hooks Hoo
 	if err := h.putFile(ctx, file, delta.Reader()); err != nil {
 		return err
 	}
+	hooks.at(kill.DeltaBeforeManifest)
 	if hooks.AfterFileWrite != nil {
 		if err := hooks.AfterFileWrite(); err != nil {
 			return err
@@ -439,6 +441,7 @@ func (h *Handle) Rebase(ctx context.Context, sh *capture.Shard, hooks Hooks) (bo
 	if err := h.putFile(ctx, base, snap.Reader()); err != nil {
 		return false, err
 	}
+	hooks.at(kill.RebaseBeforeManifest)
 	if hooks.AfterFileWrite != nil {
 		if err := hooks.AfterFileWrite(); err != nil {
 			return false, err
@@ -452,6 +455,7 @@ func (h *Handle) Rebase(ctx context.Context, sh *capture.Shard, hooks Hooks) (bo
 	}
 	delete(h.writes, FileKey(h.Name, h.Manifest.Generation, base))
 	sh.DropTail(position)
+	hooks.at(kill.RebaseAfterSwap)
 	if hooks.AfterRebaseSwap != nil {
 		if err := hooks.AfterRebaseSwap(); err != nil {
 			return true, err
@@ -510,6 +514,9 @@ func encodeSnapshot(w io.Writer, r io.Reader, position pos.Position) error {
 		return err
 	}
 	hdr := dec.Header()
+	if hdr.NoChecksum() {
+		return errors.New("the snapshot has no checksums")
+	}
 	enc, err := ltx.NewEncoder(w)
 	if err != nil {
 		return err
@@ -521,9 +528,6 @@ func encodeSnapshot(w io.Writer, r io.Reader, position pos.Position) error {
 		MinTXID:   1,
 		MaxTXID:   ltx.TXID(position),
 		Timestamp: hdr.Timestamp,
-	}
-	if hdr.NoChecksum() {
-		out.Flags = ltx.HeaderFlagNoChecksum
 	}
 	if err := enc.EncodeHeader(out); err != nil {
 		return err

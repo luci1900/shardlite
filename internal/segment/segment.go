@@ -1,7 +1,7 @@
 // Package segment writes and reads a node's journal through a journal.Store:
 // numbered segments, that each hold every shard's LTX files from one flush
 // interval. The format is the LTX files, the footer, the trailer, laid out
-// exactly as capture queued them; the store is where they live (the record, or
+// exactly as capture queued them; the store is where they live (blob storage, or
 // one of the copies in front of it later).
 //
 // Layout of a segment:
@@ -12,7 +12,7 @@
 //	8 bytes: magic "SHLSEG01"
 //
 // An empty segment is a fence (see docs/internals.md, Fencing), and lives in
-// the record.
+// blob storage.
 package segment
 
 import (
@@ -82,65 +82,11 @@ func segName(store *journal.Store, seq pos.Seg) string {
 	return fmt.Sprintf("%s/%d", store.Name(), uint64(seq))
 }
 
-// Store names one of the places a segment is written to. The zero value is no
-// store: a writer that isn't asked about a store it doesn't have waits for
-// nothing, which is the safe answer (docs/internals.md, Failing loudly, the
-// zero-value policy).
-type Store int
-
-const (
-	// StoreNone is no store: Written counts nothing and Reached is closed
-	// already, so nothing waits on it.
-	StoreNone Store = iota
-	// StoreRecord is the record: blob storage, where the fence is created and
-	// where the journal's races are decided.
-	StoreRecord
-	// StoreLocal is the node's own disk, which holds a copy of the record's
-	// segments. It decides nothing.
-	StoreLocal
-
-	// storeCount is how many places a store value can name, the array a writer
-	// keeps one store behind each.
-	storeCount = int(StoreLocal) + 1
-)
-
-// String names a store, for the logs.
-func (s Store) String() string {
-	switch s {
-	case StoreNone:
-		return "none"
-	case StoreRecord:
-		return "record"
-	case StoreLocal:
-		return "local"
-	}
-	return "unknown"
-}
-
-// Valid reports whether s is one of the stores. The zero is a store value, no
-// store.
-func (s Store) Valid() bool {
-	switch s {
-	case StoreNone, StoreRecord, StoreLocal:
-		return true
-	}
-	return false
-}
-
 // Options configure a Writer.
 type Options struct {
 	StartSeq pos.Seg       // first segment number, 1 if zero
 	Retry    time.Duration // first wait before retrying an upload whose outcome is unknown, 25 ms if zero (doubling up to 40 times that)
 	Logger   *slog.Logger  // slog.Default() if nil
-	// Local is the node's own disk, which holds a copy of every segment. It
-	// may be nil, and then the segments go to the record alone.
-	Local *journal.Store
-	// Peer is the journal's peer, the node whose disk holds a mirror of it
-	// through the mirror protocol. Every batch goes to it as it is built,
-	// beside the record and the local store, on an uploader of its own and in
-	// number order (fanout.go). It may be nil, and then the segments go
-	// nowhere else.
-	Peer *Mirror
 }
 
 // pendingEntry is one LTX file queued for the next segment.
@@ -182,33 +128,17 @@ func (h *held) close() {
 	h.dups = nil
 }
 
-// store is one place a segment is written to: its journal, the queue of the
-// batches waiting for it and the counter of the entries it has written.
-type store struct {
-	name     string
-	journal  *journal.Store
-	queue    *batchQueue
-	written  notify.Counter // the entries written to it, in the order they were appended
-	down     chan struct{}  // closed once the store refused a segment: the tier it carries is over
-	downOnce sync.Once
-}
-
-// batch is one segment on its way to the stores: its number, its body, the
-// write id of its create and the files it is made of. Each store's side of it
-// is marked as it is written, and the batch is dropped when all of them are.
+// batch is one segment on its way to storage: its number, its body, the write
+// id of its create and the files it is made of. It is dropped once storage has it.
 type batch struct {
 	seq   pos.Seg
 	body  *body
 	files []pendingEntry
 	held  held         // the descriptors the files are read through
 	count uint64       // the number of entries, which is what the counters count
-	id    blob.WriteID // the record create's write id, which the peer's create carries
+	id    blob.WriteID // the storage create's write id
 
-	recordDone   atomic.Bool // the record has the segment
-	localDone    atomic.Bool // the local store's side is finished (written or given up)
-	localWritten atomic.Bool // the local store has the segment
-	peerDone     atomic.Bool // the peer's side is finished (written, fallen out or given up)
-	dropped      atomic.Bool // the batch is dropped: its files are closed
+	dropped atomic.Bool // the batch is dropped: its files are closed
 }
 
 // closeFiles closes the descriptors the batch's files are read through, once.
@@ -221,36 +151,21 @@ func (b *batch) closeFiles() {
 // Writer batches appended LTX files into one segment per Flush. It flushes only
 // when asked.
 //
-// A segment goes to the record (blob storage), where the fence lives, to the
-// node's own disk, which holds a copy of it, and to the peer, whose disk
-// holds a mirror of it. Each has its own uploader, so a slow one never holds
-// another: the local copy is written beside the record's, out of the same
-// body, and the peer's queue fills as the batches are built. The gate that
-// waits for the local store is released as soon as the local write is durable.
+// A segment goes to blob storage, where the fence lives.
 //
 // The body is composed, not copied: it is a reader over the LTX files the
 // capture queued and the footer that names them, so the segment's bytes are
 // never copied.
 //
-// It is a service: Serve is the record's uploader, which writes the segments
+// It is a service: Serve is the storage uploader, which writes the segments
 // one at a time and in order, so nothing newer is ever written before an older
-// segment, and the local store's and the peer's uploaders, which run beside it
-// out of queues of their own. Nothing is written until it is served, and once
-// Serve has returned the writer is closed for good.
+// segment. Nothing is written until it is served, and once Serve has returned the writer is closed for good.
 type Writer struct {
-	opts   Options
-	stores [storeCount]*store
-	// peer is the segments' mirror, on another node's disk, and peerQueue is
-	// the batches waiting for its uploader, in number order. Read and swapped
-	// under peerMu: a repair swaps only at a segment boundary the seed covers,
-	// and the queue is the writer's, so it drains what the seed already copied.
-	peer      *mirrorOut
-	peerMu    sync.Mutex
-	peerQueue *batchQueue
-
-	kick    *notify.Kick // wakes the uploader: a Flush wants what is queued written
-	written [storeCount]notify.Counter
-	done    chan struct{} // closed once Serve has returned
+	opts    Options
+	storage *journal.Store
+	kick    *notify.Kick   // wakes the uploader: a Flush wants what is queued written
+	written notify.Counter // the entries storage has
+	done    chan struct{}  // closed once Serve has returned
 
 	mu       sync.Mutex
 	pending  []pendingEntry
@@ -261,15 +176,12 @@ type Writer struct {
 	stopErr  error         // set once fenced or closed
 	fenced   chan struct{} // closed once fenced
 
-	built   atomic.Uint64 // the highest segment number built, which the peer's frontier follows
 	flushes atomic.Int64
 }
 
-// NewWriter makes a writer over the record, the journal in blob storage. The
-// segments go to the node's own disk too when Options.Local names it, and to
-// the peer Options.Peer names. Nothing is written until the writer is
-// served and flushed.
-func NewWriter(record *journal.Store, opts Options) *Writer {
+// NewWriter makes a writer over the journal in blob storage. Nothing is written
+// until the writer is served and flushed.
+func NewWriter(storage *journal.Store, opts Options) *Writer {
 	if opts.Retry <= 0 {
 		opts.Retry = 25 * time.Millisecond
 	}
@@ -279,16 +191,8 @@ func NewWriter(record *journal.Store, opts Options) *Writer {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
-	w := &Writer{opts: opts, seq: opts.StartSeq, fenced: make(chan struct{}),
-		kick: notify.NewKick(), done: make(chan struct{}), peerQueue: newBatchQueue()}
-	w.stores[StoreRecord] = &store{name: "record", journal: record, queue: newBatchQueue(), down: make(chan struct{})}
-	if opts.Local != nil {
-		w.stores[StoreLocal] = &store{name: "local", journal: opts.Local, queue: newBatchQueue(), down: make(chan struct{})}
-	}
-	w.built.Store(uint64(opts.StartSeq) - 1)
-	if opts.Peer != nil && opts.Peer.Journal != nil {
-		w.peer = newMirrorOut(*opts.Peer, opts.StartSeq)
-	}
+	w := &Writer{opts: opts, storage: storage, seq: opts.StartSeq, fenced: make(chan struct{}),
+		kick: notify.NewKick(), done: make(chan struct{})}
 	return w
 }
 
@@ -315,31 +219,11 @@ func (w *Writer) Queued() uint64 {
 	return w.appended
 }
 
-// Written is how many entries are durable in the named store.
-func (w *Writer) Written(s Store) uint64 {
-	st := w.stores[s]
-	if st == nil {
-		return 0
-	}
-	return st.written.Load()
-}
+// Written is how many entries are in storage.
+func (w *Writer) Written() uint64 { return w.written.Load() }
 
-// Reached is a channel closed once the named store has written n entries.
-func (w *Writer) Reached(s Store, n uint64) <-chan struct{} {
-	st := w.stores[s]
-	if st == nil {
-		return closedChan
-	}
-	return st.written.Reached(n)
-}
-
-// closedChan is a channel that is closed already, for a store the writer
-// doesn't have.
-var closedChan = func() chan struct{} {
-	ch := make(chan struct{})
-	close(ch)
-	return ch
-}()
+// Reached is a channel closed once storage has n entries.
+func (w *Writer) Reached(n uint64) <-chan struct{} { return w.written.Reached(n) }
 
 // AppendFile queues one LTX file, a range of a log. The writer reads it through
 // a dup of the log, one for all the files of that log in the same segment, and
@@ -370,7 +254,7 @@ func (w *Writer) AppendFile(name shard.Name, generation shard.Gen, position pos.
 }
 
 // Flush asks for the entries queued so far to be written, as one segment if
-// none of them is on its way yet, and returns once they are in the record. If
+// none of them is on its way yet, and returns once they are in storage. If
 // ctx ends first, Flush returns its error and the uploader goes on: a queued
 // entry is never dropped. Only a fence (somebody else's segment under a
 // segment's number) or the end of Serve fails the entries, and Flush then
@@ -382,18 +266,18 @@ func (w *Writer) Flush(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if w.Written(StoreRecord) >= target {
+	if w.Written() >= target {
 		return nil
 	}
 	w.kick.Kick()
 	select {
-	case <-w.Reached(StoreRecord, target):
+	case <-w.Reached(target):
 		return nil
 	case <-w.done: // fenced or closed
 	case <-ctx.Done():
 		return context.Cause(ctx)
 	}
-	if w.Written(StoreRecord) >= target {
+	if w.Written() >= target {
 		return nil
 	}
 	w.mu.Lock()
@@ -406,31 +290,20 @@ func (w *Writer) Flush(ctx context.Context) error {
 
 func (w *Writer) String() string { return "writer" }
 
-// Serve is the writer's service: the record's uploader, which writes the
-// segments one at a time and in order, and the local store's and the peer's
-// uploaders, which run beside it. It returns once ctx ends, giving up the
-// segment it is writing, or once the writer is fenced. Either way the
-// uploaders end with it (the batch files are theirs too), and the writer is
+// Serve is the writer's service: the storage uploader, which writes the
+// segments one at a time and in order. It returns once ctx ends, giving up the
+// segment it is writing, or once the writer is fenced. Either way the writer is
 // closed for good.
 func (w *Writer) Serve(ctx context.Context) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	g, gctx := errgroup.WithContext(ctx)
-	g.Go(func() error { return w.servePeer(gctx) })
-	if local := w.stores[StoreLocal]; local != nil {
-		g.Go(func() error { return w.serveLocal(gctx, local) })
-	}
-	err := w.serveRecord(gctx)
-	cancel() // the local store's and the peer's uploaders end with it
-	g.Wait()
+	err := w.serveBlob(ctx)
 	w.close()
 	close(w.done)
 	return err
 }
 
-// serveRecord is the record's uploader: each wake-up writes whatever is queued
+// serveBlob is the storage uploader: each wake-up writes whatever is queued
 // as one segment.
-func (w *Writer) serveRecord(ctx context.Context) error {
+func (w *Writer) serveBlob(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -440,20 +313,6 @@ func (w *Writer) serveRecord(ctx context.Context) error {
 		if !w.writeNext(ctx) {
 			return nil
 		}
-	}
-}
-
-// serveLocal is the local store's uploader: it writes the batches the record's
-// uploader made, one at a time and in order. It is the writer's second
-// goroutine, and the local store's acknowledgement waits for it and never for
-// the record's.
-func (w *Writer) serveLocal(ctx context.Context, local *store) error {
-	for {
-		b := local.queue.pop(ctx)
-		if b == nil {
-			return nil
-		}
-		w.writeLocal(ctx, local, b)
 	}
 }
 
@@ -481,24 +340,10 @@ func (w *Writer) writeNext(ctx context.Context) bool {
 		return false
 	}
 	b := &batch{seq: seq, body: body, files: pending, held: hold, count: uint64(len(pending))}
-	// The write id is the peer's too: what the peer stores is the owner's own
-	// attempt, and an adoption's fetch copying it back into the record reads
-	// as one (docs/internals.md, Takeover).
-	b.id = w.stores[StoreRecord].journal.NewWriteID()
+	b.id = w.storage.NewWriteID()
 	w.mu.Lock()
 	w.batches = append(w.batches, b)
 	w.mu.Unlock()
-	// The peer takes the batch as it is built, on the writer's queue: a slow
-	// or dead peer never holds the record's write, and never holds another.
-	w.built.Store(uint64(seq))
-	w.queuePeer(b)
-	// The local copy is written beside the record's, out of the same body. The
-	// queue is unbounded, so a slow disk never holds the record's write.
-	if local := w.stores[StoreLocal]; local != nil {
-		local.queue.push(b)
-	} else {
-		b.localDone.Store(true) // there is no local side to wait for
-	}
 	err = w.send(ctx, seq, body, b.id)
 	switch {
 	case err == nil:
@@ -515,7 +360,7 @@ func (w *Writer) writeNext(ctx context.Context) bool {
 	w.seq++
 	w.mu.Unlock()
 	w.flushes.Add(1)
-	w.finish(b, StoreRecord, ctx)
+	w.finish(b)
 	return true
 }
 
@@ -528,7 +373,7 @@ func (w *Writer) build(ctx context.Context, seq pos.Seg, pending []pendingEntry)
 		if err == nil {
 			return body, nil
 		}
-		w.opts.Logger.Error("building a segment failed, will keep trying", "node", w.stores[StoreRecord].journal.Name(), "segment", seq, "err", err)
+		w.opts.Logger.Error("building a segment failed, will keep trying", "node", w.storage.Name(), "segment", seq, "err", err)
 		if err := sleep(ctx, backoff); err != nil {
 			return nil, err
 		}
@@ -562,111 +407,13 @@ func (w *Writer) compose(pending []pendingEntry) (*body, error) {
 	return &body{files: files, footer: fb, tail: tail, size: off + int64(len(fb)+len(tail))}, nil
 }
 
-// writeLocal writes one batch to the node's own disk, retrying a transient
-// failure as the record's uploader does: a slow disk holds the local store's
-// answers and never the record's write. A store that refuses a segment takes
-// the tier down (LocalDown): the answers waiting on it fail rather than be
-// given a weaker one, and nothing counts in the store's counter that the
-// store did not take.
-func (w *Writer) writeLocal(ctx context.Context, local *store, b *batch) {
-	id := local.journal.NewWriteID()
-	backoff := w.opts.Retry
-	for {
-		err := local.journal.CreateWithID(ctx, b.seq, b.body, id)
-		if err == nil {
-			b.localWritten.Store(true)
-			w.finish(b, StoreLocal, ctx)
-			return
-		}
-		if ctx.Err() != nil {
-			w.dropLocal(b) // the writer is stopping: nothing is owed
-			return
-		}
-		if !blob.Transient(err) {
-			w.opts.Logger.Error("the local store refused a segment, the local store is down and the answers waiting on it fail",
-				"segment", b.seq, "err", err)
-			local.downOnce.Do(func() { close(local.down) })
-			w.dropLocal(b)
-			return
-		}
-		if err := sleep(ctx, backoff); err != nil {
-			w.dropLocal(b)
-			return
-		}
-		backoff = min(backoff*2, 40*w.opts.Retry)
-	}
-}
-
-// dropLocal finishes the batch's local side without counting it: the store
-// never took the segment, and the counter is the gate's warrant that it did.
-func (w *Writer) dropLocal(b *batch) {
-	b.localDone.Store(true)
-	w.tryDrop(b)
-}
-
-// finish marks one store's side of a batch as done and counts what it has
-// written. When the record's, the local store's and the peer's sides are
-// done, the files the batch is made of are closed and the batch is forgotten.
-// The local copy goes earlier, once the record has the segment.
-func (w *Writer) finish(b *batch, s Store, ctx context.Context) {
-	switch s {
-	case StoreRecord:
-		b.recordDone.Store(true)
-	case StoreLocal:
-		b.localDone.Store(true)
-	case StoreNone:
-		panic("segment: no store to finish a batch in")
-	}
-	if b.allDone() && b.dropped.CompareAndSwap(false, true) {
-		// The files are read by every store the batch was sent to, so they
-		// stay open until the last of them is done with the batch.
-		b.held.close()
-	}
-	// The counter: the gates wait for it, so it comes after the files are
-	// closed and before the local copy is dropped.
-	switch s {
-	case StoreRecord:
-		w.stores[StoreRecord].written.Add(b.count)
-	case StoreLocal:
-		w.stores[StoreLocal].written.Add(b.count)
-	case StoreNone:
-		panic("segment: no store to count a batch in")
-	}
-	if b.recordDone.Load() && b.localDone.Load() {
-		if local := w.stores[StoreLocal]; local != nil && b.localWritten.Load() {
-			// The local copy goes once the record has the segment: while the
-			// record's write is in flight, the local copy is the only one. It
-			// does not wait for the peer.
-			if err := local.journal.Delete(ctx, b.seq); err != nil && ctx.Err() == nil {
-				w.opts.Logger.Warn("could not drop the local copy of a segment", "segment", b.seq, "err", err)
-			}
-		}
-		w.tryDrop(b)
-	}
-}
-
-// allDone reports whether every side of the batch is finished: the record's,
-// the local store's, and the peer's. A peer that has fallen out counts as
-// finished there: it takes nothing more.
-func (b *batch) allDone() bool {
-	return b.recordDone.Load() && b.localDone.Load() && b.peerDone.Load()
-}
-
-// tryDrop closes a finished batch's files and forgets it.
-func (w *Writer) tryDrop(b *batch) {
-	if !b.allDone() {
-		return
-	}
+// finish drops a batch storage has: its files are closed and it is forgotten,
+// and what it held is counted, which the gates wait for, once the files are
+// closed.
+func (w *Writer) finish(b *batch) {
 	b.closeFiles()
 	w.forget(b)
-}
-
-// peerFinished marks the batch's peer side finished: written there, fallen
-// out, or given up as the writer stopped. It drops the batch when this was
-// the last side waiting for it.
-func (w *Writer) peerFinished(b *batch) {
-	b.peerDone.Store(true)
-	w.tryDrop(b)
+	w.written.Add(b.count)
 }
 
 // forget drops a batch from the writer's list of the ones in flight.
@@ -687,7 +434,7 @@ func (w *Writer) forget(b *batch) {
 func (w *Writer) send(ctx context.Context, seq pos.Seg, body *body, id blob.WriteID) error {
 	backoff := w.opts.Retry
 	for {
-		err := w.stores[StoreRecord].journal.CreateWithID(ctx, seq, body, id)
+		err := w.storage.CreateWithID(ctx, seq, body, id)
 		if err == nil || errors.Is(err, blob.ErrExists) {
 			return err
 		}
@@ -698,7 +445,7 @@ func (w *Writer) send(ctx context.Context, seq pos.Seg, body *body, id blob.Writ
 			// Retrying won't fix this (a bad key, no permission), but the segment
 			// can't be given up either: its commits are in nobody else's hands.
 			w.opts.Logger.Error("segment upload failed with an error retrying cannot fix, will keep trying",
-				"node", w.stores[StoreRecord].journal.Name(), "segment", seq, "err", err)
+				"node", w.storage.Name(), "segment", seq, "err", err)
 		}
 		if err := sleep(ctx, backoff); err != nil {
 			return err
@@ -752,8 +499,7 @@ func (w *Writer) close() {
 	}
 	w.closePending()
 	w.pending = nil
-	// The batches in flight: their files are closed. Their local copies stay:
-	// the record may or may not have them, and the next start lands the tail.
+	// The batches in flight: their files are closed.
 	for _, b := range w.batches {
 		b.closeFiles()
 	}

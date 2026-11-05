@@ -2,6 +2,7 @@ package node
 
 import (
 	"fmt"
+	"github.com/luci1900/shardlite/internal/apptest"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -37,7 +38,7 @@ func post(t *testing.T, nd *clusterNode, target, body string) (*http.Response, s
 // it again. The shard's kind needs a short idle timeout.
 func moveShard(t *testing.T, from, to *clusterNode, target string) {
 	t.Helper()
-	eventually(t, target+" to go idle on "+string(from.env.Name), func() bool { return !from.m.Load().IsActive(shardName(target)) })
+	apptest.Eventually(t, apptest.Timeout, target+" to go idle on "+string(from.env.Name), func() bool { return !from.m.Load().IsActive(shardName(target)) })
 	to.create(target) // it held nothing, so it was deleted when it went idle
 	ask(t, to, target)
 }

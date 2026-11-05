@@ -25,20 +25,13 @@ import (
 type journalRef struct {
 	seq   pos.Seg
 	entry segment.Entry
-	// store is where the entry's file is read from, nil for the index's own:
-	// the entries the journal read took from the peer's copy of a segment the
-	// record never had are read there.
-	store *journal.Store
 }
 
 // JournalIndex lists which segment entries belong to which shard. It carries
-// the store of the journal it read, so its tail is read from the same place,
-// and the numbers the journal holds as fences, where a peer may hold the
-// segment a fence took the number of (ReadJournal).
+// the store of the journal it read, so its tail is read from the same place.
 type JournalIndex struct {
 	store   *journal.Store
 	byShard map[shard.Name][]journalRef
-	fences  []pos.Seg
 }
 
 // LoadLeasedJournal reads the footers of a node's segments from the start of the
@@ -62,24 +55,11 @@ func (f *Files) LoadLeasedJournal(ctx context.Context, node cluster.Node) (*Jour
 // (segment.Scan).
 func (f *Files) LoadJournal(ctx context.Context, node cluster.Node, from, to pos.Seg) (*JournalIndex, error) {
 	idx := &JournalIndex{store: f.Journal(node), byShard: map[shard.Name][]journalRef{}}
-	read := map[pos.Seg]bool{} // numbers that had entries
 	err := segment.Scan(ctx, idx.store, from, to, func(seq pos.Seg, e segment.Entry) error {
-		read[seq] = true
 		idx.byShard[e.Shard] = append(idx.byShard[e.Shard], journalRef{seq: seq, entry: e})
 		return nil
 	})
-	if err != nil || to == 0 {
-		return idx, err
-	}
-	// A bounded scan fails on a missing number, so a number in the range
-	// without entries is a fence: the numbers where a takeover of this journal
-	// happened, and where its dead writer's last segment may sit on the peer.
-	for seq := from; seq <= to; seq++ {
-		if !read[seq] {
-			idx.fences = append(idx.fences, seq)
-		}
-	}
-	return idx, nil
+	return idx, err
 }
 
 // tail reads the shard's entries of generation that follow position from, in
@@ -119,11 +99,7 @@ func (idx *JournalIndex) tail(ctx context.Context, f *Files, n shard.Name, gener
 			}
 			tail.Logs = []*tempfile.Log{log}
 		}
-		store := idx.store
-		if ref.store != nil {
-			store = ref.store
-		}
-		body, err := segment.ReadEntryInto(ctx, store, ref.seq, e, tail.Logs[0])
+		body, err := segment.ReadEntryInto(ctx, idx.store, ref.seq, e, tail.Logs[0])
 		if err != nil {
 			tail.Close()
 			return capture.TailFiles{}, err

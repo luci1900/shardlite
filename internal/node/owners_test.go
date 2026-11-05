@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"errors"
+	"github.com/luci1900/shardlite/internal/apptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -116,7 +117,7 @@ func TestStoppedOwnersEntriesAreForgotten(t *testing.T) {
 		ask(t, n1, shard) // cached as n0's on n1
 	}
 	n0.Stop()
-	eventually(t, "n1 to forget n0's shards", func() bool { return n1.m.Load().owners.Len() == 0 })
+	apptest.Eventually(t, apptest.Timeout, "n1 to forget n0's shards", func() bool { return n1.m.Load().owners.Len() == 0 })
 	for _, shard := range []string{"test.users/g", "test.users/h"} {
 		n1.create(shard) // n0's held nothing, so they were deleted when it stopped
 		if resp, body := post(t, n1, shard, ""); resp.StatusCode != 200 || resp.Header.Get("X-Served-By") != "n1" {

@@ -3,14 +3,12 @@ package node
 import (
 	"path/filepath"
 	"testing"
-
-	"github.com/luci1900/shardlite/internal/localdb"
 )
 
 // testDB opens a local database in a temporary directory.
-func testDB(t *testing.T) *localdb.DB {
+func testDB(t *testing.T) *LocalDB {
 	t.Helper()
-	db, err := localdb.Open(filepath.Join(t.TempDir(), localdb.Name))
+	db, err := makeLocalDB(filepath.Join(t.TempDir(), LocalDBName))
 	if err != nil {
 		t.Fatal(err)
 	}

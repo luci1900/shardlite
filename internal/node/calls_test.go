@@ -213,7 +213,7 @@ func TestCallsThatAreNotGated(t *testing.T) {
 		io.WriteString(w, "ok")
 	})
 	r.commitTo("test.users/ng1")  // the none tier: the call waits for nothing
-	r.commitTo("test.wallet/ng2") // the record's, and the header can name the record's again
+	r.commitTo("test.wallet/ng2") // storage's, and the header can name storage again
 	do := func(caller string, hdr map[string]string) {
 		h := map[string]string{"Shardlite-Target": "test.slow/ng", "Shardlite-Caller": caller}
 		for k, v := range hdr {
@@ -255,7 +255,7 @@ func TestCallsThatAreNotGated(t *testing.T) {
 	if calls.Load() != 4 {
 		t.Fatalf("%d calls reached the callee", calls.Load())
 	}
-	// ...and a none-tier caller can ask for the record on the call.
+	// ...and a none-tier caller can ask for storage on the call.
 	done := make(chan struct{})
 	go func() { do("test.users/ng1", map[string]string{"Shardlite-Sync": "storage"}); close(done) }()
 	cyclesUntil(r, done)

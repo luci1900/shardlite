@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/luci1900/shardlite/internal/apptest"
 	"io"
 	"net"
 	"net/http"
@@ -97,7 +98,7 @@ func TestGateOnResponses(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Fatalf("status %d", resp.StatusCode)
 	}
-	// Shardlite-Sync: storage on a none kind waits for the record.
+	// Shardlite-Sync: storage on a none kind waits for blob storage.
 	r.withCycles(func() {
 		r.req("POST", r.pub, "/w?sync=storage", map[string]string{"Shardlite-Target": "test.users/g2"}, "")
 	})
@@ -126,10 +127,15 @@ func TestGateOnResponses(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("Shardlite-Sync: maybe answered %d, want %d", resp.StatusCode, http.StatusBadRequest)
 	}
+	// So is the tier that was dropped.
+	resp, _ = r.req("POST", r.pub, "/w?sync=peer", map[string]string{"Shardlite-Target": "test.users/g2"}, "")
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("Shardlite-Sync: peer answered %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
 }
 
-// The none tier: the answer waits for nothing, not for a cycle and not for the
-// record. The record's write is held back here, and no cycle runs, so an
+// The none tier: the answer waits for nothing, not for a cycle and not for
+// storage. The write to storage is held back here, and no cycle runs, so an
 // answer that waited for either would never come.
 func TestNoneTierWaitsForNothing(t *testing.T) {
 	t.Parallel()
@@ -160,12 +166,12 @@ func TestNoneTierWaitsForNothing(t *testing.T) {
 		}
 	})
 	if rows := r.rows("test.users/none"); rows != 0 {
-		t.Fatalf("the record had %d rows: the write was not held back", rows)
+		t.Fatalf("storage had %d rows: the write was not held back", rows)
 	}
-	// The commit still reaches the record once a cycle runs.
+	// The commit still reaches storage once a cycle runs.
 	letGo()
 	r.cycle()
-	eventually(r.t, "the record to hold the commit", func() bool { return r.rows("test.users/none") == 1 })
+	apptest.Eventually(r.t, apptest.Timeout, "storage to hold the commit", func() bool { return r.rows("test.users/none") == 1 })
 }
 
 func TestGateOnStreams(t *testing.T) {
@@ -244,7 +250,7 @@ func TestGateOnUpgradedConnections(t *testing.T) {
 }
 
 // A call to another shard is bytes leaving the caller: the caller's node holds it
-// until what the caller committed is durable, if the caller's kind has sync on.
+// until what the caller committed is durable, if the caller's kind is on the `storage` tier.
 func TestGateOnCalls(t *testing.T) {
 	t.Parallel()
 	r := newSRigWith(t, manualFlush)
@@ -283,7 +289,7 @@ func TestGateOnCalls(t *testing.T) {
 		t.Fatalf("the callee got the call when blob storage had %d of the caller's rows", seen.Load())
 	}
 	// A none-tier caller: the call waits for nothing, and the header can ask
-	// for the record.
+	// for storage.
 	seen.Store(0)
 	r.withCycles(func() {
 		r.req("POST", r.pub, "/go?callsync=storage", map[string]string{"Shardlite-Target": "test.users/call"}, "")
@@ -314,7 +320,7 @@ func TestSyncEndpointAndLeaseLoss(t *testing.T) {
 	if _, err := other.Acquire(context.Background(), coord.NodeInfo{Name: "n1"}); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, "the lease to be lost", func() bool { return r.n.Keeper.Check() != nil })
+	apptest.Eventually(t, apptest.Timeout, "the lease to be lost", func() bool { return r.n.Keeper.Check() != nil })
 	if resp, _ := r.req("POST", r.ctl, "/_shardlite/sync", nil, ""); resp.StatusCode != 503 {
 		t.Fatalf("sync after the lease was lost: %d", resp.StatusCode)
 	}
@@ -352,7 +358,7 @@ func TestCreationOverHTTP(t *testing.T) {
 		t.Fatal(resp.StatusCode)
 	}
 	// Once idle, the shard that was only read is deleted and the written one is kept.
-	eventually(t, "idle deactivation", func() bool { return len(r.m.Active()) == 0 })
+	apptest.Eventually(t, apptest.Timeout, "idle deactivation", func() bool { return len(r.m.Active()) == 0 })
 	if _, err := r.manifest("test.users/read"); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("a shard that was only read was kept: %v", err)
 	}
@@ -382,12 +388,12 @@ func TestGatesCheckTheLease(t *testing.T) {
 		}
 		io.WriteString(w, "data: 2\n\n")
 	})
-	targets := []string{"test.wallet/l1", "test.slow/l2"} // sync on and off
+	targets := []string{"test.wallet/l1", "test.slow/l2"} // `storage` and `none`
 	for _, target := range targets {
 		if resp, _ := r.req("GET", r.pub, "/", map[string]string{"Shardlite-Target": target}, ""); resp.StatusCode != 200 {
 			t.Fatalf("%s: %d", target, resp.StatusCode)
 		}
-		eventually(t, "the shard to be captured", func() bool { return !r.shard(target).cap.hasNewFrames() })
+		apptest.Eventually(t, apptest.Timeout, "the shard to be captured", func() bool { return !r.shard(target).cap.hasNewFrames() })
 	}
 	q, _ := http.NewRequest("GET", r.pub+"/events", nil)
 	q.Header.Set("Shardlite-Target", "test.slow/l3")

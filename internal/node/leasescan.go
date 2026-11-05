@@ -71,7 +71,6 @@ type leaseScan struct {
 	log     *slog.Logger
 	scans   *notify.Counter // listings made, for tests
 	adopted *notify.Counter // adoptions finished, for tests
-	mirror  *mirrorDialer   // dials the dead node's mirrors, for the fetch before the fence
 	// died, if set, is told each node a listing first shows dead (Catalog.died).
 	died func(node cluster.Node)
 
@@ -286,10 +285,7 @@ func (s *leaseScan) adopt(ctx context.Context, x cluster.Node, w *leaseWatch) {
 		return
 	}
 	s.log.Info("adopting a dead node", "node", x, "epoch", l.Epoch, "readopted", l.AdoptedBy != nil)
-	// The fetch (docs/internals.md, Takeover): the peer is asked before
-	// the fence is written, inside AdoptJournal, since a fence over a number a
-	// peer holds would strand what the cluster still has.
-	rep, err := s.files.AdoptJournal(ctx, x, l.JournalFrom, l.JournalNext, s.mirror.dial(ctx, x, l.Epoch, l.Peer, s.log), s.log)
+	rep, err := s.files.AdoptJournal(ctx, x, l.JournalFrom, l.JournalNext, s.log)
 	if err != nil {
 		if ctx.Err() == nil {
 			s.log.Error("adopting a dead node failed, it will be adopted again", "node", x, "epoch", l.Epoch, "err", err)

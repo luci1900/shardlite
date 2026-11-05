@@ -2,11 +2,14 @@ package node_test
 
 import (
 	"context"
+	"database/sql"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/coord"
@@ -41,7 +44,7 @@ func TestRestartAfterAnotherNodeAdoptedIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rep, err := files2.AdoptJournal(ctx, "n1", dead.JournalFrom, dead.JournalNext, nil, nil)
+	rep, err := files2.AdoptJournal(ctx, "n1", dead.JournalFrom, dead.JournalNext, nil)
 	if err != nil || rep.Deltas != 1 {
 		t.Fatalf("adoption by n2: %+v %v", rep, err)
 	}
@@ -135,5 +138,82 @@ func TestOwnAdoptionIsRecorded(t *testing.T) {
 	n := r.mustStart()
 	if l := n.Keeper.Lease(); l.Epoch != 2 || l.Adopted != 1 || l.AdoptedBy != nil {
 		t.Fatalf("lease after its own adoption: %+v", l)
+	}
+}
+
+// A restart adopts its own journal from storage alone: every commit storage
+// had stays, and one it did not have (its segment was still on its way when the
+// process died) is lost, with no disk copy to land it from.
+func TestRestartAdoptsFromStorageAlone(t *testing.T) {
+	t.Parallel()
+	r := newRig(t)
+	n1 := r.mustStart()
+	s := r.create(n1, "test.users/1")
+	r.commit(s, 3) // each sync waits for its segment in storage
+	publishRange(t, n1)
+	want := apptest.Dump(t, s.path)
+
+	// A fourth commit whose segment never reaches storage: the create stalls
+	// until the process dies.
+	var stalled atomic.Bool
+	held := make(chan struct{})
+	r.local.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if op == blobtest.OpCreate && !after && strings.HasPrefix(key, journal.Root) && stalled.Load() {
+			select {
+			case held <- struct{}{}:
+			default:
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return nil
+	})
+	stalled.Store(true)
+	r.app.Must(t, "insert", s.id, "2", "100")
+	go s.sh.Sync(context.Background())
+	select {
+	case <-held:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the fourth commit's segment never reached the store")
+	}
+	r.stops[n1]() // the process dies with the segment on its way
+	stalled.Store(false)
+
+	n2 := r.mustStart()
+	if n2.Adopted.Deltas != 1 {
+		t.Fatalf("the restart adopted %d deltas, want the one for the three commits in storage", n2.Adopted.Deltas)
+	}
+	if got := r.restoreDump(n2, "test.users/1"); got != want {
+		t.Fatalf("restored after the restart:\n%s\nwant the three commits storage had:\n%s", got, want)
+	}
+}
+
+// A start deletes the local database an older node left, journal tables and
+// all, and makes the cache index in a fresh one.
+func TestStartReplacesAnOldLocalDatabase(t *testing.T) {
+	t.Parallel()
+	r := newRig(t)
+	path := filepath.Join(r.dir, node.LocalDBName)
+	old, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		`CREATE TABLE segments (node TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (node, seq))`,
+		`INSERT INTO segments VALUES ('n1', 1)`,
+	} {
+		if _, err := old.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old.Close()
+
+	n := r.mustStart()
+	if _, err := n.LocalDB.Exec(`SELECT 1 FROM segments`); err == nil {
+		t.Fatal("the old journal table survived the start")
+	}
+	var rows int
+	if err := n.LocalDB.QueryRow(`SELECT count(*) FROM shards`).Scan(&rows); err != nil || rows != 0 {
+		t.Fatalf("the cache index has %d rows (%v), want a fresh empty one", rows, err)
 	}
 }

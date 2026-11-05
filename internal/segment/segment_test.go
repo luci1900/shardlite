@@ -23,7 +23,6 @@ import (
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/journal"
-	"github.com/luci1900/shardlite/internal/localdb"
 	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/service"
 	"github.com/luci1900/shardlite/internal/shard"
@@ -58,7 +57,7 @@ func testLTX(t testing.TB, txid ltx.TXID, fill byte) []byte {
 }
 
 // testStore is n1's journal store over a memory backend, with the blob store
-// that shapes the record by key and the backend's fault hook within reach.
+// that shapes blob storage by key and the backend's fault hook within reach.
 type testStore struct {
 	*journal.Store
 	B *blob.Store
@@ -172,84 +171,6 @@ func TestManyGoroutinesOneSegment(t *testing.T) {
 	if err := w.Flush(ctx); err != nil || w.Flushes() != 1 {
 		t.Fatalf("empty flush wrote a segment (flushes=%d err=%v)", w.Flushes(), err)
 	}
-}
-
-// localStore is the node's own disk as a journal's home: the local database
-// in a temporary directory.
-func localStore(t *testing.T) *journal.Store {
-	t.Helper()
-	db, err := localdb.Open(filepath.Join(t.TempDir(), localdb.Name))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { db.Close() })
-	return journal.NewStore(journal.NewLocal(db.DB, "n1"), "n1", 1, journal.Options{Backoff: time.Millisecond})
-}
-
-// The local copy is written beside the record's, out of the same body: a slow
-// record doesn't hold the local tier's acknowledgement, and the local copy
-// goes once the record has the segment.
-func TestLocalCopyIsWrittenBesideTheRecord(t *testing.T) {
-	t.Parallel()
-	store, ctx := newStore(t), context.Background()
-	local := localStore(t)
-	// The record's write is held back.
-	release := make(chan struct{})
-	held := make(chan struct{})
-	var once atomic.Bool
-	store.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
-		if op == blobtest.OpCreate && !after && once.CompareAndSwap(false, true) {
-			close(held)
-			select {
-			case <-release:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
-		return nil
-	})
-	w := NewWriter(store.Store, Options{Local: local})
-	serve(t, w)
-	mustAppend(t, w, "test.users/1", 1, testLTX(t, 1, 1))
-	go w.Flush(ctx)
-	select {
-	case <-held:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the record's write did not start")
-	}
-	// The local store has the segment while the record's write is held, and
-	// the counter the gate waits for has moved.
-	apptest.Eventually(t, 5*time.Second, "the local copy", func() bool {
-		info, err := local.Head(ctx, 1)
-		return err == nil && info.Size > 0
-	})
-	if w.Written(StoreLocal) != 1 {
-		t.Fatalf("the local store has %d entries, want 1", w.Written(StoreLocal))
-	}
-	if w.Written(StoreRecord) != 0 {
-		t.Fatalf("the record has %d entries, want none", w.Written(StoreRecord))
-	}
-	// The bytes are the same in both stores: the body is composed, not copied.
-	localBytes, err := io.ReadAll(mustGet(ctx, local, 1))
-	if err != nil {
-		t.Fatal(err)
-	}
-	close(release)
-	if err := w.Flush(ctx); err != nil {
-		t.Fatal(err)
-	}
-	recordBytes, err := io.ReadAll(mustGet(ctx, store.Store, 1))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(localBytes, recordBytes) {
-		t.Fatal("the local copy and the record's differ")
-	}
-	// The local copy goes once the record has the segment.
-	apptest.Eventually(t, 5*time.Second, "the local copy to go", func() bool {
-		_, err := local.Head(ctx, 1)
-		return errors.Is(err, blob.ErrNotFound)
-	})
 }
 
 // mustGet reads a segment whole.
@@ -979,41 +900,4 @@ func readRange(ctx context.Context, store *journal.Store, seq pos.Seg, off, n in
 	}
 	defer rc.Close()
 	return io.ReadAll(rc)
-}
-
-// A local store that refuses a segment takes the tier down: the counter the
-// gate waits for counts nothing the store did not take, LocalDown closes, and
-// the record's copy lands all the same.
-func TestARefusingLocalStoreTakesTheTierDown(t *testing.T) {
-	t.Parallel()
-	store, ctx := newStore(t), context.Background()
-	local := localStore(t)
-	// The local store's first number is taken by a create of another writer's:
-	// a segment this life can never put there, whatever it tries.
-	if err := local.Create(ctx, 1, bytes.NewReader([]byte("somebody else's"))); err != nil {
-		t.Fatal(err)
-	}
-	w := NewWriter(store.Store, Options{Local: local})
-	serve(t, w)
-	mustAppend(t, w, "test.users/1", 1, testLTX(t, 1, 1))
-	if err := w.Flush(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if w.Written(StoreRecord) != 1 {
-		t.Fatalf("the record has %d entries, want 1", w.Written(StoreRecord))
-	}
-	apptest.Eventually(t, 5*time.Second, "the local tier to go down", func() bool {
-		select {
-		case <-w.LocalDown():
-			return true
-		default:
-			return false
-		}
-	})
-	if w.Written(StoreLocal) != 0 {
-		t.Fatalf("the local store counts %d entries, want none of the refused segment", w.Written(StoreLocal))
-	}
-	if w.LocalReady() {
-		t.Fatal("the local tier is ready after a refusal")
-	}
 }

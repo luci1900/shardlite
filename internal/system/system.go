@@ -29,7 +29,7 @@ type System struct {
 	// it is never made inside Tx. A path under /_shardlite/ is one only the node
 	// may send.
 	Call func(ctx context.Context, req *http.Request) (*http.Response, error)
-	// Sync waits until what this shard has committed so far is in the record,
+	// Sync waits until what this shard has committed so far is in blob storage,
 	// whatever the kind's tier, and fails if the node has lost its lease, as the control API's sync does for
 	// an app, but for this shard's commits only: it returns at once when the
 	// shard has nothing new. A system app commits with Tx, then calls Sync before

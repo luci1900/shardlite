@@ -16,7 +16,6 @@ import (
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/cluster"
-	"github.com/luci1900/shardlite/internal/localdb"
 	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
@@ -50,9 +49,9 @@ type cache struct {
 }
 
 // open does what a start does to the data directory (clearCache), then opens
-// the cache index in the node's local database and empties it: a restart is
-// treated as a crash, so the index's rows would be stale.
-func (c *cache) open(opts CacheOptions, db *localdb.DB) error {
+// the cache index in the node's local database, which a start has just made
+// empty: a restart is treated as a crash, so the index's rows would be stale.
+func (c *cache) open(opts CacheOptions, db *LocalDB) error {
 	left, err := clearCache(c.data, c.log)
 	if err != nil {
 		return err
@@ -61,25 +60,16 @@ func (c *cache) open(opts CacheOptions, db *localdb.DB) error {
 		return errors.New("the node has no local database for the cache index")
 	}
 	c.idx = newIndex(db.DB)
-	if err := db.ClearIndex(context.Background()); err != nil {
-		return err
-	}
 	c.held, c.every = left, opts.Every
 	c.limit.Store(opts.Limit)
 	return nil
 }
 
-// indexName is the cache index's old file in the data directory, from before
-// the index and the journal shared one database. It is deleted at the first
-// start with the new layout: it holds nothing worth keeping.
-const indexName = ".index.db"
-
 // clearCache is what a start does to the data directory, after the node has
-// adopted its own journal: it deletes the old cache index (and its journal
-// files), the contents of the temporary directory and every shard file that no
+// adopted its own journal: it deletes the contents of the temporary directory and every shard file that no
 // process has open, so the node starts with an empty cache, as a new one
-// would. The index's rows are cleared with it, and the journal's rows are
-// kept: they hold the node's own acknowledged writes.
+// would. The index's rows go with it, the node's local database being made
+// again at every start.
 //
 // The index runs with synchronous=FULL and the apps' files with NORMAL, so
 // after an OS crash the index cannot be trusted to agree with the files or
@@ -91,14 +81,6 @@ const indexName = ".index.db"
 // cache loop looks at them again until the app has closed them, and activating
 // the shard meanwhile is refused (ErrAppHolds).
 func clearCache(data string, log *slog.Logger) (held map[string]shard.Name, err error) {
-	// The node's own old index database and its files: the WAL sidecars beside
-	// it, and the rollback journal of a time before WAL mode.
-	index := filepath.Join(data, indexName)
-	for _, p := range append(capture.WALSidecarsOf(index).Paths(), index, index+"-journal") {
-		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return nil, err
-		}
-	}
 	if ents, err := os.ReadDir(filepath.Join(data, tempDirName)); err == nil {
 		for _, e := range ents {
 			if err := os.RemoveAll(filepath.Join(data, tempDirName, e.Name())); err != nil {
@@ -107,7 +89,7 @@ func clearCache(data string, log *slog.Logger) (held map[string]shard.Name, err 
 		}
 	}
 	bases := map[string]bool{} // the database file of each set of shard files
-	local := filepath.Join(data, localdb.Name)
+	local := filepath.Join(data, LocalDBName)
 	localFiles := append(capture.WALSidecarsOf(local).Paths(), local, local+"-journal")
 	err = filepath.WalkDir(data, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -119,8 +101,7 @@ func clearCache(data string, log *slog.Logger) (held map[string]shard.Name, err 
 			}
 			return nil
 		}
-		// The node's local database is not a shard's file: it holds the
-		// journal's segments, which are kept.
+		// The node's local database is not a shard's file: the index.
 		if slices.Contains(localFiles, p) {
 			return nil
 		}

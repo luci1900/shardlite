@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"errors"
+	"github.com/luci1900/shardlite/internal/apptest"
 	"runtime"
 	"strings"
 	"sync"
@@ -236,7 +237,7 @@ func TestADeltaNeverDelaysARequest(t *testing.T) {
 		t.Fatal("a second delta started")
 	}
 	unblock()
-	eventually(t, "the delta", func() bool {
+	apptest.Eventually(t, apptest.Timeout, "the delta", func() bool {
 		m, err := r.manifest("test.wallet/dd1")
 		return err == nil && len(m.Files) > 0
 	})
@@ -356,7 +357,7 @@ func TestSnapshotsWaitForAPlace(t *testing.T) {
 					t.Fatal(err)
 				}
 				if settle {
-					eventually(t, "the tail to be in a delta", func() bool { n, _ := ref.a.cap.load().TailInfo(); return n == 0 })
+					apptest.Eventually(t, apptest.Timeout, "the tail to be in a delta", func() bool { n, _ := ref.a.cap.load().TailInfo(); return n == 0 })
 				}
 			}
 			commit(true)
@@ -391,7 +392,7 @@ func TestSnapshotsWaitForAPlace(t *testing.T) {
 			} else {
 				want++
 			}
-			eventually(t, "the "+name, func() bool { return files() == want })
+			apptest.Eventually(t, apptest.Timeout, "the "+name, func() bool { return files() == want })
 		})
 	}
 }
@@ -441,7 +442,7 @@ func TestShardsGoroutinesAreJoinedWhenTheyAreLetGo(t *testing.T) {
 	})
 	r.wakeHook.Store(&hook)
 	r.remind("test.slow/gj1", "k", time.Now().Unix())
-	eventually(t, "the wake to reach the app", func() bool {
+	apptest.Eventually(t, apptest.Timeout, "the wake to reach the app", func() bool {
 		rec.mu.Lock()
 		defer rec.mu.Unlock()
 		return len(rec.got) > 0

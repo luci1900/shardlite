@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"errors"
+	"github.com/luci1900/shardlite/internal/apptest"
 	"io"
 	"net/http"
 	"sync/atomic"
@@ -158,11 +159,11 @@ func TestSegmentConfirmsAWaitingAnswer(t *testing.T) {
 		resp.Body.Close()
 		done <- resp.StatusCode
 	}()
-	eventually(t, "the lease read to begin", func() bool { return reads.Load() == 1 })
+	apptest.Eventually(t, apptest.Timeout, "the lease read to begin", func() bool { return reads.Load() == 1 })
 	// Another shard's write makes the next cycle create a segment, after the
 	// read began its wait.
 	go r.req("POST", r.pub, "/w?write=1", map[string]string{"Shardlite-Target": "test.wallet/c2"}, "")
-	eventually(t, "the write to wait for a cycle", func() bool { return r.m.flush.waiting.Load() > 0 })
+	apptest.Eventually(t, apptest.Timeout, "the write to wait for a cycle", func() bool { return r.m.flush.waiting.Load() > 0 })
 	r.cycle()
 	select {
 	case code := <-done:

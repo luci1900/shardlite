@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"github.com/luci1900/shardlite/internal/apptest"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -201,7 +202,7 @@ func TestSystemShardIsClaimedAndMoves(t *testing.T) {
 
 	first.Stop()
 	waitRuns(t, p, 2, 2)
-	eventually(t, "the probe on the other node", func() bool { return other.m.Load().IsActive(shardName(probeShard)) })
+	apptest.Eventually(t, apptest.Timeout, "the probe on the other node", func() bool { return other.m.Load().IsActive(shardName(probeShard)) })
 
 	first.Start()
 	other.cycle() // the wake's commit is in the journal: the probe counts before the gate
@@ -429,7 +430,7 @@ func TestSystemSyncOff(t *testing.T) {
 	if _, err := other.Acquire(context.Background(), coord.NodeInfo{Name: "n1"}); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, "the lease to be lost", func() bool { return r.n.Keeper.Check() != nil })
+	apptest.Eventually(t, apptest.Timeout, "the lease to be lost", func() bool { return r.n.Keeper.Check() != nil })
 	sh := r.m.tab.load(shardName(shard)).a
 	if err := sh.gate(context.Background(), kind.SyncStorage, false); err == nil {
 		t.Fatal("System.Sync passed after the lease was lost")
@@ -514,7 +515,7 @@ func TestUnhealthyAppDoesNotStopSystemWakes(t *testing.T) {
 	nd.sick.Store(true)
 	waitRuns(t, p, 1, 1)
 	var st int
-	eventually(t, "the node to report not ready", func() bool {
+	apptest.Eventually(t, apptest.Timeout, "the node to report not ready", func() bool {
 		resp, err := http.Get("http://" + nd.Public + readyPath)
 		if err != nil {
 			return false
@@ -694,7 +695,7 @@ func TestSystemShardNewerThanTheNodeIsGivenUp(t *testing.T) {
 	// A stop leaves the newer node's name in the manifest, so an owner of none
 	// means the older node claimed the probe and gave it up.
 	newer.Stop()
-	eventually(t, "the probe claimed and given up by the older node", func() bool {
+	apptest.Eventually(t, apptest.Timeout, "the probe claimed and given up by the older node", func() bool {
 		m, _, err := shardfile.NewManifestStore(blob.NewStore(c.mem, "check", 1, blob.Options{})).Get(context.Background(), shardName(probeShard))
 		return err == nil && m.Owner == ""
 	})
@@ -709,5 +710,5 @@ func TestSystemShardNewerThanTheNodeIsGivenUp(t *testing.T) {
 
 	newer.Start()
 	waitRuns(t, p, 2, 2)
-	eventually(t, "the probe on the newer node", func() bool { return newer.m.Load().IsActive(shardName(probeShard)) })
+	apptest.Eventually(t, apptest.Timeout, "the probe on the newer node", func() bool { return newer.m.Load().IsActive(shardName(probeShard)) })
 }

@@ -22,7 +22,6 @@ import (
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/cluster"
 	"github.com/luci1900/shardlite/internal/coord"
-	"github.com/luci1900/shardlite/internal/journal"
 	"github.com/luci1900/shardlite/internal/kind"
 	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/shard"
@@ -106,10 +105,7 @@ type Server struct {
 	// upgrade over HTTP/1.1 on a connection of its own.
 	forwarder *httputil.ReverseProxy
 	peers     *http.Client // the node's own requests to other nodes (dispatches)
-	// mirror serves the journals this node mirrors for other nodes, on the
-	// peer listener (docs/internals.md, Node journals and snapshots).
-	mirror http.Handler
-	ready  *ready // a service of Run's: the poll of the app's ready route
+	ready     *ready       // a service of Run's: the poll of the app's ready route
 }
 
 // NewServer makes the node's servers. The app counts as unhealthy until its
@@ -158,13 +154,6 @@ func NewServer(m *Catalog, kinds *Kinds, keeper *coord.Keeper, opts ServerOption
 		FlushInterval:  -1,
 	}
 	s.peers = &http.Client{Transport: splitTransport{h1: h1, h2c: h2c, peer: true}}
-	// The mirror endpoints on the peer listener (docs/internals.md, Node
-	// journals and snapshots): the journals this node mirrors, from its local
-	// database. A server made without a catalog (the ready poll's tests)
-	// serves none.
-	if m != nil {
-		s.mirror = journal.NewMirrorHandler(&mirrorSource{db: m.n.LocalDB}, m.n.Files.Temp)
-	}
 	return s
 }
 
@@ -375,13 +364,6 @@ func (s *Server) PeerHandler(name cluster.Node) http.Handler {
 			s.serveDispatch(w, r)
 			return
 		}
-		// The journals this node mirrors: the node's own protocol, answered
-		// before the origin check like a dispatch (docs/internals.md, Node
-		// journals and snapshots). A server without a catalog serves none.
-		if s.mirror != nil && strings.HasPrefix(r.URL.Path, journal.MirrorPath) {
-			s.mirror.ServeHTTP(w, r)
-			return
-		}
 		o := origin{forwarded: true}
 		switch r.Header.Get(hdrOrigin) {
 		case originClient:
@@ -421,9 +403,6 @@ const (
 type NodeInfoReply struct {
 	Name  cluster.Node `json:"name"`
 	Epoch pos.Epoch    `json:"epoch"`
-	// Peer is the journal's peer as the writer sees it, nil when none is
-	// named (docs/internals.md, Node journals and snapshots).
-	Peer *PeerInfo `json:"peer,omitempty"`
 	// Clock is how the node's clock stands against the store's, nil when the
 	// node does not check it.
 	Clock *ClockInfo `json:"clock,omitempty"`
@@ -436,37 +415,19 @@ type ClockInfo struct {
 	Samples      int   `json:"samples"`
 	// Warning is set when the offset is over a second, either way.
 	Warning bool `json:"warning,omitempty"`
-	// Unsteady is set while the offset has moved by more than a clock of the
-	// right rate allows, and `none` and `peer` answers fail.
-	Unsteady bool `json:"unsteady,omitempty"`
 	// Blind is set when the store's responses carry no usable time.
 	Blind bool `json:"blind,omitempty"`
 }
 
-// PeerInfo is the journal's peer, as the writer sees it: its frontier, whether
-// it is in step with the writer, and whether it has fallen out. A `peer`
-// answer goes to the peer while it stands and fails when it does not; there is
-// no third place for it to go.
-type PeerInfo struct {
-	Node     cluster.Node `json:"node"`
-	Frontier pos.Seg      `json:"frontier"`
-	Out      bool         `json:"out,omitempty"`
-	CaughtUp bool         `json:"caught_up"`
-}
-
 // nodeRoute answers GET /_shardlite/node, on the peer listener for other
-// nodes and on the control API for whoever runs the node: who this node is,
-// the state of its journal's peer — its frontier, whether it is in step,
-// and whether it has fallen out — and how its clock stands against the store's.
+// nodes and on the control API for whoever runs the node: who this node is and
+// how its clock stands against the store's.
 func (s *Server) nodeRoute(w http.ResponseWriter, name cluster.Node) {
 	w.Header().Set("Content-Type", "application/json")
 	reply := NodeInfoReply{Name: name, Epoch: s.keeper.Lease().Epoch}
-	if s.m != nil {
-		reply.Peer = s.m.PeerInfo()
-	}
 	if c := s.opts.Clock; c != nil {
 		r := c.Report()
-		reply.Clock = &ClockInfo{OffsetMillis: r.Offset.Milliseconds(), Samples: r.Samples, Warning: r.Warning, Unsteady: r.Unsteady, Blind: r.Blind}
+		reply.Clock = &ClockInfo{OffsetMillis: r.Offset.Milliseconds(), Samples: r.Samples, Warning: r.Warning, Blind: r.Blind}
 	}
 	json.NewEncoder(w).Encode(reply)
 }
@@ -810,7 +771,7 @@ func (s *Server) gateCaller(r *http.Request, info *reqInfo) (*gate, error) {
 	return g, nil
 }
 
-// syncSetting applies a Shardlite-Sync override ("none", "peer" or "storage") to the
+// syncSetting applies a Shardlite-Sync override ("none" or "storage") to the
 // kind's tier. An unknown name is refused with a 400: copying the kind's tier
 // could quietly give less than what the app said, and the guide's status table
 // already fail a malformed Shardlite-* header.
@@ -1073,4 +1034,20 @@ func grpcMessage(s string) string {
 		}
 	}
 	return b.String()
+}
+
+// newPeerTransport is the transport of the node's requests to other nodes'
+// peer listeners: h2c, one multiplexed connection per pair of nodes, a dial
+// timeout so a peer that is down fails in seconds, and pings so a peer that
+// vanished without a FIN stops swallowing requests on its pooled connection.
+func newPeerTransport() *http.Transport {
+	t := &http.Transport{
+		DialContext:         (&net.Dialer{Timeout: dialTimeout}).DialContext,
+		DisableCompression:  true,
+		MaxIdleConnsPerHost: 256, IdleConnTimeout: 90 * time.Second,
+		HTTP2: &http.HTTP2Config{SendPingTimeout: h2cPingAfter, PingTimeout: h2cPingWait},
+	}
+	t.Protocols = new(http.Protocols)
+	t.Protocols.SetUnencryptedHTTP2(true)
+	return t
 }

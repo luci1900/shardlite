@@ -3,6 +3,7 @@ package node
 import (
 	"bytes"
 	"errors"
+	"github.com/luci1900/shardlite/internal/apptest"
 	"io"
 	"log/slog"
 	"net/http"
@@ -133,7 +134,7 @@ func TestClientsGet404ForDeletedShards(t *testing.T) {
 	}
 	gone := func(target string) {
 		t.Helper()
-		eventually(t, target+" deleted", func() bool {
+		apptest.Eventually(t, apptest.Timeout, target+" deleted", func() bool {
 			_, err := r.manifest(target)
 			return errors.Is(err, blob.ErrNotFound) && !r.m.IsActive(shardName(target))
 		})

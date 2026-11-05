@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/luci1900/shardlite/internal/apptest"
 	"net"
 	"net/http"
 	"strings"
@@ -134,7 +135,7 @@ func TestWebSocketThroughTheNode(t *testing.T) {
 		if err := c.Close(websocket.StatusCode(4001), "bye from the client"); err != nil {
 			t.Logf("close: %v", err) // the handshake may report the peer's reply
 		}
-		eventually(t, "the app to see the close", func() bool { codes, _ := closes(); return len(codes) > 0 })
+		apptest.Eventually(t, apptest.Timeout, "the app to see the close", func() bool { codes, _ := closes(); return len(codes) > 0 })
 		if codes, reasons := closes(); codes[0] != 4001 || reasons[0] != "bye from the client" {
 			t.Fatalf("the app saw %v %q", codes, reasons)
 		}
@@ -151,7 +152,7 @@ func TestWebSocketThroughTheNode(t *testing.T) {
 
 		c = dial(t, "e2e.wallet/s4")
 		c.Close(websocket.StatusNormalClosure, "")
-		eventually(t, "the app to see a normal close", func() bool {
+		apptest.Eventually(t, apptest.Timeout, "the app to see a normal close", func() bool {
 			codes, _ := closes()
 			return len(codes) > 0 && codes[len(codes)-1] == 1000
 		})
@@ -175,7 +176,7 @@ func TestWebSocketThroughTheNode(t *testing.T) {
 		mu.Lock()
 		raw.Close() // gone, with no closing handshake
 		mu.Unlock()
-		eventually(t, "the app to see the connection end", func() bool { return s.appDebug().WSEnded > before })
+		apptest.Eventually(t, apptest.Timeout, "the app to see the connection end", func() bool { return s.appDebug().WSEnded > before })
 		cl := s.appDebug().WSClose
 		if rec := cl[len(cl)-1]; rec.Shard != "e2e.wallet/s5" || rec.Code != -1 {
 			t.Fatalf("the app saw %+v, want an end without a close frame", rec)
@@ -198,7 +199,7 @@ func TestWebSocketThroughTheNode(t *testing.T) {
 		if err := c.Close(websocket.StatusCode(4003), "bye through the relay"); err != nil {
 			t.Logf("close: %v", err) // the handshake may report the peer's reply
 		}
-		eventually(t, "the app to see the close", func() bool {
+		apptest.Eventually(t, apptest.Timeout, "the app to see the close", func() bool {
 			for _, rec := range s.appDebug().WSClose[before:] {
 				if rec.Shard == s8 && rec.Code == 4003 && rec.Reason == "bye through the relay" {
 					return true
@@ -246,6 +247,6 @@ func TestWebSocketThroughTheNode(t *testing.T) {
 			t.Fatalf("the shard lost its data: %q %v", n, err)
 		}
 		c.Close(websocket.StatusNormalClosure, "")
-		eventually(t, "the shard to deactivate after the WebSocket closed (its manifest goes)", func() bool { return !active("e2e.arena/s7") })
+		apptest.Eventually(t, apptest.Timeout, "the shard to deactivate after the WebSocket closed (its manifest goes)", func() bool { return !active("e2e.arena/s7") })
 	})
 }

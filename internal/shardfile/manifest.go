@@ -22,8 +22,8 @@ import (
 	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
-// Manifest is the per-shard record in blob storage (see docs/internals.md,
-// Manifest). Last owner and pin come with the cluster and pinning.
+// Manifest is the per-shard object in blob storage (see docs/internals.md,
+// Manifest).
 type Manifest struct {
 	Generation shard.Gen    `json:"generation"` // random, set at creation, part of the shard's object paths
 	Owner      cluster.Node `json:"owner"`      // the node allowed to write the shard, "" if released
@@ -215,7 +215,7 @@ func (f *Files) now() time.Time {
 
 func (f *Files) manifests() ManifestStore { return ManifestStore{f.Blob} }
 
-// Journal returns the store of one node's journal: the record's numbers behind
+// Journal returns the store of one node's journal: the segment numbers in blob storage behind
 // journal.Store, with this writer's write ids, so a lost response is
 // recognised as its own. The journal is the one named by node: this Files' own
 // (f.Node), or a dead one's being adopted or read for a restore.

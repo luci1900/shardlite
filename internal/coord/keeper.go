@@ -116,7 +116,7 @@ func (k *Keeper) Serve(ctx context.Context) error {
 	for {
 		until := k.validUntil(cur)
 
-		// Wake for the next renewal, or for expiry, whichever comes first.
+		// Wake for the next renewal or for expiry, whichever comes first.
 		wake, expire := time.NewTimer(delay), time.NewTimer(time.Until(until))
 		select {
 		case <-ctx.Done():

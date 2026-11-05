@@ -134,7 +134,7 @@ func (r *srig) startServer() {
 	var once sync.Once
 	r.stop = func() { once.Do(func() { cancel(); g.Wait() }) }
 	r.t.Cleanup(r.stop)
-	eventually(r.t, "the app to be seen as ready", func() bool { ok, _ := r.srv.Ready(); return ok })
+	apptest.Eventually(r.t, apptest.Timeout, "the app to be seen as ready", func() bool { ok, _ := r.srv.Ready(); return ok })
 }
 
 // declare changes what the fake app's ready route answers, as a new deploy of
@@ -581,7 +581,7 @@ func TestServerUpgrade(t *testing.T) {
 	}
 	conn.Close()
 	// Once it is closed the shard is free to go.
-	eventually(t, "the hold to be released", func() bool { return r.refs("test.slow/ws") == 0 })
+	apptest.Eventually(t, apptest.Timeout, "the hold to be released", func() bool { return r.refs("test.slow/ws") == 0 })
 }
 
 // The app's 1xx responses (103 Early Hints) are dropped: ReverseProxy would
@@ -817,7 +817,7 @@ func TestServerAppDown(t *testing.T) {
 	if resp, _ := r.req("POST", r.pub, "/x", map[string]string{"Shardlite-Target": "test.slow/d1", "Content-Type": "application/grpc"}, ""); resp.Header.Get("Grpc-Status") != "14" {
 		t.Fatalf("app down, grpc: %v", resp.Header)
 	}
-	eventually(t, "not ready", func() bool { ok, _ := r.srv.Ready(); return !ok })
+	apptest.Eventually(t, apptest.Timeout, "not ready", func() bool { ok, _ := r.srv.Ready(); return !ok })
 	if resp, _ := r.req("GET", r.pub, "/_shardlite/ready", nil, ""); resp.StatusCode != 503 {
 		t.Fatalf("ready with the app down: %d", resp.StatusCode)
 	}
@@ -827,26 +827,26 @@ func TestServerReadiness(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
 	ready := func() bool { ok, _ := r.srv.Ready(); return ok }
-	eventually(t, "ready", ready)
+	apptest.Eventually(t, apptest.Timeout, "ready", ready)
 
 	// The app answering 500: not ready, and the reason is on the ready route.
 	r.sick.Store(true)
-	eventually(t, "not ready while the app is sick", func() bool { return !ready() })
+	apptest.Eventually(t, apptest.Timeout, "not ready while the app is sick", func() bool { return !ready() })
 	if _, why := r.srv.Ready(); !strings.Contains(why, "500") {
 		t.Fatalf("why: %q", why)
 	}
 	r.sick.Store(false)
-	eventually(t, "ready again", ready)
+	apptest.Eventually(t, apptest.Timeout, "ready again", ready)
 
 	// A declaration that stops being valid: not ready, though the kinds of the
 	// last good declaration keep serving.
 	r.declare(`{"app": "test", "kinds": {broken`)
-	eventually(t, "not ready with a bad declaration", func() bool { return !ready() })
+	apptest.Eventually(t, apptest.Timeout, "not ready with a bad declaration", func() bool { return !ready() })
 	if _, err := r.kinds.Lookup("test.slow"); err != nil {
 		t.Fatal("kinds lost")
 	}
 	r.declare(testKinds)
-	eventually(t, "ready after the app declared itself again", ready)
+	apptest.Eventually(t, apptest.Timeout, "ready after the app declared itself again", ready)
 }
 
 // A kind that isn't public is reached by calls from the app only. A client that
@@ -856,7 +856,7 @@ func TestOnlyPublicKindsForClients(t *testing.T) {
 	r := newSRig(t)
 	r.create("test.users/1")
 	r.declare(`{"app": "test", "kinds": {"users": {"public": true, "sync": "none"}, "secret": {"sync": "none"}}}`)
-	eventually(t, "the new declaration", func() bool { _, err := r.kinds.Lookup("test.secret"); return err == nil })
+	apptest.Eventually(t, apptest.Timeout, "the new declaration", func() bool { _, err := r.kinds.Lookup("test.secret"); return err == nil })
 	r.app_(func(w http.ResponseWriter, q *http.Request) { io.WriteString(w, "ok") })
 
 	hidden, hbody := r.req("GET", r.pub, "/x", map[string]string{"Shardlite-Target": "test.secret/1"}, "")

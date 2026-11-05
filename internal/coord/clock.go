@@ -1,7 +1,6 @@
 package coord
 
 import (
-	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -25,26 +24,7 @@ const (
 	// clockWindow is how many recent samples the offset is the median of, and how
 	// many responses in a row without a time make the watch blind.
 	clockWindow = 5
-	// clockNoise is what two offsets can differ by with nothing wrong: each is
-	// good to half a second (the store's time has whole seconds), and each adds
-	// half its round trip.
-	clockNoise = time.Second
-	// clockRateMargin is the share of elapsed time that the node's clock and the
-	// store's may differ by: the lease's own margin, a fifth of the TTL.
-	clockRateMargin = 5 // as a divisor
-	// clockSteadyFor is how long the samples since a problem must span, with at
-	// least clockWindow of them, to show the offset steady again.
-	clockSteadyFor = 5 * time.Second
-	// clockHistory is how many anchors the watch compares a sample against, at
-	// least clockSpacing apart.
-	clockHistory = 32
-	clockSpacing = time.Second
 )
-
-// ErrClockUnsteady is the failure of the node's clock against the store's: the
-// offset moved by more than the noise and the margin allow, which a clock whose
-// rate is right and that has not stepped or paused never does.
-var ErrClockUnsteady = errors.New("coord: the node's clock and the store's disagree")
 
 // ClockReport is what a ClockWatch knows of the node's clock.
 type ClockReport struct {
@@ -57,10 +37,6 @@ type ClockReport struct {
 	Offset time.Duration
 	// Warning is whether the offset is over a second, either way.
 	Warning bool
-	// Unsteady is whether the offset moved by more than the noise and the 20%
-	// margin allow since an earlier sample (a rate that is off, a step, or a pause
-	// the monotonic clock did not count), and has not been steady since.
-	Unsteady bool
 	// Blind is whether the store's last responses carried no usable time, so the
 	// clock is not being checked at all.
 	Blind bool
@@ -69,35 +45,18 @@ type ClockReport struct {
 // ClockWatch checks the node's wall clock against the store's, from the samples
 // a backend takes of the responses it already gets (blob.ClockSample). It keeps
 // the latest few, and logs when the offset crosses a second and back, and when
-// the store stops giving a time. Its Sink is safe for concurrent use.
-//
-// The `none` and `peer` tiers rest on the node's clocks alone, and so the watch
-// is where a clock the guide rules out ("working clocks") gets noticed.
+// the store stops giving a time. It fails nothing: it is where an operator
+// learns of a clock the guide rules out ("working clocks"). Its Sink is safe
+// for concurrent use.
 type ClockWatch struct {
-	log  *slog.Logger
-	base time.Time // the watch's origin on both clocks, for the monotonic offsets
+	log *slog.Logger
 
-	mu       sync.Mutex
-	recent   [clockWindow]time.Duration // offsets, a ring filled up to samples
-	samples  int
-	warning  bool
-	missed   int // responses in a row without a usable time
-	blind    bool
-	lastMiss error
-
-	// The anchors a sample is compared with, and the run of steady samples since
-	// the last problem (the run only counts while unsteady).
-	history    []clockPoint
-	unsteady   bool
-	steady     int
-	steadyFrom time.Duration
-}
-
-// clockPoint is one sample's place on the node's monotonic clock (at, since the
-// watch began) and its offsets against the store's by the wall clock and by the
-// monotonic one, which differ by what the wall clock gained or lost.
-type clockPoint struct {
-	at, wall, mono, round time.Duration
+	mu      sync.Mutex
+	recent  [clockWindow]time.Duration // offsets, a ring filled up to samples
+	samples int
+	warning bool
+	missed  int // responses in a row without a usable time
+	blind   bool
 }
 
 // NewClockWatch returns a watch that logs to log (the default logger if nil).
@@ -105,7 +64,7 @@ func NewClockWatch(log *slog.Logger) *ClockWatch {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &ClockWatch{log: log, base: time.Now()}
+	return &ClockWatch{log: log}
 }
 
 // Sink is the blob.ClockSink that feeds the watch.
@@ -127,7 +86,6 @@ func (w *ClockWatch) Sink(s blob.ClockSample, err error) {
 // watch blind, so one odd response is not worth a log.
 func (w *ClockWatch) missLocked(err error) func() {
 	w.missed++
-	w.lastMiss = err
 	if w.missed < clockWindow || w.blind {
 		return nil
 	}
@@ -154,9 +112,6 @@ func (w *ClockWatch) sampleLocked(s blob.ClockSample) func() {
 	mid := s.Start.Add(round / 2) // keeps the monotonic reading
 	store := s.Store.Add(time.Second / 2)
 	offset := store.Sub(mid.Round(0))
-	p := clockPoint{at: mid.Sub(w.base), wall: offset, round: round}
-	p.mono = store.Sub(w.base.Round(0).Add(p.at))
-	say = chain(say, w.judgeLocked(p))
 	w.recent[w.samples%clockWindow] = offset
 	w.samples++
 	was := w.warning
@@ -171,67 +126,6 @@ func (w *ClockWatch) sampleLocked(s blob.ClockSample) func() {
 		say = chain(say, func() { w.log.Info("the node's clock is within a second of the store's again") })
 	}
 	return say
-}
-
-// judgeLocked compares a sample with the anchors. Any two offsets may differ by
-// the noise and a fifth of the time between them: more is a clock that is off in
-// rate, stepped, or paused where the monotonic clock did not count it. The
-// history then starts again from this sample, and the problem lasts until the
-// samples since show a steady offset for a while.
-func (w *ClockWatch) judgeLocked(p clockPoint) func() {
-	var say func()
-	if moved := w.movedLocked(p); moved != "" {
-		w.history, w.steady, w.steadyFrom = w.history[:0], 0, p.at
-		if !w.unsteady {
-			w.unsteady = true
-			say = func() {
-				w.log.Warn("the node's clock and the store's disagree: answers that rest on the clocks fail until the offset is steady", "moved", moved)
-			}
-		}
-	} else if w.unsteady {
-		w.steady++
-		if w.steady >= clockWindow && p.at-w.steadyFrom >= clockSteadyFor {
-			w.unsteady = false
-			say = func() { w.log.Info("the node's clock and the store's agree again") }
-		}
-	}
-	if n := len(w.history); n == 0 || abs(p.at-w.history[n-1].at) >= clockSpacing {
-		if n == clockHistory {
-			w.history = slices.Delete(w.history, 0, 1)
-		}
-		w.history = append(w.history, p)
-	}
-	return say
-}
-
-// movedLocked says how an anchor and p disagree, or "" if they do not.
-func (w *ClockWatch) movedLocked(p clockPoint) string {
-	for _, q := range w.history {
-		gap := abs(p.at - q.at)
-		allow := clockNoise + (p.round+q.round)/2 + gap/clockRateMargin
-		if d := abs(p.wall - q.wall); d > allow {
-			return fmt.Sprintf("offset by the wall clock %s in %s", d.Round(time.Millisecond), gap.Round(time.Millisecond))
-		}
-		if d := abs(p.mono - q.mono); d > allow {
-			return fmt.Sprintf("offset by the monotonic clock %s in %s", d.Round(time.Millisecond), gap.Round(time.Millisecond))
-		}
-	}
-	return ""
-}
-
-// Check returns ErrClockUnsteady (wrapped, with what moved) while the watch
-// reports that the node's clock and the store's disagree, and nil otherwise. A
-// nil watch checks nothing.
-func (w *ClockWatch) Check() error {
-	if w == nil {
-		return nil
-	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if !w.unsteady {
-		return nil
-	}
-	return ErrClockUnsteady
 }
 
 func chain(a, b func()) func() {
@@ -266,7 +160,7 @@ func abs(d time.Duration) time.Duration {
 func (w *ClockWatch) Report() ClockReport {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return ClockReport{Samples: w.samples, Offset: w.offsetLocked(), Warning: w.warning, Unsteady: w.unsteady, Blind: w.blind}
+	return ClockReport{Samples: w.samples, Offset: w.offsetLocked(), Warning: w.warning, Blind: w.blind}
 }
 
 // CheckStart refuses a node whose clock is more than a lease TTL from the

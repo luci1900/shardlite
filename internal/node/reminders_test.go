@@ -162,7 +162,7 @@ func (r *srig) settle(target string) {
 	if e == nil || e.a == nil || !e.is(entryActive) {
 		return
 	}
-	eventually(r.t, "the reminders loop of "+target+" to settle", func() bool { return loopSettled(e.a) })
+	apptest.Eventually(r.t, apptest.Timeout, "the reminders loop of "+target+" to settle", func() bool { return loopSettled(e.a) })
 }
 
 // cyclesUntil runs flush cycles until cond holds and returns how many it ran.
@@ -343,7 +343,7 @@ func TestActivatingAShardWithTheTableCommitsNothing(t *testing.T) {
 			path := ref.Path()
 			ref.Release()
 			r.closeInApp("test.users/t2")
-			eventually(t, "deactivation", func() bool { return r.cached("test.users/t2") })
+			apptest.Eventually(t, apptest.Timeout, "deactivation", func() bool { return r.cached("test.users/t2") })
 			if tc.purge {
 				row, ok, err := r.m.cache.idx.get(shardName("test.users/t2"))
 				if err != nil || !ok {
@@ -351,7 +351,7 @@ func TestActivatingAShardWithTheTableCommitsNothing(t *testing.T) {
 				}
 				// The entry of the shard's loop may still be in the table for a moment,
 				// and eviction leaves a shard with an entry alone.
-				eventually(t, "the eviction", func() bool {
+				apptest.Eventually(t, apptest.Timeout, "the eviction", func() bool {
 					evicted, err := r.m.cache.evict(context.Background(), row)
 					if err != nil {
 						t.Fatal(err)
@@ -396,7 +396,7 @@ func TestNeverWrittenWithTheReservedTable(t *testing.T) {
 	r := newSRig(t)
 	ref := r.acquire("test.users/t3")
 	ref.Release()
-	eventually(t, "idle deactivation", r.inactive("test.users/t3"))
+	apptest.Eventually(t, apptest.Timeout, "idle deactivation", r.inactive("test.users/t3"))
 	if _, err := r.rawManifest("test.users/t3"); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("manifest of a shard with only an empty reminders table: %v, want none", err)
 	}
@@ -408,7 +408,7 @@ func TestNeverWrittenWithTheReservedTable(t *testing.T) {
 	// drop them to leave only the reserved one.
 	r.sql("test.users/t5", `DROP TABLE kv; DROP TABLE acks`)
 	r.closeInApp("test.users/t5")
-	eventually(t, "deactivation", r.inactive("test.users/t5"))
+	apptest.Eventually(t, apptest.Timeout, "deactivation", r.inactive("test.users/t5"))
 	if _, err := r.rawManifest("test.users/t5"); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("a shard where the app left only the reserved table was kept: %v", err)
 	}
@@ -420,13 +420,13 @@ func TestNeverWrittenWithTheReservedTable(t *testing.T) {
 	// are the app's data.
 	r.sql("test.users/t4", `DROP TABLE kv; DROP TABLE acks; INSERT INTO _shardlite_reminders (key, due) VALUES ('old', unixepoch() - 999999)`)
 	r.closeInApp("test.users/t4")
-	eventually(t, "deactivation", func() bool { return r.cached("test.users/t4") })
+	apptest.Eventually(t, apptest.Timeout, "deactivation", func() bool { return r.cached("test.users/t4") })
 	if _, err := r.rawManifest("test.users/t4"); err != nil {
 		t.Fatalf("a shard holding a stale reminder was deleted: %v", err)
 	}
 	r.sql("test.users/t6", `DROP TABLE kv; DROP TABLE acks; INSERT INTO _shardlite_reminders (key, due) VALUES ('k', unixepoch() + 999999)`)
 	r.closeInApp("test.users/t6")
-	eventually(t, "deactivation", func() bool { return r.cached("test.users/t6") })
+	apptest.Eventually(t, apptest.Timeout, "deactivation", func() bool { return r.cached("test.users/t6") })
 	if _, err := r.rawManifest("test.users/t6"); err != nil {
 		t.Fatalf("a shard holding a reminder was deleted: %v", err)
 	}
@@ -466,7 +466,7 @@ func TestWakeIsAPostWithNoBody(t *testing.T) {
 	rec := &recorder{}
 	r.record(rec, "")
 	r.remind("test.users/ia1", "a", time.Now().Unix())
-	eventually(t, "the wake", func() bool { return rec.count() == 1 })
+	apptest.Eventually(t, apptest.Timeout, "the wake", func() bool { return rec.count() == 1 })
 	d := rec.all()[0]
 	if d.method != "POST" || d.body != "" || d.target != "test.users/ia1" || d.hdr.Get("Shardlite-Caller") != "test.users/ia1" || d.hdr.Get("Shardlite-File") == "" || d.hdr.Get("Shardlite-Target") != "" {
 		t.Fatalf("wake %+v", d)
@@ -492,8 +492,8 @@ func TestSeveralRemindersCauseOneWake(t *testing.T) {
 	}
 	stmt.WriteString("COMMIT;")
 	r.sql("test.users/b1", stmt.String())
-	eventually(t, "the wake", func() bool { return rec.count() >= 1 })
-	eventually(t, "the reminders to be handled", func() bool { return r.reminderRows("test.users/b1") == 0 })
+	apptest.Eventually(t, apptest.Timeout, "the wake", func() bool { return rec.count() >= 1 })
+	apptest.Eventually(t, apptest.Timeout, "the reminders to be handled", func() bool { return r.reminderRows("test.users/b1") == 0 })
 	r.settle("test.users/b1")
 	if rec.count() != 1 {
 		t.Fatalf("%d wakes for 620 reminders", rec.count())
@@ -553,7 +553,7 @@ func TestLostAcknowledgementOfTheWakeDoesNotRepeatTheWork(t *testing.T) {
 		inner(w, q)
 	})
 	r.remind("test.users/la2", "k", time.Now().Unix())
-	eventually(t, "the failed wake", func() bool { return r.m.Stats.ReminderWakeFailures.Load() >= 1 })
+	apptest.Eventually(t, apptest.Timeout, "the failed wake", func() bool { return r.m.Stats.ReminderWakeFailures.Load() >= 1 })
 	r.settle("test.users/la2")
 	if n := r.count("test.users/la2", `SELECT count(*) FROM kv`); n != 1 {
 		t.Fatalf("the work was done %d times", n)
@@ -605,7 +605,7 @@ func TestReminderResumesAfterACrash(t *testing.T) {
 	var up atomic.Bool
 	attempts := r.failUntil(&up)
 	r.remind("test.users/x1", "k", time.Now().Unix())
-	eventually(t, "a first attempt (the commit is durable by then)", func() bool { return attempts.Load() >= 1 })
+	apptest.Eventually(t, apptest.Timeout, "a first attempt (the commit is durable by then)", func() bool { return attempts.Load() >= 1 })
 	r.closeInApp("test.users/x1")
 	r.crash()
 	r.stopJournal()
@@ -621,8 +621,8 @@ func TestReminderResumesAfterACrash(t *testing.T) {
 	r.startShards(opts)
 	r.startServer()
 	up.Store(true)
-	eventually(t, "the wake after the restart, with nothing asking for the shard", func() bool { return rec.count() == 1 })
-	eventually(t, "the reminder to be handled", func() bool { return r.reminderRows("test.users/x1") == 0 })
+	apptest.Eventually(t, apptest.Timeout, "the wake after the restart, with nothing asking for the shard", func() bool { return rec.count() == 1 })
+	apptest.Eventually(t, apptest.Timeout, "the reminder to be handled", func() bool { return r.reminderRows("test.users/x1") == 0 })
 }
 
 // A reminder older than MaxAge is stale: it neither wakes the shard nor keeps
@@ -634,7 +634,7 @@ func TestStaleReminderIsIgnored(t *testing.T) {
 	r.record(rec, "")
 	r.sql("test.users/st1", fmt.Sprintf(`INSERT INTO _shardlite_reminders (key, due) VALUES ('old', %d)`, time.Now().Add(-25*time.Hour).Unix()))
 	r.closeInApp("test.users/st1")
-	eventually(t, "deactivation (a stale reminder does not hold the shard)", func() bool { return r.cached("test.users/st1") })
+	apptest.Eventually(t, apptest.Timeout, "deactivation (a stale reminder does not hold the shard)", func() bool { return r.cached("test.users/st1") })
 	if rec.count() != 0 {
 		t.Fatal("a stale reminder woke the shard")
 	}
@@ -653,7 +653,7 @@ func TestReplayedShardWithNothingToDeliverIsWokenAndLetGo(t *testing.T) {
 	opts := both(quick, withDispatch)
 	r := newSRigWith(t, opts)
 	r.sql("test.users/y1", `INSERT INTO kv (payload) VALUES (x'01')`)
-	eventually(t, "the commit to be durable", func() bool { return r.rows("test.users/y1") == 1 })
+	apptest.Eventually(t, apptest.Timeout, "the commit to be durable", func() bool { return r.rows("test.users/y1") == 1 })
 	r.sql("test.users/y1", `INSERT INTO kv (payload) VALUES (x'02')`) // only in the journal when the node dies
 	r.closeInApp("test.users/y1")
 	r.crash()
@@ -668,9 +668,9 @@ func TestReplayedShardWithNothingToDeliverIsWokenAndLetGo(t *testing.T) {
 	}
 	r.startShards(opts)
 	r.startServer()
-	eventually(t, "deactivation when idle", func() bool { return r.m.Stats.Activations.Load() > 0 && r.inactive("test.users/y1")() })
+	apptest.Eventually(t, apptest.Timeout, "deactivation when idle", func() bool { return r.m.Stats.Activations.Load() > 0 && r.inactive("test.users/y1")() })
 	// The deactivation finds no reminder, so it clears the next_reminder, with no delta.
-	eventually(t, "the next_reminder to go", func() bool { return r.nextReminder("test.users/y1") == 0 })
+	apptest.Eventually(t, apptest.Timeout, "the next_reminder to go", func() bool { return r.nextReminder("test.users/y1") == 0 })
 }
 
 // A restart that dies between a shard's entry and its delta leaves the entry in
@@ -684,7 +684,7 @@ func TestCrashBetweenTheEntryAndTheDeltaIsRepaired(t *testing.T) {
 	var up atomic.Bool
 	attempts := r.failUntil(&up)
 	r.remind("test.users/q1", "k", time.Now().Unix())
-	eventually(t, "a first attempt (the commit is durable by then)", func() bool { return attempts.Load() >= 1 })
+	apptest.Eventually(t, apptest.Timeout, "a first attempt (the commit is durable by then)", func() bool { return attempts.Load() >= 1 })
 	r.closeInApp("test.users/q1")
 	r.crash()
 	r.stopJournal()
@@ -714,10 +714,10 @@ func TestCrashBetweenTheEntryAndTheDeltaIsRepaired(t *testing.T) {
 	r.startShards(opts)
 	r.startServer()
 	up.Store(true)
-	eventually(t, "the reminder to be delivered", func() bool { return rec.count() == 1 })
-	eventually(t, "the reminder to be consumed", func() bool { return r.reminderRows("test.users/q1") == 0 })
+	apptest.Eventually(t, apptest.Timeout, "the reminder to be delivered", func() bool { return rec.count() == 1 })
+	apptest.Eventually(t, apptest.Timeout, "the reminder to be consumed", func() bool { return r.reminderRows("test.users/q1") == 0 })
 	r.closeInApp("test.users/q1") // the handler's delete opened the shard in the app again
-	eventually(t, "the next_reminder to go", func() bool { return r.cached("test.users/q1") && r.nextReminder("test.users/q1") == 0 })
+	apptest.Eventually(t, apptest.Timeout, "the next_reminder to go", func() bool { return r.cached("test.users/q1") && r.nextReminder("test.users/q1") == 0 })
 	r.settle("test.users/q1")
 	if rec.count() != 1 {
 		t.Fatalf("%d deliveries", rec.count())
@@ -738,7 +738,7 @@ func TestMarkedShardReminderSurvivesACrash(t *testing.T) {
 	attempts := r.failUntil(&up)
 	r.sql("test.lobby/e3", markSQL)
 	r.remind("test.lobby/e3", "k", time.Now().Unix())
-	eventually(t, "a first attempt", func() bool { return attempts.Load() >= 1 })
+	apptest.Eventually(t, apptest.Timeout, "a first attempt", func() bool { return attempts.Load() >= 1 })
 	r.closeInApp("test.lobby/e3")
 	r.crash()
 	r.stopJournal()
@@ -747,9 +747,9 @@ func TestMarkedShardReminderSurvivesACrash(t *testing.T) {
 	r.startShards(opts)
 	r.startServer()
 	up.Store(true)
-	eventually(t, "the wake after the restart", func() bool { return rec.count() >= 1 })
+	apptest.Eventually(t, apptest.Timeout, "the wake after the restart", func() bool { return rec.count() >= 1 })
 	r.closeInApp("test.lobby/e3") // the handler's delete opened the shard in the app again
-	eventually(t, "deletion", func() bool { return r.m.Stats.Deletes.Load() == 1 && !r.m.IsActive(shardName("test.lobby/e3")) })
+	apptest.Eventually(t, apptest.Timeout, "deletion", func() bool { return r.m.Stats.Deletes.Load() == 1 && !r.m.IsActive(shardName("test.lobby/e3")) })
 }
 
 // The reminders loop on its own: a SQLite database with the reserved table in
@@ -1091,7 +1091,7 @@ func TestEntryFailingBeforeAReleaseKeepsTheLoop(t *testing.T) {
 	due := time.Now().Add(time.Hour).Unix()
 	r.remind("test.users/hr1", "k", due)
 	r.closeInApp("test.users/hr1")
-	eventually(t, "a release to fail on the entry", func() bool {
+	apptest.Eventually(t, apptest.Timeout, "a release to fail on the entry", func() bool {
 		return strings.Contains(logs.String(), "could not deactivate an idle shard") && strings.Contains(logs.String(), "creating a reminder entry")
 	})
 	if !r.m.IsActive(shardName("test.users/hr1")) {
@@ -1104,7 +1104,7 @@ func TestEntryFailingBeforeAReleaseKeepsTheLoop(t *testing.T) {
 	default:
 	}
 	failing.Store(false)
-	eventually(t, "the next idle look to let go of the shard", func() bool { return r.cached("test.users/hr1") })
+	apptest.Eventually(t, apptest.Timeout, "the next idle look to let go of the shard", func() bool { return r.cached("test.users/hr1") })
 	if m, err := r.manifest("test.users/hr1"); err != nil || m.NextReminder != remindex.MinuteOf(due) {
 		t.Fatalf("manifest %+v (%v), want next_reminder %d", m, err, remindex.MinuteOf(due))
 	}
@@ -1142,7 +1142,7 @@ func TestShutdownJoinsEveryWakeBeforeLettingGo(t *testing.T) {
 	})
 	r.sql("test.slow/lj2", `INSERT INTO kv (payload) VALUES (x'01')`)
 	r.remind("test.slow/lj1", "k", time.Now().Unix())
-	eventually(t, "the wake to reach the app", func() bool {
+	apptest.Eventually(t, apptest.Timeout, "the wake to reach the app", func() bool {
 		rec.mu.Lock()
 		defer rec.mu.Unlock()
 		return len(rec.got) > 0

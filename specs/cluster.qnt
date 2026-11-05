@@ -28,10 +28,10 @@
 // the file set the rest.
 //
 // Tiers. The acknowledgement rides on one store: syncOn names which one the shard's kind said. With it on
-// (storage, the default), the gate holds an answer until the record's journal has everything, and ackedKept
+// (storage, the default), the gate holds an answer until the journal in storage has everything, and ackedKept
 // says what that is worth. The answer is also confirmed: `read` takes it from the node's file, and `confirm`
 // lets it go once a read of the node's lease shows its incarnation unmarked, or a segment of its journal has
-// landed since (confirmedFresh says what that is worth). With it off (none and peer) an acknowledgement sits on
+// landed since (confirmedFresh says what that is worth). With it off (the none tier) an acknowledgement sits on
 // the node alone and `respond` answers with nothing to confirm it, so the model says nothing about its loss and
 // the exhaustive check fixes sync on.
 //
@@ -41,7 +41,7 @@
 // Restarts. A restarting node adopts its own journal and starts its writer when the adoption finishes.
 //
 // The lifecycle of one node's shard (activation steps, the durability gate itself, the app holding the file
-// open) is shard.qnt, and the mirrors and their fetch are mirrors.qnt. Here a node is active, cached or idle,
+// open) is shard.qnt. Here a node is active, cached or idle,
 // and the gate is a guard on `respond`. Also left out: the interior of the database, deletion, messages,
 // forwarding, rebasing, renewals and sweeping the journal.
 //
@@ -333,7 +333,7 @@ module cluster {
   }
 
   // A client gets a response reflecting everything in the node's file, with nothing to confirm it: the none
-  // and peer tiers, which trust the clocks. (With sync on the answer is read and confirm below.)
+  // tier, which trusts the clocks. (With sync on the answer is read and confirm below.)
   action respond(n) = all {
     val ns = s.nodes.get(n)
     all {
@@ -571,8 +571,7 @@ module cluster {
 
   // Fence the journal at the first free number, above everything in it. A retry of a fence whose answer was
   // lost finds its own write id, so the adopter always learns the number. (An adopter that gives up and starts
-  // again fences again, which is harmless.) The mirrors' copy of the journal, which the fence must not strand
-  // below it, is mirrors.qnt.
+  // again fences again, which is harmless.)
   action fence(m) = all {
     val ad = s.adoptions.get(m)
     val j = segsOf(s, ad.target)
@@ -680,7 +679,7 @@ module cluster {
   // -- Scenarios
 
   // A zombie answers a read that leaves out a commit the shard's new owner acknowledged, on a tier with
-  // nothing to confirm it (sync off: none or peer). Node 0 owns the shard, commits and flushes, then its lease
+  // nothing to confirm it (sync off: none). Node 0 owns the shard, commits and flushes, then its lease
   // runs out while it carries on. Node 1 adopts it (fence, read, delta) and claims the shard, which the cleared
   // journal allows before the adoption finishes, then commits, flushes and acknowledges commit 2. Node 0 answers
   // from its file, which only has commit 1.

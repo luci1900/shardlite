@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"runtime"
 	"sync/atomic"
@@ -50,11 +51,10 @@ const (
 // and the cycle's capture has queued the commits before it. Which store the
 // chunk waits for is the kind's tier (docs/guide.md, Durability).
 type Flusher struct {
-	tab      *table            // the shards it syncs
-	writer   *segment.Writer   // the node's journal, flushed once per cycle
-	keeper   *coord.Keeper     // the lease, which an acknowledgement needs
-	clock    *coord.ClockWatch // nil when the node does not check its clock (Check passes then)
-	conf     *coord.Confirmer  // reads the lease, to confirm that the node still owns what it read
+	tab      *table           // the shards it syncs
+	writer   *segment.Writer  // the node's journal, flushed once per cycle
+	keeper   *coord.Keeper    // the lease, which an acknowledgement needs
+	conf     *coord.Confirmer // reads the lease, to confirm that the node still owns what it read
 	log      *slog.Logger
 	interval time.Duration
 	min      time.Duration // shortest time between two cycle starts
@@ -65,24 +65,14 @@ type Flusher struct {
 	waiting   atomic.Int64  // waiters in Wait that have not returned
 	wantAfter atomic.Uint64 // the highest mark a waiter has asked for a cycle after
 
-	started  atomic.Uint64
-	captured notify.Counter // cycles whose capture has queued its commits
-	queued   atomic.Pointer[queuedCount]
-	done     notify.Counter // cycles completed
-	// landed is the number of the latest cycle that created a segment in the
-	// record, which proves the node still owned its shards when it landed
+	started atomic.Uint64
+	done    notify.Counter // cycles completed
+	// landed is the number of the latest cycle that created a segment in
+	// blob storage, which proves the node still owned its shards when it landed
 	// (confirm). Only the loop stores it, before it counts the cycle done.
 	landed atomic.Uint64
 
 	exited chan struct{} // closed when the loop has ended (the shards are stopping)
-}
-
-// queuedCount is what a cycle's capture queued: the number of entries the
-// writer holds, which the stores have to have written for the output that was
-// read before the cycle may leave.
-type queuedCount struct {
-	cycle uint64
-	count uint64
 }
 
 // FlushOptions configure the flush loop.
@@ -97,8 +87,8 @@ type FlushOptions struct {
 	NoEarly bool
 }
 
-func newFlusher(tab *table, writer *segment.Writer, keeper *coord.Keeper, conf *coord.Confirmer, clock *coord.ClockWatch, log *slog.Logger, opts FlushOptions) *Flusher {
-	return &Flusher{tab: tab, writer: writer, keeper: keeper, conf: conf, clock: clock, log: log,
+func newFlusher(tab *table, writer *segment.Writer, keeper *coord.Keeper, conf *coord.Confirmer, log *slog.Logger, opts FlushOptions) *Flusher {
+	return &Flusher{tab: tab, writer: writer, keeper: keeper, conf: conf, log: log,
 		interval: opts.Interval, min: opts.Min, coalesce: opts.Coalesce, noEarly: opts.NoEarly,
 		kick: make(chan struct{}, 1), exited: make(chan struct{})}
 }
@@ -253,11 +243,7 @@ func (f *Flusher) cycle(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
-	// What the capture queued is published: a gate that waits for a store
-	// waits for that many entries to be written there. The publication comes
-	// before the counter, so a waiter that sees the counter sees this too.
-	f.queued.Store(&queuedCount{cycle: n, count: f.writer.Queued()})
-	f.captured.Inc()
+	queuedAfter := f.writer.Queued()
 	flushErr := f.writer.Flush(ctx)
 	if flushErr != nil && ctx.Err() == nil {
 		f.log.Error("flushing the node journal failed", "err", flushErr)
@@ -268,9 +254,9 @@ func (f *Flusher) cycle(ctx context.Context) {
 		// after it ran out counts as durable (the keeper logs the loss).
 		flushErr = f.keeper.Check()
 	}
-	if flushErr == nil && f.queued.Load().count > queuedBefore {
+	if flushErr == nil && queuedAfter > queuedBefore {
 		// The capture queued entries after the cycle began, and the flush
-		// returned once they were in the record: a segment was created by a
+		// returned once they were in blob storage: a segment was created by a
 		// cycle that began after any mark below n.
 		f.landed.Store(n)
 	}
@@ -357,24 +343,13 @@ func (m *Catalog) Barrier(ctx context.Context) error {
 // Name is the node's own name.
 func (m *Catalog) Name() cluster.Node { return m.n.Name }
 
-// PeerInfo is the journal's peer as the writer sees it, nil with none named:
-// its frontier, whether it is in step, and whether it has fallen out.
-func (m *Catalog) PeerInfo() *PeerInfo {
-	st, ok := m.flush.writer.Peer()
-	if !ok {
-		return nil
-	}
-	return &PeerInfo{Node: st.Name, Frontier: st.Frontier, Out: st.Out,
-		CaughtUp: m.flush.writer.PeerCovered()}
-}
-
 // Gate holds a chunk of a shard's output until what the shard committed before
 // it is durable (docs/internals.md, Durability gates):
 //
 //   - whatever the tier, the node's lease must be good: a node whose lease
 //     has run out may have lost the shard to another node, and answers nothing;
-//   - the chunk then waits for the store its tier names: the record (blob
-//     storage) or the node's own disk, unless the shard has had no new frames
+//   - the chunk then waits for the store its tier names: blob
+//     storage or the node's own disk, unless the shard has had no new frames
 //     since its last capture (a shard whose header can't be read counts as
 //     having them).
 //
@@ -404,8 +379,8 @@ func (f *Flusher) gate(ctx context.Context, c *captureState, sync kind.Sync, pro
 	if err := f.keeper.Check(); err != nil {
 		return err
 	}
-	if err := f.checkClock(sync); err != nil {
-		return err
+	if !sync.Valid() {
+		return tierUnmet(fmt.Sprintf("sync is %d, which is not a durability tier", int(sync)))
 	}
 	mark := f.Mark()
 	if !c.hasNewFrames() {
@@ -414,13 +389,7 @@ func (f *Flusher) gate(ctx context.Context, c *captureState, sync kind.Sync, pro
 		}
 		return nil
 	}
-	switch sync {
-	case kind.SyncNone:
-	case kind.SyncPeer:
-		if err := f.waitPeer(ctx, mark); err != nil {
-			return err
-		}
-	case kind.SyncStorage:
+	if sync == kind.SyncStorage {
 		if err := f.Wait(ctx, mark); err != nil {
 			return err
 		}
@@ -435,24 +404,9 @@ func (f *Flusher) gate(ctx context.Context, c *captureState, sync kind.Sync, pro
 	return c.err()
 }
 
-// checkClock fails a `none` or `peer` answer while the clock watch reports that
-// the node's clock and the store's disagree: those tiers rest on the lease check
-// alone, which is the node's own clocks (docs/internals.md, Node leases). A
-// `storage` answer confirms ownership against the record and does not care.
-func (f *Flusher) checkClock(sync kind.Sync) error {
-	switch sync {
-	case kind.SyncNone, kind.SyncPeer:
-		if f.clock.Check() != nil {
-			return tierUnmet("sync is " + sync.String() + ", but the node's clock and the store's disagree, so the lease check cannot be trusted")
-		}
-	case kind.SyncStorage:
-	}
-	return nil
-}
-
 // confirm holds a storage answer that has nothing new to commit until the node
 // has proof that it still owned its shards after the chunk was read (the mark),
-// whichever comes first: a segment created in the record by a cycle that began
+// whichever comes first: a segment created in blob storage by a cycle that began
 // after the mark, or a read of the node's own lease that began after it
 // (docs/internals.md, Confirming ownership). A lease found taken fails the node
 // as a lost renewal does. A lease that can't be read fails the answer with a
@@ -499,91 +453,3 @@ func (f *Flusher) confirm(ctx context.Context, mark uint64) error {
 // the answer fails with 503 and a retry hint, and a weaker tier is never
 // given instead (docs/guide.md, Durability).
 func tierUnmet(msg string) error { return &unavailable{msg, time.Second} }
-
-// waitLocal waits until what was committed before the mark is durable in the
-// node's own disk, as the first half of waitPeer. There being no store, or one that has refused a segment,
-// fails the answer: the tier's promise is not met, and no weaker one is given
-// instead.
-func (f *Flusher) waitLocal(ctx context.Context, mark uint64) error {
-	keeper := f.keeper
-	f.waiting.Add(1)
-	defer f.waiting.Add(-1)
-	if f.done.Load() <= mark && f.started.Load() <= mark {
-		// No cycle has begun since the mark: ask for one.
-		f.request(mark)
-	}
-	target, err := f.queuedAfter(ctx, mark)
-	if err != nil {
-		return err
-	}
-	if !f.writer.LocalReady() {
-		return tierUnmet("sync is peer, but the node keeps no usable local store")
-	}
-	select {
-	case <-f.writer.Reached(segment.StoreLocal, target):
-		return keeper.Check()
-	case <-f.writer.LocalDown():
-		return tierUnmet("sync is peer, but the local store refused a segment")
-	case <-f.exited:
-		return errFlusherStopped
-	case <-ctx.Done():
-		return context.Cause(ctx)
-	case <-keeper.Lost():
-		return keeper.Check()
-	}
-}
-
-// waitPeer waits until what was committed before the mark is durable on the
-// node's own disk and on the peer's: the local floor first, then the peer's
-// frontier. A peer that is not named, that has fallen out, or that falls out
-// mid-wait fails the answer, as an unmet local store fails it. The
-// peer's side of the wait rides on its frontier, so an answer is only ever
-// given on a run a fetch can take back whole (docs/internals.md, Takeover),
-// and the fan-out's own attempts are what bounds the wait: a peer that will
-// never take the segment falls out, and the answer fails with it.
-func (f *Flusher) waitPeer(ctx context.Context, mark uint64) error {
-	if err := f.waitLocal(ctx, mark); err != nil {
-		return err
-	}
-	if !f.writer.PeerReady() {
-		return tierUnmet("sync is peer, but the node names no standing peer")
-	}
-	keeper := f.keeper
-	// The same publication waitLocal waited on: the count the cycle queued.
-	target, err := f.queuedAfter(ctx, mark)
-	if err != nil {
-		return err
-	}
-	select {
-	case <-f.writer.PeerReached(target):
-		return keeper.Check()
-	case <-f.writer.PeerOut():
-		return tierUnmet("sync is peer, but the peer fell out before it had the segment")
-	case <-f.exited:
-		return errFlusherStopped
-	case <-ctx.Done():
-		return context.Cause(ctx)
-	case <-keeper.Lost():
-		return keeper.Check()
-	}
-}
-
-// queuedAfter waits for a capture that began after the mark and returns how
-// many entries it queued. That capture holds the commits the chunk was read
-// after, so the store has to have written that many entries before the chunk
-// may leave.
-func (f *Flusher) queuedAfter(ctx context.Context, mark uint64) (uint64, error) {
-	for {
-		pub := f.queued.Load()
-		if pub != nil && pub.cycle > mark {
-			return pub.count, nil
-		}
-		select {
-		case <-f.captured.Reached(mark + 1):
-		case <-f.exited:
-			return 0, errFlusherStopped
-		case <-ctx.Done():
-			return 0, context.Cause(ctx)
-		}
-	}
-}

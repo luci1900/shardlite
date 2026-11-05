@@ -10,7 +10,6 @@ import (
 	"io"
 	"iter"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -19,41 +18,40 @@ import (
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/cluster"
-	"github.com/luci1900/shardlite/internal/localdb"
 	"github.com/luci1900/shardlite/internal/pos"
 )
 
-// The conformance suite: what every journal's store has to do, a bucket or a
-// disk alike. It holds the semantics the protocol leans on (a number is taken
+// The conformance suite: what every journal's store has to do, whatever backend
+// is under it. It holds the semantics the protocol leans on (a number is taken
 // once, a fence is an empty segment, a listing is in number order, a write id
 // comes back on a head, a lost response costs a retry and never a fence)
 // rather than spelling them per backend, so two very different engines are
 // interchangeable behind one interface. It runs through a Store, as everything
-// does, and the record's own writes go through the store underneath it, as a
-// foreign writer's would.
+// does, and the test's own writes go to the store underneath it, as a foreign
+// writer's would.
 //
 // It is the memory backend by default, and the S3 backend on the emulator when
 // SHARDLITE_TEST_S3_ENDPOINT is set (docker/compose.s3.yaml's).
 
 // factory builds one test journal. Its store speaks for the journal of node
-// "n1" at epoch 1, over a record whose keys sit under Prefix.
-type factory func(t *testing.T) (*Store, record)
+// "n1" at epoch 1, over a backing store whose keys sit under Prefix.
+type factory func(t *testing.T) (*Store, backing)
 
-// record is the store behind a test journal's adapter (the record).
-type record struct {
+// backing is the store behind a test journal's adapter (blob storage for the
+// memory and S3 backends).
+type backing struct {
 	Below  blob.Backend
 	Prefix string // before the journal's keys in Below, "" when Below is the memory backend's root
 	// Foreign writes a segment as another writer would, for the tests that need
-	// one. A local store has no record under it, so it writes through a store
-	// of its own with another writer's identity.
+	// one.
 	Foreign func(t *testing.T, seq pos.Seg, body string)
 }
 
-func (r record) key(node cluster.Node, seq pos.Seg) string { return r.Prefix + Key(node, seq) }
+func (r backing) key(node cluster.Node, seq pos.Seg) string { return r.Prefix + Key(node, seq) }
 
 // foreign writes a segment under the journal's number as another writer, in
-// the record.
-func (r record) foreign(t *testing.T, seq pos.Seg, body string) {
+// blob storage.
+func (r backing) foreign(t *testing.T, seq pos.Seg, body string) {
 	t.Helper()
 	if _, err := r.Below.Create(context.Background(), r.key("n1", seq), strings.NewReader(body),
 		blob.WriteID{Node: "n9", Epoch: 1, N: 1}); err != nil {
@@ -61,39 +59,17 @@ func (r record) foreign(t *testing.T, seq pos.Seg, body string) {
 	}
 }
 
-func memoryFactory(t *testing.T) (*Store, record) {
+func memoryFactory(t *testing.T) (*Store, backing) {
 	t.Helper()
 	m := blob.NewMemory()
-	rec := record{Below: m}
-	rec.Foreign = rec.foreign
-	return NewStore(NewBlob(m, "n1"), "n1", 1, Options{Backoff: time.Millisecond}), rec
+	bk := backing{Below: m}
+	bk.Foreign = bk.foreign
+	return NewStore(NewBlob(m, "n1"), "n1", 1, Options{Backoff: time.Millisecond}), bk
 }
 
-// localFactory returns the node's own disk: the local database in a temporary
-// directory, with the journal of node "n1" in it.
-func localFactory(t *testing.T) (*Store, record) {
-	t.Helper()
-	db, err := localdb.Open(filepath.Join(t.TempDir(), localdb.Name))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { db.Close() })
-	back := NewLocal(db.DB, "n1")
-	rec := record{}
-	rec.Foreign = func(t *testing.T, seq pos.Seg, body string) {
-		t.Helper()
-		// Another writer: another node, another epoch.
-		other := NewStore(back, "n9", 1, Options{Backoff: time.Millisecond})
-		if err := other.Create(context.Background(), seq, bytes.NewReader([]byte(body))); err != nil {
-			t.Fatal(err)
-		}
-	}
-	return NewStore(back, "n1", 1, Options{Backoff: time.Millisecond}), rec
-}
-
-// s3Factory returns the record on the emulator, with the test's keys under a
+// s3Factory returns blob storage on the emulator, with the test's keys under a
 // prefix of their own.
-func s3Factory(t *testing.T) (*Store, record) {
+func s3Factory(t *testing.T) (*Store, backing) {
 	t.Helper()
 	endpoint := os.Getenv("SHARDLITE_TEST_S3_ENDPOINT")
 	if endpoint == "" {
@@ -122,33 +98,31 @@ func s3Factory(t *testing.T) (*Store, record) {
 	rand.Read(id[:])
 	prefix := "journal-conformance/" + hex.EncodeToString(id[:]) + "/"
 	prefixed := blob.WithPrefix(b, prefix)
-	// The record sees the keys Below does: WithPrefix hides its prefix, so the
-	// record's keys are relative to it, like the memory backend's are to its
+	// The backing store sees the keys Below does: WithPrefix hides its prefix, so the
+	// backing keys are relative to it, like the memory backend's are to its
 	// root.
-	rec := record{Below: prefixed}
-	rec.Foreign = rec.foreign
-	return NewStore(NewBlob(prefixed, "n1"), "n1", 1, Options{Backoff: time.Millisecond}), rec
+	bk := backing{Below: prefixed}
+	bk.Foreign = bk.foreign
+	return NewStore(NewBlob(prefixed, "n1"), "n1", 1, Options{Backoff: time.Millisecond}), bk
 }
 
 func TestConformanceMemory(t *testing.T) { conformance(t, memoryFactory) }
 
 func TestConformanceS3(t *testing.T) { conformance(t, s3Factory) }
 
-func TestConformanceLocal(t *testing.T) { conformance(t, localFactory) }
-
 // conformance runs every case against one factory.
 func conformance(t *testing.T, mk factory) {
 	ctx := context.Background()
-	run := func(name string, f func(t *testing.T, js *Store, rec record)) {
+	run := func(name string, f func(t *testing.T, js *Store, bk backing)) {
 		t.Run(name, func(t *testing.T) {
-			js, rec := mk(t)
-			f(t, js, rec)
+			js, bk := mk(t)
+			f(t, js, bk)
 		})
 	}
 
 	// A number is taken once: the second create fails with blob.ErrExists and
 	// the first segment stays exactly as it was.
-	run("CreateOnce", func(t *testing.T, js *Store, rec record) {
+	run("CreateOnce", func(t *testing.T, js *Store, bk backing) {
 		if err := js.Create(ctx, 1, body("one")); err != nil {
 			t.Fatal(err)
 		}
@@ -163,7 +137,7 @@ func conformance(t *testing.T, mk factory) {
 	// A write retried with its own write id succeeds: the read-back tells an
 	// own earlier attempt from a foreign segment. A retry that names another
 	// writer's id does not.
-	run("OwnRetryIsSettled", func(t *testing.T, js *Store, rec record) {
+	run("OwnRetryIsSettled", func(t *testing.T, js *Store, bk backing) {
 		id := js.NewWriteID()
 		if err := js.CreateWithID(ctx, 1, body("one"), id); err != nil {
 			t.Fatal(err)
@@ -183,11 +157,11 @@ func conformance(t *testing.T, mk factory) {
 		}
 	})
 
-	// The record can hold a foreign segment under the journal's number again
+	// Blob storage can hold a foreign segment under the journal's number again
 	// only if the write id says so: the store asks, not takes a plain "exists"
 	// for its own lost response.
-	run("ForeignSegmentIsSomebodyElses", func(t *testing.T, js *Store, rec record) {
-		rec.Foreign(t, 1, "theirs")
+	run("ForeignSegmentIsSomebodyElses", func(t *testing.T, js *Store, bk backing) {
+		bk.Foreign(t, 1, "theirs")
 		if err := js.CreateWithID(ctx, 1, body("ours"), js.NewWriteID()); !errors.Is(err, blob.ErrExists) {
 			t.Fatalf("got %v, want blob.ErrExists", err)
 		}
@@ -198,7 +172,7 @@ func conformance(t *testing.T, mk factory) {
 
 	// An empty segment is a fence: size 0, a real object, and its create and
 	// write id behave like any other segment's.
-	run("FenceIsAnEmptySegment", func(t *testing.T, js *Store, rec record) {
+	run("FenceIsAnEmptySegment", func(t *testing.T, js *Store, bk backing) {
 		id := js.NewWriteID()
 		if err := js.CreateWithID(ctx, 1, body(""), id); err != nil {
 			t.Fatal(err)
@@ -225,7 +199,7 @@ func conformance(t *testing.T, mk factory) {
 	// A listing is in number order, not the order of the keys of unpadded
 	// numbers: 10 after 2. List starts at the number it is given, and lists to
 	// the end of the journal.
-	run("ListingIsInNumberOrder", func(t *testing.T, js *Store, rec record) {
+	run("ListingIsInNumberOrder", func(t *testing.T, js *Store, bk backing) {
 		for _, seq := range []pos.Seg{1, 2, 10, 22} {
 			if err := js.Create(ctx, seq, body(fmt.Sprint(seq))); err != nil {
 				t.Fatal(err)
@@ -236,21 +210,17 @@ func conformance(t *testing.T, mk factory) {
 		assertListing(t, js.List(ctx, 23))
 	})
 
-	// The record's keys are the layout the record's other callers compose: keys
-	// are found by one path, not two. A local store has no record under it, so
-	// it has no such layout.
-	run("KeysAreTheRecordsLayout", func(t *testing.T, js *Store, rec record) {
-		if rec.Below == nil {
-			t.Skip("a local store has no record's keys")
-		}
+	// The storage keys are the layout the other blob callers compose: keys
+	// are found by one path, not two.
+	run("KeysAreTheStorageLayout", func(t *testing.T, js *Store, bk backing) {
 		for _, seq := range []pos.Seg{1, 2} {
 			if err := js.Create(ctx, seq, body("v")); err != nil {
 				t.Fatal(err)
 			}
 		}
 		for _, seq := range []pos.Seg{1, 2} {
-			key := rec.key("n1", seq)
-			info, err := rec.Below.Head(ctx, key)
+			key := bk.key("n1", seq)
+			info, err := bk.Below.Head(ctx, key)
 			if err != nil {
 				t.Fatalf("%s: %v", key, err)
 			}
@@ -260,7 +230,7 @@ func conformance(t *testing.T, mk factory) {
 		}
 	})
 
-	run("GetRange", func(t *testing.T, js *Store, rec record) {
+	run("GetRange", func(t *testing.T, js *Store, bk backing) {
 		if err := js.Create(ctx, 1, body("0123456789")); err != nil {
 			t.Fatal(err)
 		}
@@ -286,7 +256,7 @@ func conformance(t *testing.T, mk factory) {
 	// how a footer is read, and which a reader of the end of a segment cannot
 	// ask for by offset because it does not know where the end is. An empty
 	// segment has no tail, which is an empty read and not an error.
-	run("GetRangeTail", func(t *testing.T, js *Store, rec record) {
+	run("GetRangeTail", func(t *testing.T, js *Store, bk backing) {
 		if err := js.Create(ctx, 1, body("0123456789")); err != nil {
 			t.Fatal(err)
 		}
@@ -328,7 +298,7 @@ func conformance(t *testing.T, mk factory) {
 
 	// A delete is garbage collection, not an update: gone is gone, and deleting
 	// what is gone is done. Nothing of it reads back, not even whole.
-	run("Delete", func(t *testing.T, js *Store, rec record) {
+	run("Delete", func(t *testing.T, js *Store, bk backing) {
 		if err := js.Create(ctx, 1, body("v")); err != nil {
 			t.Fatal(err)
 		}
@@ -348,7 +318,7 @@ func conformance(t *testing.T, mk factory) {
 
 	// Segments can be as large as a database, and every attempt rereads the
 	// body from its start, so a body that is bigger than memory is fine.
-	run("BigAndBinary", func(t *testing.T, js *Store, rec record) {
+	run("BigAndBinary", func(t *testing.T, js *Store, bk backing) {
 		data := make([]byte, 3<<20+17)
 		rand.Read(data)
 		if err := js.Create(ctx, 1, bodyBytes(data)); err != nil {
@@ -380,18 +350,13 @@ func conformance(t *testing.T, mk factory) {
 	// A lost response is a retry of the same body and the same write id, never
 	// a fence: the first create lands and its response is lost, the retry finds
 	// it our own and succeeds, and the segment keeps the first body and id.
-	// Only the record loses responses: a local store's write is a transaction,
-	// which either commits or doesn't.
 	t.Run("LostResponseIsARetry", func(t *testing.T) {
-		_, rec := mk(t)
-		if rec.Below == nil {
-			t.Skip("a local store loses no response")
-		}
-		hooked := blobtest.WithHook(rec.Below)
+		_, bk := mk(t)
+		hooked := blobtest.WithHook(bk.Below)
 		store := NewStore(NewBlob(hooked, "n1"), "n1", 1, Options{Backoff: time.Millisecond})
 		var lost atomic.Int64
 		hooked.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
-			if op == blobtest.OpCreate && key == rec.key("n1", 1) && after && lost.Add(1) == 1 {
+			if op == blobtest.OpCreate && key == bk.key("n1", 1) && after && lost.Add(1) == 1 {
 				return errors.New("injected: the response was lost")
 			}
 			return nil
@@ -413,15 +378,12 @@ func conformance(t *testing.T, mk factory) {
 	// outcome that stayed unknown, never blob.ErrExists (which would read as
 	// "somebody else's").
 	t.Run("UnknownStaysUnknown", func(t *testing.T) {
-		_, rec := mk(t)
-		if rec.Below == nil {
-			t.Skip("a local store loses no response")
-		}
-		hooked := blobtest.WithHook(rec.Below)
+		_, bk := mk(t)
+		hooked := blobtest.WithHook(bk.Below)
 		store := NewStore(NewBlob(hooked, "n1"), "n1", 1, Options{Backoff: time.Millisecond, Attempts: 2})
 		hooked.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
 			// The creates land, and every response of create and head is lost.
-			if after && key == rec.key("n1", 1) {
+			if after && key == bk.key("n1", 1) {
 				return errors.New("injected: the response was lost")
 			}
 			return nil

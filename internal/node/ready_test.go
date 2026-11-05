@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"errors"
+	"github.com/luci1900/shardlite/internal/apptest"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -46,7 +47,7 @@ func TestReadyPoll(t *testing.T) {
 	var g errgroup.Group
 	g.Go(func() error { return srv.ready.Serve(ctx) })
 	ready := func() bool { ok, _ := srv.Ready(); return ok }
-	eventually(t, "the first declaration", ready)
+	apptest.Eventually(t, apptest.Timeout, "the first declaration", ready)
 
 	if _, err := kinds.Lookup("test.users"); err != nil {
 		t.Fatalf("the declaration's kinds: %v", err)
@@ -55,7 +56,7 @@ func TestReadyPoll(t *testing.T) {
 	// A failed poll keeps the kinds and marks the node not ready, with the
 	// reason the ready route answers.
 	status.Store(503)
-	eventually(t, "not ready with the app failing", func() bool { return !ready() })
+	apptest.Eventually(t, apptest.Timeout, "not ready with the app failing", func() bool { return !ready() })
 	if _, why := srv.Ready(); !strings.Contains(why, "503") {
 		t.Fatalf("why: %q", why)
 	}
@@ -66,7 +67,7 @@ func TestReadyPoll(t *testing.T) {
 	// A declaration that isn't valid counts as a failure, not as kinds.
 	status.Store(200)
 	decl.Store(`{"app": "test"`)
-	eventually(t, "not ready with a bad declaration", func() bool { return !ready() })
+	apptest.Eventually(t, apptest.Timeout, "not ready with a bad declaration", func() bool { return !ready() })
 	if _, err := kinds.Lookup("test.users"); err != nil {
 		t.Fatal("kinds lost on a bad declaration")
 	}
@@ -74,7 +75,7 @@ func TestReadyPoll(t *testing.T) {
 	// The app coming back with a new declaration makes the node ready and the
 	// kinds current again.
 	decl.Store(`{"app": "test", "version": "2", "kinds": {"users": {"public": true}, "wallet": {}}}`)
-	eventually(t, "ready again", ready)
+	apptest.Eventually(t, apptest.Timeout, "ready again", ready)
 	if got, err := kinds.Lookup("test.wallet"); err != nil || got.Name != "test.wallet" {
 		t.Fatalf("%+v %v", got, err)
 	}

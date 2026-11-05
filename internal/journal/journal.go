@@ -1,19 +1,17 @@
-// Package journal is where a node's journal can live. The record of every
+// Package journal is where a node's journal can live. The authoritative copy of every
 // journal is in blob storage: the fence is created there, and a journal is
 // complete without anything else (docs/internals.md, Node journals and
-// snapshots). A journal may also live in other kinds of storage, which are
-// frontiers of the record and decide nothing: the node's own disk, and a
-// mirror on another node's. They all sit behind the narrow Backend this
-// package holds, and the one Store every caller writes through, which gives a
-// local disk standing next to a bucket the same handling of a lost response.
+// snapshots). The narrow Backend this package holds sits behind the one Store every caller
+// writes through, which gives a backend the same handling of a lost response.
+// Blob storage is the only backend today, and the place a faster journal store
+// would plug in.
 //
 // A journal's segments are numbered. A segment is created once and never
 // modified, so there are no updates and no conditional deletes: deleting one
 // is the caller's choice of garbage, through journal expiry.
 //
-// The fence that an adopter puts above a dead writer's range lives in the
-// record (blob storage): one store decides the journal's races. A store of
-// another kind keeps a copy of what is below it.
+// The fence that an adopter puts above a dead writer's range lives in
+// blob storage: one store decides the journal's races.
 package journal
 
 import (
@@ -66,14 +64,14 @@ type Backend interface {
 	GetRange(ctx context.Context, seq pos.Seg, offset, length int64) (io.ReadCloser, error)
 	// Head says the segment's size and write id. A size of 0 is a fence.
 	Head(ctx context.Context, seq pos.Seg) (SegmentInfo, error)
-	// Delete removes the segment. Whether a number with no segment is
-	// ErrNotFound or an error-free success depends on the store where it lives:
-	// callers accept both.
-	Delete(ctx context.Context, seq pos.Seg) error
 	// List returns the journal's segment numbers from from (inclusive) on, in
 	// number order. It may lag. A failure before the first number may be
 	// retried by the Store; one afterwards is the caller's to see.
 	List(ctx context.Context, from pos.Seg) iter.Seq2[pos.Seg, error]
+	// Delete removes the segment. Whether a number with no segment is
+	// ErrNotFound or an error-free success depends on the store where it
+	// lives: callers accept both.
+	Delete(ctx context.Context, seq pos.Seg) error
 }
 
 // SegmentInfo is what a journal needs of a segment: its size (0 is a fence)
@@ -83,7 +81,7 @@ type SegmentInfo struct {
 	WriteID blob.WriteID
 }
 
-// Root is the key prefix of all the journals in the record (the data role,
+// Root is the key prefix of all the journals in blob storage (the data role,
 // docs/internals.md, Data and state).
 const Root = "data/journal/"
 
@@ -92,10 +90,10 @@ const Root = "data/journal/"
 // digits, and a journal never gets within centuries of 20.
 const seqDigits = 20
 
-// Prefix is the key prefix of one node's journal in the record.
+// Prefix is the key prefix of one node's journal in blob storage.
 func Prefix(node cluster.Node) string { return Root + string(node) + "/" }
 
-// Key is the record's key of one numbered segment. The number is zero-padded,
+// Key is the blob key of one numbered segment. The number is zero-padded,
 // so a key that sorts after another names a later segment.
 func Key(node cluster.Node, seq pos.Seg) string {
 	return fmt.Sprintf("%s%0*d", Prefix(node), seqDigits, uint64(seq))

@@ -10,8 +10,7 @@ import (
 	"github.com/luci1900/shardlite/internal/shard"
 )
 
-// Row states of the cache index. The value stored in SQL is the same string an
-// older node wrote, so an index written before this type still scans.
+// Row states of the cache index.
 type rowState string
 
 const (
@@ -35,13 +34,12 @@ type indexRow struct {
 	Manifest   string // the manifest and its version as of deactivation, so reactivating in the same epoch needs no blob storage call
 	ETag       string
 	// CRCs is the CRC of each page of the database at deactivation, so a shard
-	// activated from the cache reads no pages. It is empty for a row written
-	// before the checksums existed, and the pages are read then.
+	// activated from the cache reads no pages.
 	CRCs []byte
 }
 
 // index is the on-disk record of the node's shard files (rows in the node's
-// local database, internal/localdb), so a million cached shards don't cost
+// local database, localdb.go), so a million cached shards don't cost
 // memory. Its rows are cleared at every start: the files they point at are
 // deleted then too.
 type index struct{ db *sql.DB }

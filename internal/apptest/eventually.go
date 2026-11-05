@@ -5,6 +5,10 @@ import (
 	"time"
 )
 
+// Timeout is the usual deadline for Eventually: it is for failures only, and a
+// slow machine under -race takes a while.
+const Timeout = 30 * time.Second
+
 // Eventually polls cond every few milliseconds until it is true, and fails the
 // test, naming what it waited for, if timeout passes first. It is how tests
 // wait for something to happen (a delivery, a flush, a deactivation) without a

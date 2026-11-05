@@ -45,15 +45,6 @@ type NodeInfo struct {
 	// forward from JournalNext, so a JournalNext that is a little stale only costs probes.
 	JournalFrom pos.Seg `json:"journal_from"`
 	JournalNext pos.Seg `json:"journal_next"`
-	// Peer is the node whose disk holds a mirror of this node's journal:
-	// chosen once, at acquire, from the lease listing, least loaded. The
-	// choice is sticky: repair changes it, a renewal republishes it
-	// unchanged. Nothing depends on who the peer is, so the relation needs
-	// no symmetry and no coordination.
-	Peer cluster.Node `json:"peer,omitempty"`
-	// Standby says this node can hold another node's journal: its local
-	// database is persistent. Selection picks standbys only.
-	Standby bool `json:"standby,omitempty"`
 }
 
 // Incarnation is one life of a node: its name and the epoch of its lease.

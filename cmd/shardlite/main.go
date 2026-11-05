@@ -29,5 +29,9 @@ func run(log *slog.Logger) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	return node.Run(ctx, env, log, nil)
+	opts, err := faultOptions(os.Getenv)
+	if err != nil {
+		return err
+	}
+	return node.Run(ctx, env, log, nil, opts...)
 }

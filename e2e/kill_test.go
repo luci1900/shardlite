@@ -5,6 +5,7 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"github.com/luci1900/shardlite/internal/apptest"
 	"math/rand/v2"
 	"net/http"
 	"os"
@@ -257,7 +258,7 @@ func TestKillNodeUnderLoad(t *testing.T) {
 	// Stop the load, let the app close its handles, and shut down gracefully.
 	stop()
 	wg.Wait()
-	eventually(t, "the app to close its databases", func() bool { return s.appDebug().OpenDBs == 0 })
+	apptest.Eventually(t, apptest.Timeout, "the app to close its databases", func() bool { return s.appDebug().OpenDBs == 0 })
 	if err := s.node.term(60 * time.Second); err != nil {
 		t.Fatalf("graceful stop: %v\n%s", err, s.node.out.String())
 	}

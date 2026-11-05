@@ -183,7 +183,7 @@ func cycling(do func(), nodes ...*clusterNode) {
 	}
 }
 
-// A call from a shard with sync on to a shard on another node leaves only once
+// A call from a shard of a `storage` kind to a shard on another node leaves only once
 // what the caller committed is durable on its node, and its answer comes back
 // only once what the callee committed is durable on the callee's.
 func TestForwardedCallIsGatedOnBothNodes(t *testing.T) {
@@ -396,7 +396,7 @@ func TestForwardIfActive(t *testing.T) {
 		t.Fatalf("If-Active for a shard active on its owner: %d %v", resp.StatusCode, resp.Header)
 	}
 	app.Must(t, "close", p)
-	eventually(t, "the shard to go idle on its owner", func() bool { return !n0.m.Load().IsActive(shardName("test.brief/x")) })
+	apptest.Eventually(t, apptest.Timeout, "the shard to go idle on its owner", func() bool { return !n0.m.Load().IsActive(shardName("test.brief/x")) })
 	if cached, err := n0.m.Load().Cached(); err != nil || !slices.Contains(cached, shardName("test.brief/x")) {
 		t.Fatalf("the shard is not cached on its owner: %v %v", cached, err)
 	}
@@ -492,7 +492,7 @@ func TestForwardUpgrade(t *testing.T) {
 		}
 	}
 	// brief/other went idle with the same timeout: brief/ws would have too.
-	eventually(t, "test.brief/other to go idle", func() bool { return !n0.m.Load().IsActive(shardName("test.brief/other")) })
+	apptest.Eventually(t, apptest.Timeout, "test.brief/other to go idle", func() bool { return !n0.m.Load().IsActive(shardName("test.brief/other")) })
 	if !n0.m.Load().IsActive(shardName("test.brief/ws")) {
 		t.Fatal("the owner let go of a shard with a connection open")
 	}
@@ -505,7 +505,7 @@ func TestForwardUpgrade(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("closing the client did not close the app's side")
 	}
-	eventually(t, "test.brief/ws to go idle", func() bool { return !n0.m.Load().IsActive(shardName("test.brief/ws")) })
+	apptest.Eventually(t, apptest.Timeout, "test.brief/ws to go idle", func() bool { return !n0.m.Load().IsActive(shardName("test.brief/ws")) })
 }
 
 // Stopping the forwarding node ends a forwarded WebSocket on both sides, as it

@@ -31,6 +31,7 @@ type runOptions struct {
 	grace   time.Duration // the servers' grace period, ServerOptions' default if zero
 	public  net.Listener  // the public listener, in place of env.Public
 	shards  func(*CatalogOptions, *Catalog)
+	faults  Faults
 }
 
 // WithBackend makes Run use b as the blob store in place of the S3 bucket of
@@ -99,6 +100,9 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 		}
 	}
 	backend := blob.WithPrefix(raw, env.Prefix)
+	if ro.faults.Backend != nil {
+		backend = ro.faults.Backend(backend)
+	}
 	// The store must do what fencing relies on, before the node takes a lease or
 	// adopts anything.
 	if err := blob.CheckStore(ctx, backend, env.Name); err != nil {
@@ -127,9 +131,7 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 		Logger:  log,
 		Clock:   clock,
 		TempDir: tempDir,
-		// The standbys setting: how many mirrors this node names for its
-		// journal (docs/guide.md, Environment variables).
-		Standbys: env.Standbys,
+		Faults:  ro.faults,
 	})
 	if err != nil {
 		peer.Close()
@@ -145,9 +147,6 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 	journal.Add(n.Writer)
 	journal.Add(n.Keeper)
 	journal.Add(n.Confirmer)
-	// The repair's cadence is Config.Repair, defaulting to its own; Run sets
-	// nothing, so a deployment tunes it where it builds its Config.
-	journal.Add(n.repairLoop(0))
 	stopJournal := func() { stopStage(log, "the journal", journal) } // a failure before the other stages run
 	// Every listener is bound before the shards are built, since binding is quick
 	// and fails fast while opening the cache can take a while. A listener only
@@ -197,7 +196,7 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 		Kinds: kinds, Data: env.Data, Logger: log,
 		Cache:     CacheOptions{Limit: env.CacheLimit},
 		Flush:     FlushOptions{Interval: env.Flush, Min: env.FlushMin},
-		Lifecycle: LifecycleOptions{DeltaAge: env.DeltaAge, DeltaSize: env.DeltaSize},
+		Lifecycle: LifecycleOptions{DeltaAge: env.DeltaAge, DeltaSize: env.DeltaSize, At: ro.faults.At, MaxFiles: ro.faults.MaxFiles},
 		Leases:    LeaseScanOptions{TTL: env.LeaseTTL},
 		Dispatch:  &dispatch.Options{},
 		// The system kinds (docs/internals.md, System kinds), with what each is given

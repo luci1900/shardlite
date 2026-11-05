@@ -20,7 +20,7 @@ import (
 // Measured on Linux with 300 shards: 8.00 descriptors and 6.8 mappings each. A
 // shard holds one more while a delta reads its tail (a dup of its log), and the
 // segment writer holds a dup of a log for each segment queued but not yet
-// written, which a slow store or peer lets pile up, so the constant has more
+// written, which a slow store lets pile up, so the constant has more
 // than the margin the mappings have.
 const (
 	descriptorsPerShard = 10

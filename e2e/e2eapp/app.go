@@ -44,8 +44,8 @@ import (
 type Options struct {
 	Control   string        // the node's control API, host:port (127.0.0.1:2282 if empty)
 	IdleClose time.Duration // close a shard's database after this long unused (500 ms if zero)
-	// Declare names a file holding the app's declaration (docs/guide.md, The
-	// ready route), read again on every request to the ready route, so a
+	// Declare names a file holding the app's declaration (docs/guide.md, Shard
+	// kinds), read again on every request to the ready route, so a
 	// rewrite stands in for a new deploy. Empty serves DefaultDeclaration.
 	Declare string
 }
@@ -118,6 +118,10 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /{kind}/{id}/notify", a.shard(pathShard, a.notify))
 	mux.HandleFunc("POST /{kind}/{id}/remind", a.shard(pathShard, a.remind))
 	mux.HandleFunc("GET /{kind}/{id}/me", a.shard(pathShard, a.me))
+	mux.HandleFunc("POST /{kind}/{id}/bulk", a.shard(pathShard, a.bulk))
+	mux.HandleFunc("POST /{kind}/{id}/vacuum", a.shard(pathShard, a.vacuum))
+	mux.HandleFunc("POST /{kind}/{id}/checkpoints", a.shard(pathShard, a.checkpoints))
+	mux.HandleFunc("POST /{kind}/{id}/churn", a.shard(pathShard, a.churn))
 	// Routes that only take calls, and the reminder wake, take the shard from
 	// what the node opened.
 	mux.HandleFunc("POST /credit", a.internal(a.credit))

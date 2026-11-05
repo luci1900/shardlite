@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/luci1900/shardlite/internal/apptest"
 	"io"
 	"net"
 	"net/http"
@@ -115,7 +116,7 @@ func TestRelayReachesTheAppAsAClientRequest(t *testing.T) {
 		io.WriteString(w, "served")
 	})
 	resp, body := r.req("POST", r.ctl, "/items?x=1", relayed("test.slow/rr1",
-		"Shardlite-Hops", "4", "Shardlite-If-Active", "true", "Shardlite-Sync", "peer", "Idempotency-Key", "k1",
+		"Shardlite-Hops", "4", "Shardlite-If-Active", "true", "Shardlite-Sync", "storage", "Idempotency-Key", "k1",
 		"X-Forwarded-For", "203.0.113.9, 198.51.100.7", "X-Forwarded-Proto", "https", "X-Forwarded-Host", "app.example.com"), "hello")
 	q := last.Load()
 	if resp.StatusCode != http.StatusOK || body != "served" || q == nil {
@@ -309,7 +310,7 @@ func TestRelayedUpgrade(t *testing.T) {
 		t.Fatal("an open connection should keep the shard active")
 	}
 	conn.Close()
-	eventually(t, "the hold to be released", func() bool { return r.refs("test.slow/rw") == 0 })
+	apptest.Eventually(t, apptest.Timeout, "the hold to be released", func() bool { return r.refs("test.slow/rw") == 0 })
 }
 
 // Shardlite-Relay is the app's to send on the control API. From a client it is

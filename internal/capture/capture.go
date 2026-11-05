@@ -92,6 +92,10 @@ type Config struct {
 	// for its next flush cycle, so deactivations share segments with the rest;
 	// by default the shard flushes the writer itself.
 	Durable func(ctx context.Context) error
+	// Now is the clock for the LTX headers' timestamps and the tail files' times
+	// (time.Now if nil). With the same commits and the same clock, capture
+	// writes the same bytes.
+	Now func() time.Time
 }
 
 func (c Config) restartFrames() Frame {
@@ -177,6 +181,9 @@ func New(cfg Config) (sh *Shard, err error) {
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.DiscardHandler)
+	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
 	}
 	s := &Shard{cfg: cfg, side: WALSidecarsOf(cfg.Path), tail: newTail(cfg.Restored), mu: make(chan struct{}, 1)}
 	if cfg.Restored != nil {
@@ -463,6 +470,11 @@ func (s *Shard) closeConns() {
 // note records what the wal-index says, as of a sync that read all of it.
 func (s *Shard) note(info Info) {
 	s.knownSalt, s.knownFrames, s.back = info.Salt, info.MxFrame, info.NBackfill
+	if info.MxFrame == 0 {
+		// A WAL with no frames (the app truncated it): a cursor on the one before
+		// would read frames the file no longer has.
+		s.cur = nil
+	}
 }
 
 // ensureWAL opens the WAL file. A connection creates it, so it is there once
@@ -565,7 +577,7 @@ func (s *Shard) queueFile(count pos.Count, commit Pages, pf pageFrames, h walHea
 		Commit:    uint32(commit),
 		MinTXID:   ltx.TXID(pos),
 		MaxTXID:   ltx.TXID(pos.Add(count)),
-		Timestamp: time.Now().UnixMilli(),
+		Timestamp: s.cfg.Now().UnixMilli(),
 	}
 	// A snapshot has no database before it, so it has no pre-apply checksum.
 	// Every other file has the one the database has now.
@@ -595,7 +607,7 @@ func (s *Shard) queueFile(count pos.Count, commit Pages, pf pageFrames, h walHea
 		s.tail.publish(0) // refused: the writer is closed or fenced
 		return err
 	}
-	s.tail.add(body, count, seg)
+	s.tail.add(body, count, seg, s.cfg.Now())
 	// The file is in the journal, so the database it holds is the one capture
 	// has now: its checksums take the pages the file wrote.
 	s.cks.apply(p, commit)
@@ -615,10 +627,14 @@ type pages struct {
 	pageSize PageSize    // the database's page size
 	h        walHeader   // which WAL wal is, zero with no WAL read
 	pf       pageFrames  // the newest frame of each page it covers
+	before   func()      // if set, called before each page is read
 }
 
 // page reads page pgno into buf, which is one page long.
 func (p pages) page(pgno Pgno, buf []byte) error {
+	if p.before != nil {
+		p.before()
+	}
 	if f := p.pf.frame(pgno); f != 0 {
 		if err := p.h.page(p.wal, f, buf); err != nil {
 			return fmt.Errorf("capture: page %d from WAL frame %d: %w", pgno, f, err)
@@ -1041,9 +1057,9 @@ func (s *Shard) Snapshot(ctx context.Context) (position pos.Position, r io.ReadC
 			Commit:    uint32(s.dbPages),
 			MinTXID:   1,
 			MaxTXID:   ltx.TXID(position),
-			Timestamp: time.Now().UnixMilli(),
+			Timestamp: s.cfg.Now().UnixMilli(),
 		}
-		pg := pages{wal: s.walF, db: s.dbF, pageSize: s.pageSize, h: h, pf: pf}
+		pg := pages{wal: s.walF, db: s.dbF, pageSize: s.pageSize, h: h, pf: pf, before: func() { s.at(kill.SnapshotPage) }}
 		// The checksum of the database at the snapshot's position, which the
 		// snapshot's own checksum is compared with, and the checksums it is
 		// compared against: the pages are read without the shard's lock.

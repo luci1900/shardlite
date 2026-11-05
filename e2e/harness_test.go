@@ -159,6 +159,10 @@ func buildApp(t testing.TB) string {
 	return appPath
 }
 
+// nodeTags are the build tags of the node's binary: the fault build (fault_rig_test.go)
+// adds the fault tag, which is what makes the node read the fault settings.
+var nodeTags []string
+
 // stack is the node and the app, in front of RustFS.
 type stack struct {
 	t       testing.TB
@@ -176,7 +180,7 @@ type stack struct {
 func newStack(t testing.TB, nodeEnv ...string) *stack {
 	t.Helper()
 	s := &stack{t: t, store: s3test.Setup(t), dir: t.TempDir(), env: nodeEnv}
-	s.nodeBin = apptest.Build(t, "./cmd/shardlite")
+	s.nodeBin = apptest.Build(t, "./cmd/shardlite", nodeTags...)
 	appBin := buildApp(t)
 	if err := os.WriteFile(s.declarePath(), []byte(declarationJSON), 0o644); err != nil {
 		t.Fatal(err)

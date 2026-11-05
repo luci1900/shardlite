@@ -160,7 +160,7 @@ func TestProtocolsThroughTheNode(t *testing.T) {
 		t.Fatalf("notify: %d", st)
 	}
 	mustHave("a notify", "e2e.wallet/w7", "sent:m1")
-	eventually(t, "the send to reach its receiver", func() bool { return v.has("e2e.wallet/w8", "msg:m1") })
+	apptest.Eventually(t, apptest.Timeout, "the send to reach its receiver", func() bool { return v.has("e2e.wallet/w8", "msg:m1") })
 
 	// A reminder: set with a row in one transaction, and the node wakes the
 	// shard's reminders handler two seconds later, which handles and deletes it.
@@ -168,7 +168,7 @@ func TestProtocolsThroughTheNode(t *testing.T) {
 		t.Fatalf("remind: %d", st)
 	}
 	mustHave("a remind", "e2e.wallet/w9", "set:r1")
-	eventually(t, "the reminder to fire", func() bool { return v.has("e2e.wallet/w9", "fired:r1") })
+	apptest.Eventually(t, apptest.Timeout, "the reminder to fire", func() bool { return v.has("e2e.wallet/w9", "fired:r1") })
 
 	// Internal endpoints refuse requests that didn't come from another shard.
 	if st, _, _ := s.request("POST", "/credit", "e2e.wallet/w6", "x2"); st != 403 {
@@ -205,7 +205,7 @@ func TestProtocolsThroughTheNode(t *testing.T) {
 	if err := os.WriteFile(s.declarePath(), []byte(declaration), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, "the new kind", func() bool {
+	apptest.Eventually(t, apptest.Timeout, "the new kind", func() bool {
 		st, _, _ := s.control("POST", at("e2e.extra/1", "/create"), "e2e.extra/1", "")
 		return st == 204
 	})
@@ -214,7 +214,7 @@ func TestProtocolsThroughTheNode(t *testing.T) {
 	}
 
 	// Graceful stop: every shard is let go of (the app closes its handles when idle) and the lease is released.
-	eventually(t, "the app to close its databases", func() bool { return s.appDebug().OpenDBs == 0 })
+	apptest.Eventually(t, apptest.Timeout, "the app to close its databases", func() bool { return s.appDebug().OpenDBs == 0 })
 	if err := s.node.term(30 * time.Second); err != nil {
 		t.Fatalf("node exit: %v\n%s", err, s.node.out.String())
 	}
@@ -354,11 +354,6 @@ func TestRelaysKeepTheClientsLimits(t *testing.T) {
 	if st, _, err := s.control("GET", at(audit, "/count"), audit, ""); err != nil || st != 200 {
 		t.Fatalf("a call to the private kind: %d %v", st, err)
 	}
-}
-
-func eventually(t testing.TB, what string, cond func() bool) {
-	t.Helper()
-	apptest.Eventually(t, 20*time.Second, what, cond)
 }
 
 func isNotFound(err error) bool { return errors.Is(err, blob.ErrNotFound) }

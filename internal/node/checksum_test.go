@@ -3,13 +3,11 @@ package node
 import (
 	"bytes"
 	"context"
+	"github.com/luci1900/shardlite/internal/apptest"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"testing"
-
-	"github.com/superfly/ltx"
 
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/kind"
@@ -29,7 +27,7 @@ func TestShardWithABadFileIsNotServed(t *testing.T) {
 	}
 	r.app.Must(t, "close", "a")
 	ref.Release()
-	eventually(t, "deactivation", func() bool { return r.cached("test.users/8") })
+	apptest.Eventually(t, apptest.Timeout, "deactivation", func() bool { return r.cached("test.users/8") })
 
 	// The app touches the cached file, so the node cannot trust it and
 	// restores the shard from blob storage.
@@ -93,7 +91,7 @@ func TestCachedShardReactivatesWithTheIndexedChecksums(t *testing.T) {
 	}
 	r.app.Must(t, "close", "a")
 	ref.Release()
-	eventually(t, "deactivation", func() bool { return r.cached("test.users/6") })
+	apptest.Eventually(t, apptest.Timeout, "deactivation", func() bool { return r.cached("test.users/6") })
 
 	// The index holds the CRCs of the pages, and the capture's checksum is
 	// theirs.
@@ -112,53 +110,5 @@ func TestCachedShardReactivatesWithTheIndexedChecksums(t *testing.T) {
 	defer ref.Release()
 	if got := r.shard("test.users/6").cap.load().Checksums().Checksum(); got != want.Checksum() {
 		t.Fatalf("the reactivated capture's checksum is %s, the index's is %s", got, want.Checksum())
-	}
-}
-
-// A cached shard whose row has no checksums reads them once, from the file.
-func TestCachedShardWithoutChecksumsReadsThem(t *testing.T) {
-	t.Parallel()
-	r := newMRig(t)
-	ctx := context.Background()
-	ref := r.acquire("test.users/7")
-	r.write(ref, "a")
-	if err := r.m.Gate(ctx, ref, kind.SyncStorage); err != nil {
-		t.Fatal(err)
-	}
-	r.app.Must(t, "close", "a")
-	ref.Release()
-	eventually(t, "deactivation", func() bool { return r.cached("test.users/7") })
-
-	// The row's checksums are taken away, as a row written before they existed
-	// has none.
-	if _, err := r.m.cache.idx.db.Exec(`UPDATE shards SET crcs = NULL WHERE name = ?`, "test.users/7"); err != nil {
-		t.Fatal(err)
-	}
-	ref = r.acquire("test.users/7")
-	defer ref.Release()
-	cks := r.shard("test.users/7").cap.load().Checksums()
-	if cks.Pages() == 0 {
-		t.Fatal("the reactivated capture has no checksums")
-	}
-	// They are the ones of the file the shard was cached with.
-	const pageSize = 4096
-	path := r.shard("test.users/7").Path
-	fi, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n := uint32(fi.Size() / pageSize); n != uint32(cks.Pages()) {
-		t.Fatalf("the file holds %d pages, the capture has the checksums of %d", n, cks.Pages())
-	}
-	crcs := make([]ltx.Checksum, cks.Pages())
-	if _, err := ltx.ChecksumPages(path, pageSize, uint32(cks.Pages()), 0, crcs); err != nil {
-		t.Fatal(err)
-	}
-	sum := ltx.Checksum(0)
-	for _, c := range crcs {
-		sum ^= c &^ ltx.ChecksumFlag
-	}
-	if got, want := cks.Checksum(), ltx.ChecksumFlag|sum; got != want {
-		t.Fatalf("the reactivated capture's checksum is %s, the file's is %s", got, want)
 	}
 }

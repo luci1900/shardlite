@@ -1,6 +1,6 @@
 // Package kill names the places a fault test can kill a node. The names are
-// one vocabulary spread over capture, the test node and the fault rig, and
-// they cross the test node's command line, so they do not change.
+// one vocabulary spread over capture, the node and the fault rig, and they cross
+// the fault build's environment (SHARDLITE_KILL_AT), so they do not change.
 package kill
 
 // Point is a place in a node's work where a fault test kills it.
@@ -17,16 +17,20 @@ const (
 	DeltaBeforeManifest  Point = "delta-before-manifest"
 	RebaseBeforeManifest Point = "rebase-before-manifest"
 	RebaseAfterSwap      Point = "rebase-after-swap"
+	// SnapshotPage is before each page a snapshot reads, in the goroutine that
+	// reads them. A test holds the reads there to put the app's work between two
+	// of them.
+	SnapshotPage Point = "snapshot-page"
 )
 
 // ByName names the point a rig arms by name. ok is false for a name that is no
-// point's: the test node refuses it rather than arms a point that never fires,
-// so a misspelled name fails at the arm instead of leaving the test to pass
-// without killing anything.
+// point's: the fault build refuses it at the start rather than arms a point that
+// never fires, so a misspelled name fails there instead of leaving the test to
+// pass without killing anything.
 func ByName(name string) (Point, bool) {
 	switch Point(name) {
 	case Restored, Folded, ReadHeld, FirstSyncDone, SegmentBefore, SegmentAfter,
-		RestoreBeforeRename, DeltaBeforeManifest, RebaseBeforeManifest, RebaseAfterSwap:
+		RestoreBeforeRename, DeltaBeforeManifest, RebaseBeforeManifest, RebaseAfterSwap, SnapshotPage:
 		return Point(name), true
 	}
 	return "", false

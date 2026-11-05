@@ -1,34 +1,30 @@
 // How the node captures one shard's commits by reading SQLite's WAL itself, and why a checkpoint or a WAL restart
 // can't drop a frame before it is captured.
 //
-// The app writes through its own connections. The node reads committed frames from the `-wal` file and holds one read
-// transaction on a connection of its own, which is what keeps SQLite from checkpointing and restarting over frames it
-// hasn't read. SQLite's rules, as modelled:
-//   - The WAL has frames 1..mxFrame (every frame is a commit here). `back` (nBackfill) frames are copied into the
-//     database file.
-//   - A reader holds a read mark: 0 (it reads the database file only, possible only when back = mxFrame) or a frame
-//     count. The node's is always 0 (see below), so marks above 0 only come from the app's own readers, which the model
-//     leaves out (they would only lower what a checkpoint copies).
-//   - A checkpoint copies frames up to mxFrame and copies nothing while any reader holds mark 0. It may stop short (a
-//     partial copy, as when it is interrupted).
-//   - The writer restarts the WAL (a new generation, standing for new salts, with no frames and nothing copied) at the
-//     start of a write when back = mxFrame and no reader holds a nonzero mark. A reader at mark 0 doesn't stop it.
-//   - TRUNCATE restarts at once when its copy was complete. RESTART and FULL wait for readers and fail busy otherwise,
-//     so their effect is that of PASSIVE, and the restart is the next write's.
+// SQLite is the environment. The WAL has frames 1..mxFrame (every frame is a commit here), and `back` (nBackfill) of
+// them are copied into the database file. Two of SQLite's rules are taken as given, not derived:
+//   - The WAL restarts (a new generation, standing for new salts, with no frames and nothing copied) only when every
+//     frame is copied into the database file. The app's writer restarts it at the start of a write whenever that
+//     holds, and a TRUNCATE checkpoint does when its copy makes it hold.
+//   - A checkpoint copies a frame only past every reader's mark. The node's read transaction is on mark 0, so while
+//     it is held a checkpoint copies nothing (and a TRUNCATE one answers busy), and otherwise it copies the whole WAL.
+// A reader at mark 0 doesn't stop a restart, so the first rule protects nothing that isn't captured yet: that the
+// restart can't take an uncaptured frame is the node's side to make true, and the model's to check.
 //
 // The node's side:
 //   - It holds a read transaction on mark 0 whenever the shard is captured. While it does, nothing is copied into the
 //     database file and the WAL can't restart once a frame is waiting to be copied, so the WAL only grows.
 //   - A sync reads the frames after the ones it has read in the same generation, or all of a new generation (the
 //     salts changed), and adds them to the journal. It never waits for anything.
-//   - When the WAL is large it takes the write lock, syncs, ends its transaction, runs a PASSIVE checkpoint that copies
-//     everything, begins a new transaction (which gets mark 0) and lets go (`lockedRestart`). The app's writes wait
-//     for that, and its next write restarts the WAL. A TRUNCATE checkpoint can't be used: it takes the write lock
-//     itself.
+//   - When the WAL is large (more than RESTART_AT frames, with something to copy and no snapshot reading) a sync takes
+//     the write lock, syncs, ends its transaction, runs a PASSIVE checkpoint that copies everything, begins a new
+//     transaction (which gets mark 0) and lets go (`lockedRestart`). The app's writes wait for that, and its next
+//     write restarts the WAL. A TRUNCATE checkpoint can't be used: it takes the write lock itself. So a sync of a
+//     large WAL is a locked restart, and `sync` is the sync of one that is small or that a snapshot is reading.
 //   - A snapshot syncs, notes the captured end and builds a page map of the frames in the WAL that the database file
 //     doesn't hold. Then it reads one page at a time, while the app goes on, from the WAL or from the database file. The
 //     locked restart waits for it.
-//   - A release ends the node's transaction. A refused release reopens, takes the write lock, and checks the generation.
+//   - A release syncs, then ends the node's transaction. A refused release reopens, takes the write lock, and checks the generation.
 //     If it is the same and the WAL still reaches the captured end, it syncs the rest. Otherwise it writes the whole
 //     database as one file. Either way it ends as the locked restart does (`resume`).
 //
@@ -49,19 +45,20 @@
 // restart every frame is in the file, and the app's next write restarts the WAL under the node's mark 0, which wipes
 // what the map points at while the snapshot reads. The protocol maps only the frames after `back`.
 //
-// An earlier design moved the node's transaction forward after every sync (a ratchet of two overlapping read
-// transactions) so that the app's checkpoints could go on. The spike showed it didn't bound the WAL on a busy shard,
-// since the transaction it always held stopped the restart, and with the locked restart doing that job the ratchet
-// was dropped.
+// Left out: the app's own readers (they would only lower what a checkpoint copies and when the WAL restarts), a
+// checkpoint that stops short (it only delays a restart), multi-page commits (a header is only ever written for a
+// whole commit), page contents beyond which commit wrote them, the corrupt frame and the torn tail (the WAL reader's,
+// and tested there), the locked restart's threshold (here any frames at all) and how the node wins the write lock
+// against a busy writer, and liveness.
 //
-// Left out: the app's own read transactions, multi-page commits (a header is only ever written for a whole commit),
-// page contents beyond which commit wrote them, the corrupt frame and the torn tail (the WAL reader's, and tested
-// there), the locked restart's threshold (here any frames at all) and how the node wins the write lock against a busy
-// writer, and liveness.
+// Traces of this model are replayed against the capture code (docs/internals.md, The models): the reachability checks
+// below end them, and internal/capture/testdata/traces/generate.sh makes them.
 //
-// Run (simulation only):
+// Run (simulation is the check at depth: `quint verify` holds `safe` to 8 steps in about 8 minutes, and the ranges
+// are bounded by MAX_COMMITS because Apalache needs constant ones):
 //   quint typecheck specs/capture.qnt
 //   quint run specs/capture.qnt --main=captureProtocol --invariant=safe --max-steps=40 --max-samples=50000
+//   quint verify specs/capture.qnt --main=captureProtocol --invariant=safe --max-steps=8
 //   quint run specs/capture.qnt --main=lockNoSync --invariant=safe --max-steps=40 --max-samples=50000   (should fail)
 //   quint run specs/capture.qnt --main=lockGap --invariant=safe --max-steps=40 --max-samples=50000   (should fail)
 //   quint run specs/capture.qnt --main=noSalts --invariant=safe --max-steps=40 --max-samples=50000   (should fail)
@@ -71,6 +68,9 @@
 module capture {
   // At most this many commits.
   const MAX_COMMITS: int
+
+  // A sync restarts the WAL when it has more than this many frames (capture.Config.RestartFrames).
+  const RESTART_AT: int
 
   // Variants, each false in the protocol:
   //   LOCK_NO_SYNC: the locked restart doesn't sync before it checkpoints.
@@ -90,7 +90,7 @@ module capture {
   // The app's side.
   var hist: List[int]       // the page each commit wrote, in order
   var wal: List[Frame]      // the current generation's frames
-  var gen: int              // the generation (the salts)
+  var gen: int              // the generation (the salts): 0 until the WAL is first written, then one more at each restart
   var back: int             // frames copied into the database file
   var db: int -> int        // the database file: for each page, the commit that wrote what it holds
 
@@ -115,7 +115,7 @@ module capture {
   var sGot: int -> int
 
   pure def truthAt(h: List[int], s: int): int -> int =
-    PAGES.mapBy(p => 1.to(s).filter(i => h[i - 1] == p).fold(0, (a, i) => if (i > a) i else a))
+    PAGES.mapBy(p => 1.to(MAX_COMMITS).filter(i => i <= s and h[i - 1] == p).fold(0, (a, i) => if (i > a) i else a))
 
   // What a sync does, in terms of the journal's next values.
   def syncFrom: int = if (capGen == gen) capFrames else 0
@@ -150,15 +150,15 @@ module capture {
     sGot' = PAGES.mapBy(p => 0),
   }
 
-  // The app commits one page. The writer restarts the WAL first if it can (every frame copied, and no reader on a
-  // nonzero mark, of which there are none here).
+  // The app commits one page. Its writer restarts the WAL first if every frame is copied. A WAL nobody has written has
+  // no salts (the wal-index holds zeros), so the first commit gives it its own, which capture counts as another WAL.
   action commit(pg: int): bool = {
     val restart = wal.length() > 0 and back == wal.length()
     all {
       hist.length() < MAX_COMMITS,
       hist' = hist.append(pg),
       wal' = (if (restart) List() else wal).append({ pg: pg, sq: hist.length() + 1 }),
-      gen' = if (restart) gen + 1 else gen,
+      gen' = if (restart or hist.length() == 0) gen + 1 else gen,
       back' = if (restart) 0 else back,
       db' = db,
       held' = held, keepJournal, keepSnap,
@@ -166,14 +166,13 @@ module capture {
     }
   }
 
-  // An app's checkpoint. It copies nothing while mark 0 is held and otherwise all of the WAL, perhaps not all the way.
-  // TRUNCATE restarts when its copy was complete.
-  action checkpoint(trunc: bool): bool = all {
-    not(held),
-    wal.length() > 0,
-    nondet nb = oneOf(back.to(wal.length()))
+  // An app's checkpoint. It copies nothing while the node holds mark 0 and the whole WAL otherwise. TRUNCATE restarts
+  // the WAL when every frame is copied.
+  action checkpoint(trunc: bool): bool = {
+    val nb = if (held) back else wal.length()
     val done = trunc and nb == wal.length()
     all {
+      wal.length() > 0,
       db' = wal.slice(back, nb).foldl(db, (d, f) => d.set(f.pg, f.sq)),
       wal' = if (done) List() else wal,
       gen' = if (done) gen + 1 else gen,
@@ -184,9 +183,14 @@ module capture {
     }
   }
 
+  // The sync of a large WAL is the locked restart: it has frames to copy, more than the threshold, and no snapshot is
+  // reading (which needs the database file as it is).
+  def large: bool = sPhase == 0 and wal.length() > RESTART_AT and back < wal.length()
+
   // The node reads the frames it hasn't.
   action sync = all {
     phase == 0,
+    not(large),
     journal' = syncJournal,
     capSeq' = syncSeq,
     capGen' = gen,
@@ -196,14 +200,13 @@ module capture {
     phase' = phase,
   }
 
-  // The WAL is large (here any frames at all). Under the write lock, so atomic, the node syncs, ends its transaction,
+  // The WAL is large. Under the write lock, so atomic, the node syncs, ends its transaction,
   // runs a PASSIVE checkpoint that copies everything and begins a new transaction, which gets mark 0. It waits for a
   // snapshot to finish, as the snapshot needs the database file as it is. The WAL restarts at the app's next write.
   action lockedRestart = all {
     not(LOCK_GAP),
     phase == 0,
-    sPhase == 0,
-    wal.length() > 0,
+    large,
     journal' = if (LOCK_NO_SYNC) journal else syncJournal,
     capSeq' = if (LOCK_NO_SYNC) capSeq else syncSeq,
     capGen' = gen,
@@ -221,8 +224,7 @@ module capture {
   action gapStart = all {
     LOCK_GAP,
     phase == 0,
-    sPhase == 0,
-    wal.length() > 0,
+    large,
     journal' = syncJournal,
     capSeq' = syncSeq,
     capGen' = gen,
@@ -254,7 +256,7 @@ module capture {
     sPhase' = 1,
     sEnd' = syncSeq,
     sGen' = gen,
-    sMap' = PAGES.mapBy(p => 1.to(wal.length()).filter(i => wal[i - 1].pg == p and (MAP_ALL or i > back)).fold(0, (a, i) => if (i > a) i else a)),
+    sMap' = PAGES.mapBy(p => 1.to(MAX_COMMITS).filter(i => i <= wal.length() and wal[i - 1].pg == p and (MAP_ALL or i > back)).fold(0, (a, i) => if (i > a) i else a)),
     sNext' = 0,
     sGot' = PAGES.mapBy(p => -2),
     hist' = hist, keepWal,
@@ -287,13 +289,17 @@ module capture {
     phase' = phase,
   }
 
-  // The node lets go: its transaction ends.
+  // The node lets go: a final sync, then its transaction ends.
   action releaseStart = all {
     phase == 0,
     sPhase == 0,
+    journal' = syncJournal,
+    capSeq' = syncSeq,
+    capGen' = gen,
+    capFrames' = wal.length(),
     held' = false,
     phase' = 1,
-    hist' = hist, keepWal, keepJournal, keepSnap,
+    hist' = hist, keepWal, keepSnap,
   }
 
   // The release is refused. Under the write lock, so atomic, capture checks the generation and the length. Either it
@@ -343,26 +349,33 @@ module capture {
 
   val safe: bool = noLoss and replay and snapOk
 
-  // Reachability check, which should fail.
-  val neverRestarts: bool = gen == 0
+  // Reachability checks, which should fail. Four of them end a path where the code is replayed along it (see
+  // internal/capture/testdata/traces): a commit and a release, which is two steps; a WAL of three frames all copied
+  // (a locked restart, or a resume after one); four commits captured with nothing open, which a random walk reaches
+  // by many paths; and a snapshot finished after a WAL restart.
+  val neverRestarts: bool = gen <= 1
+  val neverReleasedAfterOneCommit: bool = not(phase == 1 and capSeq == 1 and back == 0)
+  val neverThreeFramesCopied: bool = not(phase == 0 and back >= 3)
+  val neverFourCapturedAtRest: bool = not(capSeq >= 4 and phase == 0 and sPhase == 0)
+  val neverSnapshotAfterRestart: bool = not(sPhase == 2 and gen >= 1)
 }
 
 module captureProtocol {
-  import capture(MAX_COMMITS = 5, LOCK_NO_SYNC = false, LOCK_GAP = false, NO_SALTS = false, MAP_ALL = false).*
+  import capture(MAX_COMMITS = 5, RESTART_AT = 2, LOCK_NO_SYNC = false, LOCK_GAP = false, NO_SALTS = false, MAP_ALL = false).*
 }
 
 module lockNoSync {
-  import capture(MAX_COMMITS = 5, LOCK_NO_SYNC = true, LOCK_GAP = false, NO_SALTS = false, MAP_ALL = false).*
+  import capture(MAX_COMMITS = 5, RESTART_AT = 2, LOCK_NO_SYNC = true, LOCK_GAP = false, NO_SALTS = false, MAP_ALL = false).*
 }
 
 module lockGap {
-  import capture(MAX_COMMITS = 5, LOCK_NO_SYNC = false, LOCK_GAP = true, NO_SALTS = false, MAP_ALL = false).*
+  import capture(MAX_COMMITS = 5, RESTART_AT = 2, LOCK_NO_SYNC = false, LOCK_GAP = true, NO_SALTS = false, MAP_ALL = false).*
 }
 
 module noSalts {
-  import capture(MAX_COMMITS = 5, LOCK_NO_SYNC = false, LOCK_GAP = false, NO_SALTS = true, MAP_ALL = false).*
+  import capture(MAX_COMMITS = 5, RESTART_AT = 2, LOCK_NO_SYNC = false, LOCK_GAP = false, NO_SALTS = true, MAP_ALL = false).*
 }
 
 module mapAll {
-  import capture(MAX_COMMITS = 5, LOCK_NO_SYNC = false, LOCK_GAP = false, NO_SALTS = false, MAP_ALL = true).*
+  import capture(MAX_COMMITS = 5, RESTART_AT = 2, LOCK_NO_SYNC = false, LOCK_GAP = false, NO_SALTS = false, MAP_ALL = true).*
 }

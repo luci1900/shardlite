@@ -21,12 +21,14 @@ var (
 )
 
 // Build builds a main package of this repository (such as ./internal/testapp)
-// once per test process and returns the binary's path.
-func Build(tb testing.TB, pkg string) string {
+// once per test process and returns the binary's path. tags are build tags
+// (the fault build of ./cmd/shardlite passes "fault").
+func Build(tb testing.TB, pkg string, tags ...string) string {
 	tb.Helper()
 	buildMu.Lock()
 	defer buildMu.Unlock()
-	if p, ok := builds[pkg]; ok {
+	key := pkg + " " + strings.Join(tags, ",")
+	if p, ok := builds[key]; ok {
 		return p
 	}
 	dir, err := os.MkdirTemp("", "shardlite-build")
@@ -35,12 +37,16 @@ func Build(tb testing.TB, pkg string) string {
 	}
 	bin := filepath.Join(dir, filepath.Base(pkg))
 	_, file, _, _ := runtime.Caller(0)
-	cmd := exec.Command("go", "build", "-o", bin, pkg)
+	args := []string{"build", "-o", bin}
+	if len(tags) > 0 {
+		args = append(args, "-tags", strings.Join(tags, ","))
+	}
+	cmd := exec.Command("go", append(args, pkg)...)
 	cmd.Dir = filepath.Join(filepath.Dir(file), "..", "..")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		tb.Fatalf("build %s: %v\n%s", pkg, err, out)
 	}
-	builds[pkg] = bin
+	builds[key] = bin
 	return bin
 }
 

@@ -229,9 +229,9 @@ func TestRestartAdoptsItsOwnJournal(t *testing.T) {
 			}
 			lastSeg := n1.Writer.NextSeq() - 1
 
-			// The process dies (its writer lives on here, as a zombie would), once the
-			// local store has every segment queued so far.
-			waitLocalCopy(t, n1, n1.Writer.Queued())
+			// The process dies (its writer lives on here, as a zombie would), once
+			// storage has every segment queued so far.
+			waitStored(t, n1, n1.Writer.Queued())
 			n2 := r.mustStart()
 			if got := n2.Keeper.Lease().Epoch; got != 2 {
 				t.Fatalf("epoch %d, want 2", got)
@@ -307,7 +307,7 @@ func TestFailedAdoptionKeepsTheRange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitLocalCopy(t, n1, n1.Writer.Queued())
+	waitStored(t, n1, n1.Writer.Queued())
 	want := apptest.Dump(t, s.path)
 
 	r.local.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
@@ -400,5 +400,15 @@ func TestHoleInTheMiddleOfTheRangeFailsTheStart(t *testing.T) {
 	}
 	if _, err := r.start(); !errors.Is(err, segment.ErrMissing) {
 		t.Fatalf("start with a segment missing from the middle of the range: %v", err)
+	}
+}
+
+// waitStored waits for storage to have the first count entries.
+func waitStored(t *testing.T, n *node.Node, count uint64) {
+	t.Helper()
+	select {
+	case <-n.Writer.Reached(count):
+	case <-time.After(10 * time.Second):
+		t.Fatal("storage did not get the segment")
 	}
 }

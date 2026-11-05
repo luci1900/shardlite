@@ -21,8 +21,8 @@ func TestParseApp(t *testing.T) {
 	if a.Kinds["test.users"].Name != "test.users" {
 		t.Fatalf("%+v", a.Kinds["test.users"])
 	}
-	// Leaving sync out gives the record, the conservative tier; the other
-	// defaults are the safe ones: not public. The peer tier is opt-in.
+	// Leaving sync out gives storage, the conservative tier; the other
+	// defaults are the safe ones: not public.
 	if w := a.Kinds["test.wallet"]; w.Sync != SyncStorage || w.Public || w.IdleTimeout != 3*time.Minute {
 		t.Fatalf("defaults: %+v", w)
 	}
@@ -39,6 +39,7 @@ func TestParseApp(t *testing.T) {
 		"unknown field": `{"app": "test", "kinds": {"users": {"synk": true}}}`,
 		"auto_delete":   `{"app": "test", "kinds": {"users": {"auto_delete": true}}}`,
 		"sync value":    `{"app": "test", "kinds": {"users": {"sync": "maybe"}}}`,
+		"sync peer":     `{"app": "test", "kinds": {"users": {"sync": "peer"}}}`,
 		"sync boolean":  `{"app": "test", "kinds": {"users": {"sync": true}}}`,
 		"bad duration":  `{"app": "test", "kinds": {"users": {"idle_timeout": "soon"}}}`,
 		"zero duration": `{"app": "test", "kinds": {"users": {"idle_timeout": "0s"}}}`,

@@ -204,12 +204,11 @@ func NewCatalog(n *Node, opts CatalogOptions, newRouting func(*Catalog) routing)
 	}
 	rt = newRouting(m)
 	m.rem = newReminders(opts.Reminders, clk, log, st, rt.wake)
-	m.flush = newFlusher(m.tab, n.Writer, n.Keeper, n.Confirmer, n.Clock, log, opts.Flush)
+	m.flush = newFlusher(m.tab, n.Writer, n.Keeper, n.Confirmer, log, opts.Flush)
 	m.leases = &leaseScan{
 		reg: n.Registry, files: n.Files, store: n.Store, nodeErr: n.Err,
 		self:  func() coord.Incarnation { l := n.Keeper.Lease(); return l.Incarnation() },
 		clock: clk, opts: opts.Leases, log: log, scans: &st.LeaseScans, adopted: &st.Adoptions, died: m.died,
-		mirror: newMirrorDialer(n.Registry, n.Files.JournalOptions),
 	}
 	m.claim = &claimer{targets: sys.targets(), active: m.IsActive, owner: m.owners.Get, live: m.isLive, acquire: m.Acquire,
 		clock: clk, opts: opts.Claims, log: log, kick: notify.NewKick(), adopted: &st.Adoptions, passes: &st.ClaimPasses}

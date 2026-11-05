@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"errors"
+	"github.com/luci1900/shardlite/internal/apptest"
 	"net/http"
 	"os"
 	"slices"
@@ -26,14 +27,14 @@ func TestNeverWrittenWithAnAutoincrementSequence(t *testing.T) {
 		t.Fatalf("%d sqlite_sequence tables", n)
 	}
 	r.closeInApp("test.users/s1")
-	eventually(t, "deactivation", r.inactive("test.users/s1"))
+	apptest.Eventually(t, apptest.Timeout, "deactivation", r.inactive("test.users/s1"))
 	if _, err := r.rawManifest("test.users/s1"); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("a shard with only the reserved table and a sequence was kept: %v", err)
 	}
 	// The app's own AUTOINCREMENT table is the app's data.
 	r.sql("test.users/s2", `DROP TABLE kv; DROP TABLE acks; CREATE TABLE mine (id INTEGER PRIMARY KEY AUTOINCREMENT)`)
 	r.closeInApp("test.users/s2")
-	eventually(t, "deactivation", func() bool { return r.cached("test.users/s2") })
+	apptest.Eventually(t, apptest.Timeout, "deactivation", func() bool { return r.cached("test.users/s2") })
 }
 
 // --- next_reminder and the reminder index ---
@@ -106,7 +107,7 @@ func TestShutdownWithAFailingHandlerLeavesAnEntryThatWakesTheShard(t *testing.T)
 			r.record(rec, "")
 			attempts := r.failUntil(&up)
 			r.remind("test.users/w1", "k", time.Now().Unix())
-			eventually(t, "a first attempt", func() bool { return attempts.Load() >= 1 })
+			apptest.Eventually(t, apptest.Timeout, "a first attempt", func() bool { return attempts.Load() >= 1 })
 			r.shutdown("test.users/w1")
 			if r.nextReminder("test.users/w1") == 0 || r.entryCount("test.users/w1") == 0 {
 				t.Fatalf("next_reminder %d and %d entries, want both", r.nextReminder("test.users/w1"), r.entryCount("test.users/w1"))
@@ -118,12 +119,12 @@ func TestShutdownWithAFailingHandlerLeavesAnEntryThatWakesTheShard(t *testing.T)
 			}
 			up.Store(true)
 			r.restart(opts)
-			eventually(t, "the reminder to be delivered after the restart, with no request for the shard", func() bool {
+			apptest.Eventually(t, apptest.Timeout, "the reminder to be delivered after the restart, with no request for the shard", func() bool {
 				return rec.count() == 1
 			})
-			eventually(t, "the reminder to be consumed", func() bool { return r.reminderRows("test.users/w1") == 0 })
+			apptest.Eventually(t, apptest.Timeout, "the reminder to be consumed", func() bool { return r.reminderRows("test.users/w1") == 0 })
 			r.closeInApp("test.users/w1") // the handler's delete opened the shard in the app again
-			eventually(t, "the next_reminder to go", func() bool { return r.cached("test.users/w1") && r.nextReminder("test.users/w1") == 0 })
+			apptest.Eventually(t, apptest.Timeout, "the next_reminder to go", func() bool { return r.cached("test.users/w1") && r.nextReminder("test.users/w1") == 0 })
 		})
 	}
 }
@@ -187,7 +188,7 @@ func (r *srig) allInADelta(target string) func() bool {
 // the delta's entry wakes it.
 func (r *srig) wokeByTheDelta(target string, mutate func(*CatalogOptions)) {
 	r.t.Helper()
-	eventually(r.t, "a delta with a next_reminder", r.allInADelta(target))
+	apptest.Eventually(r.t, apptest.Timeout, "a delta with a next_reminder", r.allInADelta(target))
 	m, err := r.manifest(target)
 	if err != nil {
 		r.t.Fatal(err)
@@ -216,10 +217,10 @@ func TestReminderFailingPastADeltaIsWokenAfterACrash(t *testing.T) {
 	}}
 	r.record(rec, "")
 	r.remind("test.users/bi1", "k", time.Now().Unix())
-	eventually(t, "a first call", func() bool { return rec.count() >= 1 })
+	apptest.Eventually(t, apptest.Timeout, "a first call", func() bool { return rec.count() >= 1 })
 	r.wokeByTheDelta("test.users/bi1", opts)
 	up.Store(true)
-	eventually(t, "the reminder to be consumed after the crash", func() bool { return r.reminderRows("test.users/bi1") == 0 })
+	apptest.Eventually(t, apptest.Timeout, "the reminder to be consumed after the crash", func() bool { return r.reminderRows("test.users/bi1") == 0 })
 }
 
 // The same for a marked shard, which is deleted when it next goes idle.
@@ -230,7 +231,7 @@ func TestMarkedShardPastADeltaIsWokenAfterACrash(t *testing.T) {
 	r.sql("test.slow/bm1", `INSERT INTO kv (payload) VALUES (x'01')`)
 	r.sql("test.slow/bm1", markSQL)
 	r.wokeByTheDelta("test.slow/bm1", opts)
-	eventually(t, "the shard to be woken", func() bool { return r.m.IsActive(shardName("test.slow/bm1")) })
+	apptest.Eventually(t, apptest.Timeout, "the shard to be woken", func() bool { return r.m.IsActive(shardName("test.slow/bm1")) })
 }
 
 // An entry that can't be created fails the delta, so the manifest never has files
@@ -251,14 +252,14 @@ func TestFailedEntryFailsTheDelta(t *testing.T) {
 	var up atomic.Bool
 	attempts := r.failUntil(&up)
 	r.remind("test.users/fd1", "k", time.Now().Unix())
-	eventually(t, "a first attempt", func() bool { return attempts.Load() >= 1 })
-	eventually(t, "a failed entry", func() bool { return failures.Load() >= 1 })
+	apptest.Eventually(t, apptest.Timeout, "a first attempt", func() bool { return attempts.Load() >= 1 })
+	apptest.Eventually(t, apptest.Timeout, "a failed entry", func() bool { return failures.Load() >= 1 })
 	r.afterSnapshotLooks(3, "test.users/fd1")
 	if m, err := r.manifest("test.users/fd1"); err != nil || len(m.Files) != 0 {
 		t.Fatalf("manifest %+v (%v): a delta without its entry", m, err)
 	}
 	failing.Store(false)
-	eventually(t, "the delta with its entry", r.allInADelta("test.users/fd1"))
+	apptest.Eventually(t, apptest.Timeout, "the delta with its entry", r.allInADelta("test.users/fd1"))
 	if r.entryCount("test.users/fd1") == 0 {
 		t.Fatal("no entry")
 	}
@@ -293,7 +294,7 @@ func (r *srig) cache(target string) {
 	r.t.Helper()
 	r.commitTo(target)
 	r.closeInApp(target)
-	eventually(r.t, "deactivation", func() bool { return r.cached(target) })
+	apptest.Eventually(r.t, apptest.Timeout, "deactivation", func() bool { return r.cached(target) })
 }
 
 // A delta whose next reminder is read while a commit that isn't captured yet has

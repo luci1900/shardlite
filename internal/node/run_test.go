@@ -138,7 +138,7 @@ func TestRunLeavesNoGoroutines(t *testing.T) {
 	case <-time.After(20 * time.Second):
 		t.Fatal("the node did not come up")
 	}
-	eventually(t, "the app to be seen as healthy", func() bool {
+	apptest.Eventually(t, apptest.Timeout, "the app to be seen as healthy", func() bool {
 		resp, err := http.Get("http://" + public + "/_shardlite/ready")
 		if err != nil {
 			return false
@@ -305,7 +305,7 @@ func TestRunJoinsRequestsBeforeLettingGo(t *testing.T) {
 		t.Fatal("the node did not come up")
 	}
 	// The first requests wait for the poll to land the declaration.
-	eventually(t, "the app's declaration", func() bool {
+	apptest.Eventually(t, apptest.Timeout, "the app's declaration", func() bool {
 		resp, err := http.Get("http://" + a.public + readyPath)
 		if err != nil {
 			return false
@@ -435,7 +435,7 @@ func startRun(t *testing.T, name string, vars map[string]string, opts ...RunOpti
 	}
 	// The kinds come from the app's declaration now, not a file read at
 	// startup: the first requests wait for the poll to land.
-	eventually(t, "the app's declaration", func() bool {
+	apptest.Eventually(t, apptest.Timeout, "the app's declaration", func() bool {
 		resp, err := http.Get("http://" + r.public + readyPath)
 		if err != nil {
 			return false
@@ -695,8 +695,7 @@ func TestPeerListenerSaysWhoTheNodeIs(t *testing.T) {
 	if resp.ProtoMajor != 2 || got.Name != "peer-test" || got.Epoch != r.lease().Epoch {
 		t.Fatalf("proto %d, reply %+v, lease %+v", resp.ProtoMajor, got, r.lease())
 	}
-	// The control API answers the same for whoever runs the node, and says
-	// that this node names no peer: it is alone.
+	// The control API answers the same for whoever runs the node.
 	cresp, err := http.Get("http://" + r.control + "/_shardlite/node")
 	if err != nil {
 		t.Fatal(err)
@@ -706,8 +705,8 @@ func TestPeerListenerSaysWhoTheNodeIs(t *testing.T) {
 	if err := json.NewDecoder(cresp.Body).Decode(&who); err != nil {
 		t.Fatal(err)
 	}
-	if cresp.StatusCode != http.StatusOK || who.Name != "peer-test" || who.Peer != nil {
-		t.Fatalf("control reply %d %+v, want this node and no peer", cresp.StatusCode, who)
+	if cresp.StatusCode != http.StatusOK || who.Name != "peer-test" {
+		t.Fatalf("control reply %d %+v, want this node", cresp.StatusCode, who)
 	}
 	// It reports the clock watch (the memory backend takes no samples).
 	if who.Clock == nil || who.Clock.Warning || who.Clock.Blind {

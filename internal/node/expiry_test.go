@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"errors"
+	"github.com/luci1900/shardlite/internal/apptest"
 	"strings"
 	"sync"
 	"testing"
@@ -62,11 +63,11 @@ func TestTailOlderThanTheAlertAgeRaisesIt(t *testing.T) {
 	if err := r.m.Gate(ctx, ref, kind.SyncStorage); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, "the tail alert", func() bool { return r.m.Stats.TailAlerts.Load() > 0 })
+	apptest.Eventually(t, apptest.Timeout, "the tail alert", func() bool { return r.m.Stats.TailAlerts.Load() > 0 })
 	if data, _ := r.segments(); data == 0 {
 		t.Fatal("the segments were gone before the alert")
 	}
-	eventually(t, "the segments to expire", func() bool { d, _ := r.segments(); return d == 0 })
+	apptest.Eventually(t, apptest.Timeout, "the segments to expire", func() bool { d, _ := r.segments(); return d == 0 })
 }
 
 // The alert doesn't depend on the delta succeeding: with every manifest update
@@ -93,7 +94,7 @@ func TestTailAlertWhenDeltasFail(t *testing.T) {
 	if err := r.m.Gate(ctx, ref, kind.SyncStorage); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, "the tail alert", func() bool { return r.m.Stats.TailAlerts.Load() > 0 })
+	apptest.Eventually(t, apptest.Timeout, "the tail alert", func() bool { return r.m.Stats.TailAlerts.Load() > 0 })
 }
 
 // A node restarted after its old segments expired adopts its own journal from the
@@ -118,7 +119,7 @@ func TestRestartAfterSegmentsExpired(t *testing.T) {
 		want[name] = r.liveDump(ref.Path())
 	}
 	// Every tail becomes a delta, so the journal holds nothing that is not in a file.
-	eventually(t, "deltas for every shard", func() bool {
+	apptest.Eventually(t, apptest.Timeout, "deltas for every shard", func() bool {
 		for name := range want {
 			m, err := r.manifest(name)
 			if err != nil || len(m.Files) == 0 || r.dumpBlob(name) != want[name] {
@@ -139,7 +140,7 @@ func TestRestartAfterSegmentsExpired(t *testing.T) {
 
 	// Everything written so far is older than the expiry age.
 	stop := r.startExpiry(300 * time.Millisecond)
-	eventually(t, "the old segments to expire", func() bool { d, _ := r.segments(); return d == 0 })
+	apptest.Eventually(t, apptest.Timeout, "the old segments to expire", func() bool { d, _ := r.segments(); return d == 0 })
 	stop()
 	if _, fences := r.segments(); fences != 0 {
 		t.Fatalf("%d fences before the restart", fences)
@@ -239,7 +240,7 @@ func TestExpiryStartsAfterAdoption(t *testing.T) {
 		t.Fatalf("the segments were not adopted: %+v", r.n.Adopted)
 	}
 	r.startExpiry(200 * time.Millisecond)
-	eventually(t, "the old segments to expire", func() bool { d, _ := r.segments(); return d == 0 })
+	apptest.Eventually(t, apptest.Timeout, "the old segments to expire", func() bool { d, _ := r.segments(); return d == 0 })
 	if got := r.dumpBlob("test.wallet/1"); got != want {
 		t.Fatal("the shard restores differently")
 	}
@@ -346,7 +347,7 @@ func TestJournalExpiryRunsAndStopJoins(t *testing.T) {
 	r := newMRig(t)
 	key := r.putSegment("n1", 3001, "seg")
 	stop := r.startExpiry(300 * time.Millisecond)
-	eventually(t, "the segment to expire", func() bool { return !r.exists(key) })
+	apptest.Eventually(t, apptest.Timeout, "the segment to expire", func() bool { return !r.exists(key) })
 	stop()
 	// Joined: a segment written now is not swept, whatever its age (the ticker
 	// is every 30 ms).

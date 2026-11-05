@@ -141,9 +141,9 @@ func (t *tail) log(dir *tempfile.Dir) (*tempfile.Log, error) {
 }
 
 // add records a file of count commits, queued in the journal at segment seg
-// (see Shard.queue), and moves the position past it.
-func (t *tail) add(body tempfile.File, count pos.Count, seg pos.Seg) {
-	t.files.Files = append(t.files.Files, TailFile{Position: t.nextPos, Count: count, Body: body, At: time.Now(), Seg: seg})
+// (see Shard.queue) at time at, and moves the position past it.
+func (t *tail) add(body tempfile.File, count pos.Count, seg pos.Seg, at time.Time) {
+	t.files.Files = append(t.files.Files, TailFile{Position: t.nextPos, Count: count, Body: body, At: at, Seg: seg})
 	t.nextPos += pos.Position(count)
 	t.publish(0)
 }

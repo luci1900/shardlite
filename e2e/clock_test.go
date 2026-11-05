@@ -14,9 +14,8 @@ import (
 
 // clockReport is the clock object of the control API's node reply.
 type clockReport struct {
-	Samples  int  `json:"samples"`
-	Warning  bool `json:"warning"`
-	Unsteady bool `json:"unsteady"`
+	Samples int  `json:"samples"`
+	Warning bool `json:"warning"`
 }
 
 func (s *stack) nodeClock(t testing.TB) clockReport {
@@ -46,11 +45,10 @@ func (s *stack) add(shard, token string) (int, string, string) {
 	return resp.StatusCode, string(b), resp.Header.Get("Retry-After")
 }
 
-// The store's clock as the node sees it is moved by a proxy. A constant offset
-// within the lease TTL only warns. A step makes `none` answers fail with a retry
-// hint while `storage` answers go on, and they recover once the offset has been
-// steady for a while. An offset past the TTL stops the node from starting.
-func TestSkewedClockFailsNoneAnswersAndNotStorage(t *testing.T) {
+// The store's clock as the node sees it is moved by a proxy. An offset within
+// the lease TTL only warns, a step in it only warns too and `none` answers go
+// on, and an offset past the TTL stops the node from starting.
+func TestSkewedClockOnlyWarns(t *testing.T) {
 	t.Parallel()
 	st := s3test.Setup(t)
 	skew := s3test.StartSkew(t, st.Endpoint)
@@ -64,41 +62,21 @@ func TestSkewedClockFailsNoneAnswersAndNotStorage(t *testing.T) {
 		c := s.nodeClock(t)
 		return c.Samples > 0 && c.Warning
 	})
-	if c := s.nodeClock(t); c.Unsteady {
-		t.Fatalf("a constant offset is unsteady: %+v", c)
-	}
 	for _, shard := range []string{"e2e.users/u1", "e2e.wallet/w1"} {
 		if code, body, _ := s.add(shard, "before-"+shard); code != 200 {
 			t.Fatalf("%s with a constant offset: %d %q", shard, code, body)
 		}
 	}
 
-	// A step: the node's none answers fail, its storage answers do not.
+	// A step: the node warns and every answer goes on.
 	skew.Set(40 * time.Second)
-	apptest.Eventually(t, 20*time.Second, "a none answer to fail on the clock", func() bool {
-		code, body, retry := s.add("e2e.users/u1", "during")
-		if code == 200 {
-			return false
+	for _, shard := range []string{"e2e.users/u1", "e2e.wallet/w1"} {
+		if code, body, _ := s.add(shard, "during-"+shard); code != 200 {
+			t.Fatalf("%s under a step: %d %q", shard, code, body)
 		}
-		if code != http.StatusServiceUnavailable || retry == "" || !strings.Contains(body, "clock") {
-			t.Fatalf("a none answer under a step: %d %q (Retry-After %q)", code, body, retry)
-		}
-		return true
-	})
-	if code, body, _ := s.add("e2e.wallet/w1", "during"); code != 200 {
-		t.Fatalf("a storage answer failed on the clock: %d %q", code, body)
 	}
-	if !s.nodeClock(t).Unsteady {
-		t.Fatal("the node does not report the step")
-	}
-
-	// It recovers once the samples since show a steady offset.
-	apptest.Eventually(t, 60*time.Second, "none answers to recover", func() bool {
-		code, _, _ := s.add("e2e.users/u1", "after")
-		return code == 200
-	})
-	if s.nodeClock(t).Unsteady {
-		t.Fatal("the node answers but still reports the step")
+	if !s.nodeClock(t).Warning {
+		t.Fatal("the node does not report the offset")
 	}
 
 	// Past the TTL the node does not start.

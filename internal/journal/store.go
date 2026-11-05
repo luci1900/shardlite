@@ -20,7 +20,7 @@ import (
 type Options blob.Options
 
 // Store is the one type every journal caller writes through. Its segments live
-// in whatever Backend the node's journal does, the record included; the same
+// in whatever Backend the node's journal does, blob storage included; the same
 // write-id and retry handling applies to all of them.
 //
 // Like blob.Store, it tags each create with a write id (its writer's node,
@@ -194,7 +194,7 @@ func (s *Store) CreateWithID(ctx context.Context, seq pos.Seg, body blob.Body, i
 	return s.create(ctx, seq, body, id, true)
 }
 
-// seqName names a segment in an error, the way the record's key would but
+// seqName names a segment in an error, the way the blob key would but
 // without the zeros: n1/129.
 func seqName(seq pos.Seg) string { return fmt.Sprintf("%d", uint64(seq)) }
 
