@@ -10,8 +10,9 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/coord"
 	"github.com/luci1900/shardlite/internal/harness"
+	"github.com/luci1900/shardlite/internal/lease"
+	shardpkg "github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/tempfile"
 )
@@ -22,37 +23,37 @@ func TestManifestStoreCompareAndSwap(t *testing.T) {
 	ms := shardfile.NewManifestStore(e.Store)
 	m := &shardfile.Manifest{Generation: "g", Owner: "n1", NodeEpoch: 1, Files: []shardfile.File{}, Journal: "n1"}
 
-	v1, err := ms.Put(ctx, shardName("test.users/1"), m, nil)
+	v1, err := ms.Put(ctx, shardName("users/1"), m, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ms.Put(ctx, shardName("test.users/1"), m, nil); !errors.Is(err, blob.ErrExists) {
+	if _, err := ms.Put(ctx, shardName("users/1"), m, nil); !errors.Is(err, blob.ErrExists) {
 		t.Fatalf("second create: %v", err)
 	}
-	got, v, err := ms.Get(ctx, shardName("test.users/1"))
+	got, v, err := ms.Get(ctx, shardName("users/1"))
 	if err != nil || v != v1 || got.Owner != "n1" || got.NodeEpoch != 1 {
 		t.Fatalf("get: %+v %v %v", got, v, err)
 	}
 	m2 := *got
 	m2.NodeEpoch = 2
-	v2, err := ms.Put(ctx, shardName("test.users/1"), &m2, &v1)
+	v2, err := ms.Put(ctx, shardName("users/1"), &m2, &v1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ms.Put(ctx, shardName("test.users/1"), &m2, &v1); !errors.Is(err, blob.ErrConflict) {
+	if _, err := ms.Put(ctx, shardName("users/1"), &m2, &v1); !errors.Is(err, blob.ErrConflict) {
 		t.Fatalf("update from an old version: %v", err)
 	}
-	if err := ms.Delete(ctx, shardName("test.users/1"), v1); !errors.Is(err, blob.ErrConflict) {
+	if err := ms.Delete(ctx, shardName("users/1"), v1); !errors.Is(err, blob.ErrConflict) {
 		t.Fatalf("delete of an old version: %v", err)
 	}
-	if err := ms.Delete(ctx, shardName("test.users/1"), v2); err != nil {
+	if err := ms.Delete(ctx, shardName("users/1"), v2); err != nil {
 		t.Fatal(err)
 	}
 	// A conditional delete removes the object.
-	if _, _, err := ms.Get(ctx, shardName("test.users/1")); !errors.Is(err, blob.ErrNotFound) {
+	if _, _, err := ms.Get(ctx, shardName("users/1")); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("get after delete: %v", err)
 	}
-	if err := ms.Delete(ctx, shardName("test.users/1"), v2); !errors.Is(err, blob.ErrNotFound) {
+	if err := ms.Delete(ctx, shardName("users/1"), v2); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("delete of a manifest already deleted: %v", err)
 	}
 }
@@ -60,7 +61,7 @@ func TestManifestStoreCompareAndSwap(t *testing.T) {
 func TestClaim(t *testing.T) {
 	t.Parallel()
 	e, ctx := harness.New(t), context.Background()
-	h, created, err := e.Files.Open(ctx, shardName("test.users/1"))
+	h, created, err := e.Files.Open(ctx, shardName("users/1"))
 	if err != nil || !created {
 		t.Fatal(err)
 	}
@@ -74,17 +75,17 @@ func TestClaim(t *testing.T) {
 	}
 
 	// Another node's shard, while its lease is valid, isn't claimed.
-	other := coord.NewRegistry(e.Blob, "n2", coord.RegistryOptions{})
-	l2, err := other.Acquire(ctx, coord.NodeInfo{Name: "n2"})
+	other := lease.NewRegistry(e.Blob, "n2", lease.RegistryOptions{})
+	l2, err := other.Acquire(ctx, lease.NodeInfo{Name: "n2"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	n2files := &shardfile.Files{Blob: blob.NewStore(e.Blob, "n2", l2.Epoch, blob.Options{}), Backend: e.Blob, Node: "n2", Leases: other, Temp: tempfile.NewDir(t.TempDir())}
-	h2, _, err := n2files.Open(ctx, shardName("test.users/2"))
+	h2, _, err := n2files.Open(ctx, shardName("users/2"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	mine, _, err := e.Files.Open(ctx, shardName("test.users/2"))
+	mine, _, err := e.Files.Open(ctx, shardName("users/2"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,15 +109,15 @@ func TestClaim(t *testing.T) {
 func TestCreatorsRacing(t *testing.T) {
 	t.Parallel()
 	e, ctx := harness.New(t), context.Background()
-	other := coord.NewRegistry(e.Blob, "n2", coord.RegistryOptions{})
-	l2, err := other.Acquire(ctx, coord.NodeInfo{Name: "n2"})
+	other := lease.NewRegistry(e.Blob, "n2", lease.RegistryOptions{})
+	l2, err := other.Acquire(ctx, lease.NodeInfo{Name: "n2"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	n2 := &shardfile.Files{Blob: blob.NewStore(e.Blob, "n2", l2.Epoch, blob.Options{}), Backend: e.Blob, Node: "n2", Leases: other, Temp: tempfile.NewDir(t.TempDir())}
 
 	for round := range 20 {
-		shard := fmt.Sprintf("test.users/race%d", round)
+		shard := fmt.Sprintf("users/race%d", round)
 		type result struct {
 			h       *shardfile.Handle
 			created bool
@@ -168,15 +169,15 @@ func TestCreatorsRacing(t *testing.T) {
 func TestDeleteShard(t *testing.T) {
 	t.Parallel()
 	e, ctx := harness.New(t), context.Background()
-	h, _, err := e.Files.Open(ctx, shardName("test.users/e1"))
+	h, _, err := e.Files.Open(ctx, shardName("users/e1"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	key := shardfile.FileKey(shardName("test.users/e1"), h.Manifest.Generation, shardfile.File{Range: shardfile.Range{Min: 1, Max: 1}, Epoch: 1})
+	key := shardfile.FileKey(shardName("users/e1"), h.Manifest.Generation, shardfile.File{Range: shardfile.Range{Min: 1, Max: 1}, Epoch: 1})
 	if _, err := e.Files.Blob.Create(ctx, key, strings.NewReader("x")); err != nil {
 		t.Fatal(err)
 	}
-	other, _, err := e.Files.Open(ctx, shardName("test.users/e1"))
+	other, _, err := e.Files.Open(ctx, shardName("users/e1"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,26 +186,26 @@ func TestDeleteShard(t *testing.T) {
 	}
 	stale := *other
 	stale.ETag = "stale"
-	if err := stale.DeleteShard(ctx); !errors.Is(err, blob.ErrConflict) {
+	if err := stale.DeleteShard(ctx, shardfile.Hooks{}); !errors.Is(err, blob.ErrConflict) {
 		t.Fatalf("delete with a stale version: %v", err)
 	}
-	if _, _, err := e.Files.GetManifest(ctx, shardName("test.users/e1")); err != nil {
+	if _, _, err := e.Files.GetManifest(ctx, shardName("users/e1")); err != nil {
 		t.Fatalf("a lost delete removed the manifest: %v", err)
 	}
-	current, err := e.Files.Attach(ctx, shardName("test.users/e1"))
+	current, err := e.Files.Attach(ctx, shardName("users/e1"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := current.DeleteShard(ctx); err != nil {
+	if err := current.DeleteShard(ctx, shardfile.Hooks{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := e.Files.GetManifest(ctx, shardName("test.users/e1")); !errors.Is(err, blob.ErrNotFound) {
+	if _, _, err := e.Files.GetManifest(ctx, shardName("users/e1")); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("after delete: %v", err)
 	}
 	if _, err := e.Files.Blob.Head(ctx, key); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("the LTX file is left: %v", err)
 	}
-	if _, err := e.Files.Attach(ctx, shardName("test.users/never")); !errors.Is(err, blob.ErrNotFound) {
+	if _, err := e.Files.Attach(ctx, shardName("users/never")); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("a shard with no manifest: %v", err)
 	}
 }
@@ -214,12 +215,47 @@ func TestDeleteShard(t *testing.T) {
 func TestManifestBadFileEntry(t *testing.T) {
 	t.Parallel()
 	e, ctx := harness.New(t), context.Background()
-	name := shardName("test.users/bad")
+	name := shardName("users/bad")
 	body := `{"generation":"g","owner":"n1","node_epoch":1,"files":["nonsense"],"journal":"n1"}`
 	if _, err := e.Store.Create(ctx, shardfile.ManifestKey(name), strings.NewReader(body)); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := e.Files.GetManifest(ctx, name); err == nil || !strings.Contains(err.Error(), `bad file name "nonsense"`) {
 		t.Fatalf("read of a manifest with a bad file entry: %v", err)
+	}
+}
+
+// A shard's files are keyed lane first, so each lane lists on its own.
+func TestFileKeysPutTheLaneFirst(t *testing.T) {
+	t.Parallel()
+	name := shardName("users/1")
+	f := shardfile.File{Range: shardfile.Range{Min: 1, Max: 5}, Epoch: 2}
+	lane := name.Lane().String()
+	if got, want := shardfile.FileKey(name, "g1", f), "data/shards/"+lane+"/users/1/g1/"+f.String()+".ltx"; got != want {
+		t.Fatalf("file key %q, want %q", got, want)
+	}
+	if got, want := shardfile.ShardPrefix(name), "data/shards/"+lane+"/users/1/"; got != want {
+		t.Fatalf("shard prefix %q, want %q", got, want)
+	}
+	if got := shardfile.LanePrefix(name.Lane()); !strings.HasPrefix(shardfile.FileKey(name, "g1", f), got) || got != "data/shards/"+lane+"/" {
+		t.Fatalf("lane prefix %q", got)
+	}
+}
+
+func TestManifestKeyPutsTheLaneFirst(t *testing.T) {
+	t.Parallel()
+	name := shardName("users/42")
+	key := shardfile.ManifestKey(name)
+	if want := "state/shards/6/users/42"; key != want {
+		t.Fatalf("manifest key %q, want %q", key, want)
+	}
+	if want := shardfile.ManifestPrefix + name.Lane().String() + "/"; !strings.HasPrefix(key, want) {
+		t.Fatalf("manifest key %q doesn't start with the shard's lane %q", key, want)
+	}
+	// Nothing parses a manifest key, so the key never carrying another lane is all there is to check.
+	for l := shardpkg.Lane(0); l < shardpkg.Lanes; l++ {
+		if l != name.Lane() && strings.HasPrefix(key, shardfile.ManifestPrefix+l.String()+"/") {
+			t.Fatalf("manifest key %q starts with lane %s, not the shard's", key, l)
+		}
 	}
 }

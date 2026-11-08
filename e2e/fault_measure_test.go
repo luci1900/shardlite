@@ -90,8 +90,8 @@ func (s *stack) activate(shard string) time.Duration {
 // one base.
 func TestFaultMeasureMemory(t *testing.T) {
 	mb := measureMB(t)
-	const shard = "e2e.wallet/m1"
-	s := newStack(t, "SHARDLITE_DELTA_SIZE=20000000", "SHARDLITE_MAX_FILES=1000")
+	const shard = "wallet/m1"
+	s := newStack(t, "SHARDLITE_DELTA_SIZE=20000000", "SHARDLITE_FAULT_MAX_FILES=1000")
 	v := newVerifier(t, s)
 	s.create(t, shard)
 	s.buildShard(shard, mb, 2500, 1000)
@@ -103,7 +103,7 @@ func TestFaultMeasureMemory(t *testing.T) {
 	apptest.Eventually(t, apptest.Timeout, "the app to close its databases", func() bool { return s.appDebug().OpenDBs == 0 })
 
 	// Restoring, then replacing the files with one base.
-	s.env = append(s.env, "SHARDLITE_MAX_FILES=1")
+	s.env = append(s.env, "SHARDLITE_FAULT_MAX_FILES=1")
 	s.startNode()
 	s.activate(shard)
 	t0 := time.Now()
@@ -124,8 +124,8 @@ func TestFaultMeasureMemory(t *testing.T) {
 //     VACUUM, each through to its delta: the same figures.
 func TestFaultMeasureLargeShard(t *testing.T) {
 	mb := measureMB(t)
-	const shard, shard2 = "e2e.wallet/m1", "e2e.wallet/m2"
-	s := newStack(t, "SHARDLITE_DELTA_SIZE=20000000", "SHARDLITE_MAX_FILES=1000")
+	const shard, shard2 = "wallet/m1", "wallet/m2"
+	s := newStack(t, "SHARDLITE_DELTA_SIZE=20000000", "SHARDLITE_FAULT_MAX_FILES=1000")
 	v := newVerifier(t, s)
 	tmp := filepath.Join(s.dir, "data", ".tmp")
 	s.create(t, shard)

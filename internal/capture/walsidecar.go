@@ -18,8 +18,7 @@ import (
 // names, so nothing outside it can remove or look for one half where the pair
 // is meant: use Remove or Any. Reading one half alone is fine, and goes
 // through the method that says why. The wal-index is derived state, rebuilt
-// from the log, so a lone stale one means nothing and is never part of a
-// signature of the files (WALStat).
+// from the log, so a lone stale one means nothing.
 type WALSidecars struct {
 	db  string
 	wal string
@@ -131,16 +130,4 @@ func (s WALSidecars) openOrCreate() (*os.File, error) {
 		_ = f.Chown(int(st.Uid), int(st.Gid))
 	}
 	return f, nil
-}
-
-// WALStat is the log's size and modification time, for telling whether a
-// shard's local files changed while the node wasn't looking. The wal-index is
-// not part of such a signature: it is rebuilt from the log and says nothing
-// about the database's content on its own.
-func (s WALSidecars) WALStat() (size, modNs int64, ok bool) {
-	fi, err := os.Stat(s.wal)
-	if err != nil {
-		return 0, 0, false
-	}
-	return fi.Size(), fi.ModTime().UnixNano(), true
 }

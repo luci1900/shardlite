@@ -1,6 +1,5 @@
 # shardlite
-
-Actors made of SQLite databases, served as virtual actors.
+SQLite databases served as virtual actors.
 
 ## Goal
 
@@ -10,15 +9,15 @@ A player shard is like a save file per player, always saved, backed up and share
 
 This is the Orleans / Durable Objects model, with SQLite as the state and two differences that matter for games: apps can be written in any language or framework (even Unreal dedicated servers), and clients can connect directly to the process holding a shard over UDP or WebRTC, not only through an HTTP proxy.
 
-Shardlite keeps Orleans' operational trade-offs. Blob storage (S3 or compatible) is the source of truth, run by someone else, and the final check against duplicate owners. Nodes keep shards on local disk only as a cache, so they are disposable. Shardlite is a router and a cache in front of blob storage, not a database to operate.
+Shardlite keeps Orleans' operational trade-offs. Blob storage (S3 or compatible) is the source of truth, run by someone else, and the final check against duplicate owners. Nodes keep only working copies of their active shards on local disk, so they are disposable. Shardlite is a router in front of blob storage, not a database to operate.
 
-An actor's state is always its SQLite file, never objects in memory, which makes activation and deactivation almost free:
+An actor's state is always its SQLite file, never objects in memory, so activation and deactivation move a file rather than an object graph:
 
-- **Deactivating** is closing the file. There is nothing to serialise, and the recent changes are already in the node journal.
-- **Activating** is opening the file. SQLite reads pages lazily, so a request loads only the pages it touches.
+- **Deactivating** is closing the file and one manifest update in storage that records its last changes and gives the shard up. There is nothing to serialise, and the recent changes are already in the node journal.
+- **Activating** is claiming the shard and restoring its file from storage, tens of milliseconds for a small shard and longer for a large one. Once it is open, SQLite reads pages lazily, so a request loads only the pages it touches.
 - **Memory follows the working set,** not the number or size of actors, so a node can hold far more actors than fit in memory.
 
-The trade-off is that reads go through SQLite (microseconds from cache) and anything the app keeps in memory outside SQLite is lost on deactivation. A shard is also not a turn-based actor: requests for the same shard run concurrently, and the app's transactions are the concurrency control, so a handler that reads and then writes does both in one transaction. An app written for Orleans or Durable Objects, which run one turn at a time, loses updates here.
+The trade-off is that reads go through SQLite (microseconds once the pages are in memory) and anything the app keeps in memory outside SQLite is lost on deactivation. A shard is also not a turn-based actor: requests for the same shard run concurrently, and the app's transactions are the concurrency control, so a handler that reads and then writes does both in one transaction. An app written for Orleans or Durable Objects, which run one turn at a time, loses updates here.
 
 Shardlite's own state about a shard lives in the shard, and anything global only points into it (reminders are rows in the shard's table, and the reminder index holds no payload). So nothing global has to stay consistent with the shards, deleting a shard takes its state with it, and the node's memory is a cache it can lose at any time.
 
@@ -34,13 +33,12 @@ A shardlite app should be no more exposed to abuse than any web app. Clients can
 
 | Term | Meaning |
 |---|---|
-| **Shard** | One SQLite database, identified by `app.kind/id` (e.g. `game.users/42`). |
-| **Shard kind** | A category of shards (`users`, `zone`) with shared configuration, qualified by the app that serves it. |
+| **Shard** | One SQLite database, identified by `kind/id` (e.g. `users/42`). |
+| **Shard kind** | A category of shards (`users`, `zone`) with shared configuration. |
 | **Node** | The shardlite process, one per host and shared by the app processes on it. Disposable. |
-| **App** | Any process on the host that uses shardlite, in any language. It serves whole kinds. Its name is chosen once, since it is in every stored path. |
+| **App** | Any process on the host that uses shardlite, in any language. It serves whole kinds. |
 | **Owner** | The node allowed to write a shard, for as long as its lease is valid. |
-| **Active shard** | A shard that is open on its owner and shipping changes. Costs memory and CPU. |
-| **Local cache** | Shard files kept on a node's disk after deactivation. Evictable. Costs disk only. |
+| **Active shard** | A shard that is open on its owner, its working copy on the owner's disk, and shipping changes. Costs memory, CPU and disk. A shard that is not active lives only in blob storage. |
 | **Gate** | The node holds a shard's output until the writes before it meet the kind's tier: nothing for `none`, blob storage for `storage` (the default). A tier the node cannot meet fails the answer. |
 
 ## Architecture
@@ -53,12 +51,12 @@ flowchart TB
 
   subgraph hostA [Host A]
     nodeA[Node] <-->|localhost| appA["App (any language)"]
-    appA --- diskA[("Local disk: cache")]
+    appA --- diskA[("Local disk: active shards")]
   end
 
   subgraph hostB [Host B]
     nodeB[Node] <-->|localhost| appB[App]
-    appB --- diskB[("Local disk: cache")]
+    appB --- diskB[("Local disk: active shards")]
   end
 
   nodeA <-->|HTTP| nodeB

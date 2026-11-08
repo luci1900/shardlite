@@ -5,9 +5,9 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/luci1900/shardlite/internal/dueindex"
 	"github.com/luci1900/shardlite/internal/harness"
 	"github.com/luci1900/shardlite/internal/pos"
-	"github.com/luci1900/shardlite/internal/remindex"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
@@ -34,7 +34,7 @@ func TestBeforeUpdateRunsBeforeTheManifestUpdate(t *testing.T) {
 	var calls int
 	var end pos.Position
 	hooks := func(wantFiles int) shardfile.Hooks {
-		return shardfile.Hooks{BeforeUpdate: func(_ context.Context, e2 pos.Position) (remindex.Minute, error) {
+		return shardfile.Hooks{BeforeUpdate: func(_ context.Context, e2 pos.Position) (dueindex.Minute, error) {
 			if files := storedFiles(t, e); len(files) != wantFiles {
 				t.Errorf("manifest changed before the hook: files %v", files)
 			}
@@ -83,7 +83,7 @@ func TestBeforeUpdateErrorLeavesTheManifest(t *testing.T) {
 	etag := h.ETag
 
 	boom := errors.New("row record failed")
-	failing := shardfile.Hooks{BeforeUpdate: func(context.Context, pos.Position) (remindex.Minute, error) { return 0, boom }}
+	failing := shardfile.Hooks{BeforeUpdate: func(context.Context, pos.Position) (dueindex.Minute, error) { return 0, boom }}
 	ack(t, app, sh, 2)
 	if err := h.WriteDelta(ctx, sh, failing); !errors.Is(err, boom) {
 		t.Fatalf("delta: %v", err)

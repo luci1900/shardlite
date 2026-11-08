@@ -6,12 +6,11 @@
 //
 // The rest of the world is nondeterministic: other nodes claim and release the shard, the node's lease
 // expires, the process crashes, the app opens and closes the file. See docs/internals.md (Activation,
-// Letting go of a shard, Fencing, Takeover) and internal/node/actor.go and catalog.go.
+// Letting go of a shard, Fencing, Takeover) and internal/node/actor.go and shardset.go.
 //
 // Run:
 //   quint typecheck specs/shard.qnt
 //   quint run specs/shard.qnt --invariant=safe --max-steps=40 --max-samples=20000
-//   quint run specs/shard.qnt --invariant=neverCached   (should fail: the witness shows it is reachable)
 
 module shard {
   // Positions stop here so the state space stays finite.
@@ -19,11 +18,10 @@ module shard {
   pure val MAX_REFS = 2
 
   type Phase =
-    | Inactive      // nothing open on this node. The shard may have a cached file (see Cached) or none
+    | Inactive      // nothing open on this node and no files: the shard is only in blob storage
     | Activating    // claimed, being restored or created
     | Active        // open in the app, WAL captured, serving
     | Deactivating  // refusing new requests, shipping its tail and letting go
-    | Cached        // deactivated, files at rest on disk, no capture, no open handles
 
   type Owner =
     | Nobody  // the manifest names no owner
@@ -34,7 +32,6 @@ module shard {
   // Where an activation gets the shard from.
   type Source =
     | FromNew
-    | FromCache
     | FromSnapshot
 
   type Manifest = {
@@ -51,7 +48,6 @@ module shard {
     manifest: Manifest,
     local: int,           // last commit in the file this node has (meaningful while working)
     durable: int,         // last commit of this process in its node journal
-    cached: int,          // last commit in the cached file (meaningful while Cached)
     acked: int,           // highest position reflected in any response a client has received
     refs: int,            // requests and connections holding the shard
     held: int,            // responses waiting at the gate
@@ -79,10 +75,9 @@ module shard {
   def journalOk(st: State): bool = not(st.journalFenced)
 
   // The process dies, or exits after a write told it that it has been fenced, and restarts. Everything in
-  // memory is gone and files that were active are discarded at the next activation. Cached files are kept
-  // and checked.
+  // memory is gone and the files are discarded at the next activation.
   def restarted(st: State): State = { ...st,
-    phase: if (st.phase == Cached) Cached else Inactive,
+    phase: Inactive,
     capturing: false,
     manifest: { ...st.manifest, owner: if (st.manifest.owner == Me) Dead else st.manifest.owner },
     refs: 0,
@@ -91,8 +86,7 @@ module shard {
     idle: true,
     msgs: false,
     fenced: false,
-    journalFenced: false,
-    cached: if (st.phase == Cached) st.cached else 0
+    journalFenced: false
   }
 
   // What blob storage has for the shard, however the owner changes.
@@ -112,7 +106,6 @@ module shard {
       manifest: { exists: false, owner: Nobody, snap: 0, autoDelete: false },
       local: 0,
       durable: 0,
-      cached: 0,
       acked: 0,
       refs: 0,
       held: 0,
@@ -161,38 +154,12 @@ module shard {
     }
   }
 
-  // A cached file that is current is reused. If the node still owns the shard that needs no blob storage
-  // request. After a crash the file is reclaimed by CAS.
-  action activateFromCache = all {
-    s.phase == Cached,
-    s.manifest.exists,
-    s.manifest.owner == Nobody or s.manifest.owner == Me,
-    s.cached == s.manifest.snap,
-    not(s.fenced),
-    not(s.appOpen),
-    s' = { ...s,
-      phase: Activating,
-      source: FromCache,
-      manifest: { ...s.manifest, owner: Me },
-      durable: s.manifest.snap
-    }
-  }
-
-  // A cached file that is behind (another node wrote since) or whose shard is gone is dropped, and the
-  // next request takes the normal path.
-  action discardStaleCache = all {
-    s.phase == Cached,
-    s.cached != s.manifest.snap or not(s.manifest.exists),
-    s' = { ...s, phase: Inactive, cached: 0 }
-  }
-
   action finishActivation = {
     nondet hasMsgs = Set(true, false).oneOf()
     all {
       s.phase == Activating,
       val pos = match s.source {
         | FromNew => 0
-        | FromCache => s.cached
         | FromSnapshot => s.manifest.snap
       }
       s' = { ...s,
@@ -200,7 +167,6 @@ module shard {
         capturing: true,
         local: pos,
         durable: pos,
-        cached: 0,
         idle: false,
         msgs: hasMsgs
       }
@@ -210,7 +176,7 @@ module shard {
   // A restore or a blob storage request fails. A claim stays (the next request claims it again).
   action failActivation = all {
     s.phase == Activating,
-    s' = { ...s, phase: Inactive, cached: 0 }
+    s' = { ...s, phase: Inactive }
   }
 
   // -- Serving
@@ -326,7 +292,8 @@ module shard {
       s' = { ...s, capturing: false }
   }
 
-  // The shard is let go of by CAS on the manifest. If the CAS fails (the node no longer owns the shard) capture
+  // The shard is let go of by one CAS on the manifest, which records the tail as the snapshot and gives the
+  // shard up (no owner), and the files go. If the CAS fails (the node no longer owns the shard) capture
   // resumes and the shard stays active.
   action finishDeactivation = all {
     s.phase == Deactivating,
@@ -341,53 +308,26 @@ module shard {
         manifest: { exists: false, owner: Nobody, snap: 0, autoDelete: false },
         local: 0,
         durable: 0,
-        cached: 0,
         acked: 0,
         deletes: s.deletes + 1
       }
     else
-      // The tail becomes a delta and the files stay as a cache.
+      // The tail becomes the snapshot, the shard is released and the files go.
       s' = { ...s,
-        phase: Cached,
-        manifest: { ...s.manifest, snap: s.local },
-        durable: s.local,
-        cached: s.local
+        phase: Inactive,
+        manifest: { ...s.manifest, owner: Nobody, snap: s.local },
+        local: 0,
+        durable: 0
       }
   }
 
-  // The delta fails for another reason (a blob storage error): capture resumes and the shard stays active.
+  // The write fails for another reason (a blob storage error whose outcome is known): capture resumes and the
+  // shard stays active. (One whose outcome is unknown is asked again until it is known, which the model leaves
+  // out, since it only ends in one of the other two.)
   action abortDeactivation = all {
     s.phase == Deactivating,
     not(s.capturing),
     s' = { ...s, phase: Active, capturing: true }
-  }
-
-  // Delete: the owner deactivates the shard, then deletes the manifest by conditional delete.
-  action deleteCached = all {
-    s.phase == Cached,
-    if (casOk(s))
-      s' = { ...s,
-        phase: Inactive,
-        manifest: { exists: false, owner: Nobody, snap: 0, autoDelete: false },
-        local: 0,
-        durable: 0,
-        cached: 0,
-        acked: 0,
-        deletes: s.deletes + 1
-      }
-    else s' = s
-  }
-
-  // Disk is full: the least recently used cached shard is released by CAS and its files dropped.
-  action evict = all {
-    s.phase == Cached,
-    if (casOk(s))
-      s' = { ...s,
-        phase: Inactive,
-        manifest: { ...s.manifest, owner: Nobody },
-        cached: 0
-      }
-    else s' = s
   }
 
   // -- The world
@@ -444,8 +384,6 @@ module shard {
   action step = any {
     activateNew,
     activateFromSnapshot,
-    activateFromCache,
-    discardStaleCache,
     finishActivation,
     failActivation,
     acquire,
@@ -462,8 +400,6 @@ module shard {
     releaseFile,
     finishDeactivation,
     abortDeactivation,
-    deleteCached,
-    evict,
     toggleAppOpen,
     reloadKinds,
     leaseLost,
@@ -490,11 +426,6 @@ module shard {
   val deletedIsClean = not(s.manifest.exists) implies
     (s.manifest.owner == Nobody and s.manifest.snap == 0)
 
-  // The files in the cache are closed: nobody has them open, and if the node still owns the shard they
-  // are the latest snapshot.
-  val cacheIsClosed = s.phase == Cached implies not(s.appOpen)
-  val cacheIsCurrent = (s.phase == Cached and s.manifest.owner == Me) implies s.cached == s.manifest.snap
-
   // Requests only hold an active shard, and deactivation waits for them.
   val refsOnlyWhenActive = (s.refs > 0) implies s.phase == Active
   val heldAreRefs = s.held <= s.refs
@@ -512,8 +443,6 @@ module shard {
     oneWriter,
     manifestExists,
     deletedIsClean,
-    cacheIsClosed,
-    cacheIsCurrent,
     refsOnlyWhenActive,
     heldAreRefs,
     journalOrdered,
@@ -522,7 +451,6 @@ module shard {
   }
 
   // Witnesses: each of these should be violated, which shows the state is reachable.
-  val neverCached = s.phase != Cached
   val neverHeld = s.held == 0
   val neverDeleted = s.deletes == 0
   val neverZombieAdopted = not(s.fenced and s.journalFenced)

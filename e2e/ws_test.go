@@ -14,8 +14,6 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-
-	"github.com/luci1900/shardlite/e2e/e2eapp"
 )
 
 // WebSocket through the node with the reference client and server.
@@ -35,14 +33,14 @@ func TestWebSocketThroughTheNode(t *testing.T) {
 		return c
 	}
 
-	s.create(t, "e2e.wallet/s1", "e2e.wallet/s2", "e2e.wallet/s3", "e2e.wallet/s4", "e2e.wallet/s5", "e2e.wallet/s8", "e2e.wallet/s9", "e2e.arena/s7")
+	s.create(t, "wallet/s1", "wallet/s2", "wallet/s3", "wallet/s4", "wallet/s5", "wallet/s8", "wallet/s9", "arena/s7")
 
 	t.Run("text and binary both ways", func(t *testing.T) {
-		c := dial(t, "e2e.wallet/s1")
+		c := dial(t, "wallet/s1")
 		if echo, err := wsEcho(ctx, c, "hello"); err != nil || echo != "ok:hello" {
 			t.Fatalf("%q %v", echo, err)
 		}
-		if !v.has("e2e.wallet/s1", "hello") {
+		if !v.has("wallet/s1", "hello") {
 			t.Fatal("the echo came before the commit was durable")
 		}
 		payload := []byte{0, 1, 2, 0xff, 0xfe, 'a'}
@@ -63,7 +61,7 @@ func TestWebSocketThroughTheNode(t *testing.T) {
 	})
 
 	t.Run("messages of several megabytes", func(t *testing.T) {
-		c := dial(t, "e2e.wallet/s2")
+		c := dial(t, "wallet/s2")
 		big := bytes.Repeat([]byte("0123456789abcdef"), 4<<20/16) // 4 MB
 		for i := range 3 {
 			big[i*1000] = byte(i + 1)
@@ -88,7 +86,7 @@ func TestWebSocketThroughTheNode(t *testing.T) {
 	})
 
 	t.Run("ping and pong", func(t *testing.T) {
-		c := dial(t, "e2e.wallet/s3")
+		c := dial(t, "wallet/s3")
 		// The client pings the app: Ping needs a reader running, and the app answers from its own read loop.
 		msgs := make(chan string, 8)
 		go func() {
@@ -125,13 +123,13 @@ func TestWebSocketThroughTheNode(t *testing.T) {
 		before := len(s.appDebug().WSClose)
 		closes := func() (codes []int, reasons []string) {
 			for _, rec := range s.appDebug().WSClose[before:] {
-				if rec.Shard == "e2e.wallet/s4" {
+				if rec.Shard == "wallet/s4" {
 					codes, reasons = append(codes, rec.Code), append(reasons, rec.Reason)
 				}
 			}
 			return
 		}
-		c := dial(t, "e2e.wallet/s4")
+		c := dial(t, "wallet/s4")
 		if err := c.Close(websocket.StatusCode(4001), "bye from the client"); err != nil {
 			t.Logf("close: %v", err) // the handshake may report the peer's reply
 		}
@@ -140,7 +138,7 @@ func TestWebSocketThroughTheNode(t *testing.T) {
 			t.Fatalf("the app saw %v %q", codes, reasons)
 		}
 
-		c = dial(t, "e2e.wallet/s4")
+		c = dial(t, "wallet/s4")
 		if err := c.Write(ctx, websocket.MessageText, []byte("close:4002:bye from the app")); err != nil {
 			t.Fatal(err)
 		}
@@ -150,7 +148,7 @@ func TestWebSocketThroughTheNode(t *testing.T) {
 			t.Fatalf("the client saw %v", err)
 		}
 
-		c = dial(t, "e2e.wallet/s4")
+		c = dial(t, "wallet/s4")
 		c.Close(websocket.StatusNormalClosure, "")
 		apptest.Eventually(t, apptest.Timeout, "the app to see a normal close", func() bool {
 			codes, _ := closes()
@@ -169,7 +167,7 @@ func TestWebSocketThroughTheNode(t *testing.T) {
 			mu.Unlock()
 			return c, err
 		}}}
-		c := dial(t, "e2e.wallet/s5", func(o *websocket.DialOptions) { o.HTTPClient = hc })
+		c := dial(t, "wallet/s5", func(o *websocket.DialOptions) { o.HTTPClient = hc })
 		if echo, err := wsEcho(ctx, c, "here"); err != nil || echo != "ok:here" {
 			t.Fatalf("%q %v", echo, err)
 		}
@@ -178,41 +176,37 @@ func TestWebSocketThroughTheNode(t *testing.T) {
 		mu.Unlock()
 		apptest.Eventually(t, apptest.Timeout, "the app to see the connection end", func() bool { return s.appDebug().WSEnded > before })
 		cl := s.appDebug().WSClose
-		if rec := cl[len(cl)-1]; rec.Shard != "e2e.wallet/s5" || rec.Code != -1 {
+		if rec := cl[len(cl)-1]; rec.Shard != "wallet/s5" || rec.Code != -1 {
 			t.Fatalf("the app saw %+v, want an end without a close frame", rec)
 		}
 	})
 
-	t.Run("a mismatched target is relayed", func(t *testing.T) {
-		// The path says the connection is for s8. The hint names s9, so the node
-		// opens s9 and the app relays the connection to s8, for its whole life.
-		const s8, s9 = "e2e.wallet/s8", "e2e.wallet/s9"
-		n, before := s.relayCount(), len(s.appDebug().WSClose)
-		c := dial(t, s8, func(o *websocket.DialOptions) { o.HTTPHeader.Set("Shardlite-Target", s9) })
-		if echo, err := wsEcho(ctx, c, "hello"); err != nil || echo != "ok:hello" {
-			t.Fatalf("%q %v", echo, err)
-		}
-		if !v.has(s8, "hello") || v.has(s9, "hello") {
-			t.Fatal("the message did not land in the shard the path names")
-		}
-		// Close frames pass through the relay: the app that serves s8 sees the code.
-		if err := c.Close(websocket.StatusCode(4003), "bye through the relay"); err != nil {
-			t.Logf("close: %v", err) // the handshake may report the peer's reply
-		}
-		apptest.Eventually(t, apptest.Timeout, "the app to see the close", func() bool {
-			for _, rec := range s.appDebug().WSClose[before:] {
-				if rec.Shard == s8 && rec.Code == 4003 && rec.Reason == "bye through the relay" {
-					return true
-				}
+	t.Run("a mismatched target is refused", func(t *testing.T) {
+		// The path says the connection is for s8. The hint names s9, or there is
+		// none, so the app refuses the upgrade and nothing is written.
+		const s8, s9 = "wallet/s8", "wallet/s9"
+		for name, hint := range map[string]string{"another shard": s9, "no hint": ""} {
+			o := &websocket.DialOptions{HTTPHeader: http.Header{}}
+			if hint != "" {
+				o.HTTPHeader.Set("Shardlite-Target", hint)
 			}
-			return false
-		})
-		// No hint at all.
-		c = dial(t, s8, func(o *websocket.DialOptions) { o.HTTPHeader.Del("Shardlite-Target") })
-		if echo, err := wsEcho(ctx, c, "again"); err != nil || echo != "ok:again" || !v.has(s8, "again") {
-			t.Fatalf("no hint: %q %v", echo, err)
+			c, resp, err := websocket.Dial(ctx, "ws://"+s.pub+at(s8, "/ws"), o)
+			if err == nil {
+				c.CloseNow()
+				t.Fatalf("%s: the connection was accepted", name)
+			}
+			if resp == nil || resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("%s: %v (%v), want 400", name, resp, err)
+			}
 		}
-		s.checkRelays(t, n, e2eapp.RelayRec{Opened: s9, For: s8}, e2eapp.RelayRec{For: s8})
+		if v.has(s8, "hello") || v.has(s9, "hello") {
+			t.Fatal("a refused connection wrote to a shard")
+		}
+		// The right hint is served.
+		c := dial(t, s8)
+		if echo, err := wsEcho(ctx, c, "hello"); err != nil || echo != "ok:hello" || !v.has(s8, "hello") {
+			t.Fatalf("the right hint: %q %v", echo, err)
+		}
 	})
 
 	t.Run("an open connection keeps its shard active", func(t *testing.T) {
@@ -227,26 +221,26 @@ func TestWebSocketThroughTheNode(t *testing.T) {
 			}
 			return err == nil
 		}
-		c := dial(t, "e2e.arena/s7")
+		c := dial(t, "arena/s7")
 		if echo, err := wsEcho(ctx, c, "kept"); err != nil || echo != "ok:kept" {
 			t.Fatalf("%q %v", echo, err)
 		}
 		if reply, err := wsEcho(ctx, c, "mark"); err != nil || reply != "marked" {
 			t.Fatalf("mark: %q %v", reply, err)
 		}
-		if !active("e2e.arena/s7") {
+		if !active("arena/s7") {
 			t.Fatal("no manifest for an active shard")
 		}
 		// 1.5 s is five idle timeouts, with a janitor pass in it after the shard
 		// had been idle for one, with the connection idle.
 		time.Sleep(1500 * time.Millisecond)
-		if !active("e2e.arena/s7") {
+		if !active("arena/s7") {
 			t.Fatal("the shard was deactivated under an open WebSocket")
 		}
 		if n, err := wsEcho(ctx, c, "count"); err != nil || n != "1" {
 			t.Fatalf("the shard lost its data: %q %v", n, err)
 		}
 		c.Close(websocket.StatusNormalClosure, "")
-		apptest.Eventually(t, apptest.Timeout, "the shard to deactivate after the WebSocket closed (its manifest goes)", func() bool { return !active("e2e.arena/s7") })
+		apptest.Eventually(t, apptest.Timeout, "the shard to deactivate after the WebSocket closed (its manifest goes)", func() bool { return !active("arena/s7") })
 	})
 }

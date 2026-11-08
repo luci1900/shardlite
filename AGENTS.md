@@ -31,6 +31,7 @@ Always use simulation for non-trivial Quint models (`quint run`): verification (
 - Never stage, commit, amend or push. Stop and wait for review after each part of a plan and at the end of each stage.
 - Only spawn sub-agents when they'd run on a smaller model than yours, so they actually save tokens. Otherwise do the work yourself.
 - Prefer removing dead, redundant and wrapper code over keeping it.
+- The repo is worked on from macOS and Linux, so `sed` and friends may be BSD's or GNU's, and they differ. In particular BSD `sed -i -E ...` takes `-E` as the backup suffix.
 
 ## Tests
 
@@ -51,4 +52,4 @@ Always use simulation for non-trivial Quint models (`quint run`): verification (
 
 For docs and comments: plain language, no hard wraps, no Oxford comma, few em dashes or semicolons, parentheses for asides.
 
-Never name a stage in docs or comments. Stages live in `plans/`, which is deleted once the stage is done, so a reference to one dangles. Name the thing itself (the lease scan, the journal's writer, the cache index) or point at the code or doc that carries the fact.
+Never name a stage in docs or comments. Stages live in `plans/`, which is deleted once the stage is done, so a reference to one dangles. Name the thing itself (the lease scan, the journal's writer, the due index) or point at the code or doc that carries the fact.

@@ -121,7 +121,7 @@ func TestFaultTemporaryFiles(t *testing.T) {
 	for _, op := range []string{"create", "append", "dup"} {
 		t.Run(op, func(t *testing.T) {
 			t.Parallel()
-			newFaultRig(t, "SHARDLITE_TEMP_FAULT="+op+":300").faults(op + " faults") // 30% of them
+			newFaultRig(t, "SHARDLITE_FAULT_TEMP="+op+":300").faults(op + " faults") // 30% of them
 		})
 	}
 }
@@ -132,7 +132,19 @@ func TestFaultStorage(t *testing.T) {
 	for _, mode := range []string{"fail", "lost"} {
 		t.Run(mode, func(t *testing.T) {
 			t.Parallel()
-			newFaultRig(t, "SHARDLITE_STORAGE_FAULT="+mode+":300:30ms").faults(mode + " faults") // 30% of segment PUTs, up to 30 ms slow
+			newFaultRig(t, "SHARDLITE_FAULT_STORAGE="+mode+":300:30ms").faults(mode + " faults") // 30% of segment PUTs, up to 30 ms slow
+		})
+	}
+}
+
+// Failing orphan entries: the entry made before every file's upload fails, so deltas
+// and rebases fail and are retried by the node's own loop, and nothing acknowledged is lost.
+func TestFaultOrphanEntries(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{"fail", "lost"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			newFaultRig(t, "SHARDLITE_FAULT_STORAGE="+mode+":300:30ms:orphans").faults(mode + " orphan entries") // 30% of the creates
 		})
 	}
 }

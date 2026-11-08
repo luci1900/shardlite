@@ -74,8 +74,8 @@ func TestKillNodeUnderLoad(t *testing.T) {
 		seconds, _ = strconv.Atoi(v)
 	}
 
-	// A short delta age and a small cache, so deltas, rebases, deactivation and eviction happen under the load too.
-	s := newStack(t, "SHARDLITE_DELTA_AGE=300ms", "SHARDLITE_CACHE_LIMIT=150K")
+	// A short delta age, so deltas, rebases and deactivation happen under the load too.
+	s := newStack(t, "SHARDLITE_DELTA_AGE=300ms")
 	v := newVerifier(t, s)
 	led := &ledger{acked: map[string]map[string]bool{}, counts: map[string]int{}}
 
@@ -83,7 +83,7 @@ func TestKillNodeUnderLoad(t *testing.T) {
 	wallets := make([]string, nShards)
 	users := make([]string, nShards)
 	for i := range nShards {
-		wallets[i], users[i] = fmt.Sprintf("e2e.wallet/w%d", i), fmt.Sprintf("e2e.users/u%d", i)
+		wallets[i], users[i] = fmt.Sprintf("wallet/w%d", i), fmt.Sprintf("users/u%d", i)
 	}
 	s.create(t, append(wallets, users...)...)
 

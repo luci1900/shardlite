@@ -5,8 +5,8 @@ import "time"
 // Clock is the time the shards use for reminders (their timers and due times),
 // their next_reminder and the index entries (which are due), the age of reminders, the
 // retry backoff of reminders, each shard's idle and delta timers with the times
-// they compare (a shard's last use and hold-off), and the periods of the cache
-// loop, the watchdog and the lease scan. Tests move it. Flush cycles, the ages of
+// they compare (a shard's last use and hold-off), and the periods of the
+// watchdog and the lease scan. Tests move it. Flush cycles, the ages of
 // tails (which decide whether a delta is due, and the tail alert), the short
 // pauses between a commit's writes, and shutdown use real time.
 type Clock interface {
@@ -33,4 +33,4 @@ func (realClock) NewTicker(d time.Duration) (<-chan time.Time, func()) {
 	return t.C, t.Stop
 }
 
-func (m *Catalog) now() time.Time { return m.opts.Clock.Now() }
+func (m *Shardset) now() time.Time { return m.opts.Clock.Now() }

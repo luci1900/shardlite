@@ -12,8 +12,6 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/capture"
-	"github.com/luci1900/shardlite/internal/kind"
-	"github.com/luci1900/shardlite/internal/migrate"
 	"github.com/luci1900/shardlite/internal/notify"
 )
 
@@ -34,7 +32,7 @@ const (
 
 // wakeFunc wakes a shard's app for its reminders: a POST to
 // /_shardlite/reminders for the shard. status is the answer (0 if there was
-// none), and err says why not. The server's is given when the Catalog is built.
+// none), and err says why not. The server's is given when the shardset is built.
 type wakeFunc func(ctx context.Context, a *actor) (status int, err error)
 
 // ReminderOptions configure how shards are woken for their reminders
@@ -92,17 +90,11 @@ func (rm *reminders) call(ctx context.Context, a *actor) (ok bool, err error) {
 }
 
 // ensureTables creates the reserved table and its index through capture's
-// connection, and for a system shard (sys) applies its kind's migrations and
-// inserts its first reminder, "run", due at now if it has none or only a stale
-// one (a cluster that was down for longer than reminders are kept must not leave
-// a system shard that never runs again) (docs/internals.md, System kinds), all in
-// one transaction. A system shard at a
-// version newer than its kind's migrations (a newer node migrated it) is
-// refused with migrate.ErrNewer, and nothing is changed. A shard that has
+// connection, in one transaction. A shard that has
 // everything commits nothing; otherwise the commit is captured at once, so the
 // shard's final sync has nothing new to find (a shard the app never wrote to is
 // still deleted as never written).
-func ensureTables(ctx context.Context, sh *capture.Shard, sys *kind.Kind, now, since int64) error {
+func ensureTables(ctx context.Context, sh *capture.Shard) error {
 	before, herr := sh.Header()
 	if err := sh.Use(ctx, func(db *sql.DB) error {
 		tx, err := db.BeginTx(ctx, nil)
@@ -112,14 +104,6 @@ func ensureTables(ctx context.Context, sh *capture.Shard, sys *kind.Kind, now, s
 		defer tx.Rollback()
 		if _, err := tx.ExecContext(ctx, reservedSchema); err != nil {
 			return err
-		}
-		if sys != nil {
-			if err := migrate.Migrate(ctx, tx, sys.Migrations, migrate.Latest); err != nil {
-				return err
-			}
-			if _, err := tx.ExecContext(ctx, `INSERT INTO _shardlite_reminders (key, due) VALUES ('run', ?1) ON CONFLICT (key) DO UPDATE SET due = ?1 WHERE due < ?2`, now, since); err != nil {
-				return err
-			}
 		}
 		return tx.Commit()
 	}); err != nil {

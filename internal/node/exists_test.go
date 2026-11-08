@@ -35,36 +35,36 @@ func TestClientsReachOnlyShardsThatExist(t *testing.T) {
 	var served atomic.Int64
 	h := http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) { served.Add(1); io.WriteString(w, "served") })
 	r.handler.Store(&h)
-	target := map[string]string{"Shardlite-Target": "test.slow/e1"}
+	target := map[string]string{"Shardlite-Target": "slow/e1"}
 
 	gets, writes := r.calls("get", shardfile.ManifestPrefix), r.shardWrites()
 	resp, body := r.req("GET", r.pub, "/x", target, "")
-	_, undeclared := r.req("GET", r.pub, "/x", map[string]string{"Shardlite-Target": "test.slow2/e1"}, "")
-	if resp.StatusCode != http.StatusNotFound || strings.Replace(body, `"test.slow"`, `"test.slow2"`, 1) != undeclared {
+	_, undeclared := r.req("GET", r.pub, "/x", map[string]string{"Shardlite-Target": "slow2/e1"}, "")
+	if resp.StatusCode != http.StatusNotFound || strings.Replace(body, `"slow"`, `"slow2"`, 1) != undeclared {
 		t.Fatalf("a client's request for a missing shard: %d %q, an undeclared kind: %q", resp.StatusCode, body, undeclared)
 	}
 	if got := r.calls("get", shardfile.ManifestPrefix) - gets; got != 1 {
 		t.Fatalf("%d manifest reads", got)
 	}
-	if got := r.shardWrites() - writes; got != 0 || served.Load() != 0 || r.m.IsActive(shardName("test.slow/e1")) {
-		t.Fatalf("%d writes, %d requests to the app, active %v", got, served.Load(), r.m.IsActive(shardName("test.slow/e1")))
+	if got := r.shardWrites() - writes; got != 0 || served.Load() != 0 || r.m.IsActive(shardName("slow/e1")) {
+		t.Fatalf("%d writes, %d requests to the app, active %v", got, served.Load(), r.m.IsActive(shardName("slow/e1")))
 	}
-	if _, err := r.manifest("test.slow/e1"); !errors.Is(err, blob.ErrNotFound) {
+	if _, err := r.manifest("slow/e1"); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("manifest: %v", err)
 	}
 
 	// gRPC clients get NOT_FOUND.
-	resp, _ = r.req("POST", r.pub, "/svc/Method", map[string]string{"Shardlite-Target": "test.slow/e1", "Content-Type": "application/grpc"}, "")
+	resp, _ = r.req("POST", r.pub, "/svc/Method", map[string]string{"Shardlite-Target": "slow/e1", "Content-Type": "application/grpc"}, "")
 	if resp.StatusCode != http.StatusOK || resp.Header.Get("Grpc-Status") != "5" {
 		t.Fatalf("gRPC: %d grpc-status %q", resp.StatusCode, resp.Header.Get("Grpc-Status"))
 	}
 
 	// A call that asks only for an existing shard doesn't create it either.
-	ifExists := map[string]string{"Shardlite-Target": "test.slow/e1", "Shardlite-If-Exists": "true"}
+	ifExists := map[string]string{"Shardlite-Target": "slow/e1", "Shardlite-If-Exists": "true"}
 	if resp, _ := r.req("GET", r.ctl, "/x", ifExists, ""); resp.StatusCode != http.StatusNotFound || served.Load() != 0 {
 		t.Fatalf("a call with Shardlite-If-Exists: %d, %d requests to the app", resp.StatusCode, served.Load())
 	}
-	if _, err := r.manifest("test.slow/e1"); !errors.Is(err, blob.ErrNotFound) {
+	if _, err := r.manifest("slow/e1"); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("manifest after the call with Shardlite-If-Exists: %v", err)
 	}
 
@@ -72,7 +72,7 @@ func TestClientsReachOnlyShardsThatExist(t *testing.T) {
 	if resp, body := r.req("GET", r.ctl, "/x", target, ""); resp.StatusCode != http.StatusOK || body != "served" {
 		t.Fatalf("a call: %d %q", resp.StatusCode, body)
 	}
-	if _, err := r.manifest("test.slow/e1"); err != nil {
+	if _, err := r.manifest("slow/e1"); err != nil {
 		t.Fatalf("no manifest after the call: %v", err)
 	}
 	for name, base := range map[string]string{"the client": r.pub, "a call with Shardlite-If-Exists": r.ctl} {
@@ -99,7 +99,7 @@ func TestForwardedClientRequestDoesNotCreate(t *testing.T) {
 		want   int
 	}{{originClient, http.StatusNotFound}, {originCall, http.StatusOK}} {
 		req, _ := http.NewRequest(http.MethodGet, "http://"+nd.Peer+"/x", nil)
-		req.Header.Set(hdrTarget, "test.users/fwd-"+tc.origin)
+		req.Header.Set(hdrTarget, "users/fwd-"+tc.origin)
 		req.Header.Set(hdrOrigin, tc.origin)
 		resp, err := client.Do(req)
 		if err != nil {
@@ -121,7 +121,7 @@ func TestClientsGet404ForDeletedShards(t *testing.T) {
 	var logs bytes.Buffer
 	var lmu sync.Mutex
 	logger := slog.New(slog.NewTextHandler(writerFunc(func(p []byte) (int, error) { lmu.Lock(); defer lmu.Unlock(); return logs.Write(p) }), &slog.HandlerOptions{Level: slog.LevelDebug}))
-	r := newSRigWith(t, func(o *CatalogOptions) { o.Logger = logger })
+	r := newSRigWith(t, func(o *ShardsetOptions) { o.Logger = logger })
 	logged := func(level, shard string) bool {
 		lmu.Lock()
 		defer lmu.Unlock()
@@ -144,24 +144,24 @@ func TestClientsGet404ForDeletedShards(t *testing.T) {
 	}
 
 	// Marked for deletion.
-	ref := r.acquire("test.users/d1")
+	ref := r.acquire("users/d1")
 	r.write(ref, "a")
 	r.app.Must(t, "exec", "a", "CREATE TABLE _shardlite_delete (x)")
 	r.app.Must(t, "close", "a")
 	ref.Release()
-	gone("test.users/d1")
-	if logged("INFO", "test.users/d1") || !logged("DEBUG", "test.users/d1") {
+	gone("users/d1")
+	if logged("INFO", "users/d1") || !logged("DEBUG", "users/d1") {
 		t.Fatalf("the marked shard's deletion was logged wrongly:\n%s", logs.String())
 	}
 
 	// Created by a call that writes nothing, twice.
-	for _, target := range []string{"test.users/d2", "test.users/d3"} {
+	for _, target := range []string{"users/d2", "users/d3"} {
 		if resp, _ := r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": target}, ""); resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("a call to %s: %d", target, resp.StatusCode)
 		}
 		gone(target)
 	}
-	if !logged("INFO", "test.users/d2") || logged("INFO", "test.users/d3") || !logged("DEBUG", "test.users/d3") {
+	if !logged("INFO", "users/d2") || logged("INFO", "users/d3") || !logged("DEBUG", "users/d3") {
 		t.Fatalf("the empty shards' deletions were logged wrongly:\n%s", logs.String())
 	}
 }

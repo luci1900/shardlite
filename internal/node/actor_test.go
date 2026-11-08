@@ -14,6 +14,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/luci1900/shardlite/internal/blobtest"
+	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/kind"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
@@ -61,14 +62,14 @@ func notYet[T any](t *testing.T, what string, ch <-chan T) {
 func TestTwoActivationsOfOneNameShareOne(t *testing.T) {
 	t.Parallel()
 	r := newMRig(t)
-	entered, _, unblock := r.blockCreates(shardfile.ManifestKey(shardName("test.users/sa1")))
+	entered, _, unblock := r.blockCreates(shardfile.ManifestKey(shardName("users/sa1")))
 	defer unblock()
 	refs := make(chan *Hold, 2)
 	var g errgroup.Group
 	defer g.Wait()
 	acquire := func() {
 		g.Go(func() error {
-			ref, err := r.m.Acquire(context.Background(), shardName("test.users/sa1"))
+			ref, err := r.m.Acquire(context.Background(), shardName("users/sa1"))
 			if err != nil {
 				return err
 			}
@@ -79,7 +80,7 @@ func TestTwoActivationsOfOneNameShareOne(t *testing.T) {
 	acquire()
 	<-entered // the first activation is creating the shard's manifest
 	acquire()
-	if e := r.m.tab.load(shardName("test.users/sa1")); e == nil || !e.is(entryActivating) {
+	if e := r.m.tab.load(shardName("users/sa1")); e == nil || !e.is(entryActivating) {
 		t.Fatal("no activating entry for the shard")
 	}
 	notYet(t, "a request for a shard being activated", refs)
@@ -105,7 +106,7 @@ func TestAnActivationRacingARelease(t *testing.T) {
 	t.Parallel()
 	r := newMRig(t)
 	ctx := context.Background()
-	ref := r.acquire("test.slow/ar1")
+	ref := r.acquire("slow/ar1")
 	r.write(ref, "a")
 	if err := r.m.Gate(ctx, ref, kind.SyncStorage); err != nil {
 		t.Fatal(err)
@@ -115,7 +116,7 @@ func TestAnActivationRacingARelease(t *testing.T) {
 	ref.Release()
 	old := ref.a
 
-	entered, _, unblock := r.blockCreates(shardfile.ShardPrefix(shardName("test.slow/ar1"))) // the release's delta
+	entered, _, unblock := r.blockCreates(shardfile.ShardPrefix(shardName("slow/ar1"))) // the release's delta
 	defer unblock()
 	released := make(chan error, 1)
 	go func() {
@@ -131,7 +132,7 @@ func TestAnActivationRacingARelease(t *testing.T) {
 	}
 	got := make(chan *Hold, 1)
 	go func() {
-		ref, err := r.m.Acquire(ctx, shardName("test.slow/ar1"))
+		ref, err := r.m.Acquire(ctx, shardName("slow/ar1"))
 		if err != nil {
 			t.Error(err)
 		}
@@ -151,8 +152,8 @@ func TestAnActivationRacingARelease(t *testing.T) {
 	if ref.a == old {
 		t.Fatal("the request got the shard that was let go of")
 	}
-	if n, hits := r.m.Stats.Activations.Load(), r.m.Stats.CachedHits.Load(); n != 2 || hits != 1 {
-		t.Fatalf("%d activations, %d from the cache: want the shard activated again from its cached file", n, hits)
+	if n, restores := r.m.Stats.Activations.Load(), r.m.Stats.Restores.Load(); n != 2 || restores != 1 {
+		t.Fatalf("%d activations, %d restores: want the shard created, then restored from storage", n, restores)
 	}
 	if r.liveDump(ref.Path()) != want {
 		t.Fatal("the shard differs after it was activated again")
@@ -164,31 +165,15 @@ func TestAnActivationRacingARelease(t *testing.T) {
 func TestARequestRacingTheRemovalOfItsEntry(t *testing.T) {
 	t.Parallel()
 	r := newMRig(t)
-	ctx := context.Background()
-	// A cached shard's entry (an eviction, say) that a request finds and waits on.
-	e, ok := r.m.tab.claim(shardName("test.users/rr1"))
-	if !ok {
-		t.Fatal("could not claim a name with no entry")
-	}
-	if _, ok := r.m.tab.claim(shardName("test.users/rr1")); ok {
-		t.Fatal("claimed a name twice")
-	}
-	got := make(chan *Hold, 1)
-	go func() {
-		ref, err := r.m.Acquire(ctx, shardName("test.users/rr1"))
-		if err != nil {
-			t.Error(err)
-		}
-		got <- ref
-	}()
-	notYet(t, "a request for a name with a busy entry", got)
-	r.m.tab.remove(e, nil)
-	ref := <-got
-	if ref == nil {
-		t.FailNow()
-	}
+	ref := r.acquire("slow/rr1")
+	r.write(ref, "a")
+	r.app.Must(t, "close", "a")
+	ref.Release()
+	e := ref.a.e // the entry a request loaded just before the shard was let go of
+	r.release("slow/rr1")
+	ref = r.acquire("slow/rr1")
 	defer ref.Release()
-	if ref.a.e == e || r.m.Stats.Activations.Load() != 1 {
+	if ref.a.e == e || r.m.Stats.Activations.Load() != 2 {
 		t.Fatal("the request did not activate the shard under an entry of its own")
 	}
 	// The removed entry, as a request that loaded it just before sees it.
@@ -197,11 +182,14 @@ func TestARequestRacingTheRemovalOfItsEntry(t *testing.T) {
 	}
 	r.m.tab.remove(e, nil)
 	r.m.tab.forget(e)
-	if r.m.tab.load(shardName("test.users/rr1")) != ref.a.e {
+	if r.m.tab.load(shardName("slow/rr1")) != ref.a.e {
 		t.Fatal("removing an old entry again removed the one that took its place")
 	}
-	if r.refs("test.users/rr1") != 1 {
-		t.Fatalf("%d references, want the request's", r.refs("test.users/rr1"))
+	if r.refs("slow/rr1") != 1 {
+		t.Fatalf("%d references, want the request's", r.refs("slow/rr1"))
+	}
+	if n := len(r.m.Active()); n != 1 {
+		t.Fatalf("%d shards in the table, want 1", n)
 	}
 }
 
@@ -209,11 +197,11 @@ func TestARequestRacingTheRemovalOfItsEntry(t *testing.T) {
 // through the shard's loop, and gates wait for the flush loop alone.
 func TestADeltaNeverDelaysARequest(t *testing.T) {
 	t.Parallel()
-	r := newMRigWith(t, func(o *CatalogOptions) { o.Lifecycle.DeltaAge = time.Millisecond })
+	r := newMRigWith(t, func(o *ShardsetOptions) { o.Lifecycle.DeltaAge = time.Millisecond })
 	ctx := context.Background()
-	ref := r.acquire("test.wallet/dd1")
+	ref := r.acquire("wallet/dd1")
 	defer ref.Release()
-	entered, _, unblock := r.blockCreates(shardfile.ShardPrefix(shardName("test.wallet/dd1")))
+	entered, _, unblock := r.blockCreates(shardfile.ShardPrefix(shardName("wallet/dd1")))
 	defer unblock()
 	r.write(ref, "a")
 	if err := r.m.Gate(ctx, ref, kind.SyncStorage); err != nil {
@@ -223,7 +211,7 @@ func TestADeltaNeverDelaysARequest(t *testing.T) {
 	quick, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	for range 3 {
-		other, err := r.m.Acquire(quick, shardName("test.wallet/dd1"))
+		other, err := r.m.Acquire(quick, shardName("wallet/dd1"))
 		if err != nil {
 			t.Fatalf("a request waited for the delta: %v", err)
 		}
@@ -238,7 +226,7 @@ func TestADeltaNeverDelaysARequest(t *testing.T) {
 	}
 	unblock()
 	apptest.Eventually(t, apptest.Timeout, "the delta", func() bool {
-		m, err := r.manifest("test.wallet/dd1")
+		m, err := r.manifest("wallet/dd1")
 		return err == nil && len(m.Files) > 0
 	})
 }
@@ -250,7 +238,7 @@ func TestIdleDeactivationOnTheFakeClock(t *testing.T) {
 	t.Parallel()
 	clk := newFakeClock()
 	r := newMRigWith(t, withClock(clk)) // users' idle timeout is 300 ms
-	ref := r.acquire("test.users/fi1")
+	ref := r.acquire("users/fi1")
 	r.write(ref, "a")
 	if err := r.m.Gate(context.Background(), ref, kind.SyncStorage); err != nil {
 		t.Fatal(err)
@@ -260,21 +248,24 @@ func TestIdleDeactivationOnTheFakeClock(t *testing.T) {
 	a := ref.a
 
 	clk.Advance(200 * time.Millisecond)
-	r.acquire("test.users/fi1").Release() // used at 200 ms: idle until 500 ms
+	r.acquire("users/fi1").Release() // used at 200 ms: idle until 500 ms
 	clk.Advance(100 * time.Millisecond)
 	waitCounter(t, "the idle timer's look at 300 ms", &a.looks.idle, 1)
-	if !r.m.IsActive(shardName("test.users/fi1")) {
+	if !r.m.IsActive(shardName("users/fi1")) {
 		t.Fatal("let go of 100 ms after its last use")
 	}
 	clk.Advance(199 * time.Millisecond)
-	if !r.m.IsActive(shardName("test.users/fi1")) || a.looks.idle.Load() != 1 {
+	if !r.m.IsActive(shardName("users/fi1")) || a.looks.idle.Load() != 1 {
 		t.Fatalf("looked at again (%d looks) before the timeout since the last use", a.looks.idle.Load())
 	}
 	clk.Advance(time.Millisecond)
 	waitCounter(t, "the idle timer's look at 500 ms", &a.looks.idle, 2)
 	<-a.ended
-	if r.m.IsActive(shardName("test.users/fi1")) || !r.cached("test.users/fi1") {
+	if r.m.IsActive(shardName("users/fi1")) {
 		t.Fatal("not let go of after its idle timeout")
+	}
+	if man, err := r.manifest("users/fi1"); err != nil || man.Owner != "" {
+		t.Fatalf("the manifest of a shard let go of when idle: %+v %v", man, err)
 	}
 }
 
@@ -282,10 +273,10 @@ func TestIdleDeactivationOnTheFakeClock(t *testing.T) {
 // are asked to be.
 func TestTheDeactivationLimitHolds(t *testing.T) {
 	t.Parallel()
-	r := newMRigWith(t, func(o *CatalogOptions) { o.limits.deactivate = 2 })
+	r := newMRigWith(t, func(o *ShardsetOptions) { o.limits.deactivate = 2 })
 	ctx := context.Background()
 	var shards []*actor
-	for _, name := range []string{"test.slow/l1", "test.slow/l2", "test.slow/l3", "test.slow/l4", "test.slow/l5"} {
+	for _, name := range []string{"slow/l1", "slow/l2", "slow/l3", "slow/l4", "slow/l5"} {
 		ref := r.acquire(name)
 		r.write(ref, name)
 		if err := r.m.Gate(ctx, ref, kind.SyncStorage); err != nil {
@@ -295,7 +286,7 @@ func TestTheDeactivationLimitHolds(t *testing.T) {
 		ref.Release()
 		shards = append(shards, ref.a)
 	}
-	entered, inside, unblock := r.blockCreates(shardfile.FilesPrefix + "test.slow/") // the releases' deltas
+	entered, inside, unblock := r.blockCreates(shardfile.FilesPrefix) // the releases' deltas
 	defer unblock()
 	var g errgroup.Group
 	for _, a := range shards {
@@ -333,7 +324,7 @@ func TestSnapshotsWaitForAPlace(t *testing.T) {
 		name := map[bool]string{false: "delta", true: "rebase"}[rebase]
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			r := newMRigWith(t, func(o *CatalogOptions) {
+			r := newMRigWith(t, func(o *ShardsetOptions) {
 				o.Lifecycle.DeltaAge = time.Millisecond
 				o.limits.snapshot, o.limits.rebase = 1, 1
 				if rebase {
@@ -341,10 +332,10 @@ func TestSnapshotsWaitForAPlace(t *testing.T) {
 				}
 			})
 			ctx := context.Background()
-			ref := r.acquire("test.slow/sw1")
+			ref := r.acquire("slow/sw1")
 			defer ref.Release()
 			files := func() int {
-				m, err := r.manifest("test.slow/sw1")
+				m, err := r.manifest("slow/sw1")
 				if err != nil {
 					return 0
 				}
@@ -361,9 +352,9 @@ func TestSnapshotsWaitForAPlace(t *testing.T) {
 				}
 			}
 			commit(true)
-			sem, want := r.m.deps.snapshots, files()
+			sem, want := r.m.deps.sems.snapshot, files()
 			if rebase {
-				sem = r.m.deps.rebases
+				sem = r.m.deps.sems.rebase
 				sem <- struct{}{} // the only place is taken
 				// Deltas until the shard has more files than MaxFiles: then its next
 				// snapshot is a rebase.
@@ -381,7 +372,7 @@ func TestSnapshotsWaitForAPlace(t *testing.T) {
 			}
 			quick, cancel := context.WithTimeout(ctx, 10*time.Second)
 			defer cancel()
-			other, err := r.m.Acquire(quick, shardName("test.slow/sw1"))
+			other, err := r.m.Acquire(quick, shardName("slow/sw1"))
 			if err != nil {
 				t.Fatalf("a request waited for the shard's loop: %v", err)
 			}
@@ -413,7 +404,7 @@ func shardGoroutines() []string {
 		if i == 0 {
 			continue
 		}
-		for _, f := range []string{"node.(*actor)", "capture.(*Shard)", "node.(*msgOwner)", "node.(*wakeHints)", "node.(*messenger)", "node.(*Catalog)", "node.(*table)", "node.(*Flusher)", "service.(*Group)"} {
+		for _, f := range []string{"node.(*actor)", "capture.(*Shard)", "node.(*msgOwner)", "node.(*wakeHints)", "node.(*messenger)", "node.(*Shardset)", "node.(*table)", "node.(*Flusher)", "service.(*Group)"} {
 			if strings.Contains(g, f) {
 				out = append(out, g)
 				break
@@ -441,14 +432,14 @@ func TestShardsGoroutinesAreJoinedWhenTheyAreLetGo(t *testing.T) {
 		return status, err
 	})
 	r.wakeHook.Store(&hook)
-	r.remind("test.slow/gj1", "k", time.Now().Unix())
+	r.remind("slow/gj1", "k", time.Now().Unix())
 	apptest.Eventually(t, apptest.Timeout, "the wake to reach the app", func() bool {
 		rec.mu.Lock()
 		defer rec.mu.Unlock()
 		return len(rec.got) > 0
 	})
-	r.acquire("test.users/gj2").Release() // and a shard with nothing to wake for
-	r.closeInApp("test.slow/gj1")
+	r.acquire("users/gj2").Release() // and a shard with nothing to wake for
+	r.closeInApp("slow/gj1")
 	if err := r.mrig.stop(); err != nil {
 		t.Fatal(err)
 	}
@@ -459,4 +450,40 @@ func TestShardsGoroutinesAreJoinedWhenTheyAreLetGo(t *testing.T) {
 	if n := len(r.m.Active()); n != 0 {
 		t.Fatalf("%d shards still active", n)
 	}
+}
+
+// deactivateNow lets go of the shard through its loop, as an idle deactivation
+// does but whether or not it has been idle, and returns once its loop has ended
+// and its name is free. The shard is released. It reports false if
+// the shard is in use or the app has it open. A shard that was let go of
+// meanwhile, or never activated, counts as let go of.
+func (a *actor) deactivateNow(ctx context.Context) (bool, error) {
+	type result struct {
+		ok  bool
+		err error
+	}
+	r, err := do(ctx, a.ops, a.ended, func() result {
+		ok, err := a.deactivate(ctx, capture.ResumeIfHeld)
+		return result{ok, err}
+	})
+	if errors.Is(err, errLoopEnded) {
+		select {
+		case <-a.ready:
+		default:
+			return true, nil // never activated: nothing to let go of
+		}
+		if a.gone {
+			return true, nil
+		}
+		return false, errShardsStopped
+	}
+	if err != nil {
+		return false, err
+	}
+	if r.ok {
+		if err := a.waitEnded(ctx); err != nil {
+			return false, err
+		}
+	}
+	return r.ok, r.err
 }

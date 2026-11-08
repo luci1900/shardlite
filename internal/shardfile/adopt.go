@@ -12,9 +12,9 @@ import (
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/cluster"
+	"github.com/luci1900/shardlite/internal/dueindex"
+	"github.com/luci1900/shardlite/internal/journal"
 	"github.com/luci1900/shardlite/internal/pos"
-	"github.com/luci1900/shardlite/internal/remindex"
-	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/shard"
 )
 
@@ -84,7 +84,7 @@ func (f *Files) ReadJournal(ctx context.Context, node cluster.Node, from, next p
 	a := &Adoption{f: f, node: node, log: logger}
 	from, next = max(from, 1), max(next, 1)
 	js := f.Journal(node)
-	fence, err := segment.Fence(ctx, js, next)
+	fence, err := journal.Fence(ctx, js, next)
 	if err != nil {
 		return a, fmt.Errorf("adopt %s: fence: %w", node, err)
 	}
@@ -93,8 +93,8 @@ func (f *Files) ReadJournal(ctx context.Context, node cluster.Node, from, next p
 	// Segments expire. A lease that has been idle for longer than they live can
 	// name ones that are gone, and the journal then starts where the listing says.
 	if from < fence {
-		if _, err := segment.ReadFooter(ctx, js, from); errors.Is(err, blob.ErrNotFound) {
-			low, _, err := segment.Bounds(ctx, js)
+		if _, err := journal.ReadFooter(ctx, js, from); errors.Is(err, blob.ErrNotFound) {
+			low, _, err := journal.Bounds(ctx, js)
 			if err != nil {
 				return a, fmt.Errorf("adopt %s: %w", node, err)
 			}
@@ -205,12 +205,9 @@ func (f *Files) adoptShard(ctx context.Context, node cluster.Node, n shard.Name,
 		// this node dies before the delta, a repeated adoption finds the tail and
 		// creates an entry again. The delta records a reminder due now, since the
 		// shard may hold reminders that were never delivered and the adopter can't
-		// read them. A system shard has none: the claimer brings it back.
-		var hooks Hooks
-		if !n.System() {
-			now := remindex.MinuteAt(f.now())
-			hooks.BeforeUpdate = func(context.Context, pos.Position) (remindex.Minute, error) { return now, nil }
-		}
+		// read them.
+		now := dueindex.MinuteAt(f.now())
+		hooks := Hooks{BeforeUpdate: func(context.Context, pos.Position) (dueindex.Minute, error) { return now, nil }}
 		err = h.putTail(ctx, tail.Files, hooks, func(n *Manifest) { n.Journal = "" })
 		tail.Close()
 		if errors.Is(err, blob.ErrConflict) {

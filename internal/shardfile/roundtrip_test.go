@@ -56,8 +56,8 @@ func (c *caseTB) finish() {
 const maxActions = 30
 
 // shardSim drives one shard through its life: the app writes, the node syncs,
-// writes deltas and rebases, lets go of the shard and activates it again from the
-// cache or from blob storage, and crashes.
+// writes deltas and rebases, lets go of the shard and then either carries on with
+// the same file or restores it from blob storage, and crashes.
 type shardSim struct {
 	rt  *rapid.T
 	e   *harness.Env
@@ -108,7 +108,7 @@ func (s *shardSim) liveDump() string {
 }
 
 // activate starts capture on the file (restored from blob storage if res is
-// set, cached otherwise), takes the first sync before the app opens it, then
+// set, the file the shard already had otherwise), takes the first sync before the app opens it, then
 // starts the app and checks it sees what the shard held.
 func (s *shardSim) activate(res *shardfile.Restored) {
 	s.rt.Helper()
@@ -133,7 +133,7 @@ func (s *shardSim) activate(res *shardfile.Restored) {
 func (s *shardSim) startApp() {
 	s.rt.Helper()
 	s.app = apptest.Start(s.e.T)
-	s.do("open", "a", s.path(), "50")
+	s.do("create", "a", s.path(), "50")
 }
 
 // deactivate lets go of the shard as the node does: the app closes it, Release
@@ -148,7 +148,7 @@ func (s *shardSim) deactivate() {
 	if err := s.app.Exit(); err != nil {
 		s.rt.Fatal(err)
 	}
-	released, _, err := s.sh.Release(s.ctx, nil)
+	released, _, err := s.sh.Release(s.ctx, nil, capture.ResumeIfHeld)
 	if err != nil || !released {
 		s.rt.Fatalf("release: released=%v err=%v", released, err)
 	}
@@ -207,7 +207,7 @@ func (s *shardSim) pickTable(label string) (string, bool) {
 	return rapid.SampledFrom(names).Draw(s.rt, label), true
 }
 
-// dropLocal deletes a shard's local file, as eviction or a lost disk would.
+// dropLocal deletes a shard's local file, as a release or a lost disk would.
 func dropLocal(t *rapid.T, path string) {
 	t.Helper()
 	for _, p := range []string{path, path + "-wal", path + "-shm"} {
@@ -348,13 +348,13 @@ func (s *shardSim) actionsMap() map[string]func(*rapid.T) {
 			})
 		},
 		"deactivate": func(*rapid.T) { s.step(s.deactivate) },
-		"reactivate from the cache": func(*rapid.T) {
+		"carry on with the same file": func(*rapid.T) {
 			s.step(func() {
 				s.deactivate()
 				s.activate(nil)
 			})
 		},
-		"reactivate from blob storage": func(*rapid.T) {
+		"restore from blob storage": func(*rapid.T) {
 			s.step(func() {
 				s.deactivate()
 				dropLocal(s.rt, s.path())

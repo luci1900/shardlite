@@ -21,6 +21,12 @@ type Faults struct {
 	// rebases the shard (LifecycleOptions.MaxFiles), so a test reaches a rebase
 	// with a few deltas. Zero keeps the default.
 	MaxFiles int
+	// PeerHeader is given the name and the value of every Shardlite-Node and
+	// Shardlite-Placement header the node is about to send another node and returns
+	// what goes on the wire: the same value, a garbled one, or "" to send none. The
+	// receiver ignores a header that does not read, so placement only gets worse
+	// for it, never wrong.
+	PeerHeader func(name, value string) string
 }
 
 // WithFaults makes Run arm f.

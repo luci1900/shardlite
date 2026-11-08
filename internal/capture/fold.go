@@ -9,7 +9,7 @@ import (
 // foldWAL leaves the database file complete on its own and no WAL sidecars
 // beside it. A database that never had either needs nothing.
 //
-// A pair that a cached or resumed shard left behind may hold commits that are
+// A pair that a restore or a resumed capture left behind may hold commits that are
 // not in the database file, so a connection of the node's checkpoints and
 // removes it. Nobody else may have the shard open (the caller has just
 // checked), and the node has nothing open on it that closing a descriptor

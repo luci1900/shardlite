@@ -21,7 +21,7 @@ import (
 	"github.com/luci1900/shardlite/internal/sqlitetest"
 )
 
-const shard = "test.users/42"
+const shard = "users/42"
 
 // shardName is a shard's name in the tests that need the parsed type.
 // tailOf is the shard's tail, closed when the test ends.
@@ -47,7 +47,7 @@ func write(t *testing.T, _ *harness.Env, app mustDoer, sync func() error, i int)
 	}
 }
 
-// removeLocal deletes a shard's local file, as eviction or a lost disk would.
+// removeLocal deletes a shard's local file, as a release or a lost disk would.
 func removeLocal(t *testing.T, path string) {
 	t.Helper()
 	for _, p := range []string{path, path + "-wal", path + "-shm"} {
@@ -400,11 +400,63 @@ func TestManifestUpdateWithAnUnknownOutcomeDoesNotLeaveAStaleHandle(t *testing.T
 	if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); err != nil {
 		t.Fatalf("the next delta: %v", err)
 	}
-	if err := h.ReleaseOwnership(ctx); err != nil {
+	if err := h.SetReminder(ctx, h.Manifest.NextReminder, true); err != nil {
 		t.Fatalf("release: %v", err)
 	}
 	if got := restoreDump(t, e, "unknown"); got == "" {
 		t.Fatal("nothing restored")
+	}
+	sh.Close(ctx)
+}
+
+// A release whose outcome is unknown, which landed and was followed by another
+// node's claim before the handle could look: the stored manifest is neither the
+// handle's version nor the one it wrote. The handle must say the shard is gone
+// (ErrMovedOn), never that the release didn't land, or its node would resume a
+// shard another node serves.
+func TestReleaseWithAnUnknownOutcomeThenAClaimIsNotTakenForNotLanding(t *testing.T) {
+	t.Parallel()
+	e := harness.New(t)
+	ctx := context.Background()
+	app := e.StartApp(shard)
+	h, sh := e.NewShard(shard)
+	write(t, e, app, func() error { return sh.Sync(ctx) }, 0)
+	var down atomic.Bool
+	down.Store(true)
+	e.Blob.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if down.Load() && strings.HasPrefix(key, shardfile.ManifestPrefix) {
+			if op == blobtest.OpUpdate && after {
+				return errors.New("response lost") // it happened
+			}
+			if op == blobtest.OpHead || op == blobtest.OpGet {
+				return errors.New("storage slow") // and nothing can be read back
+			}
+		}
+		return nil
+	})
+	err := h.WriteDelta(ctx, sh, shardfile.Hooks{Release: true})
+	if err == nil || !h.Unsettled() {
+		t.Fatalf("want an unknown outcome, got %v (unsettled %v)", err, h.Unsettled())
+	}
+	down.Store(false)
+	// The release landed, so the shard is unowned, and another claim takes it
+	// before the handle looks again.
+	other, err := e.Files.Attach(ctx, h.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.Manifest.Owner != "" {
+		t.Fatalf("the release did not land: owner %q", other.Manifest.Owner)
+	}
+	if err := other.Claim(ctx); err != nil {
+		t.Fatal(err)
+	}
+	err = h.WriteDelta(ctx, sh, shardfile.Hooks{Release: true})
+	if !errors.Is(err, shardfile.ErrMovedOn) {
+		t.Fatalf("asking again: %v, want ErrMovedOn", err)
+	}
+	if h.Unsettled() {
+		t.Fatal("the handle is still unsettled after learning the outcome")
 	}
 	sh.Close(ctx)
 }
@@ -438,7 +490,7 @@ func TestManifestUpdateCancelledAfterLandingDoesNotLeaveAStaleHandle(t *testing.
 	if err := h.WriteDelta(context.Background(), sh, shardfile.Hooks{}); err != nil {
 		t.Fatalf("the next delta: %v", err)
 	}
-	if err := h.ReleaseOwnership(context.Background()); err != nil {
+	if err := h.SetReminder(context.Background(), h.Manifest.NextReminder, true); err != nil {
 		t.Fatalf("release: %v", err)
 	}
 	sh.Close(context.Background())

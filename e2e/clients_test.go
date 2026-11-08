@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"slices"
 	"testing"
 	"time"
 
@@ -39,8 +38,9 @@ func withMD(ctx context.Context, kv ...string) context.Context {
 }
 
 // onShard adds the metadata of a call to shard as a client SDK for the app makes
-// it: x-shard says which shard the call is for, and shardlite-target names the
-// same shard to save a hop. More metadata follows as in withMD.
+// it: x-shard says which shard the call is for, and shardlite-target is the hint
+// that names the same shard, which the node opens for the call. More metadata
+// follows as in withMD.
 func onShard(ctx context.Context, shard string, kv ...string) context.Context {
 	return withMD(ctx, append([]string{"shardlite-target", shard, "x-shard", shard}, kv...)...)
 }
@@ -90,19 +90,6 @@ func wsEcho(ctx context.Context, c *websocket.Conn, text string) (string, error)
 	}
 	_, b, err := c.Read(ctx)
 	return string(b), err
-}
-
-// relayCount is how many requests the app has relayed so far.
-func (s *stack) relayCount() int { return len(s.appDebug().Relays) }
-
-// checkRelays checks the requests the app relayed after the first n, in order.
-// The app records a relay before it answers, so no waiting is needed once the
-// client has its answer.
-func (s *stack) checkRelays(t testing.TB, n int, want ...e2eapp.RelayRec) {
-	t.Helper()
-	if got := s.appDebug().Relays[n:]; !slices.Equal(got, want) {
-		t.Errorf("the app relayed %+v, want %+v", got, want)
-	}
 }
 
 func timeout(d time.Duration) (context.Context, context.CancelFunc) {

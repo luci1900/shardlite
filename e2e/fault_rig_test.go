@@ -4,7 +4,6 @@ package e2e
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -17,6 +16,7 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/apptest"
+	"github.com/luci1900/shardlite/internal/audit"
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/kill"
 	"github.com/luci1900/shardlite/internal/node"
@@ -32,13 +32,17 @@ import (
 func init() { nodeTags = []string{"fault"} }
 
 const (
-	faultWallet = "e2e.wallet/f1" // sync on: a 200 means the write is durable
-	faultUsers  = "e2e.users/f1"  // sync none: a 200 means nothing yet
+	faultWallet = "wallet/f1" // sync on: a 200 means the write is durable
+	faultUsers  = "users/f1"  // sync none: a 200 means nothing yet
 )
 
 // faultEnv is what every node of the rig runs with: tails become deltas within
 // a few snapshot passes, and a manifest with three files is due a rebase.
-var faultEnv = []string{"SHARDLITE_DELTA_AGE=300ms", "SHARDLITE_MAX_FILES=2"}
+var faultEnv = []string{"SHARDLITE_DELTA_AGE=" + faultDeltaAge.String(), "SHARDLITE_FAULT_MAX_FILES=2"}
+
+// faultDeltaAge is the delta age of every node of the rig, which sets the node's age
+// rule for orphans (node.JournalExpiry).
+const faultDeltaAge = 300 * time.Millisecond
 
 // activationPoints are where an activation of a restored shard can be killed
 // between the restore and the first sync: after the restore, as the node folds
@@ -75,7 +79,25 @@ func newFaultRig(t *testing.T, extra ...string) *faultRig {
 			}
 		}
 	}
+	t.Cleanup(r.audit)
 	return r
+}
+
+// audit is the end of every scenario, run as the rig's cleanup before the processes are
+// killed (they are older cleanups): it stops the node, so no upload is on its way to a
+// manifest, and walks the store as it would stand after the age rule (internal/audit).
+// A path that writes LTX files without an orphan index entry first leaves a file that
+// the walk finds. The age is the node's own, which the rig's delta age sets.
+// A scenario that failed is left as it is.
+func (r *faultRig) audit() {
+	if r.t.Failed() {
+		return
+	}
+	r.crash()
+	age := node.JournalExpiry(faultDeltaAge)
+	if err := audit.Run(context.Background(), r.v.files.Blob, age, time.Now().Add(age+time.Hour)); err != nil {
+		r.t.Errorf("the audit of the store after the scenario: %v", err)
+	}
 }
 
 // restart kills the node, as losing the host would, and starts a new one with
@@ -107,7 +129,7 @@ func (r *faultRig) arm(point kill.Point) {
 	r.t.Helper()
 	r.fires++
 	r.fire = filepath.Join(r.s.dir, fmt.Sprintf("fire-%d", r.fires))
-	r.restart("SHARDLITE_KILL_AT="+string(point), "SHARDLITE_KILL_WHEN="+r.fire)
+	r.restart("SHARDLITE_FAULT_KILL_AT="+string(point), "SHARDLITE_FAULT_KILL_WHEN="+r.fire)
 }
 
 // fireNow arms the point: from here the node dies when it reaches it.
@@ -199,18 +221,13 @@ func (r *faultRig) writeUntilDeath(point kill.Point) {
 	r.t.Fatalf("the node did not die at %s", point)
 }
 
-// waitCached waits until the node has let go of the shard and kept its files.
-func (r *faultRig) waitCached(shard string) {
+// waitReleased waits until the node has let go of the shard: it is released in
+// blob storage and its files are gone.
+func (r *faultRig) waitReleased(shard string) {
 	r.t.Helper()
-	path := filepath.Join(r.s.dir, "data", node.LocalDBName)
-	apptest.Eventually(r.t, apptest.Timeout, shard+" to be cached", func() bool {
-		db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=busy_timeout(5000)")
-		if err != nil {
-			return false
-		}
-		defer db.Close()
-		var state string
-		return db.QueryRow(`SELECT state FROM shards WHERE name = ?`, shard).Scan(&state) == nil && state == "cached"
+	apptest.Eventually(r.t, apptest.Timeout, shard+" to be let go of", func() bool {
+		files, err := filepath.Glob(filepath.Join(r.s.dir, "data", shard+".*"))
+		return err == nil && len(files) == 0
 	})
 }
 

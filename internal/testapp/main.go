@@ -69,7 +69,7 @@ func (a *app) open(id, path, busy string) error {
 		busy = "5000"
 	}
 	a.busy[id] = busy
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout("+busy+")&_pragma=synchronous(NORMAL)")
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=rw&_pragma=journal_mode(WAL)&_pragma=busy_timeout("+busy+")&_pragma=synchronous(NORMAL)")
 	if err != nil {
 		return err
 	}
@@ -104,7 +104,7 @@ func (a *app) do(f []string) (string, error) {
 		return strconv.Quote(out), err
 	}
 	if cmd == "openro" {
-		db, err := sql.Open("sqlite", "file:"+f[2]+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+		db, err := sql.Open("sqlite", "file:"+f[2]+"?mode=rw&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
 		if err != nil {
 			return "", err
 		}
@@ -117,10 +117,18 @@ func (a *app) do(f []string) (string, error) {
 		a.paths[id], a.dbs[id] = f[2], db
 		return strconv.Itoa(n), nil
 	}
-	if cmd == "open" {
+	if cmd == "create" || cmd == "open" {
 		busy := ""
 		if len(f) > 3 {
 			busy = f[3]
+		}
+		if cmd == "create" {
+			// Stands in for the node, which creates a shard's file before it hands the path to the app: a test that makes its own file creates it, then opens it as an app does (without create).
+			file, err := os.OpenFile(f[2], os.O_CREATE|os.O_WRONLY, 0o644)
+			if err != nil {
+				return "", err
+			}
+			file.Close()
 		}
 		return "", a.open(id, f[2], busy)
 	}
@@ -215,7 +223,7 @@ func (a *app) do(f []string) (string, error) {
 
 // queryRows runs one query on a connection of its own and formats the rows.
 func queryRows(path, query string) (string, error) {
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=rw&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return "", err
 	}

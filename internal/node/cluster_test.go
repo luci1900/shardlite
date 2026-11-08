@@ -2,7 +2,6 @@ package node
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/luci1900/shardlite/internal/apptest"
@@ -19,14 +18,14 @@ import (
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/blobtest"
-	"github.com/luci1900/shardlite/internal/coord"
+	"github.com/luci1900/shardlite/internal/lease"
 )
 
 // testCluster is several nodes in one process: Run on one in-memory store, each
 // with its own directories, listeners on 127.0.0.1:0 and a fake app (HTTP/1.1
 // and h2c) that answers 200 unless a test gives it a handler. The fake app never
-// opens a shard, so commits are for tests that start a real one. Stage 2.14's
-// fault rig is for real crashes.
+// opens a shard, so commits are for tests that start a real one. The fault rig
+// (docs/internals.md, Failing loudly) is for real crashes.
 type testCluster struct {
 	t     *testing.T
 	mem   *blob.Memory
@@ -45,8 +44,8 @@ type clusterNode struct {
 	sick   atomic.Bool // the ready route answers 500, as a failing app would
 	killed chan struct{}
 	// tune changes the shards' options at each start, and m is the running shards.
-	tune   func(*CatalogOptions)
-	m      atomic.Pointer[Catalog]
+	tune   func(*ShardsetOptions)
+	m      atomic.Pointer[Shardset]
 	cancel context.CancelFunc
 	ran    chan error
 
@@ -58,13 +57,13 @@ type clusterNode struct {
 func newCluster(t *testing.T, n int) *testCluster { return newClusterWith(t, n, nil) }
 
 // newClusterWith is newCluster with the shards' options changed by tune.
-func newClusterWith(t *testing.T, n int, tune func(*CatalogOptions)) *testCluster {
+func newClusterWith(t *testing.T, n int, tune func(*ShardsetOptions)) *testCluster {
 	t.Helper()
 	return newClusterEnv(t, n, nil, tune)
 }
 
 // newClusterEnv is newClusterWith with environment variables set on every node.
-func newClusterEnv(t *testing.T, n int, vars map[string]string, tune func(*CatalogOptions)) *testCluster {
+func newClusterEnv(t *testing.T, n int, vars map[string]string, tune func(*ShardsetOptions)) *testCluster {
 	t.Helper()
 	c := &testCluster{t: t, mem: blob.NewMemory(), vars: vars}
 	for i := range n {
@@ -120,7 +119,7 @@ func (c *testCluster) newNode(name string) *clusterNode {
 	return nd
 }
 
-const clusterKinds = `{"app": "test", "kinds": {
+const clusterKinds = `{"kinds": {
 	"users":  {"public": true, "sync": "none", "idle_timeout": "1h"},
 	"wallet": {"public": true, "idle_timeout": "1h"},
 	"audit":  {"idle_timeout": "1h"},
@@ -168,7 +167,7 @@ func (n *clusterNode) Start() {
 	up := make(chan [3]string, 1)
 	go func() {
 		n.ran <- Run(ctx, n.env, slog.New(slog.DiscardHandler), func(public, control, peer string) { up <- [3]string{public, control, peer} },
-			WithBackend(n.hooked), withGrace(200*time.Millisecond), withShards(func(o *CatalogOptions, m *Catalog) {
+			WithBackend(n.hooked), withGrace(200*time.Millisecond), withShardset(func(o *ShardsetOptions, m *Shardset) {
 				if o != nil && n.tune != nil {
 					n.tune(o)
 				}
@@ -193,7 +192,7 @@ func (n *clusterNode) Start() {
 		if m == nil {
 			return false
 		}
-		_, err := m.opts.Kinds.Lookup("test.users")
+		_, err := m.opts.Kinds.Lookup("users")
 		return err == nil
 	})
 }
@@ -230,31 +229,37 @@ func (n *clusterNode) Kill() {
 }
 
 // Lease is the node's lease as it is in blob storage.
-func (n *clusterNode) Lease() *coord.NodeLease {
+func (n *clusterNode) Lease() *lease.Record {
 	n.t.Helper()
-	l, err := coord.NewRegistry(blob.WithPrefix(n.mem, n.env.Prefix), n.env.Name, coord.RegistryOptions{}).Get(context.Background(), n.env.Name)
+	l, err := lease.NewRegistry(blob.WithPrefix(n.mem, n.env.Prefix), n.env.Name, lease.RegistryOptions{}).Get(context.Background(), n.env.Name)
 	if err != nil {
 		n.t.Fatal(err)
 	}
 	return l
 }
 
-// whoIs asks the node's peer listener who it is, over h2c.
-func (n *clusterNode) whoIs() (NodeInfoReply, error) {
-	var got NodeInfoReply
+// peerAnswers asks the peer listener at addr, over h2c, for a shard that doesn't
+// exist, and fails if it does not answer 404 over HTTP/2.
+func peerAnswers(addr string) error {
 	protos := new(http.Protocols)
 	protos.SetUnencryptedHTTP2(true)
 	client := &http.Client{Transport: &http.Transport{Protocols: protos}, Timeout: 5 * time.Second}
 	defer client.CloseIdleConnections()
-	resp, err := client.Get("http://" + n.Peer + "/_shardlite/node")
+	req, err := http.NewRequest(http.MethodGet, "http://"+addr+"/x", nil)
 	if err != nil {
-		return got, err
+		return err
+	}
+	req.Header.Set("Shardlite-Origin", originClient)
+	req.Header.Set("Shardlite-Target", "users/nope")
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || resp.ProtoMajor != 2 {
-		return got, fmt.Errorf("status %d over HTTP/%d", resp.StatusCode, resp.ProtoMajor)
+	if resp.StatusCode != http.StatusNotFound || resp.ProtoMajor != 2 {
+		return fmt.Errorf("status %d over HTTP/%d", resp.StatusCode, resp.ProtoMajor)
 	}
-	return got, json.NewDecoder(resp.Body).Decode(&got)
+	return nil
 }
 
 // Every node of a cluster answers on its peer listener, the others go on
@@ -265,12 +270,11 @@ func TestClusterNodesAnswerOnTheirPeerListeners(t *testing.T) {
 	c := newCluster(t, 3)
 	check := func(nd *clusterNode) {
 		t.Helper()
-		got, err := nd.whoIs()
-		if err != nil {
+		if err := peerAnswers(nd.Peer); err != nil {
 			t.Fatalf("%s: %v", nd.env.Name, err)
 		}
-		if l := nd.Lease(); got.Name != nd.env.Name || got.Epoch != l.Epoch || l.Address != nd.Peer {
-			t.Fatalf("%s answered %+v, its lease is %+v", nd.env.Name, got, l)
+		if l := nd.Lease(); l.Address != nd.Peer {
+			t.Fatalf("%s listens at %s, its lease is %+v", nd.env.Name, nd.Peer, l)
 		}
 	}
 	for _, nd := range c.nodes {
@@ -278,7 +282,7 @@ func TestClusterNodesAnswerOnTheirPeerListeners(t *testing.T) {
 	}
 
 	c.nodes[1].Stop()
-	if _, err := c.nodes[1].whoIs(); err == nil {
+	if err := peerAnswers(c.nodes[1].Peer); err == nil {
 		t.Fatal("a stopped node still answers")
 	}
 	check(c.nodes[0])

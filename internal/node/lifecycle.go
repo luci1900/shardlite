@@ -3,21 +3,17 @@ package node
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/superfly/ltx"
 
-	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/capture"
+	"github.com/luci1900/shardlite/internal/dueindex"
 	"github.com/luci1900/shardlite/internal/kill"
-	"github.com/luci1900/shardlite/internal/migrate"
 	"github.com/luci1900/shardlite/internal/pos"
-	"github.com/luci1900/shardlite/internal/remindex"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
@@ -28,10 +24,8 @@ import (
 // the first job of the shard's loop, which runs once the shard's entry is in
 // the table, so nothing else activates the shard meanwhile:
 //
-//  1. a file cached since this process started is opened again, with no blob
-//     storage call;
-//  2. any other shard is claimed by compare-and-swap on its manifest and restored;
-//  3. a shard with no manifest is created: a conditional create of its manifest
+//  1. a shard with a manifest is claimed by compare-and-swap on it and restored;
+//  2. a shard with no manifest is created: a conditional create of its manifest
 //     claims it, and its file starts empty. If another node creates it first,
 //     it is claimed like any other shard.
 func (a *actor) activate(ctx context.Context) error {
@@ -40,15 +34,6 @@ func (a *actor) activate(ctx context.Context) error {
 	if _, err := d.kinds.Lookup(target.Kind()); err != nil {
 		return err
 	}
-	if row, ok, err := d.cache.idx.get(target); err != nil {
-		return err
-	} else if ok && row.State == stateCached {
-		done, err := a.activateCached(ctx, row)
-		if done || err != nil {
-			return err
-		}
-	}
-
 	h, created := a.read, false
 	if h == nil {
 		var err error
@@ -94,79 +79,30 @@ func (a *actor) activate(ctx context.Context) error {
 		d.at(kill.Restored)
 		d.stats.Restores.Add(1)
 	}
-	// The row goes in before capture starts, so that an activation that fails
-	// leaves no capture running: nothing would ever close it.
-	if err := d.cache.put(a, stateActive, 0); err != nil {
-		return err
-	}
-	err := a.startCapture(ctx, restored)
-	if errors.Is(err, migrate.ErrNewer) {
-		// A newer node migrated this system shard. It is given up, so that a node
-		// that can read it claims it instead of finding it owned here. Nothing was
-		// committed (the migration rolled back) and the files are all of it, so
-		// there is no tail to write first.
-		if rerr := a.h.ReleaseOwnership(ctx); rerr != nil {
-			err = errors.Join(err, rerr)
-		}
-	}
-	return err
+	return a.startCapture(ctx, restored)
 }
 
-// setPath points the shard at its local file for h's generation, removing
-// whatever an earlier activation left there.
+// setPath points the shard at a new local file for h's generation (pathFor
+// never gives the same path twice). A path this activation set before, when it
+// starts over, is deleted with whatever a restore left there.
 func (a *actor) setPath(h *shardfile.Handle) error {
-	a.Gen, a.Path = h.Manifest.Generation, a.d.cache.pathFor(a.Name, h.Manifest.Generation)
-	if err := a.d.cache.clearLocal(a.Path); err != nil {
-		return err
+	if a.Path != "" {
+		removeLocal(a.Path)
 	}
+	a.Gen, a.Path = h.Manifest.Generation, pathFor(a.d.data, a.Name, h.Manifest.Generation)
 	return os.MkdirAll(filepath.Dir(a.Path), 0o755)
 }
 
-// activateCached reuses a cached file. done is false when the file had to be
-// discarded and the shard needs the normal path.
-func (a *actor) activateCached(ctx context.Context, row indexRow) (done bool, err error) {
-	d := a.d
-	// Capture leaves the -wal in place when it closes, and it is part of the
-	// file's state, so both must be as they were at deactivation.
-	_, serr := os.Stat(row.Path)
-	if sig := statSig(row.Path); serr != nil || sig != (fileSig{db: row.Size, dbMod: row.MTimeNs, wal: row.WALSize, walMod: row.WALMTimeNs}) {
-		d.log.Warn("cached shard files changed since it was deactivated, discarding them", "shard", a.Name, "path", row.Path, "err", serr)
-		return false, d.cache.discard(row)
+// discardFiles deletes the files a failed activation left: the next activation
+// restores into a new file.
+func (a *actor) discardFiles() {
+	if a.Path != "" {
+		removeLocal(a.Path)
 	}
-	// Nothing else may have the file open (the node's own handles are closed).
-	if held, err := capture.WALSidecarsOf(row.Path).Held(); err != nil {
-		return false, err
-	} else if held {
-		d.log.Error("a process has a deactivated shard's file open", "shard", a.Name, "path", row.Path)
-		return false, fmt.Errorf("%w: %s", ErrAppHolds, a.Name)
-	}
-	// The row was written by this process (the cache starts empty), so the manifest
-	// it recorded is the one the node holds, and nothing needs asking of blob storage.
-	var man shardfile.Manifest
-	if err := json.Unmarshal([]byte(row.Manifest), &man); err != nil {
-		return false, d.cache.discard(row)
-	}
-	// The CRCs of the pages, so the capture reads no page to continue.
-	cks := capture.NewChecksums()
-	if err := cks.UnmarshalBinary(row.CRCs); err != nil {
-		d.log.Error("a cached shard's checksums are unreadable, discarding the file", "shard", a.Name, "err", err)
-		return false, d.cache.discard(row)
-	}
-	h := &shardfile.Handle{F: d.files, Name: a.Name, Manifest: &man, ETag: blob.ETag(row.ETag)}
-	a.h, a.Gen, a.Path = h, row.Generation, row.Path
-	// Before capture starts, as in activate.
-	if err := d.cache.put(a, stateActive, 0); err != nil {
-		return false, err
-	}
-	if err := a.startCapture(ctx, &capture.Restored{Position: row.Position, Checksums: cks}); err != nil {
-		return false, err
-	}
-	d.stats.CachedHits.Add(1)
-	return true, nil
 }
 
 // startCapture starts capturing the shard's file and runs the first sync
-// before the app can open it. A restored (or cached) shard continues from the
+// before the app can open it. A restored shard continues from the
 // restored position without reading the database, so that first sync writes
 // nothing and the position stays the restored one. A new shard (restored is nil)
 // gets an empty file first, and its first sync, of an empty database, is its
@@ -205,9 +141,9 @@ func (a *actor) startCapture(ctx context.Context, restored *capture.Restored) er
 	if restored != nil {
 		d.at(kill.FirstSyncDone)
 	}
-	// The reserved table (and a system kind's schema and seed) go in after the
-	// first sync, before the app has the shard.
-	if err := ensureTables(ctx, sh, a.sys, d.now().Unix(), d.rem.since(d.now())); err != nil {
+	// The reserved table goes in after the first sync, before the app has the
+	// shard.
+	if err := ensureTables(ctx, sh); err != nil {
 		a.cap.uncounted(sh)
 		sh.Close(ctx)
 		sh.Discard()
@@ -242,22 +178,24 @@ func (a *actor) resumeIfClosed(ctx context.Context, sh *capture.Shard) {
 }
 
 // deactivate lets go of an idle shard: Release (a final sync and closing every
-// handle, then the -shm check), a delta for its tail, and a row in the cache
-// index. A shard that holds nothing of the app's (it was never written, or the
-// app removed everything) is deleted instead, so requests for ids that don't
-// exist leave nothing behind. It reports
-// whether the shard was let go of. A shard the app still holds, or one in use,
-// stays active.
-func (a *actor) deactivate(ctx context.Context) (bool, error) {
+// handle, then the -shm check) and a delta for its tail, which gives the shard
+// up in the same manifest update, and deletes its files. A shard that holds
+// nothing of the app's (it was never written, or the app removed everything) is
+// deleted instead, so requests for ids that don't exist leave nothing behind.
+// ifHeld is what to do with a file another process has open: resume capture
+// and keep the shard active (what an idle deactivation does), or go ahead (what
+// a stop does). It reports whether the shard was let go of. A shard the app
+// still holds (unless ifHeld goes ahead), or one in use, stays active.
+func (a *actor) deactivate(ctx context.Context, ifHeld capture.IfHeld) (bool, error) {
 	d := a.d
 	if a.gone {
 		return true, nil
 	}
 	a.idle.held = false
-	if !acquireSem(ctx, d.deactivations) {
+	if !acquireSem(ctx, d.sems.deactivate) {
 		return false, context.Cause(ctx)
 	}
-	defer func() { <-d.deactivations }()
+	defer func() { <-d.sems.deactivate }()
 	if !a.e.close() {
 		return false, nil // a request holds it
 	}
@@ -287,23 +225,28 @@ func (a *actor) deactivate(ctx context.Context) (bool, error) {
 		return err
 	}
 	sh := a.cap.load()
-	released, final, err := sh.Release(ctx, read)
+	released, final, err := sh.Release(ctx, read, ifHeld)
 	if err != nil {
 		a.resumeIfClosed(ctx, sh)
 		return false, err
 	}
 	if !released {
 		a.idle.held = true
-		d.log.Warn("the app still has the shard open, keeping it active", "shard", a.Name)
+		if ifHeld == capture.GoAheadIfHeld {
+			// Going ahead releases whatever the app has open, so what stopped it is a commit made during the release.
+			d.log.Warn("the app committed to the shard while it was being let go of, keeping it active", "shard", a.Name)
+		}
 		return false, nil
 	}
+	// Whether the app had the file open at the release (only a stop's release goes ahead over one that is).
+	open := sh.OpenAtRelease()
 	// The tail is only in the journal until the delta (or the deletion) is done, so
 	// the lease's range covers it until then. A resumed capture is counted instead.
 	defer a.cap.uncounted(sh)
 	// The reminder to record with the delta: the exact time when the release's
 	// read saw the final state, and now otherwise, since the shard's state at
 	// the end is then unknown and now is never late.
-	var reminder func(end pos.Position) remindex.Minute
+	var reminder func(end pos.Position) dueindex.Minute
 	switch r := final.(type) {
 	case *capture.Deleted:
 		// The shard leaves nothing behind, and no final delta: the tail goes with the
@@ -311,52 +254,99 @@ func (a *actor) deactivate(ctx context.Context) (bool, error) {
 		// capture resumes and the shard stays active.
 		defer sh.Discard() // the shard is deleted, or resumed with the tail handed on
 		resume := func() error { return a.resume(ctx, sh) }
-		if err := d.cache.deleteReleased(ctx, a.Name, a.Path, a.h, resume); err != nil {
+		if err := a.deleteReleased(ctx, shardfile.Hooks{At: d.opts.At}, resume); err != nil {
 			return false, err
 		}
+		a.warnOpen(open)
 		d.logDeleted(a, r.Marked)
 		d.stats.Deletes.Add(1) // before the shard stops being active, so whoever sees it gone sees the count
 		a.gone = true
 		return true, nil
 	case *capture.Kept:
-		reminder = func(end pos.Position) remindex.Minute { return a.recordedFor(next, r.At, end) }
+		reminder = func(end pos.Position) dueindex.Minute { return a.recordedFor(next, r.At, end) }
 	case *capture.Uncertain:
 		// The read did not see the final state, so the shard's state at the end
 		// is unknown and the reminder is now, never late. A shard with nothing
 		// in it has no reminder to be late for, and none is recorded.
-		reminder = func(end pos.Position) remindex.Minute {
+		reminder = func(end pos.Position) dueindex.Minute {
 			if end == 0 {
 				return 0
 			}
 			return a.recordedNow()
 		}
 	}
-	// A tail is a delta by the time the shard is cached, so the lease's journal range
+	// A tail is a delta by the time the shard is let go of, so the lease's journal range
 	// never has to cover a shard that isn't active. The delta's manifest update
 	// records the next reminder, with its entry in the reminder index created
-	// first. With no tail there is no delta, and the next reminder is written
-	// alone if it differs from the manifest's (a reminder that went stale, or an
-	// adoption's). If either fails, capture resumes and the shard stays active.
-	recorded := false
-	record := func(_ context.Context, end pos.Position) (remindex.Minute, error) {
-		recorded = true
-		return reminder(end), nil
-	}
-	err = a.h.WriteDelta(ctx, sh, shardfile.Hooks{BeforeUpdate: record, At: d.opts.At})
-	if err == nil && !recorded {
-		err = a.h.SetReminder(ctx, reminder(sh.Position()))
+	// first, and gives the shard up too (shardfile.Hooks.Release). With no tail
+	// there is no delta, and the next reminder is written alone (the release with
+	// it). If either fails, capture resumes and the shard stays active.
+	err = a.finish(sh, reminder)
+	if errors.Is(err, shardfile.ErrMovedOn) {
+		// The release landed and another node has claimed the shard since: it was
+		// given up after all, so it goes as a release does.
+		err = nil
 	}
 	if err != nil {
+		if a.h.Unsettled() {
+			// The update may have landed, which left the shard unowned: it is never
+			// served again from here, and capture does not resume. Nothing was
+			// served or dropped on a guess, and the node's stop or adoption settles it.
+			d.log.Error("the release of a shard has an unknown outcome and the node is stopping, abandoning it", "shard", a.Name, "err", err)
+			a.gone = true
+			return false, err
+		}
 		if rerr := a.resume(ctx, sh); rerr != nil {
 			d.log.Error("could not resume capture after a failed delta", "shard", a.Name, "err", rerr)
 		}
 		return false, err
 	}
-	if err := d.cache.put(a, stateCached, a.h.Manifest.LastPosition()); err != nil {
-		return false, err
-	}
 	a.gone = true
+	// The manifest names nobody now, and the files go: nothing here will be reused.
+	a.warnOpen(open)
+	removeLocal(a.Path)
 	return true, nil
+}
+
+// warnOpen says a shard was let go of at a stop though the app had its file open, if it did (open), and counts it. The file is deleted: the app's handle keeps the inode until it closes it, and a commit through that handle is lost. Only a stop goes ahead over an open file, so nothing else gets here with open set.
+func (a *actor) warnOpen(open bool) {
+	if !open {
+		return
+	}
+	a.d.stats.LetGoHeld.Add(1)
+	a.d.log.Warn("the app still had the shard's file open when the node stopped, so the node let the shard go and deleted the file: close connections within the idle timeout, and never write a shard outside a request", "shard", a.Name)
+}
+
+// finish writes the shard's tail as a delta and its next reminder, and gives
+// the shard up in the same update. Giving up cannot be told from not having
+// landed when the outcome is unknown (the handle is unsettled), and a shard that was given up must
+// not be served while one that wasn't must not be dropped, so it asks again until it
+// learns, which is safe since the update is the same each time (the handle looks at the
+// stored manifest first). It runs on the loop's context and not the caller's,
+// since a caller giving up must not leave the outcome unlearned, and only the loop's ending
+// (the node stopping) ends the asking.
+func (a *actor) finish(sh *capture.Shard, reminder func(end pos.Position) dueindex.Minute) error {
+	ctx := a.ctx
+	wait := 100 * time.Millisecond
+	for {
+		recorded := false
+		record := func(_ context.Context, end pos.Position) (dueindex.Minute, error) {
+			recorded = true
+			return reminder(end), nil
+		}
+		err := a.h.WriteDelta(ctx, sh, shardfile.Hooks{BeforeUpdate: record, At: a.d.opts.At, Release: true})
+		if err == nil && !recorded {
+			err = a.h.SetReminder(ctx, reminder(sh.Position()), true)
+		}
+		if err == nil || !a.h.Unsettled() || ctx.Err() != nil {
+			return err
+		}
+		a.d.log.Warn("the release of a shard has an unknown outcome, trying again", "shard", a.Name, "err", err)
+		if !sleep(ctx, wait) {
+			return err
+		}
+		wait = min(2*wait, 2*time.Second)
+	}
 }
 
 // logDeleted says a shard was deleted at deactivation because it held nothing.

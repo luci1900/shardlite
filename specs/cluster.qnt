@@ -2,7 +2,7 @@
 //
 // There is no consensus protocol here. The only agreement is blob storage's linearizable conditional
 // writes, so the store is modelled as shared state that every write changes atomically. Each node claims
-// the shard, serves it, ships its commits, caches it and lets go of it, adopts dead nodes' journals, and the
+// the shard, serves it, ships its commits, lets go of it when it goes idle, adopts dead nodes' journals, and the
 // store decides whether each of its writes succeeds. Nodes never check their own standing before writing:
 // a node whose lease has expired but which hasn't noticed (a zombie) attempts everything a healthy node
 // does, adoptions included, and fencing and compare-and-swap have to stop it.
@@ -41,7 +41,7 @@
 // Restarts. A restarting node adopts its own journal and starts its writer when the adoption finishes.
 //
 // The lifecycle of one node's shard (activation steps, the durability gate itself, the app holding the file
-// open) is shard.qnt. Here a node is active, cached or idle,
+// open) is shard.qnt. Here a node is active or idle,
 // and the gate is a guard on `respond`. Also left out: the interior of the database, deletion, messages,
 // forwarding, rebasing, renewals and sweeping the journal.
 //
@@ -55,7 +55,7 @@
 //   quint run specs/cluster.qnt --main=resumeAfterUnknown --invariant=ackedKept --max-steps=40   (should fail)
 //   quint run specs/cluster.qnt --main=restartOverrides --invariant=liveNeverFenced --max-steps=40   (should fail)
 //   quint test specs/cluster.qnt --main=protocol
-//   quint test specs/cluster.qnt --main=claimNeedsCleared --match=cachedClaim   (should fail)
+//   quint test specs/cluster.qnt --main=claimNeedsCleared --match=namedJournalClaim   (should fail)
 //   quint test specs/cluster.qnt --main=claimNeedsAdopted --match=earlyClaim   (should fail)
 //
 // Simulation is the check on protocol: three nodes are what makes the interesting traces reachable, and
@@ -77,7 +77,7 @@ module cluster {
   // counterexample, which its instance at the end of the file reaches.
   //   CLAIM_AFTER_LEASE: claim a dead owner's shard as soon as its lease is invalid (the code's earlier rule).
   //   RESTART_OVERRIDES: a restarting node takes its lease even while another node is adopting it.
-  //   RESUME_AFTER_UNKNOWN: a node whose release's outcome is unknown keeps the shard cached as its own.
+  //   RESUME_AFTER_UNKNOWN: a node whose deactivation's outcome is unknown resumes the shard as active, as its own.
   //   CLAIM_NEEDS_ADOPTED: a dead owner's shard is claimed only once its adoption has finished, even if the
   //     adopter has already cleared its journal.
   //   CLAIM_NEEDS_CLEARED: a dead owner's shard is claimed only once its manifest names no journal, whether or
@@ -123,7 +123,6 @@ module cluster {
   type NodeState = {
     ready: bool,        // the process is up and its own adoption is done
     active: bool,
-    cached: bool,       // deactivated, still owned as far as the node knows
     local: List[int],   // the commits in the node's copy of the file
     durable: int,       // how many of them are in the node's journal (or the snapshot)
     base: int,          // how many are in the snapshot as far as the node knows
@@ -166,7 +165,7 @@ module cluster {
     lateClaims: bool,    // a dead owner's shard was claimed
     namedClaims: bool,   // a dead owner's shard was claimed while its manifest still named the owner's journal
     earlyClaims: bool,   // a dead owner's shard was claimed before its node's adoption finished
-    handedOff: bool,     // a handoff in one write happened
+    deactivated: bool,   // a deactivation's write landed
     staleAnswers: bool,  // a node that isn't the manifest's owner responded
     staleReads: bool,    // a response left out a commit some client had seen acknowledged
     staleConfirms: bool, // a confirmed answer left out a commit acknowledged before it was read
@@ -258,7 +257,7 @@ module cluster {
   val noManifest: Manifest = { exists: false, owner: NoOwner, journal: false, snap: List() }
   val noLease: Lease = { epoch: 0, expired: false, released: false, adoptedBy: -1, adopted: -1, jnext: 0 }
   val noAdoption: Adoption = { phase: 0, target: -1, epoch: -1, lseen: noLease, landed: false, fence: -1, tail: List() }
-  val down: NodeState = { ready: false, active: false, cached: false, local: List(), durable: 0, base: 0, next: 0, pend: -1,
+  val down: NodeState = { ready: false, active: false, local: List(), durable: 0, base: 0, next: 0, pend: -1,
                           mseen: noManifest, hasUnk: false, unk: noManifest,
                           rd: false, ans: List(), rdseg: 0, rdacked: Set() }
 
@@ -287,7 +286,7 @@ module cluster {
       lateClaims: false,
       namedClaims: false,
       earlyClaims: false,
-      handedOff: false,
+      deactivated: false,
       staleAnswers: false,
       staleReads: false,
       staleConfirms: false,
@@ -314,7 +313,6 @@ module cluster {
     all {
       ns.ready,
       not(ns.active),
-      not(ns.cached),
       claimable(s),
       if (learn)
         s' = withNode(st, n, { ...ns, active: true, local: content, durable: content.length(),
@@ -442,61 +440,25 @@ module cluster {
     }
   }
 
-  // Deactivation: once its last commit is in the journal the node writes its tail as a delta (by CAS) and
-  // keeps the shard cached, still its own. The manifest keeps naming the node's journal. If the CAS fails or
-  // its outcome is unknown, capture resumes and the shard stays active, as the code does.
+  // Deactivation: once its last commit is in the journal, the node writes its tail as the snapshot and
+  // releases the shard (no owner, no journal), both by one CAS, and drops its files. If the CAS fails the
+  // shard stays active (capture resumes, as the code does). The code asks again until it learns the outcome,
+  // and a node that stops first abandons the shard without serving it, so an unknown outcome drops the files
+  // too and the node never serves on a guess, unless RESUME_AFTER_UNKNOWN.
   action deactivate(n, learn) = all {
     val ns = s.nodes.get(n)
     all {
       ns.active,
       ns.pend < 0,
       ns.durable == ns.local.length(),
-      if (ns.base == ns.durable)
-        s' = withNode(s, n, { ...ns, active: false, cached: true })
-      else if (casOK(s, ns)) {
-        val m = { ...s.manifest, snap: ns.local }
-        if (learn) s' = withNode(setManifest(s, m), n, { ...ns, active: false, cached: true, base: ns.durable, mseen: m, hasUnk: false })
-        else s' = withNode(setManifest(s, m), n, { ...ns, hasUnk: true, unk: m })
-      } else
-        s' = { ...s, rejected: true }
-    }
-  }
-
-  // A cached shard comes back with no blob storage request.
-  action reactivate(n) = all {
-    s.nodes.get(n).cached,
-    s' = withNode(s, n, { ...s.nodes.get(n), active: true, cached: false })
-  }
-
-  // Eviction, or the second half of a handoff: the cached shard's manifest is released by CAS (no owner, no
-  // journal) and the files go. A conflict means somebody else changed it: the files go anyway. An unknown
-  // outcome drops the files too, unless RESUME_AFTER_UNKNOWN.
-  action release(n, learn) = all {
-    val ns = s.nodes.get(n)
-    all {
-      ns.cached,
       if (casOK(s, ns)) {
-        val m = { ...s.manifest, owner: NoOwner, journal: false }
-        if (learn or not(RESUME_AFTER_UNKNOWN)) s' = withNode(setManifest(s, m), n, { ...ns, cached: false, local: List(), durable: 0, base: 0, hasUnk: false, rd: false })
-        else s' = withNode(setManifest(s, m), n, { ...ns, hasUnk: true, unk: m })
+        val m = { ...s.manifest, owner: NoOwner, journal: false, snap: ns.local }
+        val st = { ...setManifest(s, m), deactivated: true }
+        if (learn or not(RESUME_AFTER_UNKNOWN))
+          s' = withNode(st, n, { ...ns, active: false, local: List(), durable: 0, base: 0, hasUnk: false, rd: false })
+        else
+          s' = withNode(st, n, { ...ns, hasUnk: true, unk: m })
       } else
-        s' = { ...withNode(s, n, { ...ns, cached: false, local: List(), durable: 0, base: 0, rd: false }), rejected: true }
-    }
-  }
-
-  // A handoff in one write: once its last commit is in the journal, the active node writes its tail as the
-  // snapshot and releases the shard, both by one CAS, and drops its files. An unknown outcome drops them too.
-  // The code does this as two writes (deactivate, then release), which the model also has.
-  action handOff(n, learn) = all {
-    val ns = s.nodes.get(n)
-    all {
-      ns.active,
-      ns.pend < 0,
-      ns.durable == ns.local.length(),
-      if (casOK(s, ns))
-        s' = withNode({ ...setManifest(s, { ...s.manifest, owner: NoOwner, journal: false, snap: ns.local }), handedOff: true }, n,
-                      { ...ns, active: false, local: List(), durable: 0, base: 0, hasUnk: false, rd: false })
-      else
         s' = { ...s, rejected: true }
     }
   }
@@ -515,7 +477,7 @@ module cluster {
     }
   }
 
-  // A graceful shutdown: nothing active, so every tail is a delta. The lease is released by CAS, recording that
+  // A graceful shutdown: nothing active, so every shard has been let go of. The lease is released by CAS, recording that
   // every epoch up to this one needs no adoption. A lease being adopted has changed, and the CAS fails. An
   // adoption of another node that is in progress is cancelled first (the lease scan stops early).
   action shutdown(n) = all {
@@ -661,9 +623,6 @@ module cluster {
       flushAck(n),
       delta(n, learn),
       deactivate(n, learn),
-      handOff(n, learn),
-      reactivate(n),
-      release(n, learn),
       expireLease(n),
       shutdown(n),
       restart(n),
@@ -727,12 +686,12 @@ module cluster {
       .then(finish(1, true))
       .expect(s.earlyClaims and s.leases.get(0).adopted == 0 and safe)
 
-  // A dead node's cached shard: its manifest still names the journal, which holds nothing beyond the
-  // snapshot, so the adopter writes nothing for it. Only the finished adoption lets node 2 claim it (it fails
-  // under CLAIM_NEEDS_CLEARED: the claim is never enabled).
-  run cachedClaimTest =
+  // A dead node's active shard whose tail its delta has already written: the manifest still names the
+  // journal, which holds nothing beyond the snapshot, so the adopter writes nothing for it. Only the
+  // finished adoption lets node 2 claim it (it fails under CLAIM_NEEDS_CLEARED: the claim is never enabled).
+  run namedJournalClaimTest =
     initWith(true)
-      .then(claim(0, true)).then(commit(0)).then(flush(0)).then(flushAck(0)).then(deactivate(0, true))
+      .then(claim(0, true)).then(commit(0)).then(flush(0)).then(flushAck(0)).then(delta(0, true))
       .then(expireLease(0))
       .then(mark(1, 0, true)).then(fence(1)).then(readJournal(1)).then(adoptDelta(1, true)).then(finish(1, true))
       .then(claim(2, true))
@@ -818,15 +777,16 @@ module cluster {
   val neverLateClaim = not(s.lateClaims)
   val neverLateClaimWithAck = not(s.lateClaims and s.acked.size() > 1)
   val neverStaleAnswer = not(s.staleAnswers)
-  // A dead owner's cached shard (its manifest still names the journal) claimed after the adoption finished.
+  // A dead owner's shard whose manifest still names the journal, claimed after the adoption finished.
   val neverNamedClaim = not(s.namedClaims)
   // A shard whose tail an adopter wrote, claimed before the adoption as a whole finished.
   val neverEarlyClaim = not(s.earlyClaims)
-  val neverHandedOff = not(s.handedOff and s.manifest.owner != NoOwner)
+  // A shard let go of at deactivation and owned again since.
+  val neverReclaimed = not(s.deactivated and s.manifest.owner != NoOwner)
   val neverZombieAck = not(s.acked.size() > 0 and NODES.exists(n => dead(s, incOf(s, n)) and s.nodes.get(n).active))
   val neverReleased = NODES.forall(n => not(s.leases.get(n).released))
-  // A shard let go of with data in it, by a release or a handoff's first half.
-  val neverHandoff = not(s.manifest.exists and s.manifest.owner == NoOwner and s.manifest.snap.length() > 0)
+  // A shard let go of with data in it.
+  val neverDeactivatedWithData = not(s.manifest.exists and s.manifest.owner == NoOwner and s.manifest.snap.length() > 0)
 }
 
 // The protocol, for simulation: three nodes (a third is needed to take over a dead adopter's work).

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -13,11 +14,10 @@ import (
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/capture"
-	"github.com/luci1900/shardlite/internal/coord"
 	"github.com/luci1900/shardlite/internal/journal"
+	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/node"
 	"github.com/luci1900/shardlite/internal/pos"
-	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/service"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
@@ -47,8 +47,8 @@ func (r *rig) start(opts ...func(*node.Config)) (*node.Node, error) {
 		TempDir: r.t.TempDir(),
 		Backend: r.local,
 		Blob:    blob.Options{Backoff: time.Millisecond},
-		Lease:   coord.RegistryOptions{TTL: time.Hour, Blob: blob.Options{Backoff: time.Millisecond}},
-		Keeper:  coord.KeeperOptions{Interval: 30 * time.Minute, Margin: time.Minute},
+		Lease:   lease.RegistryOptions{TTL: time.Hour, Blob: blob.Options{Backoff: time.Millisecond}},
+		Keeper:  lease.KeeperOptions{Interval: 30 * time.Minute, Margin: time.Minute},
 	}
 	for _, o := range opts {
 		o(&cfg)
@@ -78,16 +78,13 @@ func TestStartRefusesAClockFarFromTheStores(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			clock := coord.NewClockWatch(nil)
+			clock := lease.NewClockWatch(nil)
 			store := blob.NewMemory(blob.WithClock(func() time.Time { return time.Now().Add(c.skew) }), blob.WithClockSink(clock.Sink))
 			r := newRig(t)
 			r.local = blobtest.WithHook(store)
-			n, err := r.start(func(cfg *node.Config) { cfg.Clock = clock })
+			_, err := r.start(func(cfg *node.Config) { cfg.Clock = clock })
 			if c.refused != (err != nil) {
 				t.Fatalf("a clock %v from the store's: err %v, want refused %v", c.skew, err, c.refused)
-			}
-			if err == nil {
-				t.Cleanup(func() { n.Close() })
 			}
 		})
 	}
@@ -97,7 +94,7 @@ func TestStartRefusesAClockFarFromTheStores(t *testing.T) {
 // is taken.
 func TestStartRefusesBeforeTakingTheLease(t *testing.T) {
 	t.Parallel()
-	clock := coord.NewClockWatch(nil)
+	clock := lease.NewClockWatch(nil)
 	for range 5 {
 		start := time.Now()
 		clock.Sink(blob.ClockSample{Store: start.Add(3 * time.Hour).Truncate(time.Second), Start: start, End: start.Add(time.Millisecond)}, nil)
@@ -106,7 +103,7 @@ func TestStartRefusesBeforeTakingTheLease(t *testing.T) {
 	if _, err := r.start(func(cfg *node.Config) { cfg.Clock = clock }); err == nil {
 		t.Fatal("started")
 	}
-	if _, err := coord.NewRegistry(r.local, "n1", coord.RegistryOptions{}).Get(context.Background(), "n1"); !errors.Is(err, blob.ErrNotFound) {
+	if _, err := lease.NewRegistry(r.local, "n1", lease.RegistryOptions{}).Get(context.Background(), "n1"); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("a refused start left a lease behind: %v", err)
 	}
 }
@@ -133,11 +130,14 @@ type liveShard struct {
 	sh   *capture.Shard
 }
 
-// create makes a shard on n: the app creates the file, the node captures it.
+// create makes a shard on n: the node creates the file (empty, as an activation does), the app opens it and the node captures it.
 func (r *rig) create(n *node.Node, name string) *liveShard {
 	r.t.Helper()
 	ctx := context.Background()
 	s := &liveShard{name: name, path: filepath.Join(r.dir, strings.ReplaceAll(name, "/", "-")+".db"), id: strings.ReplaceAll(name, "/", "-")}
+	if err := os.WriteFile(s.path, nil, 0o644); err != nil {
+		r.t.Fatal(err)
+	}
 	r.app.Must(r.t, "open", s.id, s.path)
 	h, created, err := n.Files.Open(ctx, shardName(name))
 	if err != nil || !created {
@@ -163,7 +163,7 @@ func (r *rig) commit(s *liveShard, k int) {
 }
 
 // publishRange writes the node's current journal range into its lease, as a renewal would.
-func publishRange(t *testing.T, n *node.Node) coord.NodeLease {
+func publishRange(t *testing.T, n *node.Node) lease.Record {
 	t.Helper()
 	l, err := n.Registry.Renew(context.Background(), n.Keeper.Lease(), n.Info())
 	if err != nil {
@@ -194,10 +194,10 @@ func TestRestartAdoptsItsOwnJournal(t *testing.T) {
 			r := newRig(t)
 			n1 := r.mustStart()
 
-			withDelta := r.create(n1, "test.users/1")
-			tailOnly := r.create(n1, "test.users/2")
-			deleted := r.create(n1, "test.users/3")
-			quiet := r.create(n1, "test.users/4")
+			withDelta := r.create(n1, "users/1")
+			tailOnly := r.create(n1, "users/2")
+			deleted := r.create(n1, "users/3")
+			quiet := r.create(n1, "users/4")
 			r.commit(withDelta, 4)
 			if err := withDelta.h.WriteDelta(ctx, withDelta.sh, shardfile.Hooks{}); err != nil {
 				t.Fatal(err)
@@ -209,7 +209,7 @@ func TestRestartAdoptsItsOwnJournal(t *testing.T) {
 				t.Fatal(err)
 			}
 			// A shard deleted since: its manifest is gone, its entries are never read.
-			if err := shardfile.NewManifestStore(n1.Store).Delete(ctx, shardName("test.users/3"), deleted.h.ETag); err != nil {
+			if err := shardfile.NewManifestStore(n1.Store).Delete(ctx, shardName("users/3"), deleted.h.ETag); err != nil {
 				t.Fatal(err)
 			}
 			r.commit(quiet, 1)
@@ -223,9 +223,9 @@ func TestRestartAdoptsItsOwnJournal(t *testing.T) {
 				}
 			}
 			want := map[string]string{
-				"test.users/1": apptest.Dump(t, withDelta.path),
-				"test.users/2": apptest.Dump(t, tailOnly.path),
-				"test.users/4": apptest.Dump(t, quiet.path),
+				"users/1": apptest.Dump(t, withDelta.path),
+				"users/2": apptest.Dump(t, tailOnly.path),
+				"users/4": apptest.Dump(t, quiet.path),
 			}
 			lastSeg := n1.Writer.NextSeq() - 1
 
@@ -250,7 +250,7 @@ func TestRestartAdoptsItsOwnJournal(t *testing.T) {
 				t.Fatalf("lease after start: %+v %v", l, err)
 			}
 
-			for _, name := range []string{"test.users/1", "test.users/2"} {
+			for _, name := range []string{"users/1", "users/2"} {
 				m, _, err := n2.Files.GetManifest(ctx, shardName(name))
 				if err != nil {
 					t.Fatal(err)
@@ -277,10 +277,10 @@ func TestRestartAdoptsItsOwnJournal(t *testing.T) {
 
 			// The old writer is a zombie: its next segment finds the fence.
 			r.app.Must(t, "insert", withDelta.id, "2", "100")
-			if err := withDelta.sh.Sync(ctx); !errors.Is(err, segment.ErrFenced) {
+			if err := withDelta.sh.Sync(ctx); !errors.Is(err, journal.ErrFenced) {
 				t.Fatalf("zombie's sync = %v, want ErrFenced", err)
 			}
-			if got := r.restoreDump(n2, "test.users/1"); got != want["test.users/1"] {
+			if got := r.restoreDump(n2, "users/1"); got != want["users/1"] {
 				t.Fatal("a write after the fence reached the shard's history")
 			}
 
@@ -300,7 +300,7 @@ func TestFailedAdoptionKeepsTheRange(t *testing.T) {
 	ctx := context.Background()
 	r := newRig(t)
 	n1 := r.mustStart()
-	s := r.create(n1, "test.users/1")
+	s := r.create(n1, "users/1")
 	r.commit(s, 4)
 	publishRange(t, n1)
 	before, err := n1.Registry.Get(ctx, "n1")
@@ -332,7 +332,7 @@ func TestFailedAdoptionKeepsTheRange(t *testing.T) {
 	if n3.Adopted.Deltas != 1 || n3.Keeper.Lease().Epoch != 3 {
 		t.Fatalf("second start: %+v epoch %d", n3.Adopted, n3.Keeper.Lease().Epoch)
 	}
-	if got := r.restoreDump(n3, "test.users/1"); got != want {
+	if got := r.restoreDump(n3, "users/1"); got != want {
 		t.Fatal("restore differs")
 	}
 }
@@ -345,8 +345,8 @@ func TestAdoptionWithExpiredSegments(t *testing.T) {
 	ctx := context.Background()
 	r := newRig(t)
 	n1 := r.mustStart()
-	s := r.create(n1, "test.users/1")
-	ok := r.create(n1, "test.users/2")
+	s := r.create(n1, "users/1")
+	ok := r.create(n1, "users/2")
 	r.commit(s, 3) // each sync waits for its own segment
 	r.commit(ok, 1)
 	r.stops[n1]()
@@ -366,7 +366,7 @@ func TestAdoptionWithExpiredSegments(t *testing.T) {
 	if !rep.Expired || rep.From <= 1 {
 		t.Fatalf("adoption: %+v", rep)
 	}
-	if len(rep.Lost) != 1 || rep.Lost[0].String() != "test.users/1" || len(rep.Problems) != 0 {
+	if len(rep.Lost) != 1 || rep.Lost[0].String() != "users/1" || len(rep.Problems) != 0 {
 		t.Fatalf("lost %v problems %v", rep.Lost, rep.Problems)
 	}
 	// The lease moved on all the same.
@@ -383,7 +383,7 @@ func TestHoleInTheMiddleOfTheRangeFailsTheStart(t *testing.T) {
 	ctx := context.Background()
 	r := newRig(t)
 	n1 := r.mustStart()
-	s := r.create(n1, "test.users/1")
+	s := r.create(n1, "users/1")
 	r.commit(s, 4) // one segment each
 	l1 := n1.Keeper.Lease()
 	if _, err := n1.Registry.Renew(ctx, l1, n1.Info()); err != nil {
@@ -398,7 +398,7 @@ func TestHoleInTheMiddleOfTheRangeFailsTheStart(t *testing.T) {
 	if err := n1.Store.Delete(ctx, journal.Key("n1", info.JournalFrom+2), ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.start(); !errors.Is(err, segment.ErrMissing) {
+	if _, err := r.start(); !errors.Is(err, journal.ErrMissing) {
 		t.Fatalf("start with a segment missing from the middle of the range: %v", err)
 	}
 }

@@ -5,7 +5,7 @@
 // One shard, whose state is a version and the minute its pending reminder is due (`rem`, -1 for none). The cluster
 // is assumed, as cluster.qnt checks it: one live node owns the shard at a time, a node's journal holds what it has
 // flushed and nothing a fenced node writes after, and a dead owner's shard can't be claimed until its journal is
-// adopted. So here a node is alive or dead (for good), the shard on it is active or cached, with what its file holds
+// adopted. So here a node is alive or dead (for good), the shard on it is active or not there, with what its file holds
 // (`local`) and what its journal holds (`durable`). A crash leaves the tail to an adopter, and an adoption is the two
 // steps the index cares about: the entry, then the delta that sets `next_reminder` to the adoption's minute and
 // clears the journal. A write the dead node had in flight may still land (a zombie's CAS), since nothing fences a
@@ -13,7 +13,7 @@
 // changes what a restore sees.
 //
 // The manifest's `nr` is `next_reminder`: owner writes (deltas and deactivations) set it from the state they
-// write (here exactly `rem`), claims and releases keep it, and an adoption's delta sets it to the adoption's minute
+// write (here exactly `rem`), claims keep it, and an adoption's delta sets it to the adoption's minute
 // (the adopter can't read the shard's reminders). The rules:
 //   - Index first: before a manifest write that sets `nr` to a minute, the writer creates the entry for that minute
 //     with its own base (the ETag the write will CAS against). It may pause between the two, and its CAS fails if
@@ -36,7 +36,10 @@
 //
 // Variants (constants below) each drop one rule, to show it is needed. Each has an instance at the end.
 //
-// Left out: lost responses, deletion, handoffs in one write, rebasing, reads that don't match the files (they set
+// A deactivation is one write that records the shard's state and releases it (no owner, no journal), and the node's
+// files go. So a shard that isn't active on a node is not there at all, and the next dispatch claims it where it lands.
+//
+// Left out: lost responses, deletion, rebasing, reads that don't match the files (they set
 // `next_reminder` to now, which is no different here), how far a move goes (any later minute is as safe as
 // another, so moves go one minute on), where dispatches go and limits.
 //
@@ -93,7 +96,6 @@ module dispatch {
     alive: bool,
     adopted: bool,      // dead, and its journal adopted (or released by a stop)
     active: bool,
-    cached: bool,
     local: St,
     durable: St,        // the last state in its journal (or the snapshot it restored)
     mseen: Manifest,
@@ -137,7 +139,7 @@ module dispatch {
   pure val noEntry: Entry = { minute: -1, base: -1, n: -1 }
   pure val noAdoption: Adoption = { on: false, target: -1, minute: -1, base: -1 }
   pure val idle: Disp = { phase: 0, e: noEntry, m: noManifest, answered: false }
-  pure val fresh: NodeState = { alive: true, adopted: false, active: false, cached: false, local: emptySt,
+  pure val fresh: NodeState = { alive: true, adopted: false, active: false, local: emptySt,
                                 durable: emptySt, mseen: noManifest, w: noWrite }
 
   // The owner's journal holds commits past the manifest's snapshot.
@@ -185,7 +187,7 @@ module dispatch {
 
   def canClaim(st: State, n: int): bool = {
     val ns = st.nodes.get(n)
-    ns.alive and not(ns.active) and not(ns.cached) and claimable(st)
+    ns.alive and not(ns.active) and claimable(st)
   }
 
   action init = s' = {
@@ -240,8 +242,9 @@ module dispatch {
     }
   }
 
-  // The first half of a delta (deact false) or a deactivation that writes the manifest (deact true): the entry for
-  // the state's reminder, with the ETag the write will CAS against as its base.
+  // The first half of a delta (deact false) or of a deactivation (deact true), which always writes the manifest
+  // (even with nothing new to record, since it releases the shard): the entry for the state's reminder, with the
+  // ETag the write will CAS against as its base.
   action prepare(n, deact) = all {
     val ns = s.nodes.get(n)
     val snap = ns.durable
@@ -251,14 +254,16 @@ module dispatch {
     all {
       ns.active,
       not(ns.w.on),
-      if (deact) ns.local == ns.durable and ns.mseen.snap != ns.durable else ns.mseen.snap.v < ns.durable.v,
+      if (deact) ns.local == ns.durable else ns.mseen.snap.v < ns.durable.v,
       val st = if (snap.rem >= 0 and not(MANIFEST_FIRST) and not(shared)) addEntry(s, e) else s
       s' = withNode(st, n, { ...ns, w: { on: true, late: false, snap: snap, deact: deact, base: base } })
     }
   }
 
-  // The second half: the CAS, which may land after its node has died. A manifest that has moved on fails it, and the
-  // node no longer owns the shard.
+  // The second half: the CAS, which may land after its node has died. A deactivation's also releases the shard (no
+  // owner, no journal) and the node's files go. The code asks again until it learns the outcome and never serves
+  // the shard on a guess, so a node that dies or stops first just leaves the write to land or not (a crash). A
+  // manifest that has moved on fails the CAS, and the node no longer owns the shard.
   action cas(n) = all {
     val ns = s.nodes.get(n)
     val w = ns.w
@@ -266,13 +271,16 @@ module dispatch {
       w.on,
       not(w.late),
       if (s.manifest.exists and s.manifest.etag == w.base) {
-        val st = writeManifest(s, { ...s.manifest, snap: w.snap, nr: w.snap.rem })
+        val m = if (w.deact) { ...s.manifest, owner: -1, journal: false, snap: w.snap, nr: w.snap.rem }
+                else { ...s.manifest, snap: w.snap, nr: w.snap.rem }
+        val st = writeManifest(s, m)
         val late = MANIFEST_FIRST and w.snap.rem >= 0 and ns.alive
-        s' = withNode(st, n, if (ns.alive) { ...ns, active: not(w.deact), cached: w.deact, mseen: st.manifest,
-                                             w: if (late) { ...w, late: true } else noWrite }
-                             else { ...ns, w: noWrite })
+        val w2 = if (late) { ...w, late: true } else noWrite
+        s' = withNode(st, n, if (not(ns.alive)) { ...ns, w: noWrite }
+                             else if (w.deact) { ...ns, active: false, local: emptySt, durable: emptySt, mseen: noManifest, w: w2 }
+                             else { ...ns, mseen: st.manifest, w: w2 })
       } else
-        s' = { ...withNode(s, n, { ...ns, active: false, cached: false, w: noWrite }), casFailed: true }
+        s' = { ...withNode(s, n, { ...ns, active: false, w: noWrite }), casFailed: true }
     }
   }
 
@@ -283,35 +291,6 @@ module dispatch {
       ns.alive,
       ns.w.late,
       s' = withNode(addEntry(s, { minute: ns.w.snap.rem, base: ns.w.base, n: 0 }), n, { ...ns, w: noWrite })
-    }
-  }
-
-  // Deactivation with nothing to write: the manifest's snapshot (and its next_reminder) is the shard's state.
-  action deactivateClean(n) = all {
-    val ns = s.nodes.get(n)
-    all {
-      ns.active,
-      not(ns.w.on),
-      ns.local == ns.durable,
-      ns.mseen.snap == ns.durable,
-      s' = withNode(s, n, { ...ns, active: false, cached: true })
-    }
-  }
-
-  // A cached shard comes back with no blob storage request.
-  action reactivate(n) = all {
-    s.nodes.get(n).cached,
-    s' = withNode(s, n, { ...s.nodes.get(n), active: true, cached: false })
-  }
-
-  // Eviction: the manifest names no owner and keeps its next_reminder.
-  action release(n) = all {
-    val ns = s.nodes.get(n)
-    all {
-      ns.cached,
-      s.manifest == ns.mseen,
-      val st = writeManifest(s, { ...s.manifest, owner: -1, journal: false })
-      s' = withNode(st, n, { ...ns, cached: false, local: emptySt, durable: emptySt, mseen: st.manifest })
     }
   }
 
@@ -327,13 +306,13 @@ module dispatch {
     all {
       ns.alive,
       survivor(s, n),
-      s' = withAdoption(withNode(s, n, { ...ns, alive: false, active: false, cached: false, local: emptySt,
+      s' = withAdoption(withNode(s, n, { ...ns, alive: false, active: false, local: emptySt,
                                          w: if (ns.w.late) noWrite else ns.w }), n, noAdoption)
     }
   }
 
-  // A stop: nothing active, so every tail is a delta, and the released lease counts as adopted. Nothing about
-  // reminders.
+  // A stop: nothing active, so every shard has been let go of, and the released lease counts as adopted. Nothing
+  // about reminders.
   action stop(n) = all {
     val ns = s.nodes.get(n)
     all {
@@ -342,7 +321,7 @@ module dispatch {
       not(ns.active),
       not(ns.w.on),
       not(s.adoptions.get(n).on),
-      s' = withNode(s, n, { ...ns, alive: false, adopted: true, cached: false, local: emptySt })
+      s' = withNode(s, n, { ...ns, alive: false, adopted: true, local: emptySt })
     }
   }
 
@@ -395,7 +374,7 @@ module dispatch {
   }
 
   // A dispatch of a backed entry to node n, which acquires the shard without creating it: active there answers,
-  // cached there is reactivated, claimable is claimed there. Otherwise it answers with an error.
+  // claimable is claimed there. Otherwise it answers with an error.
   action dispatchTo(d, n) = all {
     val x = s.disps.get(d)
     val ns = s.nodes.get(n)
@@ -404,8 +383,6 @@ module dispatch {
       backs(x.m, x.e),
       if (ns.active)
         s' = withDisp(s, d, { ...x, phase: 2, answered: true })
-      else if (ns.cached)
-        s' = withDisp(withNode(s, n, { ...ns, active: true, cached: false }), d, { ...x, phase: 2, answered: true })
       else if (s.manifest.exists and canClaim(s, n))
         s' = { ...withDisp(claimed(s, n), d, { ...x, phase: 2, answered: true }), claimedByDispatch: true }
       else
@@ -431,7 +408,7 @@ module dispatch {
     }
   }
 
-  // A dispatcher stops partway (a move of `_system.dispatch`, a crash): it forgets its pass.
+  // A dispatcher stops partway (a stop, a crash): it forgets its pass.
   action dStop(d) = all {
     s.disps.get(d).phase > 0,
     s' = withDisp(s, d, idle)
@@ -452,9 +429,6 @@ module dispatch {
       prepare(n, deact),
       cas(n),
       lateEntry(n),
-      deactivateClean(n),
-      reactivate(n),
-      release(n),
       crash(n),
       stop(n),
       adoptEntry(n, x),
@@ -494,8 +468,8 @@ module dispatch {
 
   // -- Scenarios
 
-  // A shard deactivated with a reminder: its entry is dispatched when due, the shard is reactivated and the entry
-  // moved forward.
+  // A shard deactivated with a reminder: its entry is dispatched when due, the shard is claimed again where the
+  // dispatch lands and the entry moved forward.
   run deactivateTest =
     init
       .then(claim(0)).then(commit(0, 1)).then(flush(0)).then(prepare(0, true)).then(cas(0))
@@ -503,10 +477,10 @@ module dispatch {
       .then(dRead(0, { minute: 1, base: 1, n: 0 })).then(dispatchTo(0, 0)).then(dSettle(0))
       .expect(s.nodes.get(0).active and s.entries == Set({ minute: 2, base: 1, n: 1 }) and safe)
 
-  // An evicted shard is claimed by the node its dispatch went to.
-  run evictTest =
+  // A deactivated shard is claimed by the node its dispatch went to.
+  run dispatchClaimTest =
     init
-      .then(claim(0)).then(commit(0, 0)).then(flush(0)).then(prepare(0, true)).then(cas(0)).then(release(0))
+      .then(claim(0)).then(commit(0, 0)).then(flush(0)).then(prepare(0, true)).then(cas(0))
       .then(dRead(0, { minute: 0, base: 1, n: 0 })).then(dispatchTo(0, 1)).then(dSettle(0))
       .expect(s.nodes.get(1).active and s.claimedByDispatch and safe)
 
@@ -540,7 +514,7 @@ module dispatch {
   // and the moved entry still wakes it.
   run dispatchedCrashTest =
     init
-      .then(claim(0)).then(commit(0, 0)).then(flush(0)).then(prepare(0, true)).then(cas(0)).then(release(0))
+      .then(claim(0)).then(commit(0, 0)).then(flush(0)).then(prepare(0, true)).then(cas(0))
       .then(dRead(0, { minute: 0, base: 1, n: 0 })).then(dispatchTo(0, 1)).then(dSettle(0))
       .then(crash(1))
       .then(adoptEntry(2, 1)).then(adoptDelta(2))

@@ -2,8 +2,6 @@ package node_test
 
 import (
 	"context"
-	"database/sql"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -12,8 +10,8 @@ import (
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/blobtest"
-	"github.com/luci1900/shardlite/internal/coord"
 	"github.com/luci1900/shardlite/internal/journal"
+	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/node"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/tempfile"
@@ -27,14 +25,14 @@ func TestRestartAfterAnotherNodeAdoptedIt(t *testing.T) {
 	ctx := context.Background()
 	r := newRig(t)
 	n1 := r.mustStart()
-	s := r.create(n1, "test.users/1")
+	s := r.create(n1, "users/1")
 	r.commit(s, 3)
 	dead := publishRange(t, n1)
-	want := r.restoreDump(n1, "test.users/1")
+	want := r.restoreDump(n1, "users/1")
 
 	// n2 adopts n1's journal: mark, fence and deltas, then finish.
-	reg2 := coord.NewRegistry(r.local, "n2", coord.RegistryOptions{TTL: time.Hour})
-	l2, err := reg2.Acquire(ctx, coord.NodeInfo{Name: "n2"})
+	reg2 := lease.NewRegistry(r.local, "n2", lease.RegistryOptions{TTL: time.Hour})
+	l2, err := reg2.Acquire(ctx, lease.NodeInfo{Name: "n2"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +61,7 @@ func TestRestartAfterAnotherNodeAdoptedIt(t *testing.T) {
 	if l.Epoch != 2 || l.Adopted != 1 || l.AdoptedBy != nil || l.JournalNext != n1b.Adopted.Fence+1 {
 		t.Fatalf("lease: %+v", l)
 	}
-	if got := r.restoreDump(n1b, "test.users/1"); got != want {
+	if got := r.restoreDump(n1b, "users/1"); got != want {
 		t.Fatalf("restored after the restart:\n%s\nwant:\n%s", got, want)
 	}
 }
@@ -75,7 +73,7 @@ func TestRestartRenewsItsLeaseWhileItAdopts(t *testing.T) {
 	t.Parallel()
 	r := newRig(t)
 	n1 := r.mustStart()
-	s := r.create(n1, "test.users/1")
+	s := r.create(n1, "users/1")
 	r.commit(s, 2)
 	publishRange(t, n1)
 
@@ -85,7 +83,7 @@ func TestRestartRenewsItsLeaseWhileItAdopts(t *testing.T) {
 	var unrenewed atomic.Bool
 	r.local.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
 		switch {
-		case op == blobtest.OpUpdate && key == coord.Key("n1") && after:
+		case op == blobtest.OpUpdate && key == lease.Key("n1") && after:
 			select {
 			case renewed <- struct{}{}:
 			default:
@@ -108,8 +106,8 @@ func TestRestartRenewsItsLeaseWhileItAdopts(t *testing.T) {
 	n2, err := node.Start(context.Background(), node.Config{
 		Name: "n1", TempDir: t.TempDir(), Backend: r.local,
 		Blob:   blob.Options{Backoff: time.Millisecond},
-		Lease:  coord.RegistryOptions{TTL: 300 * time.Millisecond, Blob: blob.Options{Backoff: time.Millisecond}},
-		Keeper: coord.KeeperOptions{Interval: 50 * time.Millisecond, Margin: 60 * time.Millisecond},
+		Lease:  lease.RegistryOptions{TTL: 300 * time.Millisecond, Blob: blob.Options{Backoff: time.Millisecond}},
+		Keeper: lease.KeeperOptions{Interval: 50 * time.Millisecond, Margin: 60 * time.Millisecond},
 	})
 	r.local.SetHook(nil)
 	if err != nil {
@@ -148,7 +146,7 @@ func TestRestartAdoptsFromStorageAlone(t *testing.T) {
 	t.Parallel()
 	r := newRig(t)
 	n1 := r.mustStart()
-	s := r.create(n1, "test.users/1")
+	s := r.create(n1, "users/1")
 	r.commit(s, 3) // each sync waits for its segment in storage
 	publishRange(t, n1)
 	want := apptest.Dump(t, s.path)
@@ -183,37 +181,7 @@ func TestRestartAdoptsFromStorageAlone(t *testing.T) {
 	if n2.Adopted.Deltas != 1 {
 		t.Fatalf("the restart adopted %d deltas, want the one for the three commits in storage", n2.Adopted.Deltas)
 	}
-	if got := r.restoreDump(n2, "test.users/1"); got != want {
+	if got := r.restoreDump(n2, "users/1"); got != want {
 		t.Fatalf("restored after the restart:\n%s\nwant the three commits storage had:\n%s", got, want)
-	}
-}
-
-// A start deletes the local database an older node left, journal tables and
-// all, and makes the cache index in a fresh one.
-func TestStartReplacesAnOldLocalDatabase(t *testing.T) {
-	t.Parallel()
-	r := newRig(t)
-	path := filepath.Join(r.dir, node.LocalDBName)
-	old, err := sql.Open("sqlite", "file:"+path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, q := range []string{
-		`CREATE TABLE segments (node TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (node, seq))`,
-		`INSERT INTO segments VALUES ('n1', 1)`,
-	} {
-		if _, err := old.Exec(q); err != nil {
-			t.Fatal(err)
-		}
-	}
-	old.Close()
-
-	n := r.mustStart()
-	if _, err := n.LocalDB.Exec(`SELECT 1 FROM segments`); err == nil {
-		t.Fatal("the old journal table survived the start")
-	}
-	var rows int
-	if err := n.LocalDB.QueryRow(`SELECT count(*) FROM shards`).Scan(&rows); err != nil || rows != 0 {
-		t.Fatalf("the cache index has %d rows (%v), want a fresh empty one", rows, err)
 	}
 }

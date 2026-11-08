@@ -34,8 +34,8 @@ func BenchmarkCapture(b *testing.B) {
 		b.Run(fmt.Sprintf("%dKB", size>>10), func(b *testing.B) {
 			app := apptest.Start(b)
 			path := filepath.Join(b.TempDir(), "bench.db")
-			app.Must(b, "open", "a", path)
-			sh, err := capture.New(capture.Config{Name: shardName("test.bench/1"), Path: path, Generation: "g1", Writer: nowhere{}, TempDir: tempfile.NewDir(b.TempDir()), RestartFrames: 1 << 30})
+			app.Must(b, "create", "a", path)
+			sh, err := capture.New(capture.Config{Name: shardName("bench/1"), Path: path, Generation: "g1", Writer: nowhere{}, TempDir: tempfile.NewDir(b.TempDir()), RestartFrames: 1 << 30})
 			if err != nil {
 				b.Fatal(err)
 			}

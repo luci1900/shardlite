@@ -31,7 +31,7 @@ func TestEntryTake(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			e := newEntry(shardName("test.wallet/1"), tc.state)
+			e := newEntry(shardName("wallet/1"), tc.state)
 			e.err = tc.err
 			ok, wait, err := e.take(now)
 			if ok != tc.ok || (wait != nil) != tc.wait || !errors.Is(err, tc.fail) {

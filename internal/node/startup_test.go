@@ -56,7 +56,7 @@ func TestRefusesNetworkFilesystems(t *testing.T) {
 		"unreadable":   {map[string]string{}, "checking the filesystem"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			c := startupChecks{fsType: on(tc.fs), limits: func() limits { return limits{} }, log: slog.New(slog.DiscardHandler)}
+			c := startupChecks{fsType: on(tc.fs), hostLimits: func() hostLimits { return hostLimits{} }, log: slog.New(slog.DiscardHandler)}
 			err := c.refuse("/data")
 			switch {
 			case tc.want == "" && err != nil:
@@ -70,17 +70,17 @@ func TestRefusesNetworkFilesystems(t *testing.T) {
 
 func TestStartupWarnings(t *testing.T) {
 	t.Parallel()
-	run := func(fs string, l limits) string {
+	run := func(fs string, l hostLimits) string {
 		var buf bytes.Buffer
 		c := startupChecks{
-			fsType: func(string) (string, error) { return fs, nil },
-			limits: func() limits { return l },
-			log:    slog.New(slog.NewTextHandler(&buf, nil)),
+			fsType:     func(string) (string, error) { return fs, nil },
+			hostLimits: func() hostLimits { return l },
+			log:        slog.New(slog.NewTextHandler(&buf, nil)),
 		}
 		c.warn()
 		return buf.String()
 	}
-	roomy := limits{maxMapCount: 1 << 20, fdHard: 1 << 20}
+	roomy := hostLimits{maxMapCount: 1 << 20, fdHard: 1 << 20}
 	out := run("tmpfs", roomy)
 	if strings.Contains(out, "level=WARN") || !strings.Contains(out, "how many active shards") {
 		t.Fatalf("roomy limits on tmpfs:\n%s", out)
@@ -97,21 +97,21 @@ func TestStartupWarnings(t *testing.T) {
 	// Half of what 10,000 active shards need.
 	lowMaps := int64(minActiveShards*mappingsPerShard+baseMappings) / 2
 	lowFDs := uint64(minActiveShards*descriptorsPerShard+baseDescriptors) / 2
-	out = run("tmpfs", limits{maxMapCount: lowMaps, fdHard: 1 << 20})
+	out = run("tmpfs", hostLimits{maxMapCount: lowMaps, fdHard: 1 << 20})
 	if !strings.Contains(out, "vm.max_map_count allows only about") || strings.Contains(out, "open file limit allows") {
 		t.Fatalf("default max_map_count:\n%s", out)
 	}
-	out = run("tmpfs", limits{maxMapCount: 1 << 20, fdHard: lowFDs})
+	out = run("tmpfs", hostLimits{maxMapCount: 1 << 20, fdHard: lowFDs})
 	if !strings.Contains(out, "open file limit allows only about") || strings.Contains(out, "vm.max_map_count allows") {
 		t.Fatalf("low fd limit:\n%s", out)
 	}
 	// Unknown limits (macOS has no vm.max_map_count) neither warn nor crash.
-	out = run("tmpfs", limits{})
+	out = run("tmpfs", hostLimits{})
 	if strings.Contains(out, "level=WARN") || !strings.Contains(out, "unknown") {
 		t.Fatalf("unknown limits:\n%s", out)
 	}
 	// The figure is what the limit divided by the cost per shard gives.
-	l := limits{maxMapCount: 100_000, fdHard: 100_000}
+	l := hostLimits{maxMapCount: 100_000, fdHard: 100_000}
 	byFD, byMaps = l.capacity()
 	if byFD != (100_000-baseDescriptors)/descriptorsPerShard || byMaps != (100_000-baseMappings)/mappingsPerShard {
 		t.Fatalf("capacity %d %d", byFD, byMaps)

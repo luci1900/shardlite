@@ -13,8 +13,8 @@ import (
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/harness"
+	"github.com/luci1900/shardlite/internal/journal"
 	"github.com/luci1900/shardlite/internal/pos"
-	"github.com/luci1900/shardlite/internal/segment"
 )
 
 // dbChecksum is the checksum of the database at path, which holds nPages pages
@@ -115,9 +115,9 @@ func TestCaptureChecksumMatchesTheDatabase(t *testing.T) {
 
 // entriesAndSeqs returns the shard's journal entries and the segments holding
 // them.
-func entriesAndSeqs(t *testing.T, e *harness.Env, shard string) (out []segment.Entry, seqs []pos.Seg) {
+func entriesAndSeqs(t *testing.T, e *harness.Env, shard string) (out []journal.Entry, seqs []pos.Seg) {
 	t.Helper()
-	err := segment.Scan(context.Background(), e.Journal, 1, 0, func(seq pos.Seg, en segment.Entry) error {
+	err := journal.Scan(context.Background(), e.Journal, 1, 0, func(seq pos.Seg, en journal.Entry) error {
 		if en.Shard.String() == shard {
 			out, seqs = append(out, en), append(seqs, seq)
 		}

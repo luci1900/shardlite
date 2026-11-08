@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -10,7 +11,14 @@ import (
 // ones the test app asks for took effect.
 func TestOpenPragmasTakeEffect(t *testing.T) {
 	a := &app{paths: map[string]string{}, busy: map[string]string{}, dbs: map[string]*sql.DB{}}
-	if err := a.open("a", filepath.Join(t.TempDir(), "app.db"), "1234"); err != nil {
+	path := filepath.Join(t.TempDir(), "app.db")
+	if err := a.open("a", path, "1234"); err == nil {
+		t.Fatal("the app made the file it was handed to open")
+	}
+	if err := os.WriteFile(path, nil, 0o644); err != nil { // the node creates the file first
+		t.Fatal(err)
+	}
+	if err := a.open("a", path, "1234"); err != nil {
 		t.Fatal(err)
 	}
 	defer a.dbs["a"].Close()

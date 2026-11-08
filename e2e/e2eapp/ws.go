@@ -22,8 +22,8 @@ import (
 //
 // A binary message is echoed back as it is, without a commit.
 //
-// A connection that arrives at the wrong shard is relayed for its whole life
-// (see App.shard), with the app in the data path.
+// A connection that arrives at the wrong shard is refused before the upgrade
+// (see App.shard).
 func (a *App) ws(w http.ResponseWriter, r *http.Request, s *shardReq) {
 	c, err := websocket.Accept(w, r, nil)
 	if err != nil {

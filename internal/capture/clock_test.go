@@ -19,8 +19,8 @@ func tailBytes(t *testing.T, now func() time.Time) (bodies [][]byte, times []tim
 	e := newEnv(t)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
-	app.Must(t, "open", "a", path)
-	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w, Now: now})
+	app.Must(t, "create", "a", path)
+	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName("users/1"), Path: path, Generation: "g1", Writer: e.w, Now: now})
 	if err != nil {
 		t.Fatal(err)
 	}

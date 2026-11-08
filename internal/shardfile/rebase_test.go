@@ -402,7 +402,7 @@ func TestDeltasBasesAndRestoresCloseTheirLogs(t *testing.T) {
 	h, sh := e.NewShard(shard)
 	defer sh.Close(ctx)
 
-	// The shard's tail holds a log while it has files, and the segment writer a dup
+	// The shard's tail holds a log while it has files, and the journal writer a dup
 	// of it until the segment is written, so what is checked for is the count
 	// with the tail discarded and the writer flushed.
 	var creates, gets atomic.Int32

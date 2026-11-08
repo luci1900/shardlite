@@ -19,7 +19,7 @@ import (
 func main() {
 	listen := flag.String("listen", "127.0.0.1:0", "address to serve on")
 	control := flag.String("control", "127.0.0.1:2282", "the node's control API")
-	idle := flag.Duration("idle-close", 500*time.Millisecond, "close a shard's database after this long unused")
+	idle := flag.Duration("idle-close", 200*time.Millisecond, "close a shard's database after this long unused (within the shortest idle timeout the app declares)")
 	declare := flag.String("declare", "", "file holding the app's declaration, read on every request to the ready route (the built-in declaration if empty)")
 	flag.Parse()
 

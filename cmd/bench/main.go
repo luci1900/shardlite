@@ -194,7 +194,7 @@ func run(root, kind string) []result {
 	// What the app declares at its ready route: the file is a stand-in for the
 	// app's own, checked into its repository.
 	df := filepath.Join(d, "declaration.json")
-	os.WriteFile(df, []byte(`{"app": "bench", "kinds": {"users": {"public": true, "sync": "none", "idle_timeout": "1h"}, "wallet": {"public": true, "idle_timeout": "1h"}}}`), 0o644)
+	os.WriteFile(df, []byte(`{"kinds": {"users": {"public": true, "sync": "none", "idle_timeout": "1h"}, "wallet": {"public": true, "idle_timeout": "1h"}}}`), 0o644)
 	pub, ctl := freeAddr(), freeAddr()
 	// The app keeps each shard's database open (its idle close is long) so the measurement is of serving, not of reopening.
 	app := start(*appBin, nil, "-listen", "127.0.0.1:0", "-control", ctl, "-idle-close", "10m", "-declare", df)

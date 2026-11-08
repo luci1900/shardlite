@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"github.com/luci1900/shardlite/internal/apptest"
+	"net/http"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -12,7 +13,7 @@ import (
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/cluster"
-	"github.com/luci1900/shardlite/internal/coord"
+	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
@@ -40,29 +41,23 @@ func ask(t *testing.T, nd *clusterNode, target string) {
 func TestMissForAShardOwnedElsewhereReadsOneManifest(t *testing.T) {
 	c := newCluster(t, 2)
 	n0, n1 := c.nodes[0], c.nodes[1]
-	n0.create("test.users/o")
-	ask(t, n0, "test.users/o")
+	n0.create("users/o")
+	ask(t, n0, "users/o")
 	reads := n1.countReads(shardfile.ManifestPrefix)
 
-	ask(t, n1, "test.users/o")
+	ask(t, n1, "users/o")
 	if got := reads.Load(); got != 1 {
 		t.Fatalf("the miss read %d manifests", got)
 	}
 	m := n1.m.Load()
-	// (A system shard may be active here: the claimer races the other node's for it.)
-	for _, name := range m.Active() {
-		if !strings.HasPrefix(name.String(), "_") {
-			t.Fatalf("the miss started an activation: %v", m.Active())
-		}
-	}
-	if m.tab.load(shardName("test.users/o")) != nil {
+	if m.tab.load(shardName("users/o")) != nil {
 		t.Fatalf("the miss started an activation: %v", m.Active())
 	}
-	if owner, ok := m.owners.Get(shardName("test.users/o")); !ok || owner != "n0" {
+	if owner, ok := m.owners.Get(shardName("users/o")); !ok || owner != "n0" {
 		t.Fatalf("the cache names %q (%v)", owner, ok)
 	}
-	ask(t, n1, "test.users/o")
-	ask(t, n1, "test.users/o")
+	ask(t, n1, "users/o")
+	ask(t, n1, "users/o")
 	if got := reads.Load(); got != 1 {
 		t.Fatalf("%d manifest reads after the cache was filled", got)
 	}
@@ -71,14 +66,14 @@ func TestMissForAShardOwnedElsewhereReadsOneManifest(t *testing.T) {
 // With room for one owner the cache forgets the other shard's, and both are
 // still served.
 func TestOwnerCacheOfOne(t *testing.T) {
-	c := newClusterWith(t, 2, func(o *CatalogOptions) { o.OwnerCache = 1 })
+	c := newClusterWith(t, 2, func(o *ShardsetOptions) { o.OwnerCache = 1 })
 	n0, n1 := c.nodes[0], c.nodes[1]
-	n0.create("test.users/a")
-	ask(t, n0, "test.users/a")
-	n0.create("test.users/b")
-	ask(t, n0, "test.users/b")
+	n0.create("users/a")
+	ask(t, n0, "users/a")
+	n0.create("users/b")
+	ask(t, n0, "users/b")
 	reads := n1.countReads(shardfile.ManifestPrefix)
-	for _, target := range []string{"test.users/a", "test.users/b", "test.users/a", "test.users/b"} {
+	for _, target := range []string{"users/a", "users/b", "users/a", "users/b"} {
 		ask(t, n1, target)
 	}
 	if got := reads.Load(); got != 4 {
@@ -93,13 +88,13 @@ func TestOwnerCacheOfOne(t *testing.T) {
 func TestClaimingForgetsTheOwner(t *testing.T) {
 	c := newCluster(t, 1)
 	m := c.nodes[0].m.Load()
-	m.owners.Add(shardName("test.users/c"), "n9")
-	ref, err := m.Acquire(context.Background(), shardName("test.users/c"))
+	m.owners.Add(shardName("users/c"), "n9")
+	ref, err := m.Acquire(context.Background(), shardName("users/c"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	ref.Release()
-	if _, ok := m.owners.Get(shardName("test.users/c")); ok {
+	if _, ok := m.owners.Get(shardName("users/c")); ok {
 		t.Fatal("the cache still names an owner for a shard this node claimed")
 	}
 }
@@ -108,17 +103,17 @@ func TestClaimingForgetsTheOwner(t *testing.T) {
 // forgets every owner cache entry naming it, so the next request for one of its
 // shards claims the shard here, with no answer from the stopped node first.
 func TestStoppedOwnersEntriesAreForgotten(t *testing.T) {
-	c := newClusterWith(t, 2, func(o *CatalogOptions) { o.Leases.Every = 50 * time.Millisecond })
+	c := newClusterWith(t, 2, func(o *ShardsetOptions) { o.Leases.Every = 50 * time.Millisecond })
 	n0, n1 := c.nodes[0], c.nodes[1]
 	n1.echoes()
-	for _, shard := range []string{"test.users/g", "test.users/h"} {
+	for _, shard := range []string{"users/g", "users/h"} {
 		n0.create(shard)
 		ask(t, n0, shard)
 		ask(t, n1, shard) // cached as n0's on n1
 	}
 	n0.Stop()
 	apptest.Eventually(t, apptest.Timeout, "n1 to forget n0's shards", func() bool { return n1.m.Load().owners.Len() == 0 })
-	for _, shard := range []string{"test.users/g", "test.users/h"} {
+	for _, shard := range []string{"users/g", "users/h"} {
 		n1.create(shard) // n0's held nothing, so they were deleted when it stopped
 		if resp, body := post(t, n1, shard, ""); resp.StatusCode != 200 || resp.Header.Get("X-Served-By") != "n1" {
 			t.Fatalf("%s: %d %q", shard, resp.StatusCode, body)
@@ -126,20 +121,20 @@ func TestStoppedOwnersEntriesAreForgotten(t *testing.T) {
 	}
 }
 
-// The address cache reads a lease once, and again when the node is forgotten or
-// the listing shows it wrote its lease after the cached one would have expired.
+// The address cache reads a lease once, and again when the listing shows the node
+// wrote its lease after the cached one would have expired.
 func TestAddressCache(t *testing.T) {
 	now := time.Now()
 	var reads int
 	address := "a:1"
 	var list atomic.Pointer[NodeList]
 	a := &addresses{
-		get: func(_ context.Context, node cluster.Node) (*coord.NodeLease, error) {
+		get: func(_ context.Context, node cluster.Node) (*lease.Record, error) {
 			reads++
 			if node == "gone" {
 				return nil, blob.ErrNotFound
 			}
-			return &coord.NodeLease{NodeInfo: coord.NodeInfo{Name: node, Address: address}, Renewed: now, TTL: 10 * time.Second}, nil
+			return &lease.Record{NodeInfo: lease.NodeInfo{Name: node, Address: address}, Renewed: now, TTL: 10 * time.Second}, nil
 		},
 		nodes: list.Load,
 	}
@@ -154,20 +149,52 @@ func TestAddressCache(t *testing.T) {
 	want("a:1", 1)
 	want("a:1", 1)
 	// A renewal: written before the cached lease would have expired.
-	list.Store(&NodeList{Nodes: []NodeView{{Listed: coord.Listed{Name: "n0"}}, {Listed: coord.Listed{Name: "n1", LastModified: now.Add(5 * time.Second)}}}})
+	list.Store(&NodeList{Nodes: []NodeView{{Listed: lease.Listed{Name: "n0"}}, {Listed: lease.Listed{Name: "n1", LastModified: now.Add(5 * time.Second)}}}})
 	want("a:1", 1)
 	// The node was gone for longer than its TTL and came back elsewhere.
 	address = "b:2"
-	list.Store(&NodeList{Nodes: []NodeView{{Listed: coord.Listed{Name: "n1", LastModified: now.Add(30 * time.Second)}}}})
+	list.Store(&NodeList{Nodes: []NodeView{{Listed: lease.Listed{Name: "n1", LastModified: now.Add(30 * time.Second)}}}})
 	want("b:2", 2)
-	address = "c:3"
-	a.set("n1", nil)
-	list.Store(nil)
-	want("c:3", 3)
-	// A lease read by the owner check replaces the cached one.
-	a.set("n1", &coord.NodeLease{NodeInfo: coord.NodeInfo{Name: "n1", Address: "d:4"}, Renewed: now, TTL: 10 * time.Second})
-	want("d:4", 3)
 	if _, err := a.address(ctx, "gone"); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("a node with no lease: %v", err)
+	}
+}
+
+// A request forwarded on an owner cache entry that is stale because the owner let the shard go when it went idle is answered 503 with Retry-After 0, and the client's retry claims the shard at the node it asked, where its session is.
+func TestStaleOwnerCacheAfterAReleaseCostsARetry(t *testing.T) {
+	r := newPairRigOn(t, nil)
+	n0, n1 := r.nodes[0], r.nodes[1]
+	const target = "users/a"
+	r.create(target)
+	if got := get(t, n1, target); got != (reply{200, "n0"}) {
+		t.Fatalf("the first request through n1: %+v, want 200 served by n0", got)
+	}
+	if owner, ok := n1.m.Load().owners.Get(shardName(target)); !ok || owner != "n0" {
+		t.Fatalf("n1's owner cache names %q (%v), want n0", owner, ok)
+	}
+	releaseOn(t, n0, target)
+	r.releasedFromN0(t, target)
+
+	q, err := http.NewRequest("GET", "http://"+n1.Public+"/x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q.Header.Set("Shardlite-Target", target)
+	resp, err := clusterClient.Do(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") != "0" {
+		t.Fatalf("a request on a stale owner cache entry got %d with Retry-After %q, want 503 with 0", resp.StatusCode, resp.Header.Get("Retry-After"))
+	}
+	if n0.m.Load().IsActive(shardName(target)) || n1.m.Load().IsActive(shardName(target)) {
+		t.Fatal("the shard was claimed by the refused request")
+	}
+	if got := get(t, n1, target); got != (reply{200, "n1"}) {
+		t.Fatalf("the retry: %+v, want 200 served by n1", got)
+	}
+	if got := owner(t, n1, target); got != "n1" {
+		t.Fatalf("the manifest names %q after the retry, want n1", got)
 	}
 }

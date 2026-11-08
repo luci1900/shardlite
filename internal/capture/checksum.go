@@ -1,7 +1,6 @@
 package capture
 
 import (
-	"encoding/binary"
 	"fmt"
 	"hash"
 
@@ -76,31 +75,6 @@ func (c *Checksums) Clone() *Checksums {
 	out := &Checksums{sum: c.sum, pages: make([]ltx.Checksum, len(c.pages))}
 	copy(out.pages, c.pages)
 	return out
-}
-
-// MarshalBinary encodes the CRCs of the pages, for the cache index.
-func (c *Checksums) MarshalBinary() ([]byte, error) {
-	b := make([]byte, 8*len(c.pages))
-	for i, p := range c.pages {
-		binary.LittleEndian.PutUint64(b[8*i:], uint64(p))
-	}
-	return b, nil
-}
-
-// UnmarshalBinary decodes the CRCs of the pages, as MarshalBinary wrote them.
-func (c *Checksums) UnmarshalBinary(b []byte) error {
-	if len(b)%8 != 0 {
-		return fmt.Errorf("capture: the checksums are %d bytes, not a multiple of 8", len(b))
-	}
-	c.pages = make([]ltx.Checksum, len(b)/8)
-	for i := range c.pages {
-		c.pages[i] = ltx.Checksum(binary.LittleEndian.Uint64(b[8*i:]))
-	}
-	c.sum = 0
-	for _, p := range c.pages {
-		c.sum ^= p & checksumMask
-	}
-	return nil
 }
 
 // readChecksums reads the CRCs of the pages of the database at path, which

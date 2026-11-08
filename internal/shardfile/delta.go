@@ -14,9 +14,9 @@ import (
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/capture"
+	"github.com/luci1900/shardlite/internal/dueindex"
 	"github.com/luci1900/shardlite/internal/kill"
 	"github.com/luci1900/shardlite/internal/pos"
-	"github.com/luci1900/shardlite/internal/remindex"
 	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
@@ -48,7 +48,13 @@ type Hooks struct {
 	// none), which the update records with its entry in the reminder index
 	// (docs/internals.md, Reminder index). Without the hook the manifest keeps its
 	// own.
-	BeforeUpdate func(ctx context.Context, end pos.Position) (nextReminder remindex.Minute, err error)
+	BeforeUpdate func(ctx context.Context, end pos.Position) (nextReminder dueindex.Minute, err error)
+	// Release makes the delta's manifest update also give the shard up (no owner and no
+	// journal, as SetReminder does with release), so that a deactivation is one write. Everything the
+	// tail holds is in the delta, so nothing is left in any journal. The update is
+	// idempotent, so after blob.ErrUnknown the caller calls again until it learns the outcome:
+	// the shard may be unowned, and must not be served or dropped before that.
+	Release bool
 }
 
 func (hk Hooks) at(p kill.Point) {
@@ -250,7 +256,14 @@ func merge(w io.Writer, files []capture.TailFile, rg Range) error {
 // say) is the same write: the handle keeps the write id until the manifest
 // has adopted the file, so blob.Store can tell the earlier attempt's object
 // from somebody else's without comparing bytes.
-func (h *Handle) putFile(ctx context.Context, f File, body blob.Body) error {
+//
+// The generation's entry in the orphan index comes first, so a file that never
+// reaches a manifest is found. A failed entry fails the write with nothing uploaded.
+func (h *Handle) putFile(ctx context.Context, f File, body blob.Body, hooks Hooks) error {
+	if err := h.orphanEntry(ctx, h.Manifest.Generation); err != nil {
+		return err
+	}
+	hooks.at(kill.OrphanEntryBeforeFile)
 	key := FileKey(h.Name, h.Manifest.Generation, f)
 	id, ok := h.writes[key]
 	if !ok {
@@ -277,7 +290,11 @@ func (h *Handle) WriteDelta(ctx context.Context, sh *capture.Shard, hooks Hooks)
 	if len(tail.Files) == 0 {
 		return nil
 	}
-	if err := h.putTail(ctx, tail.Files, hooks, nil); err != nil {
+	var edit func(*Manifest)
+	if hooks.Release {
+		edit = giveUp
+	}
+	if err := h.putTail(ctx, tail.Files, hooks, edit); err != nil {
 		return err
 	}
 	sh.DropTail(tail.Files[len(tail.Files)-1].Last())
@@ -319,7 +336,7 @@ func (h *Handle) putTail(ctx context.Context, tail []capture.TailFile, hooks Hoo
 	if err := h.reminder(ctx, hooks, r.Max, next); err != nil {
 		return err
 	}
-	if err := h.putFile(ctx, file, delta.Reader()); err != nil {
+	if err := h.putFile(ctx, file, delta.Reader(), hooks); err != nil {
 		return err
 	}
 	hooks.at(kill.DeltaBeforeManifest)
@@ -438,7 +455,7 @@ func (h *Handle) Rebase(ctx context.Context, sh *capture.Shard, hooks Hooks) (bo
 	if err := h.reminder(ctx, hooks, position, next); err != nil {
 		return false, err
 	}
-	if err := h.putFile(ctx, base, snap.Reader()); err != nil {
+	if err := h.putFile(ctx, base, snap.Reader(), hooks); err != nil {
 		return false, err
 	}
 	hooks.at(kill.RebaseBeforeManifest)
@@ -462,7 +479,10 @@ func (h *Handle) Rebase(ctx context.Context, sh *capture.Shard, hooks Hooks) (bo
 		}
 	}
 	// Superseded files are garbage now. A failure here only leaves garbage behind,
-	// and a delete that finds nothing is done.
+	// and a delete that finds nothing is done. The rebase makes no orphan entry of
+	// its own: the base's upload made one before the swap, due an age later, and by
+	// then the manifest lists the base alone, so that entry finds what a failure here
+	// leaves.
 	var firstErr error
 	for _, f := range superseded {
 		if f == base {

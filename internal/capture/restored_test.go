@@ -16,8 +16,8 @@ import (
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/harness"
+	"github.com/luci1900/shardlite/internal/journal"
 	"github.com/luci1900/shardlite/internal/pos"
-	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
 )
@@ -126,7 +126,7 @@ func replayInto(t *testing.T, e *harness.Env, path string) {
 	}
 	ctx := context.Background()
 	var last pos.Position
-	err = segment.Scan(ctx, e.Journal, 1, 0, func(seq pos.Seg, en segment.Entry) error {
+	err = journal.Scan(ctx, e.Journal, 1, 0, func(seq pos.Seg, en journal.Entry) error {
 		if en.Shard.String() != name || en.Last() <= last {
 			return nil
 		}
@@ -215,7 +215,7 @@ func TestRestoredShardCapturePaths(t *testing.T) {
 			}
 			// A short busy timeout: a TRUNCATE checkpoint waits for the node's reader.
 			app := apptest.Start(t)
-			app.Must(t, "open", "a", e.Path(name), "200")
+			app.Must(t, "create", "a", e.Path(name), "200")
 			tc.run(t, app, sh, ctx)
 			if err := sh.Sync(ctx); err != nil {
 				t.Fatal(err)
@@ -243,7 +243,7 @@ func TestRestoredShardNeverWritten(t *testing.T) {
 	if err := sh.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
-	released, f, err := sh.Release(ctx, nil)
+	released, f, err := sh.Release(ctx, nil, capture.ResumeIfHeld)
 	if err != nil || !released {
 		t.Fatalf("release: %v, %v", released, err)
 	}
@@ -258,9 +258,10 @@ func TestRestoredShardNeverWritten(t *testing.T) {
 	}
 }
 
-// A cached shard is activated again with the WAL its last activation left, which
+// A shard whose release did not go through (its delta failed, or the app held the
+// file) is captured again on the same file with the WAL the release left, which
 // may hold commits that are not in the database file. The history stays whole
-// across activations.
+// across the two captures.
 func TestReactivationFoldsTheWALItLeft(t *testing.T) {
 	t.Parallel()
 	e := harness.New(t)
@@ -275,7 +276,7 @@ func TestReactivationFoldsTheWALItLeft(t *testing.T) {
 		}
 	}
 	app.Must(t, "close", "a")
-	released, _, err := sh.Release(ctx, nil)
+	released, _, err := sh.Release(ctx, nil, capture.ResumeIfHeld)
 	if err != nil || !released {
 		t.Fatalf("release: %v, %v", released, err)
 	}
@@ -404,7 +405,7 @@ func TestRefusedReleaseAfterTheTailWasDropped(t *testing.T) {
 		if n, _ := sh.TailInfo(); n != 0 {
 			t.Fatalf("%d files in the tail after a delta", n)
 		}
-		released, _, err := sh.Release(ctx, nil)
+		released, _, err := sh.Release(ctx, nil, capture.ResumeIfHeld)
 		if err != nil || released {
 			t.Fatalf("release with the app holding the shard: %v, %v", released, err)
 		}

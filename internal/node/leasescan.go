@@ -11,7 +11,7 @@ import (
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/cluster"
-	"github.com/luci1900/shardlite/internal/coord"
+	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/notify"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
@@ -21,17 +21,20 @@ type LeaseScanOptions struct {
 	// Every is how often the cluster as a whole lists state/leases/: each node lists
 	// every N × Every on average, N being the nodes in its last listing. 2 s if zero.
 	Every time.Duration
-	// TTL is the lease TTL the cluster runs with, coord.DefaultTTL if zero. A
+	// TTL is the lease TTL the cluster runs with, lease.DefaultTTL if zero. A
 	// lease last written longer ago than that may have expired.
 	TTL time.Duration
 }
 
 // NodeView is what the lease scan last saw of one node.
 type NodeView struct {
-	coord.Listed
+	lease.Listed
 	// Dead is true once the node's lease is released, or this node has seen it
 	// unchanged for its TTL on its own clock (docs/internals.md, Noticing dead
 	// nodes). That is a decision, not a hint: the holder's own deadline has passed.
+	// It stays true through the writes that adopting the node makes to its lease,
+	// and ends only when the lease shows a new epoch, which is the node's own
+	// restart.
 	Dead bool
 }
 
@@ -42,7 +45,7 @@ type NodeList struct {
 	Nodes []NodeView
 }
 
-// leaseScan is the part of the Catalog that lists state/leases/, finds dead nodes and
+// leaseScan is the part of the shardset that lists state/leases/, finds dead nodes and
 // adopts them (docs/internals.md, Takeover). A
 // lease whose last write (the store's clock) is older than the TTL by the scan's
 // clock may have expired: the scan reads it, notes its ETag and looks again once
@@ -59,19 +62,24 @@ type NodeList struct {
 // short (an error, the scan stopping, this node dying) is simply made again, by
 // this node or another.
 //
+// The watch of a node found dead is kept: the writes to its lease that follow
+// (the adopter's mark and finish) are not renewals, so the node stays dead in
+// every listing until its lease shows a new epoch, when it restarted. The scan
+// reads the lease again whenever the listing shows a dead node's ETag changed.
+//
 // Its loop owns the watches. What others read is the published NodeList.
 type leaseScan struct {
-	reg     *coord.Registry
+	reg     *lease.Registry
 	files   *shardfile.Files
 	store   *blob.Store
-	self    func() coord.Incarnation // this node's own incarnation
+	self    func() lease.Incarnation // this node's own incarnation
 	nodeErr func() error             // nil while this node may write (Node.Err)
 	clock   Clock
 	opts    LeaseScanOptions
 	log     *slog.Logger
 	scans   *notify.Counter // listings made, for tests
 	adopted *notify.Counter // adoptions finished, for tests
-	// died, if set, is told each node a listing first shows dead (Catalog.died).
+	// died, if set, is told each node a listing first shows dead (Shardset.died).
 	died func(node cluster.Node)
 
 	view    atomic.Pointer[NodeList]
@@ -80,7 +88,7 @@ type leaseScan struct {
 
 // leaseWatch is a lease that may have expired, as of its last read.
 type leaseWatch struct {
-	lease *coord.NodeLease
+	lease *lease.Record
 	due   time.Time // when to look again: a TTL after the read, by the scan's clock
 	dead  bool
 	done  bool // dead and needing nothing more from this node: adopted, or nothing to adopt
@@ -90,7 +98,7 @@ type leaseWatch struct {
 // never before it: a renewal that lands while the read is in flight gives its
 // holder a TTL from then, so the second look must come a full TTL after the
 // read returned.
-func newWatch(l *coord.NodeLease, read time.Time) *leaseWatch {
+func newWatch(l *lease.Record, read time.Time) *leaseWatch {
 	return &leaseWatch{lease: l, due: read.Add(l.TTL), dead: l.Released}
 }
 
@@ -145,7 +153,12 @@ func (s *leaseScan) scan(ctx context.Context, now time.Time) int {
 	for _, e := range listed {
 		seen[e.Name] = true
 		w := s.watches[e.Name]
+		if w != nil && w.dead && w.lease.ETag != e.ETag {
+			w = s.refresh(ctx, e.Name, w)
+		}
 		switch {
+		case w != nil && w.dead:
+			// Stays dead, whatever was written to its lease since: only a new epoch ends it.
 		case now.Before(e.LastModified.Add(s.opts.TTL)):
 			delete(s.watches, e.Name) // written lately: renewed
 			w = nil
@@ -193,6 +206,31 @@ func (s *leaseScan) watch(ctx context.Context, node cluster.Node) *leaseWatch {
 	}
 	w := newWatch(l, s.clock.Now())
 	s.watches[node] = w
+	return w
+}
+
+// refresh reads the lease of a node found dead after it was written to. The
+// same epoch is the adoption's writes (or a holder that came back too late), so
+// the node stays dead and the watch takes the new lease. A newer epoch is the
+// node's own restart, which ends the watch (nil). A lease that can't be read now
+// leaves the watch as it is, to be refreshed at the next listing, and one that is
+// gone ends it.
+func (s *leaseScan) refresh(ctx context.Context, node cluster.Node, w *leaseWatch) *leaseWatch {
+	l, err := s.reg.Get(ctx, node)
+	switch {
+	case errors.Is(err, blob.ErrNotFound):
+		delete(s.watches, node)
+		return nil
+	case err != nil:
+		if ctx.Err() == nil {
+			s.log.Warn("could not read a node lease", "node", node, "err", err)
+		}
+		return w
+	case l.Epoch > w.lease.Epoch:
+		delete(s.watches, node)
+		return nil
+	}
+	w.lease = l
 	return w
 }
 
@@ -255,8 +293,9 @@ func (s *leaseScan) adoptDead(ctx context.Context) {
 
 // adopt adopts the dead node x, whose lease is as the watch last read it. A
 // lease another node is already adopting is left to it while that node isn't
-// known to be dead. When anything changed under it, the watch goes: the next
-// listing looks at the node afresh.
+// known to be dead. When anything changed under it, the lease is read again
+// (refresh): the node stays dead and is adopted again if it needs it, unless it
+// restarted.
 func (s *leaseScan) adopt(ctx context.Context, x cluster.Node, w *leaseWatch) {
 	l, me := w.lease, s.self()
 	if x == me.Node {
@@ -275,8 +314,8 @@ func (s *leaseScan) adopt(ctx context.Context, x cluster.Node, w *leaseWatch) {
 	}
 	marked, err := s.reg.Adopt(ctx, *l, me)
 	switch {
-	case errors.Is(err, coord.ErrNotAdoptable):
-		delete(s.watches, x) // it renewed, restarted or someone else marked it
+	case errors.Is(err, lease.ErrNotAdoptable):
+		s.refresh(ctx, x, w) // it renewed, restarted or someone else marked it
 		return
 	case err != nil:
 		if ctx.Err() == nil {
@@ -290,7 +329,7 @@ func (s *leaseScan) adopt(ctx context.Context, x cluster.Node, w *leaseWatch) {
 		if ctx.Err() == nil {
 			s.log.Error("adopting a dead node failed, it will be adopted again", "node", x, "epoch", l.Epoch, "err", err)
 		}
-		delete(s.watches, x)
+		s.refresh(ctx, x, w)
 		return
 	}
 	if s.nodeErr() != nil {
@@ -300,7 +339,7 @@ func (s *leaseScan) adopt(ctx context.Context, x cluster.Node, w *leaseWatch) {
 		if ctx.Err() == nil {
 			s.log.Warn("could not finish adopting a dead node, it will be adopted again", "node", x, "epoch", l.Epoch, "err", err)
 		}
-		delete(s.watches, x)
+		s.refresh(ctx, x, w)
 		return
 	}
 	// Segments from the fence on may be the node's next life's by now.
@@ -316,7 +355,7 @@ func (s *leaseScan) adopt(ctx context.Context, x cluster.Node, w *leaseWatch) {
 // incarnationDead reports whether an adopter is known to be dead: its node has a
 // newer epoch or released its lease, or this scan has confirmed its lease
 // unrenewed. A watch on it starts with the scan's next listing.
-func (s *leaseScan) incarnationDead(ctx context.Context, inc coord.Incarnation) bool {
+func (s *leaseScan) incarnationDead(ctx context.Context, inc lease.Incarnation) bool {
 	if w := s.watches[inc.Node]; w != nil && w.dead && w.lease.Epoch == inc.Epoch {
 		return true
 	}

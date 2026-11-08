@@ -33,8 +33,8 @@ func TestSnapshotWhileTheAppCommits(t *testing.T) {
 	// restarts, which under load is longer than a short timeout (the default
 	// five seconds).
 	app := apptest.Start(t)
-	app.Must(t, "open", "a", e.Path(name))
-	app.Must(t, "open", "c", e.Path(name), "20")
+	app.Must(t, "create", "a", e.Path(name))
+	app.Must(t, "create", "c", e.Path(name), "20")
 	h, _, _ := e.Files.Open(ctx, shardName(name))
 	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W, RestartFrames: 10})
 	if err != nil {

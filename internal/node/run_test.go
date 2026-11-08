@@ -17,13 +17,14 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/blobtest"
-	"github.com/luci1900/shardlite/internal/coord"
+	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
@@ -44,7 +45,7 @@ func nodeGoroutines() []string {
 		if i == 0 || strings.Contains(g, "_test.go") {
 			continue // the calling goroutine, and the test's helpers
 		}
-		for _, pkg := range []string{"internal/node.", "internal/capture.", "internal/journal.", "internal/segment.", "internal/coord.", "internal/shardfile.", "internal/blob."} {
+		for _, pkg := range []string{"internal/node.", "internal/capture.", "internal/journal.", "internal/lease.", "internal/shardfile.", "internal/blob."} {
 			if strings.Contains(g, "luci1900/shardlite/"+pkg) {
 				out = append(out, g)
 				break
@@ -83,10 +84,10 @@ func startedSince(before, now []string) []string {
 // runKinds is what the test's app declares: long idle timeouts, so the shards
 // the test activates stay active while it counts goroutines, and sync off for
 // users, so a flush is not what the writes wait for.
-const runKinds = `{"app": "test", "kinds": {"users": {"public": true, "sync": "none", "idle_timeout": "1h"}, "wallet": {"public": true, "idle_timeout": "1h"}}}`
+const runKinds = `{"kinds": {"users": {"public": true, "sync": "none", "idle_timeout": "1h"}, "wallet": {"public": true, "idle_timeout": "1h"}}}`
 
 // Run returns only after every goroutine it started has ended: the loops, the
-// servers, the ready poll, the flush cycle's syncs, the segment writer and
+// servers, the declaration poll, the flush cycle's syncs, the journal writer and
 // the lease keeper.
 func TestRunLeavesNoGoroutines(t *testing.T) {
 	app := apptest.Start(t)
@@ -148,7 +149,7 @@ func TestRunLeavesNoGoroutines(t *testing.T) {
 	})
 	// Shards of both kinds with writes, created by calls: lazy creation, capture, syncs, gated responses.
 	for i := range 5 {
-		for _, kind := range []string{"test.users", "test.wallet"} {
+		for _, kind := range []string{"users", "wallet"} {
 			q, _ := http.NewRequest("POST", "http://"+control+"/write", nil)
 			q.Header.Set("Shardlite-Target", fmt.Sprintf("%s/%d", kind, i))
 			resp, err := http.DefaultClient.Do(q)
@@ -245,16 +246,17 @@ func (l *runLog) Handle(_ context.Context, r slog.Record) error {
 func (l *runLog) WithAttrs([]slog.Attr) slog.Handler { return l }
 func (l *runLog) WithGroup(string) slog.Handler      { return l }
 
-// Run's shutdown ends and joins the servers' requests before it lets go of the
-// shards: a WebSocket on the public server and a call on the control server
-// still running after the grace period both end, their shards are let go and
-// the lease is given up.
-func TestRunJoinsRequestsBeforeLettingGo(t *testing.T) {
+// Run's shutdown ends the servers' requests that outlast their grace period, so
+// that the shards they hold can be let go of: a WebSocket on the public server
+// and a call on the control server (which is still serving while the shards are
+// let go of, and is stopped after the grace period if the call has not ended)
+// both end, their shards are let go and the lease is given up.
+func TestRunEndsRequestsThatHoldShardsAtTheStop(t *testing.T) {
 	t.Parallel()
 	var started apptest.Log[string]
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
 		if q.URL.Path == appReadyPath {
-			io.WriteString(w, `{"app": "test", "kinds": {"users": {"public": true, "sync": "none", "idle_timeout": "1h"}}}`)
+			io.WriteString(w, `{"kinds": {"users": {"public": true, "sync": "none", "idle_timeout": "1h"}}}`)
 			return
 		}
 		switch q.URL.Path {
@@ -316,7 +318,7 @@ func TestRunJoinsRequestsBeforeLettingGo(t *testing.T) {
 
 	// A call creates the shard the client connects to.
 	q, _ := http.NewRequest("GET", "http://"+a.control+"/", nil)
-	q.Header.Set("Shardlite-Target", "test.users/ws")
+	q.Header.Set("Shardlite-Target", "users/ws")
 	if resp, err := http.DefaultClient.Do(q); err != nil || resp.StatusCode != 200 {
 		t.Fatalf("creating users/ws: %v %v", resp, err)
 	} else {
@@ -327,7 +329,7 @@ func TestRunJoinsRequestsBeforeLettingGo(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	fmt.Fprintf(conn, "GET /ws?shardlite-target=test.users/ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+	fmt.Fprintf(conn, "GET /ws?shardlite-target=users/ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
 	br := bufio.NewReader(conn)
 	if resp, err := http.ReadResponse(br, nil); err != nil || resp.StatusCode != 101 {
 		t.Fatalf("upgrade: %v %v", resp, err)
@@ -335,7 +337,7 @@ func TestRunJoinsRequestsBeforeLettingGo(t *testing.T) {
 	slow := make(chan error, 1)
 	go func() {
 		q, _ := http.NewRequest("GET", "http://"+a.control+"/slow", nil)
-		q.Header.Set("Shardlite-Target", "test.users/call")
+		q.Header.Set("Shardlite-Target", "users/call")
 		resp, err := http.DefaultClient.Do(q)
 		if err == nil {
 			_, err = io.ReadAll(resp.Body)
@@ -367,6 +369,70 @@ func TestRunJoinsRequestsBeforeLettingGo(t *testing.T) {
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	if _, err := br.ReadString('\n'); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("the WebSocket is still open: %v", err)
+	}
+}
+
+// A stop with a shard the app still holds open does not wait for the app: once no request holds the shard it is let go of, released, and the lease is released, so no shard waits for adoption. The file the app keeps is deleted.
+func TestRunLetsGoOfAShardTheAppHolds(t *testing.T) {
+	t.Parallel()
+	var m atomic.Pointer[Shardset]
+	r := startRun(t, "run-held-test", nil, withShardset(func(_ *ShardsetOptions, c *Shardset) {
+		if c != nil {
+			m.Store(c)
+		}
+	}))
+	resp, err := http.Get("http://" + r.control + "/x?shardlite-target=users/held") // a call, which creates the shard
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	files, _ := filepath.Glob(filepath.Join(r.env.Data, "users", "held.*.db"))
+	if len(files) != 1 {
+		t.Fatalf("the shard's files: %v", files)
+	}
+	app := apptest.Start(t)
+	app.Must(t, "open", "a", files[0]) // the app keeps its connection open
+	app.Must(t, "exec", "a", `CREATE TABLE t (x)`)
+
+	r.cancel()
+	if err := r.wait(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	for _, w := range r.log.warned.All() {
+		if strings.Contains(w, "not deactivated") || strings.Contains(w, "releasing the lease") || strings.Contains(w, "still running") {
+			t.Fatalf("Run logged %q", w)
+		}
+	}
+	if !slices.Contains(r.log.warned.All(), "the app still had the shard's file open when the node stopped, so the node let the shard go and deleted the file: close connections within the idle timeout, and never write a shard outside a request") {
+		t.Fatalf("no warning for the shard let go of: %v", r.log.warned.All())
+	}
+	if got := m.Load().Stats.LetGoHeld.Load(); got != 1 {
+		t.Fatalf("%d shards let go of while held, want 1", got)
+	}
+	if got := m.Load().Stats.HeldPastIdle.Load(); got != 0 {
+		t.Fatalf("%d held shards counted at a stop, want none", got)
+	}
+	if l := r.lease(); !l.Released {
+		t.Fatalf("the lease was kept: %+v", l)
+	}
+	var man shardfile.Manifest
+	// The stored key is built from the shard's name alone, with its lane first and no app segment.
+	if key := shardfile.ManifestKey(shardName("users/held")); key != "state/shards/b/users/held" {
+		t.Fatalf("the manifest key is %q", key)
+	}
+	body, _, err := blob.WithPrefix(r.mem, r.env.Prefix).Get(context.Background(), shardfile.ManifestKey(shardName("users/held")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer body.Close()
+	if err := json.NewDecoder(body).Decode(&man); err != nil {
+		t.Fatal(err)
+	}
+	if man.Owner != "" {
+		t.Fatalf("the manifest still names %q", man.Owner)
+	}
+	if _, err := os.Stat(files[0]); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the file the app has open is still there: %v", err)
 	}
 }
 
@@ -460,9 +526,9 @@ func (r *runRig) wait() error {
 }
 
 // lease is the node's lease as it is in blob storage.
-func (r *runRig) lease() *coord.NodeLease {
+func (r *runRig) lease() *lease.Record {
 	r.t.Helper()
-	l, err := coord.NewRegistry(blob.WithPrefix(r.mem, r.env.Prefix), r.env.Name, coord.RegistryOptions{}).Get(context.Background(), r.env.Name)
+	l, err := lease.NewRegistry(blob.WithPrefix(r.mem, r.env.Prefix), r.env.Name, lease.RegistryOptions{}).Get(context.Background(), r.env.Name)
 	if err != nil {
 		r.t.Fatal(err)
 	}
@@ -486,19 +552,24 @@ func (r *runRig) in(groups ...[]string) {
 	}
 }
 
-// stopOrder is the order of Run's shutdown: the public server, the control and
-// peer servers and the shards. The journal (the writer and the keeper) stops
-// last, and has no line of its own.
-var stopOrder = [][]string{{"stop public server"}, {"stop control server", "stop peer server"}, {"stop catalog"}}
+// stopOrder is the order of Run's shutdown after a failure: the public server,
+// the control and peer servers and the shards. The journal (the writer and the
+// keeper) stops last, and has no line of its own. A stop that was asked for keeps the
+// control and peer servers up while the shards are let go of (askedStopOrder).
+var stopOrder = [][]string{{"stop public server"}, {"stop control server", "stop peer server"}, {"stop shardset"}}
+
+// askedStopOrder is the order of a shutdown that was asked for: the public server,
+// the shards, and the control and peer servers last.
+var askedStopOrder = [][]string{{"stop public server"}, {"stop shardset"}, {"stop control server", "stop peer server"}}
 
 // Run starts every service at once, with everything built before, and stops
-// them one supervisor at a time: the services that depend on nothing (the ready poll,
+// them one supervisor at a time: the services that depend on nothing (the declaration poll,
 // the journal expiry and pprof) stop with the public server,
 // first. A shard being let go of holds up the shards' stop.
 func TestRunStartsAndStopsInOrder(t *testing.T) {
 	t.Parallel()
 	r := startRun(t, "run-order-test", map[string]string{"SHARDLITE_LISTEN_PPROF": "127.0.0.1:0"})
-	all := []string{"public server", "control server", "peer server", "ready poll", "catalog", "journal expiry", "pprof"}
+	all := []string{"public server", "control server", "peer server", "declaration poll", "shardset", "journal expiry", "pprof"}
 	r.log.events.WaitFor(t, 5*time.Second, "every service to start", func(e []string) bool {
 		for _, p := range all {
 			if !slices.Contains(e, "start "+p) {
@@ -507,14 +578,14 @@ func TestRunStartsAndStopsInOrder(t *testing.T) {
 		}
 		return true
 	})
-	resp, err := http.Get("http://" + r.control + "/x?shardlite-target=test.users/o1") // a call, which creates the shard
+	resp, err := http.Get("http://" + r.control + "/x?shardlite-target=users/o1") // a call, which creates the shard
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
 	release := make(chan struct{})
 	r.hooked.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
-		if after || op == blobtest.OpGet || op == blobtest.OpList || !strings.HasSuffix(key, shardfile.ManifestKey(shardName("test.users/o1"))) {
+		if after || op == blobtest.OpGet || op == blobtest.OpList || !strings.HasSuffix(key, shardfile.ManifestKey(shardName("users/o1"))) {
 			return nil
 		}
 		select {
@@ -523,7 +594,7 @@ func TestRunStartsAndStopsInOrder(t *testing.T) {
 		}
 		return nil
 	})
-	independent := []string{"stop ready poll", "stop journal expiry", "stop pprof"}
+	independent := []string{"stop declaration poll", "stop journal expiry", "stop pprof"}
 
 	r.cancel()
 	r.log.events.WaitFor(t, 10*time.Second, "the services that depend on nothing to stop", func(e []string) bool {
@@ -538,8 +609,8 @@ func TestRunStartsAndStopsInOrder(t *testing.T) {
 	if err := r.wait(); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	r.in(stopOrder...)
-	r.in(independent, []string{"stop catalog"})
+	r.in(askedStopOrder...)
+	r.in(independent, []string{"stop shardset"})
 	if l := r.lease(); !l.Released {
 		t.Fatalf("the lease was not released: %+v", l)
 	}
@@ -552,12 +623,12 @@ func TestRunStopsAtOnceWhenTheLeaseIsLost(t *testing.T) {
 	t.Parallel()
 	r := startRun(t, "run-lost-test", map[string]string{"SHARDLITE_LEASE_TTL": "1500ms"})
 	// Another life of the node takes the lease. The keeper's next renewal finds it.
-	other, err := coord.NewRegistry(blob.WithPrefix(r.mem, r.env.Prefix), r.env.Name, coord.RegistryOptions{TTL: time.Hour}).Acquire(context.Background(), coord.NodeInfo{Name: r.env.Name})
+	other, err := lease.NewRegistry(blob.WithPrefix(r.mem, r.env.Prefix), r.env.Name, lease.RegistryOptions{TTL: time.Hour}).Acquire(context.Background(), lease.NodeInfo{Name: r.env.Name})
 	if err != nil {
 		t.Fatal(err)
 	}
 	err = r.wait()
-	if !errors.Is(err, coord.ErrLeaseLost) {
+	if !errors.Is(err, lease.ErrLost) {
 		t.Fatalf("Run returned %v, want a fatal lease error", err)
 	}
 	r.in(stopOrder...)
@@ -572,7 +643,7 @@ func TestRunStopsAtOnceWhenTheLeaseIsLost(t *testing.T) {
 func TestRunFatalErrorDuringShutdown(t *testing.T) {
 	t.Parallel()
 	r := startRun(t, "run-fatal-stop-test", map[string]string{"SHARDLITE_LEASE_TTL": "1500ms"})
-	resp, err := http.Get("http://" + r.control + "/x?shardlite-target=test.users/fs1") // a call, which creates the shard
+	resp, err := http.Get("http://" + r.control + "/x?shardlite-target=users/fs1") // a call, which creates the shard
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -580,7 +651,7 @@ func TestRunFatalErrorDuringShutdown(t *testing.T) {
 	entered, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	r.hooked.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
-		if after || op == blobtest.OpGet || op == blobtest.OpList || !strings.HasSuffix(key, shardfile.ManifestKey(shardName("test.users/fs1"))) {
+		if after || op == blobtest.OpGet || op == blobtest.OpList || !strings.HasSuffix(key, shardfile.ManifestKey(shardName("users/fs1"))) {
 			return nil
 		}
 		once.Do(func() { close(entered) })
@@ -596,7 +667,7 @@ func TestRunFatalErrorDuringShutdown(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatalf("the shard was not let go of: %v", r.log.events.All())
 	}
-	other, err := coord.NewRegistry(blob.WithPrefix(r.mem, r.env.Prefix), r.env.Name, coord.RegistryOptions{TTL: time.Hour}).Acquire(context.Background(), coord.NodeInfo{Name: r.env.Name})
+	other, err := lease.NewRegistry(blob.WithPrefix(r.mem, r.env.Prefix), r.env.Name, lease.RegistryOptions{TTL: time.Hour}).Acquire(context.Background(), lease.NodeInfo{Name: r.env.Name})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -605,10 +676,10 @@ func TestRunFatalErrorDuringShutdown(t *testing.T) {
 	})
 	close(release)
 	err = r.wait()
-	if !errors.Is(err, coord.ErrLeaseLost) {
+	if !errors.Is(err, lease.ErrLost) {
 		t.Fatalf("Run returned %v, want a fatal lease error", err)
 	}
-	r.in(stopOrder...)
+	r.in(askedStopOrder...)
 	if l := r.lease(); l.Released || l.Epoch != other.Epoch {
 		t.Fatalf("the lease is %+v, want the other life's (epoch %d) as it took it", l, other.Epoch)
 	}
@@ -617,6 +688,64 @@ func TestRunFatalErrorDuringShutdown(t *testing.T) {
 			t.Fatalf("Run logged %q", m)
 		}
 	}
+}
+
+// A stop that the context asked for drains first, and a failed node doesn't: a lost lease and a service that fails stop it at once, as before.
+func TestRunDrainsOnlyOnACleanStop(t *testing.T) {
+	t.Parallel()
+	// start runs a node whose shardset the test can look at.
+	start := func(t *testing.T, name string, vars map[string]string, opts ...RunOption) (*runRig, *atomic.Pointer[Shardset]) {
+		var m atomic.Pointer[Shardset]
+		opts = append(opts, withShardset(func(_ *ShardsetOptions, c *Shardset) {
+			if c != nil {
+				m.Store(c)
+			}
+		}))
+		return startRun(t, name, vars, opts...), &m
+	}
+	t.Run("the context ends", func(t *testing.T) {
+		t.Parallel()
+		r, m := start(t, "run-drain-test", nil)
+		if m.Load().draining.Load() {
+			t.Fatal("the node drains before it is told to stop")
+		}
+		r.cancel()
+		if err := r.wait(); err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if !m.Load().draining.Load() {
+			t.Fatal("a stop that the context asked for did not drain")
+		}
+	})
+	t.Run("the lease is lost", func(t *testing.T) {
+		t.Parallel()
+		r, m := start(t, "run-nodrain-lost-test", map[string]string{"SHARDLITE_LEASE_TTL": "1500ms"})
+		if _, err := lease.NewRegistry(blob.WithPrefix(r.mem, r.env.Prefix), r.env.Name, lease.RegistryOptions{TTL: time.Hour}).Acquire(context.Background(), lease.NodeInfo{Name: r.env.Name}); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.wait(); !errors.Is(err, lease.ErrLost) {
+			t.Fatalf("Run returned %v, want a fatal lease error", err)
+		}
+		if m.Load().draining.Load() {
+			t.Fatal("a node that lost its lease drained")
+		}
+	})
+	t.Run("a service fails", func(t *testing.T) {
+		t.Parallel()
+		inner, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ln := &brokenListener{Listener: inner, broken: make(chan struct{})}
+		r, m := start(t, "run-nodrain-fail-test", nil, withPublicListener(ln))
+		close(ln.broken)
+		if err := r.wait(); !errors.Is(err, errListenerBroke) {
+			t.Fatalf("Run returned %v, want the listener's error", err)
+		}
+		if m.Load().draining.Load() {
+			t.Fatal("a node with a failed service drained")
+		}
+	})
 }
 
 // brokenListener is a listener whose Accept fails once broken is closed.
@@ -671,48 +800,22 @@ func TestRunStopsGracefullyWhenAPartFails(t *testing.T) {
 	}
 }
 
-// The peer listener answers who the node is over h2c, and nothing else. The
-// lease publishes its address, SHARDLITE_ADVERTISE_PEER if set.
-func TestPeerListenerSaysWhoTheNodeIs(t *testing.T) {
+// The peer listener answers over h2c and serves nothing else. The lease publishes its address,
+// SHARDLITE_ADVERTISE_PEER if set.
+func TestPeerListenerAnswersAsTheNode(t *testing.T) {
 	t.Parallel()
 	r := startRun(t, "peer-test", map[string]string{"SHARDLITE_ADVERTISE_PEER": "peer-test.internal:2281"})
 	if got := r.lease().Address; got != "peer-test.internal:2281" {
 		t.Fatalf("the lease's address is %q", got)
 	}
+	if err := peerAnswers(r.peer); err != nil {
+		t.Fatalf("the peer listener: %v", err)
+	}
 	protos := new(http.Protocols)
 	protos.SetUnencryptedHTTP2(true)
 	client := &http.Client{Transport: &http.Transport{Protocols: protos}}
 	defer client.CloseIdleConnections()
-	resp, err := client.Get("http://" + r.peer + "/_shardlite/node")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	var got NodeInfoReply
-	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
-		t.Fatal(err)
-	}
-	if resp.ProtoMajor != 2 || got.Name != "peer-test" || got.Epoch != r.lease().Epoch {
-		t.Fatalf("proto %d, reply %+v, lease %+v", resp.ProtoMajor, got, r.lease())
-	}
-	// The control API answers the same for whoever runs the node.
-	cresp, err := http.Get("http://" + r.control + "/_shardlite/node")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cresp.Body.Close()
-	var who NodeInfoReply
-	if err := json.NewDecoder(cresp.Body).Decode(&who); err != nil {
-		t.Fatal(err)
-	}
-	if cresp.StatusCode != http.StatusOK || who.Name != "peer-test" {
-		t.Fatalf("control reply %d %+v, want this node", cresp.StatusCode, who)
-	}
-	// It reports the clock watch (the memory backend takes no samples).
-	if who.Clock == nil || who.Clock.Warning || who.Clock.Blind {
-		t.Fatalf("control reply's clock is %+v, want a quiet report", who.Clock)
-	}
-	for _, path := range []string{"/", "/_shardlite/ready", "/x?shardlite-target=test.users/o1"} {
+	for _, path := range []string{"/", "/_shardlite/ready", "/x?shardlite-target=users/o1"} {
 		resp, err := client.Get("http://" + r.peer + path)
 		if err != nil {
 			t.Fatal(err)
@@ -728,7 +831,7 @@ func TestPeerListenerSaysWhoTheNodeIs(t *testing.T) {
 		t.Fatal(err)
 	}
 	req.Header.Set("Shardlite-Origin", "delete")
-	req.Header.Set("Shardlite-Target", "test.users/x")
+	req.Header.Set("Shardlite-Target", "users/x")
 	if resp, err := client.Do(req); err != nil || resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("a delete on the peer listener: %v, %v", resp, err)
 	} else {

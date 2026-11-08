@@ -14,17 +14,17 @@ import (
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/harness"
+	"github.com/luci1900/shardlite/internal/journal"
 	"github.com/luci1900/shardlite/internal/pos"
-	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
 )
 
-const name = "test.users/7"
+const name = "users/7"
 
-func entriesOf(t *testing.T, e *harness.Env, shard string) (out []segment.Entry) {
+func entriesOf(t *testing.T, e *harness.Env, shard string) (out []journal.Entry) {
 	t.Helper()
-	err := segment.Scan(context.Background(), e.Journal, 1, 0, func(_ pos.Seg, en segment.Entry) error {
+	err := journal.Scan(context.Background(), e.Journal, 1, 0, func(_ pos.Seg, en journal.Entry) error {
 		if en.Shard.String() == shard {
 			out = append(out, en)
 		}
@@ -97,7 +97,7 @@ func TestCheckpointsNeverLoseFrames(t *testing.T) {
 			replayed := filepath.Join(t.TempDir(), "replayed.db")
 			ap, _ := shardfile.NewApplier(replayed)
 			var full int
-			err = segment.Scan(ctx, e.Journal, 1, 0, func(seq pos.Seg, en segment.Entry) error {
+			err = journal.Scan(ctx, e.Journal, 1, 0, func(seq pos.Seg, en journal.Entry) error {
 				if en.Shard.String() != name {
 					return nil
 				}
@@ -311,7 +311,7 @@ func TestReleaseChecksShm(t *testing.T) {
 	obs := apptest.Start(t) // a third process, to see who holds the shard
 
 	// The app has the shard open: the node doesn't let go, and capture carries on where it was.
-	if released, _, err := sh.Release(ctx, nil); err != nil || released {
+	if released, _, err := sh.Release(ctx, nil, capture.ResumeIfHeld); err != nil || released {
 		t.Fatalf("app open: released=%v err=%v", released, err)
 	}
 	pos := sh.Position()
@@ -324,7 +324,7 @@ func TestReleaseChecksShm(t *testing.T) {
 	}
 	// Doing it again and again changes nothing.
 	for range 5 {
-		if released, _, err := sh.Release(ctx, nil); err != nil || released {
+		if released, _, err := sh.Release(ctx, nil, capture.ResumeIfHeld); err != nil || released {
 			t.Fatalf("app open: released=%v err=%v", released, err)
 		}
 	}
@@ -334,7 +334,7 @@ func TestReleaseChecksShm(t *testing.T) {
 
 	// The app closes its connection: now the node can let go.
 	app.Must(t, "close", "a")
-	if released, _, err := sh.Release(ctx, nil); err != nil || !released {
+	if released, _, err := sh.Release(ctx, nil, capture.ResumeIfHeld); err != nil || !released {
 		t.Fatalf("app closed: released=%v err=%v", released, err)
 	}
 	if err := sh.Sync(ctx); err == nil {
@@ -422,7 +422,7 @@ func TestReleaseSeesACommitAfterTheFinalSync(t *testing.T) {
 			if late {
 				// Between the connections closing and the -shm check.
 				late = false
-				app.Must(t, "open", "a", e.Path(name))
+				app.Must(t, "create", "a", e.Path(name))
 				app.Must(t, "insert", "a", "5", "100")
 				app.Must(t, "close", "a")
 			}
@@ -439,7 +439,7 @@ func TestReleaseSeesACommitAfterTheFinalSync(t *testing.T) {
 	at := sh.Position()
 
 	late = true
-	if released, _, err := sh.Release(ctx, nil); err != nil || released {
+	if released, _, err := sh.Release(ctx, nil, capture.ResumeIfHeld); err != nil || released {
 		t.Fatalf("commit after the final sync: released=%v err=%v", released, err)
 	}
 	if err := sh.Sync(ctx); err != nil {
@@ -451,9 +451,9 @@ func TestReleaseSeesACommitAfterTheFinalSync(t *testing.T) {
 	// The late commit landed while the node held nothing, so the resumed
 	// release could not trust the WAL: it wrote the whole database as one
 	// file, which is the one entry past the position the release stopped at.
-	var en segment.Entry
+	var en journal.Entry
 	var seq pos.Seg
-	if err := segment.Scan(ctx, e.Journal, 1, 0, func(s pos.Seg, en2 segment.Entry) error {
+	if err := journal.Scan(ctx, e.Journal, 1, 0, func(s pos.Seg, en2 journal.Entry) error {
 		if en2.Shard.String() == name && en2.Position > at {
 			en, seq = en2, s
 		}
@@ -477,7 +477,7 @@ func TestReleaseSeesACommitAfterTheFinalSync(t *testing.T) {
 		t.Fatal("the history after a commit the final sync missed does not restore to the app's database")
 	}
 	// With nothing new, the node lets go.
-	if released, _, err := sh.Release(ctx, nil); err != nil || !released {
+	if released, _, err := sh.Release(ctx, nil, capture.ResumeIfHeld); err != nil || !released {
 		t.Fatalf("nothing new: released=%v err=%v", released, err)
 	}
 }
@@ -509,14 +509,14 @@ func TestReleaseWhoseWaitFailsReopensCapture(t *testing.T) {
 		t.Fatal(err)
 	}
 	app.Must(t, "close", "a")
-	if released, _, err := sh.Release(ctx, nil); !errors.Is(err, errStorage) || released {
+	if released, _, err := sh.Release(ctx, nil, capture.ResumeIfHeld); !errors.Is(err, errStorage) || released {
 		t.Fatalf("release whose wait failed: released=%v err=%v", released, err)
 	}
 	if !sh.Open() {
 		t.Fatal("capture was not reopened")
 	}
 	pos := sh.Position()
-	app.Must(t, "open", "a", e.Path(name))
+	app.Must(t, "create", "a", e.Path(name))
 	app.Must(t, "insert", "a", "5", "100")
 	app.Must(t, "close", "a")
 	if err := sh.Sync(ctx); err != nil {
@@ -525,7 +525,7 @@ func TestReleaseWhoseWaitFailsReopensCapture(t *testing.T) {
 	if sh.Position() <= pos {
 		t.Fatal("a commit after the failed release was not captured")
 	}
-	if released, _, err := sh.Release(ctx, nil); err != nil || !released {
+	if released, _, err := sh.Release(ctx, nil, capture.ResumeIfHeld); err != nil || !released {
 		t.Fatalf("second release: released=%v err=%v", released, err)
 	}
 	if sh.Open() {
@@ -548,11 +548,11 @@ func TestCloseWithAFencedWriterDoesNotRetry(t *testing.T) {
 	}
 	// An adopter fences the journal, and the writer finds out at its next flush.
 	adopter := e.Adopter("n2", e.Node)
-	if _, err := segment.Fence(ctx, adopter, 1); err != nil {
+	if _, err := journal.Fence(ctx, adopter, 1); err != nil {
 		t.Fatal(err)
 	}
 	app.Must(t, "insert", "a", "6", "100")
-	if err := sh.Sync(ctx); !errors.Is(err, segment.ErrFenced) {
+	if err := sh.Sync(ctx); !errors.Is(err, journal.ErrFenced) {
 		t.Fatalf("sync after the fence: %v, want ErrFenced", err)
 	}
 	// The final sync has a commit to queue, and the writer refuses it.
@@ -561,7 +561,7 @@ func TestCloseWithAFencedWriterDoesNotRetry(t *testing.T) {
 	go func() { done <- sh.Close(ctx) }()
 	select {
 	case err := <-done:
-		if !errors.Is(err, segment.ErrFenced) {
+		if !errors.Is(err, journal.ErrFenced) {
 			t.Fatalf("close: %v, want ErrFenced", err)
 		}
 	case <-time.After(10 * time.Second):

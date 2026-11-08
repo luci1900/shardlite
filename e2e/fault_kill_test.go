@@ -60,32 +60,32 @@ func (r *faultRig) activation(point kill.Point) {
 	r.recoverAndCheck(string(point))
 }
 
-// A kill when a shard that was let go of is activated again from the files that
-// were kept, WAL included, which the node folds into the database file.
-func (r *faultRig) cachedActivation(point kill.Point) {
+// A kill when a shard that was let go of when it went idle is activated again:
+// it is claimed and restored from blob storage, and the node dies at point on the way.
+func (r *faultRig) releasedActivation(point kill.Point) {
 	r.t.Helper()
 	r.arm(point)
 	r.settle(1)
-	r.waitCached(faultWallet)
+	r.waitReleased(faultWallet)
 	r.fireNow()
 	if r.touch(faultWallet) {
 		r.t.Fatalf("the shard was served though the node should have died at %s", point)
 	}
 	r.dies(point)
-	r.recoverAndCheck("cached " + string(point))
+	r.recoverAndCheck("released " + string(point))
 }
 
-// Activations from the cache that are not killed carry on, and the shard's
-// history restores to what the app wrote.
-func (r *faultRig) cachedCarriesOn() {
+// Activations of a shard let go of when it went idle that are not killed carry
+// on, and the shard's history restores to what the app wrote.
+func (r *faultRig) releasedCarriesOn() {
 	r.t.Helper()
 	r.settle(1)
 	for range 3 {
-		r.waitCached(faultWallet)
+		r.waitReleased(faultWallet)
 		r.mustCommit(faultWallet)
 		r.mustCommit(faultWallet)
 	}
-	r.verify("after three cached activations")
+	r.verify("after three activations after a release")
 }
 
 func TestFaultKillAfterWriteBeforeSync(t *testing.T) {
@@ -133,19 +133,17 @@ func TestFaultKillBetweenRestoreAndFirstSync(t *testing.T) {
 	}
 }
 
-// Restored is the restore's own point, which a cached activation does not
-// reach, so the cached activation is killed at the ones after it.
-func TestFaultKillCachedActivation(t *testing.T) {
+func TestFaultKillReleasedActivation(t *testing.T) {
 	t.Parallel()
-	for _, point := range activationPoints[1:] {
+	for _, point := range activationPoints {
 		t.Run(string(point), func(t *testing.T) {
 			t.Parallel()
-			newFaultRig(t).cachedActivation(point)
+			newFaultRig(t).releasedActivation(point)
 		})
 	}
 }
 
-func TestFaultCachedActivationCarriesOn(t *testing.T) {
+func TestFaultReleasedActivationCarriesOn(t *testing.T) {
 	t.Parallel()
-	newFaultRig(t).cachedCarriesOn()
+	newFaultRig(t).releasedCarriesOn()
 }

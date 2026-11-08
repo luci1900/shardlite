@@ -12,8 +12,8 @@ import (
 
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/capture"
+	"github.com/luci1900/shardlite/internal/journal"
 	"github.com/luci1900/shardlite/internal/pos"
-	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/tempfile"
 )
@@ -29,7 +29,7 @@ func shmIdent(t *testing.T, path string) (ino uint64, size int64) {
 
 func newShard(t *testing.T, e *env, path string) *capture.Shard {
 	t.Helper()
-	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w})
+	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName("users/1"), Path: path, Generation: "g1", Writer: e.w})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestWALIndexSurvivesAppChurn(t *testing.T) {
 	e := newEnv(t)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
-	app.Must(t, "open", "a", path)
+	app.Must(t, "create", "a", path)
 	app.Must(t, "close", "a") // the app is gone before the node maps
 	w, err := capture.MapWALIndex(path)
 	if err != nil {
@@ -107,7 +107,7 @@ func TestWALIndexSurvivesAppChurn(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := range 200 {
-		app.Must(t, "open", "a", path)
+		app.Must(t, "create", "a", path)
 		app.Must(t, "ack", "a", itoa(i))
 		h, err := w.Read()
 		if err != nil {
@@ -150,7 +150,7 @@ func TestWALIndexNeverFaultsWhileCaptured(t *testing.T) {
 	e := newEnv(t)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
-	app.Must(t, "open", "a", path)
+	app.Must(t, "create", "a", path)
 	app.Must(t, "close", "a")
 	w, err := capture.MapWALIndex(path)
 	if err != nil {
@@ -182,7 +182,7 @@ func TestWALIndexNeverFaultsWhileCaptured(t *testing.T) {
 		}
 	}()
 	for i := range 40 {
-		app.Must(t, "open", "a", path)
+		app.Must(t, "create", "a", path)
 		app.Must(t, "insert", "a", "5", "2000")
 		if i%3 == 0 {
 			app.Must(t, "ckpt", "a", "PASSIVE")
@@ -209,7 +209,7 @@ func TestWALIndexAcrossHeldRelease(t *testing.T) {
 	e := newEnv(t)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
-	app.Must(t, "open", "a", path)
+	app.Must(t, "create", "a", path)
 	w, err := capture.MapWALIndex(path)
 	if err != nil {
 		t.Fatal(err)
@@ -225,7 +225,7 @@ func TestWALIndexAcrossHeldRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.Close()
-	released, _, err := sh.Release(ctx, nil)
+	released, _, err := sh.Release(ctx, nil, capture.ResumeIfHeld)
 	if err != nil || released {
 		t.Fatalf("release: %v %v", released, err)
 	}
@@ -244,7 +244,7 @@ func TestWALIndexAcrossHeldRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	app.Must(t, "close", "a")
-	if released, _, err = sh.Release(ctx, nil); err != nil || !released {
+	if released, _, err = sh.Release(ctx, nil, capture.ResumeIfHeld); err != nil || !released {
 		t.Fatalf("final release: %v %v", released, err)
 	}
 }
@@ -259,25 +259,25 @@ func TestHeldReleaseKeepsTheWALForTheNextRelease(t *testing.T) {
 	e := newEnv(t)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
-	app.Must(t, "open", "a", path)
+	app.Must(t, "create", "a", path)
 	sh := newShard(t, e, path)
 	ctx := context.Background()
 	app.Must(t, "insert", "a", "20", "1000")
 	if err := sh.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if released, _, err := sh.Release(ctx, nil); err != nil || released {
+	if released, _, err := sh.Release(ctx, nil, capture.ResumeIfHeld); err != nil || released {
 		t.Fatalf("release with the app holding the shard: %v %v", released, err)
 	}
-	before, _ := e.entriesFor(t, "test.users/1")
+	before, _ := e.entriesFor(t, "users/1")
 	app.Must(t, "close", "a")
 	if err := sh.Sync(ctx); err != nil { // the next flush cycle, or the messages owner's first read
 		t.Fatal(err)
 	}
-	if released, _, err := sh.Release(ctx, nil); err != nil || !released {
+	if released, _, err := sh.Release(ctx, nil, capture.ResumeIfHeld); err != nil || !released {
 		t.Fatalf("release once the app closed it: %v %v", released, err)
 	}
-	if after, _ := e.entriesFor(t, "test.users/1"); len(after) != len(before) {
+	if after, _ := e.entriesFor(t, "users/1"); len(after) != len(before) {
 		t.Fatalf("the shard's sync and release after the app closed it captured %d files, want none", len(after)-len(before))
 	}
 }
@@ -290,7 +290,7 @@ func TestWALIndexSeesEveryCommit(t *testing.T) {
 	e := newEnv(t)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
-	app.Must(t, "open", "a", path)
+	app.Must(t, "create", "a", path)
 	w, err := capture.MapWALIndex(path)
 	if err != nil {
 		t.Fatal(err)
@@ -298,7 +298,7 @@ func TestWALIndexSeesEveryCommit(t *testing.T) {
 	defer w.Close()
 	sh, err := capture.New(capture.Config{
 		TempDir: tempDir(t),
-		Name:    shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w,
+		Name:    shardName("users/1"), Path: path, Generation: "g1", Writer: e.w,
 		RestartFrames: 3,
 	})
 	if err != nil {
@@ -358,7 +358,7 @@ func waitFor(t *testing.T, ch <-chan struct{}, what string) {
 
 // appendHook calls before at the start of every AppendFile.
 type appendHook struct {
-	*segment.Writer
+	*journal.Writer
 	before func()
 }
 
@@ -378,8 +378,8 @@ func TestHeaderDuringASlowSyncAnswers(t *testing.T) {
 	entered, release := make(chan struct{}), make(chan struct{})
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
-	app.Must(t, "open", "a", path)
-	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: appendHook{e.w, func() {
+	app.Must(t, "create", "a", path)
+	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName("users/1"), Path: path, Generation: "g1", Writer: appendHook{e.w, func() {
 		if armed.CompareAndSwap(true, false) {
 			close(entered)
 			<-release
@@ -436,8 +436,8 @@ func TestHeaderAfterCloseIsClosed(t *testing.T) {
 	e := newEnv(t)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
-	app.Must(t, "open", "a", path)
-	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w})
+	app.Must(t, "create", "a", path)
+	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName("users/1"), Path: path, Generation: "g1", Writer: e.w})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -449,5 +449,50 @@ func TestHeaderAfterCloseIsClosed(t *testing.T) {
 	}
 	if _, err := sh.Header(); !errors.Is(err, capture.ErrClosed) {
 		t.Fatalf("header after close: %v, want ErrClosed", err)
+	}
+}
+
+// A release told to go ahead lets go of a shard the app still holds, and says the file was open.
+func TestReleaseGoesAheadOverAHeldFile(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	app := apptest.Start(t)
+	path := filepath.Join(e.dir, "users-1.db")
+	app.Must(t, "create", "a", path)
+	sh := newShard(t, e, path)
+	ctx := context.Background()
+	app.Must(t, "ack", "a", "1")
+	if err := sh.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	released, _, err := sh.Release(ctx, nil, capture.GoAheadIfHeld)
+	if err != nil || !released {
+		t.Fatalf("release over a held file: %v %v", released, err)
+	}
+	if !sh.OpenAtRelease() {
+		t.Fatal("the release did not say the file was open")
+	}
+}
+
+// A file nobody holds is released as not open, going ahead or not.
+func TestReleaseGoingAheadReportsNothingOpenWhenTheFileIsClosed(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	app := apptest.Start(t)
+	path := filepath.Join(e.dir, "users-1.db")
+	app.Must(t, "create", "a", path)
+	sh := newShard(t, e, path)
+	ctx := context.Background()
+	app.Must(t, "ack", "a", "1")
+	app.Must(t, "close", "a")
+	if err := sh.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	released, _, err := sh.Release(ctx, nil, capture.GoAheadIfHeld)
+	if err != nil || !released {
+		t.Fatalf("release of a closed file: %v %v", released, err)
+	}
+	if sh.OpenAtRelease() {
+		t.Fatal("a file nobody had open was reported as open")
 	}
 }

@@ -75,15 +75,14 @@ type flushResult struct {
 func loadFlush(t *testing.T, cfg flushCfg, n int, d time.Duration) flushResult {
 	t.Helper()
 	s := s3test.Setup(t)
-	r := newMRigOn(t, func(o *CatalogOptions) {
+	r := newMRigOn(t, func(o *ShardsetOptions) {
 		o.Flush.Interval, o.Flush.Min, o.Flush.Coalesce, o.Flush.NoEarly = cfg.interval, cfg.min, cfg.coales, cfg.noEarly
-		o.Cache.Every = time.Hour
 	}, s.Backend(t))
 	var puts counter
 	const shards = 20
 	refs := make([]*Hold, shards)
 	for i := range refs {
-		refs[i] = r.acquire(fmt.Sprintf("test.wallet/m%d", i))
+		refs[i] = r.acquire(fmt.Sprintf("wallet/m%d", i))
 		r.write(refs[i], fmt.Sprint(i))
 	}
 	if err := r.m.Gate(context.Background(), refs[0], kind.SyncStorage); err != nil {
@@ -185,13 +184,13 @@ func TestMeasureDeltas(t *testing.T) {
 	)
 	one := func(name string, age time.Duration, size int64) {
 		s := s3test.Setup(t)
-		r := newMRigOn(t, func(o *CatalogOptions) {
-			o.Lifecycle.DeltaAge, o.Lifecycle.DeltaSize, o.Lifecycle.SnapshotEvery, o.Cache.Every = age, size, 200*time.Millisecond, time.Hour
+		r := newMRigOn(t, func(o *ShardsetOptions) {
+			o.Lifecycle.DeltaAge, o.Lifecycle.DeltaSize, o.Lifecycle.SnapshotEvery = age, size, 200*time.Millisecond
 		}, s.Backend(t))
 		var puts counter
 		refs := make([]*Hold, shards)
 		for i := range refs {
-			refs[i] = r.acquire(fmt.Sprintf("test.slow/m%d", i)) // (sync off: nothing waits, the tick flushes)
+			refs[i] = r.acquire(fmt.Sprintf("slow/m%d", i)) // (sync off: nothing waits, the tick flushes)
 			r.write(refs[i], fmt.Sprint(i))
 		}
 		r.afterCycle()
@@ -235,12 +234,12 @@ func TestMeasureReplay(t *testing.T) {
 	measuring(t, "replay")
 	for _, d := range []time.Duration{10 * time.Second, 30 * time.Second} {
 		s := s3test.Setup(t)
-		r := newMRigOn(t, func(o *CatalogOptions) { o.Cache.Every = time.Hour; o.Lifecycle.DeltaAge = time.Hour }, s.Backend(t))
+		r := newMRigOn(t, func(o *ShardsetOptions) { o.Lifecycle.DeltaAge = time.Hour }, s.Backend(t))
 		var puts counter
 		const shards = 20
 		refs := make([]*Hold, shards)
 		for i := range refs {
-			refs[i] = r.acquire(fmt.Sprintf("test.wallet/m%d", i))
+			refs[i] = r.acquire(fmt.Sprintf("wallet/m%d", i))
 			r.write(refs[i], fmt.Sprint(i))
 		}
 		s3Latency(r, &puts)

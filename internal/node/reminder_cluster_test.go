@@ -26,7 +26,7 @@ import (
 // then answers 503 after a call that succeeded, so the call is made three times
 // and the receiver does its work once.
 func TestDurableSendBetweenNodes(t *testing.T) {
-	c := newClusterWith(t, 2, func(o *CatalogOptions) {
+	c := newClusterWith(t, 2, func(o *ShardsetOptions) {
 		o.Reminders.Backoff, o.Reminders.MaxBackoff = 20*time.Millisecond, 50*time.Millisecond
 	})
 	n0, n1 := c.nodes[0], c.nodes[1]
@@ -105,11 +105,11 @@ func TestDurableSendBetweenNodes(t *testing.T) {
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}
 	})
-	n0.create("test.users/s")
-	ask(t, n0, "test.users/s")
+	n0.create("users/s")
+	ask(t, n0, "users/s")
 	sender := <-paths
-	n1.create("test.users/r")
-	ask(t, n1, "test.users/r")
+	n1.create("users/r")
+	ask(t, n1, "users/r")
 	receiver := <-paths
 	for _, p := range []string{sender, receiver} {
 		app.Must(t, "open", p, p)
@@ -117,7 +117,7 @@ func TestDurableSendBetweenNodes(t *testing.T) {
 	}
 	app.Must(t, "exec", receiver, `CREATE TABLE seen (caller TEXT, key TEXT, PRIMARY KEY (caller, key)); CREATE TABLE work (payload TEXT)`)
 	app.Must(t, "exec", sender, `CREATE TABLE sends (key TEXT PRIMARY KEY, target TEXT, path TEXT, body TEXT)`)
-	app.Must(t, "exec", sender, `BEGIN; INSERT INTO sends VALUES ('send:1', 'test.users/r', '/work', 'hello'); INSERT INTO _shardlite_reminders (key, due) VALUES ('send:1', unixepoch()); COMMIT;`)
+	app.Must(t, "exec", sender, `BEGIN; INSERT INTO sends VALUES ('send:1', 'users/r', '/work', 'hello'); INSERT INTO _shardlite_reminders (key, due) VALUES ('send:1', unixepoch()); COMMIT;`)
 
 	apptest.Eventually(t, 30*time.Second, "the reminder to be handled", func() bool {
 		return app.Must(t, "query", "q", sender, `SELECT count(*) FROM _shardlite_reminders`) == `"0"`
@@ -137,7 +137,7 @@ func TestDurableSendBetweenNodes(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	for _, h := range seen {
-		if h.Get("Shardlite-Caller") != "test.users/s" || h.Get("Idempotency-Key") != "send:1" {
+		if h.Get("Shardlite-Caller") != "users/s" || h.Get("Idempotency-Key") != "send:1" {
 			t.Fatalf("the receiver saw %v", h)
 		}
 	}
@@ -158,8 +158,8 @@ func TestInboxHeaderIsOrdinaryBetweenNodes(t *testing.T) {
 		mu.Unlock()
 		io.WriteString(w, "served")
 	})
-	n0.create("test.users/h")
-	ask(t, n0, "test.users/h") // n0 owns it
+	n0.create("users/h")
+	ask(t, n0, "users/h") // n0 owns it
 	for _, via := range []struct{ name, base string }{
 		{"public, local", "http://" + n0.Public},
 		{"public, forwarded", "http://" + n1.Public},
@@ -168,7 +168,7 @@ func TestInboxHeaderIsOrdinaryBetweenNodes(t *testing.T) {
 		mu.Lock()
 		seen = nil
 		mu.Unlock()
-		resp, body := send(t, "POST", via.base+"/hello", map[string]string{"Shardlite-Target": "test.users/h", "Shardlite-Inbox": "true"}, "body")
+		resp, body := send(t, "POST", via.base+"/hello", map[string]string{"Shardlite-Target": "users/h", "Shardlite-Inbox": "true"}, "body")
 		if resp.StatusCode != http.StatusOK || body != "served" {
 			t.Fatalf("%s: answered %d %q, want the app's 200", via.name, resp.StatusCode, body)
 		}
@@ -188,7 +188,7 @@ func TestInboxHeaderIsOrdinaryBetweenNodes(t *testing.T) {
 		mu.Lock()
 		seen = nil
 		mu.Unlock()
-		hdr := map[string]string{"Shardlite-Target": "test.users/h", "Shardlite-Caller": "test.users/x", "Shardlite-Hops": "0", "Shardlite-Inbox": "true"}
+		hdr := map[string]string{"Shardlite-Target": "users/h", "Shardlite-Caller": "users/x", "Shardlite-Hops": "0", "Shardlite-Inbox": "true"}
 		if tc.origin != "" {
 			hdr["Shardlite-Origin"] = tc.origin
 		}

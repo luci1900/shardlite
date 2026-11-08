@@ -8,7 +8,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
-	"slices"
+
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -63,25 +63,25 @@ func TestForwardIsServedByTheOwner(t *testing.T) {
 		})
 	}
 	hdr := map[string]string{
-		"Shardlite-Foo": "1", "Shardlite-Caller": "test.users/9", "Shardlite-Hops": "7", "Shardlite-Deadline": "5",
+		"Shardlite-Foo": "1", "Shardlite-Caller": "users/9", "Shardlite-Hops": "7", "Shardlite-Deadline": "5",
 		"Traceparent":     "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
 		"X-Forwarded-For": "203.0.113.9", "X-Forwarded-Proto": "https", "Content-Type": "text/plain", "X-Custom": "a",
 	}
 	ask := func(nd *clusterNode) seen {
 		t.Helper()
-		resp, body := send(t, "POST", "http://"+nd.Public+"/items?x=1&shardlite-target=test.users/f1&y=2", hdr, "hello")
+		resp, body := send(t, "POST", "http://"+nd.Public+"/items?x=1&shardlite-target=users/f1&y=2", hdr, "hello")
 		if resp.StatusCode != 200 || body != "served" || resp.Header.Get("X-Served-By") != "n0" {
 			t.Fatalf("through %s: %d %q from %q", nd.env.Name, resp.StatusCode, body, resp.Header.Get("X-Served-By"))
 		}
 		return <-got
 	}
-	c.nodes[0].create("test.users/f1")
+	c.nodes[0].create("users/f1")
 	local := ask(c.nodes[0])
 	fwd := ask(c.nodes[1])
 	if fwd.node != "n0" {
 		t.Fatalf("the forward was served by %s", fwd.node)
 	}
-	if local.uri != "/items?x=1&y=2" || local.body != "hello" || local.hdr.Get("Shardlite-Opened") != "test.users/f1" ||
+	if local.uri != "/items?x=1&y=2" || local.body != "hello" || local.hdr.Get("Shardlite-Opened") != "users/f1" ||
 		local.hdr.Get("Shardlite-Hops") != "0" || local.hdr.Get("Shardlite-Foo") != "" || local.hdr.Get("Shardlite-Caller") != "" ||
 		local.hdr.Get("Shardlite-Deadline") != "" || local.hdr.Get("X-Forwarded-For") != "203.0.113.9, 127.0.0.1" {
 		t.Fatalf("the local request: %+v", local)
@@ -101,11 +101,11 @@ func TestForwardKeepsUncleanPaths(t *testing.T) {
 		got <- q.RequestURI
 		io.WriteString(w, "served")
 	})
-	c.nodes[0].create("test.users/f1") // so the request through n1 is a forward
+	c.nodes[0].create("users/f1") // so the request through n1 is a forward
 	for _, p := range []string{"/a//b", "/a/../b"} {
 		// http.NewRequest keeps the path as it is given, so the client does not clean it.
 		for i, nd := range c.nodes {
-			resp, body := send(t, "GET", "http://"+nd.Public+p, map[string]string{"Shardlite-Target": "test.users/f1"}, "")
+			resp, body := send(t, "GET", "http://"+nd.Public+p, map[string]string{"Shardlite-Target": "users/f1"}, "")
 			if resp.StatusCode != 200 || body != "served" {
 				t.Fatalf("%s through n%d: %d %q", p, i, resp.StatusCode, body)
 			}
@@ -140,10 +140,10 @@ func TestForwardStreams(t *testing.T) {
 			}
 		}
 	})
-	c.nodes[0].create("test.users/sse")
+	c.nodes[0].create("users/sse")
 
 	q, _ := http.NewRequest("GET", "http://"+c.nodes[1].Public+"/events", nil)
-	q.Header.Set("Shardlite-Target", "test.users/sse")
+	q.Header.Set("Shardlite-Target", "users/sse")
 	resp, err := clusterClient.Do(q)
 	if err != nil {
 		t.Fatal(err)
@@ -203,7 +203,7 @@ func TestForwardedCallIsGatedOnBothNodes(t *testing.T) {
 			return
 		}
 		a := arrival{callerCycles: n0.cycles()}
-		if b, _ := io.ReadAll(q.Body); string(b) != "the call" || q.Header.Get("Shardlite-Caller") != "test.wallet/c" {
+		if b, _ := io.ReadAll(q.Body); string(b) != "the call" || q.Header.Get("Shardlite-Caller") != "wallet/c" {
 			http.Error(w, "bad call", 400)
 			return
 		}
@@ -214,9 +214,9 @@ func TestForwardedCallIsGatedOnBothNodes(t *testing.T) {
 	})
 	var caller, callee string
 	cycling(func() {
-		send(t, "GET", "http://"+n0.Control+"/", map[string]string{"Shardlite-Target": "test.wallet/c"}, "")
+		send(t, "GET", "http://"+n0.Control+"/", map[string]string{"Shardlite-Target": "wallet/c"}, "")
 		caller = <-paths
-		send(t, "GET", "http://"+n1.Control+"/", map[string]string{"Shardlite-Target": "test.wallet/d"}, "")
+		send(t, "GET", "http://"+n1.Control+"/", map[string]string{"Shardlite-Target": "wallet/d"}, "")
 		callee = <-paths
 	}, n0, n1)
 	for _, p := range []string{caller, callee} {
@@ -229,8 +229,8 @@ func TestForwardedCallIsGatedOnBothNodes(t *testing.T) {
 	answered := make(chan string, 1)
 	go func() {
 		q, _ := http.NewRequest("POST", "http://"+n0.Control+"/call", strings.NewReader("the call"))
-		q.Header.Set("Shardlite-Target", "test.wallet/d")
-		q.Header.Set("Shardlite-Caller", "test.wallet/c")
+		q.Header.Set("Shardlite-Target", "wallet/d")
+		q.Header.Set("Shardlite-Caller", "wallet/c")
 		resp, err := clusterClient.Do(q)
 		if err != nil {
 			answered <- err.Error()
@@ -282,10 +282,10 @@ func TestForwardIsCancelled(t *testing.T) {
 		<-q.Context().Done()
 		close(ended)
 	})
-	c.nodes[0].create("test.users/w")
+	c.nodes[0].create("users/w")
 	ctx, cancel := context.WithCancel(context.Background())
 	q, _ := http.NewRequestWithContext(ctx, "GET", "http://"+c.nodes[1].Public+"/wait", nil)
-	q.Header.Set("Shardlite-Target", "test.users/w")
+	q.Header.Set("Shardlite-Target", "users/w")
 	go func() {
 		if resp, err := clusterClient.Do(q); err == nil {
 			resp.Body.Close()
@@ -351,17 +351,17 @@ func TestForwardGRPC(t *testing.T) {
 		w.Header().Set("Grpc-Status", "0")
 		w.Header().Set("Grpc-Message", "fine")
 	})
-	c.nodes[0].create("test.users/rpc")
+	c.nodes[0].create("users/rpc")
 	through := "http://" + c.nodes[1].Public
 
-	resp := grpcRequest(t, through+"/svc/Unary", "test.users/rpc", nil)
+	resp := grpcRequest(t, through+"/svc/Unary", "users/rpc", nil)
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if string(body) != "frame1" || resp.Trailer.Get("Grpc-Status") != "0" || resp.Trailer.Get("Grpc-Message") != "fine" {
 		t.Fatalf("unary: %q %v", body, resp.Trailer)
 	}
 
-	resp = grpcRequest(t, through+"/svc/Stream", "test.users/rpc", nil)
+	resp = grpcRequest(t, through+"/svc/Stream", "users/rpc", nil)
 	defer resp.Body.Close()
 	buf := make([]byte, 6)
 	if _, err := io.ReadFull(resp.Body, buf); err != nil || string(buf) != "frame1" {
@@ -374,8 +374,8 @@ func TestForwardGRPC(t *testing.T) {
 }
 
 // A call with Shardlite-If-Active: true for a shard another node owns goes to
-// the owner: it is served while the shard is active there and answered 404 by
-// the owner once it is only cached, and isn't activated by it.
+// the owner: it is served while the shard is active there and answered 404 once
+// the shard has gone idle and been released (the manifest names nobody), and isn't activated.
 func TestForwardIfActive(t *testing.T) {
 	c := newCluster(t, 2)
 	n0, n1 := c.nodes[0], c.nodes[1]
@@ -387,25 +387,25 @@ func TestForwardIfActive(t *testing.T) {
 		}
 		w.Header().Set("X-Served-By", "n0")
 	})
-	send(t, "GET", "http://"+n0.Control+"/", map[string]string{"Shardlite-Target": "test.brief/x"}, "")
+	send(t, "GET", "http://"+n0.Control+"/", map[string]string{"Shardlite-Target": "brief/x"}, "")
 	p := <-paths
 	app.Must(t, "open", p, p)
-	app.Must(t, "insert", p, "1", "64") // written, so it is cached when it goes idle
-	call := map[string]string{"Shardlite-Target": "test.brief/x", "Shardlite-Caller": "app", "Shardlite-If-Active": "true"}
+	app.Must(t, "insert", p, "1", "64") // written, so it is kept when it goes idle
+	call := map[string]string{"Shardlite-Target": "brief/x", "Shardlite-Caller": "app", "Shardlite-If-Active": "true"}
 	if resp, _ := send(t, "GET", "http://"+n1.Control+"/presence", call, ""); resp.StatusCode != 200 || resp.Header.Get("X-Served-By") != "n0" {
 		t.Fatalf("If-Active for a shard active on its owner: %d %v", resp.StatusCode, resp.Header)
 	}
 	app.Must(t, "close", p)
-	apptest.Eventually(t, apptest.Timeout, "the shard to go idle on its owner", func() bool { return !n0.m.Load().IsActive(shardName("test.brief/x")) })
-	if cached, err := n0.m.Load().Cached(); err != nil || !slices.Contains(cached, shardName("test.brief/x")) {
-		t.Fatalf("the shard is not cached on its owner: %v %v", cached, err)
+	apptest.Eventually(t, apptest.Timeout, "the shard to go idle on its owner", func() bool { return !n0.m.Load().IsActive(shardName("brief/x")) })
+	if got := owner(t, n0, "brief/x"); got != "" {
+		t.Fatalf("the manifest of the shard that went idle names %q, want nobody", got)
 	}
 
-	arrived := n0.countReads(shardfile.ManifestKey(shardName("test.brief/x"))) // n0 reads it to find the shard isn't active
-	if resp, _ := send(t, "GET", "http://"+n1.Control+"/presence", call, ""); resp.StatusCode != http.StatusNotFound || arrived.Load() == 0 {
-		t.Fatalf("If-Active for a shard cached on its owner: %d, %d manifest reads on the owner", resp.StatusCode, arrived.Load())
+	reads := n1.countReads(shardfile.ManifestKey(shardName("brief/x"))) // n1 reads it to find that nobody owns the shard
+	if resp, _ := send(t, "GET", "http://"+n1.Control+"/presence", call, ""); resp.StatusCode != http.StatusNotFound || reads.Load() == 0 {
+		t.Fatalf("If-Active for a shard released by its owner: %d, %d manifest reads on the asked node", resp.StatusCode, reads.Load())
 	}
-	if n0.m.Load().IsActive(shardName("test.brief/x")) || n1.m.Load().IsActive(shardName("test.brief/x")) {
+	if n0.m.Load().IsActive(shardName("brief/x")) || n1.m.Load().IsActive(shardName("brief/x")) {
 		t.Fatal("If-Active activated the shard")
 	}
 }
@@ -471,15 +471,15 @@ func TestForwardUpgrade(t *testing.T) {
 	// timeout is 100 ms, and a shard that nothing has written is deleted when it
 	// goes idle, which leaves the client's request nothing to reach.
 	var refs []*Hold
-	for _, target := range []string{"test.brief/ws", "test.brief/other"} {
+	for _, target := range []string{"brief/ws", "brief/other"} {
 		ref, err := n0.m.Load().Acquire(context.Background(), shardName(target))
 		if err != nil {
 			t.Fatalf("claim %s: %v", target, err)
 		}
 		refs = append(refs, ref)
 	}
-	conn, br := upgrade(t, n1.Public, map[string]string{"Shardlite-Target": "test.brief/ws"})
-	if line, err := br.ReadString('\n'); err != nil || line != "hello test.brief/ws\n" {
+	conn, br := upgrade(t, n1.Public, map[string]string{"Shardlite-Target": "brief/ws"})
+	if line, err := br.ReadString('\n'); err != nil || line != "hello brief/ws\n" {
 		t.Fatalf("%q %v", line, err)
 	}
 	for _, ref := range refs { // the open connection holds brief/ws from here
@@ -492,11 +492,11 @@ func TestForwardUpgrade(t *testing.T) {
 		}
 	}
 	// brief/other went idle with the same timeout: brief/ws would have too.
-	apptest.Eventually(t, apptest.Timeout, "test.brief/other to go idle", func() bool { return !n0.m.Load().IsActive(shardName("test.brief/other")) })
-	if !n0.m.Load().IsActive(shardName("test.brief/ws")) {
+	apptest.Eventually(t, apptest.Timeout, "brief/other to go idle", func() bool { return !n0.m.Load().IsActive(shardName("brief/other")) })
+	if !n0.m.Load().IsActive(shardName("brief/ws")) {
 		t.Fatal("the owner let go of a shard with a connection open")
 	}
-	if n1.m.Load().IsActive(shardName("test.brief/ws")) {
+	if n1.m.Load().IsActive(shardName("brief/ws")) {
 		t.Fatal("the forwarding node activated the shard")
 	}
 	conn.Close()
@@ -505,7 +505,7 @@ func TestForwardUpgrade(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("closing the client did not close the app's side")
 	}
-	apptest.Eventually(t, apptest.Timeout, "test.brief/ws to go idle", func() bool { return !n0.m.Load().IsActive(shardName("test.brief/ws")) })
+	apptest.Eventually(t, apptest.Timeout, "brief/ws to go idle", func() bool { return !n0.m.Load().IsActive(shardName("brief/ws")) })
 }
 
 // Stopping the forwarding node ends a forwarded WebSocket on both sides, as it
@@ -516,9 +516,9 @@ func TestForwardUpgradeEndsWithTheForwardingNode(t *testing.T) {
 	n0, n1 := c.nodes[0], c.nodes[1]
 	closed := make(chan string, 1)
 	n0.serve(echoWS(closed))
-	n0.create("test.users/ws")
-	conn, br := upgrade(t, n1.Public, map[string]string{"Shardlite-Target": "test.users/ws"})
-	if line, err := br.ReadString('\n'); err != nil || line != "hello test.users/ws\n" {
+	n0.create("users/ws")
+	conn, br := upgrade(t, n1.Public, map[string]string{"Shardlite-Target": "users/ws"})
+	if line, err := br.ReadString('\n'); err != nil || line != "hello users/ws\n" {
 		t.Fatalf("%q %v", line, err)
 	}
 	n1.Stop()
@@ -534,5 +534,70 @@ func TestForwardUpgradeEndsWithTheForwardingNode(t *testing.T) {
 	n0.Stop()
 	if left := startedSince(before, nodeGoroutines()); len(left) > 0 {
 		t.Fatalf("%d node goroutines left after the cluster stopped:\n%s", len(left), strings.Join(left, "\n\n"))
+	}
+}
+
+// A client's request forwarded here for a shard nobody owns went by a stale owner cache, so the shard is claimed where the client's session is: the forward is answered 421 naming the sender (Shardlite-Node). A forward that carries Shardlite-Placement: avoid is a draining node's claim placed here, and is claimed here. So is one from a call, which has no session.
+func TestSendBackRuleReadsThePlacementOfAForward(t *testing.T) {
+	c := newCluster(t, 2)
+	n0 := c.nodes[0]
+	n0.serve(func(w http.ResponseWriter, q *http.Request) { io.WriteString(w, "served") })
+	for _, tc := range []struct {
+		name   string
+		hdr    map[string]string
+		status int
+		owner  string // the node the 421 names
+	}{
+		{"a client's forward", map[string]string{"Shardlite-Origin": originClient, hdrNode: "n1"}, 421, "n1"},
+		{"a client's forward from a draining node", map[string]string{"Shardlite-Origin": originClient, hdrNode: "n1", hdrPlacement: placementAvoid}, 200, ""},
+		{"a client's forward that avoids with a parameter", map[string]string{"Shardlite-Origin": originClient, hdrNode: "n1", hdrPlacement: placementAvoid + ";for=5"}, 200, ""},
+		{"a client's forward with a bad placement", map[string]string{"Shardlite-Origin": originClient, hdrNode: "n1", hdrPlacement: "yes"}, 421, "n1"},
+		{"a client's forward that avoids with no name", map[string]string{"Shardlite-Origin": originClient, hdrPlacement: placementAvoid}, 200, ""},
+		{"a client's forward with no name", map[string]string{"Shardlite-Origin": originClient}, 200, ""},
+		{"a client's forward with a bad name", map[string]string{"Shardlite-Origin": originClient, hdrNode: "n 1"}, 200, ""},
+		{"a call's forward", map[string]string{"Shardlite-Origin": originCall, hdrNode: "n1"}, 200, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			target := "users/" + strings.NewReplacer(" ", "-", "'", "", ";", "").Replace(tc.name)
+			n0.unowned(target)
+			tc.hdr["Shardlite-Target"] = target
+			got := n0.peerDo("GET", "/x", tc.hdr, "")
+			if got.status != tc.status || got.final.Get(hdrOwner) != tc.owner {
+				t.Fatalf("answered %d naming %q, want %d naming %q", got.status, got.final.Get(hdrOwner), tc.status, tc.owner)
+			}
+			if active := n0.m.Load().IsActive(shardName(target)); active != (tc.status == 200) {
+				t.Fatalf("the shard is active here: %v", active)
+			}
+		})
+	}
+}
+
+// A forward answered by a draining node carries Shardlite-Placement: avoid in the 102 and the final answer, the forwarding node avoids the node from the 102 on, and the client sees none of it. An answer from the node without it ends the avoiding.
+func TestForwardLearnsAvoidFromTheOwnersAnswers(t *testing.T) {
+	c := newCluster(t, 2)
+	n0, n1 := c.nodes[0], c.nodes[1]
+	n0.serve(func(w http.ResponseWriter, q *http.Request) { io.WriteString(w, "served") })
+	n0.create("users/a")
+	p1 := n1.m.Load().placer
+	forward := func() {
+		t.Helper()
+		resp, body := send(t, "GET", "http://"+n1.Public+"/x", map[string]string{"Shardlite-Target": "users/a"}, "")
+		if resp.StatusCode != 200 || body != "served" || len(resp.Header.Values(hdrPlacement)) != 0 {
+			t.Fatalf("the forward: %d %q, placement %v", resp.StatusCode, body, resp.Header.Values(hdrPlacement))
+		}
+	}
+	forward()
+	if p1.avoids("n0") {
+		t.Fatal("n1 avoids n0 though it doesn't drain")
+	}
+	n0.m.Load().Drain()
+	forward()
+	if !p1.avoids("n0") {
+		t.Fatal("n1 did not hear that n0 drains")
+	}
+	n0.m.Load().draining.Store(false)
+	forward()
+	if p1.avoids("n0") {
+		t.Fatal("n1 still avoids n0 after an answer without the header")
 	}
 }

@@ -99,14 +99,14 @@ func TestGateOnStreamingCallBody(t *testing.T) {
 			r := newSRigWith(t, manualFlush)
 			seen := make(chan seenChunk, 16)
 			started := make(chan struct{})
-			r.calleeReadingBody("test.wallet/st1", seen, started)
+			r.calleeReadingBody("wallet/st1", seen, started)
 
 			commits := 1
-			r.commitTo("test.wallet/st1")
+			r.commitTo("wallet/st1")
 			pr, pw := io.Pipe()
 			req, _ := http.NewRequest("POST", r.ctl+"/stream", pr)
-			req.Header.Set("Shardlite-Target", "test.slow/callee")
-			req.Header.Set("Shardlite-Caller", "test.wallet/st1")
+			req.Header.Set("Shardlite-Target", "slow/callee")
+			req.Header.Set("Shardlite-Caller", "wallet/st1")
 			req.Header.Set("Content-Type", tc.ctype)
 			client := r.client
 			if tc.h2 {
@@ -130,12 +130,12 @@ func TestGateOnStreamingCallBody(t *testing.T) {
 			}()
 			// The headers wait for the first commit.
 			cyclesUntil(r, started)
-			if got := r.rows("test.wallet/st1"); got != 1 {
+			if got := r.rows("wallet/st1"); got != 1 {
 				t.Fatalf("the callee got the call with %d rows in blob storage", got)
 			}
 
 			for _, chunk := range []string{"first", "second"} {
-				r.commitTo("test.wallet/st1")
+				r.commitTo("wallet/st1")
 				commits++
 				if _, err := pw.Write([]byte(chunk)); err != nil {
 					t.Fatal(err)
@@ -146,7 +146,7 @@ func TestGateOnStreamingCallBody(t *testing.T) {
 				}
 			}
 			// The end of the body (which carries trailers) is gated as well.
-			r.commitTo("test.wallet/st1")
+			r.commitTo("wallet/st1")
 			commits++
 			pw.Close()
 			c := cyclesUntil(r, seen)
@@ -156,7 +156,7 @@ func TestGateOnStreamingCallBody(t *testing.T) {
 			if got := cyclesUntil(r, res); got.err != nil || got.resp.StatusCode != 200 || got.body != "done" {
 				t.Fatalf("%v %v %q", got.err, got.resp, got.body)
 			}
-			r.closeInApp("test.wallet/st1")
+			r.closeInApp("wallet/st1")
 		})
 	}
 }
@@ -179,7 +179,7 @@ func TestUpgradedCallFromAShardIsRefused(t *testing.T) {
 	for _, tc := range []struct {
 		caller string
 		want   int
-	}{{"test.wallet/up1", http.StatusBadRequest}, {"test.users/up2", http.StatusBadRequest}, {"app", http.StatusSwitchingProtocols}, {"", http.StatusSwitchingProtocols}} {
+	}{{"wallet/up1", http.StatusBadRequest}, {"users/up2", http.StatusBadRequest}, {"app", http.StatusSwitchingProtocols}, {"", http.StatusSwitchingProtocols}} {
 		conn, err := net.Dial("tcp", strings.TrimPrefix(r.ctl, "http://"))
 		if err != nil {
 			t.Fatal(err)
@@ -188,7 +188,7 @@ func TestUpgradedCallFromAShardIsRefused(t *testing.T) {
 		if tc.caller != "" {
 			caller = "Shardlite-Caller: " + tc.caller + "\r\n"
 		}
-		fmt.Fprintf(conn, "GET /ws HTTP/1.1\r\nHost: x\r\nShardlite-Target: test.slow/up\r\n%sUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n", caller)
+		fmt.Fprintf(conn, "GET /ws HTTP/1.1\r\nHost: x\r\nShardlite-Target: slow/up\r\n%sUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n", caller)
 		rs, err := http.ReadResponse(bufio.NewReader(conn), nil)
 		conn.Close()
 		if err != nil || rs.StatusCode != tc.want {
@@ -212,10 +212,10 @@ func TestCallsThatAreNotGated(t *testing.T) {
 		io.Copy(io.Discard, q.Body)
 		io.WriteString(w, "ok")
 	})
-	r.commitTo("test.users/ng1")  // the none tier: the call waits for nothing
-	r.commitTo("test.wallet/ng2") // storage's, and the header can name storage again
+	r.commitTo("users/ng1")  // the none tier: the call waits for nothing
+	r.commitTo("wallet/ng2") // storage's, and the header can name storage again
 	do := func(caller string, hdr map[string]string) {
-		h := map[string]string{"Shardlite-Target": "test.slow/ng", "Shardlite-Caller": caller}
+		h := map[string]string{"Shardlite-Target": "slow/ng", "Shardlite-Caller": caller}
 		for k, v := range hdr {
 			h[k] = v
 		}
@@ -242,22 +242,22 @@ func TestCallsThatAreNotGated(t *testing.T) {
 		}
 	}
 	r.withoutCycle(func() {
-		do("test.wallet/neverseen", nil) // not active on this node
+		do("wallet/neverseen", nil) // not active on this node
 		do("app", nil)
 	})
 	if calls.Load() != 2 {
 		t.Fatalf("%d calls reached the callee", calls.Load())
 	}
 	r.withoutCycle(func() {
-		do("test.users/ng1", nil)
-		do("test.wallet/ng2", map[string]string{"Shardlite-Sync": "none"})
+		do("users/ng1", nil)
+		do("wallet/ng2", map[string]string{"Shardlite-Sync": "none"})
 	})
 	if calls.Load() != 4 {
 		t.Fatalf("%d calls reached the callee", calls.Load())
 	}
 	// ...and a none-tier caller can ask for storage on the call.
 	done := make(chan struct{})
-	go func() { do("test.users/ng1", map[string]string{"Shardlite-Sync": "storage"}); close(done) }()
+	go func() { do("users/ng1", map[string]string{"Shardlite-Sync": "storage"}); close(done) }()
 	cyclesUntil(r, done)
 }
 
@@ -275,13 +275,13 @@ func TestCallWithAnUnknownTierIsRefused(t *testing.T) {
 			io.WriteString(w, "ok")
 		}
 	})
-	r.commitTo("test.users/ng1")
+	r.commitTo("users/ng1")
 	type result struct{ status int }
 	ch := make(chan result, 1)
 	go func() {
 		req, _ := http.NewRequest("POST", r.ctl+"/x", strings.NewReader("chunk"))
-		req.Header.Set("Shardlite-Target", "test.slow/ng")
-		req.Header.Set("Shardlite-Caller", "test.users/ng1")
+		req.Header.Set("Shardlite-Target", "slow/ng")
+		req.Header.Set("Shardlite-Caller", "users/ng1")
 		req.Header.Set("Shardlite-Sync", "maybe")
 		resp, err := r.client.Do(req)
 		if err != nil {
@@ -310,14 +310,14 @@ func TestCallerStaysActiveForTheCall(t *testing.T) {
 	r := newSRigWith(t, withClock(clk)) // wallet's idle timeout is 300 ms
 	seen := make(chan seenChunk, 16)
 	started := make(chan struct{})
-	r.calleeReadingBody("test.wallet/ia1", seen, started)
-	r.commitTo("test.wallet/ia1")
-	r.closeInApp("test.wallet/ia1")
+	r.calleeReadingBody("wallet/ia1", seen, started)
+	r.commitTo("wallet/ia1")
+	r.closeInApp("wallet/ia1")
 
 	pr, pw := io.Pipe()
 	req, _ := http.NewRequest("POST", r.ctl+"/stream", pr)
-	req.Header.Set("Shardlite-Target", "test.slow/callee")
-	req.Header.Set("Shardlite-Caller", "test.wallet/ia1")
+	req.Header.Set("Shardlite-Target", "slow/callee")
+	req.Header.Set("Shardlite-Caller", "wallet/ia1")
 	done := make(chan error, 1)
 	go func() {
 		resp, err := r.client.Do(req)
@@ -328,13 +328,13 @@ func TestCallerStaysActiveForTheCall(t *testing.T) {
 		done <- err
 	}()
 	<-started
-	a := r.shard("test.wallet/ia1")
+	a := r.shard("wallet/ia1")
 	for range 4 { // four idle timeouts, with a look of the idle timer in each
 		looks := a.looks.idle.Load()
 		clk.Advance(300 * time.Millisecond)
 		waitCounter(t, "a look of the idle timer", &a.looks.idle, looks+1)
 	}
-	if !r.m.IsActive(shardName("test.wallet/ia1")) {
+	if !r.m.IsActive(shardName("wallet/ia1")) {
 		t.Fatal("the caller was deactivated during its streaming call")
 	}
 	pw.Write([]byte("late"))
@@ -345,7 +345,7 @@ func TestCallerStaysActiveForTheCall(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	advanceUntil(t, clk, 100*time.Millisecond, "the caller to deactivate once the call ended", r.inactive("test.wallet/ia1"))
+	advanceUntil(t, clk, 100*time.Millisecond, "the caller to deactivate once the call ended", r.inactive("wallet/ia1"))
 }
 
 // --- hops ---
@@ -356,14 +356,14 @@ func TestCallerStaysActiveForTheCall(t *testing.T) {
 func TestHopsAreTheNodes(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
-	r.create("test.slow/dd1")
+	r.create("slow/dd1")
 	var last atomic.Pointer[http.Request]
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		last.Store(q.Clone(context.Background()))
 		w.Header().Set("Shardlite-Hops", "9")
 		w.Header().Set("Shardlite-Deadline", "9")
 	})
-	resp, _ := r.req("GET", r.pub, "/x", map[string]string{"Shardlite-Target": "test.slow/dd1", "Shardlite-Hops": "20", "Shardlite-Deadline": "1"}, "")
+	resp, _ := r.req("GET", r.pub, "/x", map[string]string{"Shardlite-Target": "slow/dd1", "Shardlite-Hops": "20", "Shardlite-Deadline": "1"}, "")
 	q := last.Load()
 	if resp.StatusCode != 200 || q.Header.Get("Shardlite-Hops") != "0" || q.Header.Get("Shardlite-Deadline") != "" {
 		t.Fatalf("a client request reached the app with hops %q and deadline %q", q.Header.Get("Shardlite-Hops"), q.Header.Get("Shardlite-Deadline"))
@@ -377,19 +377,19 @@ func TestHopsAreTheNodes(t *testing.T) {
 		t.Fatalf("shardless: %v", q.Header)
 	}
 	// A call is one deeper than the call it says it is serving, and starts at 0 when it says nothing.
-	r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "test.slow/dd1", "Shardlite-Hops": "4"}, "")
+	r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "slow/dd1", "Shardlite-Hops": "4"}, "")
 	if d := last.Load().Header.Get("Shardlite-Hops"); d != "5" {
 		t.Fatalf("hops of a call from hops 4: %q", d)
 	}
-	r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "test.slow/dd1"}, "")
+	r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "slow/dd1"}, "")
 	if d := last.Load().Header.Get("Shardlite-Hops"); d != "0" {
 		t.Fatalf("hops of a call with none: %q", d)
 	}
-	if resp, _ := r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "test.slow/dd1", "Shardlite-Hops": "x"}, ""); resp.StatusCode != 400 {
+	if resp, _ := r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "slow/dd1", "Shardlite-Hops": "x"}, ""); resp.StatusCode != 400 {
 		t.Fatalf("bad hops: %d", resp.StatusCode)
 	}
 	// A Shardlite-Deadline on a call is stripped, not read: a value that isn't a number is no error.
-	if resp, _ := r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "test.slow/dd1", "Shardlite-Deadline": "soon"}, ""); resp.StatusCode != 200 || last.Load().Header.Get("Shardlite-Deadline") != "" {
+	if resp, _ := r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "slow/dd1", "Shardlite-Deadline": "soon"}, ""); resp.StatusCode != 200 || last.Load().Header.Get("Shardlite-Deadline") != "" {
 		t.Fatalf("a call with a deadline: %d %q", resp.StatusCode, last.Load().Header.Get("Shardlite-Deadline"))
 	}
 }
@@ -398,7 +398,7 @@ func TestHopsAreTheNodes(t *testing.T) {
 func TestCallLoopStopsAtTheHopLimit(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
-	r.create("test.slow/la")
+	r.create("slow/la")
 	var logs bytes.Buffer
 	var lmu sync.Mutex
 	r.srv.log = slog.New(slog.NewTextHandler(writerFunc(func(p []byte) (int, error) { lmu.Lock(); defer lmu.Unlock(); return logs.Write(p) }), nil))
@@ -414,7 +414,7 @@ func TestCallLoopStopsAtTheHopLimit(t *testing.T) {
 		d, _ := strconv.Atoi(q.Header.Get("Shardlite-Hops"))
 		maxSeen.Store(max(maxSeen.Load(), int64(d)))
 		self := q.Header.Get("Shardlite-Opened")
-		other := map[string]string{"test.slow/la": "test.slow/lb", "test.slow/lb": "test.slow/la"}[self]
+		other := map[string]string{"slow/la": "slow/lb", "slow/lb": "slow/la"}[self]
 		next := "/ping"
 		if q.URL.Query().Has("left") { // the bounded variant counts down
 			n, _ := strconv.Atoi(q.URL.Query().Get("left"))
@@ -437,7 +437,7 @@ func TestCallLoopStopsAtTheHopLimit(t *testing.T) {
 		resp.Body.Close()
 		w.WriteHeader(resp.StatusCode)
 	})
-	resp, _ := r.req("POST", r.pub, "/ping", map[string]string{"Shardlite-Target": "test.slow/la"}, "")
+	resp, _ := r.req("POST", r.pub, "/ping", map[string]string{"Shardlite-Target": "slow/la"}, "")
 	if resp.StatusCode != 508 {
 		t.Fatalf("a call loop ended with %d, want 508", resp.StatusCode)
 	}
@@ -448,11 +448,11 @@ func TestCallLoopStopsAtTheHopLimit(t *testing.T) {
 	lmu.Lock()
 	logged := logs.String()
 	lmu.Unlock()
-	if !strings.Contains(logged, "chained too far") || !strings.Contains(logged, "target=test.slow/") || !strings.Contains(logged, "caller=test.slow/") {
+	if !strings.Contains(logged, "chained too far") || !strings.Contains(logged, "target=slow/") || !strings.Contains(logged, "caller=slow/") {
 		t.Fatalf("the refusal was not logged with the caller and target:\n%s", logged)
 	}
 	// gRPC callers get RESOURCE_EXHAUSTED.
-	g, _ := r.req("POST", r.ctl, "/svc/M", map[string]string{"Shardlite-Target": "test.slow/la", "Shardlite-Hops": strconv.Itoa(DefaultMaxHops), "Content-Type": "application/grpc"}, "")
+	g, _ := r.req("POST", r.ctl, "/svc/M", map[string]string{"Shardlite-Target": "slow/la", "Shardlite-Hops": strconv.Itoa(DefaultMaxHops), "Content-Type": "application/grpc"}, "")
 	if g.Header.Get("Grpc-Status") != "8" {
 		t.Fatalf("gRPC: %v", g.Header)
 	}
@@ -461,7 +461,7 @@ func TestCallLoopStopsAtTheHopLimit(t *testing.T) {
 	pass.Store(false)
 	invocations.Store(0)
 	maxSeen.Store(0)
-	resp, _ = r.req("POST", r.pub, "/ping?left=60", map[string]string{"Shardlite-Target": "test.slow/la"}, "")
+	resp, _ = r.req("POST", r.pub, "/ping?left=60", map[string]string{"Shardlite-Target": "slow/la"}, "")
 	if resp.StatusCode != 200 || invocations.Load() != 61 || maxSeen.Load() != 0 {
 		t.Fatalf("without passing it on: status %d, %d invocations, deepest %d", resp.StatusCode, invocations.Load(), maxSeen.Load())
 	}
@@ -511,7 +511,7 @@ func (r *srig) slowJournal(d time.Duration) {
 func TestGRPCTimeoutPassesThrough(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
-	r.create("test.slow/gt1")
+	r.create("slow/gt1")
 	var gt atomic.Value
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		gt.Store(q.Header.Get("Grpc-Timeout"))
@@ -521,7 +521,7 @@ func TestGRPCTimeoutPassesThrough(t *testing.T) {
 	q, _ := http.NewRequest("POST", r.pub+"/svc/Method", strings.NewReader("x"))
 	q.Header.Set("Content-Type", "application/grpc")
 	q.Header.Set("Grpc-Timeout", "5S")
-	q.Header.Set("Shardlite-Target", "test.slow/gt1")
+	q.Header.Set("Shardlite-Target", "slow/gt1")
 	resp, err := r.h2c.Do(q)
 	if err != nil {
 		t.Fatal(err)

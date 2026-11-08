@@ -7,11 +7,11 @@
 // that belongs to a shard works out which shard a request is for from the
 // request itself (the path, or x-shard metadata for gRPC) and uses the file the
 // node opened (Shardlite-File) only if that is the shard the node opened
-// (Shardlite-Opened). Otherwise it relays the request to the right shard
-// through the control API, marked Shardlite-Relay so that the node serves it as
-// the client's request it is. Routes that only take calls, and the reminder
-// wake, take their identity from Shardlite-Opened. The app uses WAL mode with default locking, migrates
-// lazily on the first write and closes shards that have been idle for a while.
+// (Shardlite-Opened). Otherwise it refuses the request, since the client's hint
+// was missing or wrong and the client fixes it. Routes that only take calls, and
+// the reminder wake, take their identity from Shardlite-Opened. The app uses WAL
+// mode with default locking, migrates lazily on the first write and closes
+// shards that have been idle for a while.
 package e2eapp
 
 import (
@@ -25,7 +25,6 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"os"
 	"strconv"
@@ -43,14 +42,14 @@ import (
 // Options configure an App.
 type Options struct {
 	Control   string        // the node's control API, host:port (127.0.0.1:2282 if empty)
-	IdleClose time.Duration // close a shard's database after this long unused (500 ms if zero)
+	IdleClose time.Duration // close a shard's database after this long unused (200 ms if zero, so a connection is closed within the shortest idle timeout the app declares, arena's 300 ms, as the guide asks)
 	// Declare names a file holding the app's declaration (docs/guide.md, Shard
 	// kinds), read again on every request to the ready route, so a
 	// rewrite stands in for a new deploy. Empty serves DefaultDeclaration.
 	Declare string
 }
 
-const DefaultDeclaration = `{"app": "e2e", "version": "1", "kinds": {
+const DefaultDeclaration = `{"version": "1", "kinds": {
 	"users":  {"public": true, "sync": "none", "idle_timeout": "2s"},
 	"wallet": {"public": true, "idle_timeout": "2s"},
 	"lobby":  {"public": true, "idle_timeout": "2s"},
@@ -66,7 +65,6 @@ type App struct {
 	opts  Options
 	pool  *pool
 	http  *http.Client
-	h2c   *http.Transport // to the control API over HTTP/2 without TLS, for relayed gRPC
 	grpc  *grpc.Server
 	debug Debug
 
@@ -80,11 +78,9 @@ func New(opts Options) *App {
 		opts.Control = "127.0.0.1:2282"
 	}
 	if opts.IdleClose <= 0 {
-		opts.IdleClose = 500 * time.Millisecond
+		opts.IdleClose = 200 * time.Millisecond
 	}
 	a := &App{opts: opts, pool: newPool(opts.IdleClose), http: &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{MaxIdleConnsPerHost: 64}}}
-	a.h2c = &http.Transport{Protocols: new(http.Protocols)}
-	a.h2c.Protocols.SetUnencryptedHTTP2(true)
 	a.grpc = a.newGRPC()
 	return a
 }
@@ -177,13 +173,13 @@ type shardHandler func(w http.ResponseWriter, r *http.Request, s *shardReq)
 // shard wraps a handler for a route that belongs to a shard and that clients can
 // reach. of works out which shard the request is for from the request itself.
 // If that is the shard the node opened, h gets its open file. Otherwise (the
-// client's Shardlite-Target was missing or wrong) the request is relayed to the
-// right shard, so a wrong hint costs a hop and never correctness.
+// client's Shardlite-Target was missing or wrong) the request is refused: the
+// app never calls a shard with an id the client supplied, so a wrong hint is the
+// client's to fix.
 //
 // This app has no authentication. One that did would authenticate before this
-// decision, and the same way for a relayed request, which arrives with no
-// Shardlite-Caller as a client's does: Shardlite-Caller is never a reason to
-// skip it on a route clients can reach.
+// decision: Shardlite-Caller is never a reason to skip it on a route clients can
+// reach.
 func (a *App) shard(of func(*http.Request) string, h shardHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		name := of(r)
@@ -191,8 +187,8 @@ func (a *App) shard(of func(*http.Request) string, h shardHandler) http.HandlerF
 			refuse(w, r, http.StatusBadRequest, "the request does not say which shard it is for")
 			return
 		}
-		if name != r.Header.Get("Shardlite-Opened") {
-			a.relay(w, r, name)
+		if opened := r.Header.Get("Shardlite-Opened"); name != opened {
+			refuse(w, r, http.StatusBadRequest, fmt.Sprintf("the request is for %s but the node opened %q: send Shardlite-Target naming the shard", name, opened))
 			return
 		}
 		a.serveOpened(w, r, h)
@@ -234,46 +230,6 @@ func (a *App) serveOpened(w http.ResponseWriter, r *http.Request, h shardHandler
 	}
 	defer db.release()
 	h(w, r, &shardReq{name: name, file: file, db: db})
-}
-
-// relay sends r to the shard it is for through the node's control API and
-// streams the answer back. It is marked Shardlite-Relay: true, so the node
-// serves it as the client's request it is (only kinds clients can name, never
-// creating a shard) with no Shardlite-Caller, and not as a call, which would
-// widen what the client can reach. HTTP, server-sent events, WebSocket and gRPC
-// all go through it, since a reverse proxy passes upgrades, streams and trailers
-// on. The client's headers (credentials, traceparent) go on as they are,
-// Shardlite-Hops is passed on as the guide asks and so are the X-Forwarded-*
-// headers the node gave the request, which the reverse proxy would drop.
-func (a *App) relay(w http.ResponseWriter, r *http.Request, name string) {
-	a.debug.mu.Lock()
-	a.debug.Relays = append(a.debug.Relays, RelayRec{Opened: r.Header.Get("Shardlite-Opened"), For: name})
-	a.debug.mu.Unlock()
-	control := &url.URL{Scheme: "http", Host: a.opts.Control}
-	transport := a.http.Transport
-	if r.ProtoMajor == 2 {
-		transport = a.h2c
-	}
-	proxy := &httputil.ReverseProxy{
-		Transport:     transport,
-		FlushInterval: -1,
-		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.SetURL(control)
-			for k := range pr.Out.Header {
-				if strings.HasPrefix(k, "Shardlite-") && k != "Shardlite-Hops" {
-					delete(pr.Out.Header, k) // the node's own: the file and what it opened
-				}
-			}
-			for _, h := range []string{"X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto"} {
-				if v := pr.In.Header.Values(h); len(v) > 0 {
-					pr.Out.Header[h] = v
-				}
-			}
-			pr.Out.Header.Set("Shardlite-Target", name)
-			pr.Out.Header.Set("Shardlite-Relay", "true")
-		},
-	}
-	proxy.ServeHTTP(w, r)
 }
 
 // pathShard is the shard of a route whose path is /{kind}/{id}/...
@@ -435,7 +391,7 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad user name", http.StatusBadRequest)
 		return
 	}
-	shard := "e2e.users/" + name
+	shard := "users/" + name
 	// The client can only reach a shard that exists, so create it first.
 	q, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, "http://"+a.opts.Control+"/"+shard+"/create", nil)
 	q.Header.Set("Shardlite-Target", shard)
@@ -454,7 +410,7 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 }
 
 // transfer debits this shard, then credits another one by calling it through
-// the node's control API: ?to=e2e.wallet/b&token=t. The debit is committed before the
+// the node's control API: ?to=wallet/b&token=t. The debit is committed before the
 // call, and the call carries this shard as its caller, so the node holds it until
 // the debit is durable if this shard's kind has sync on.
 func (a *App) transfer(w http.ResponseWriter, r *http.Request, s *shardReq) {
@@ -496,7 +452,7 @@ func (a *App) credit(w http.ResponseWriter, r *http.Request, s *shardReq) {
 
 // notify is a durable send (docs/guide.md, Durable send). It records a row, the
 // call to another shard and a reminder due now under one key, in one
-// transaction: ?to=e2e.wallet/b&token=t. The node wakes this shard's reminders
+// transaction: ?to=wallet/b&token=t. The node wakes this shard's reminders
 // handler once the transaction is durable, and the handler makes the call to
 // /receive on the target.
 func (a *App) notify(w http.ResponseWriter, r *http.Request, s *shardReq) {
@@ -708,7 +664,7 @@ func (p *pool) get(path string) (*handle, error) {
 		h.refs++
 		p.mu.Unlock()
 		// WAL mode, the default locking mode, and write transactions that start with BEGIN IMMEDIATE.
-		h.sql, h.err = sql.Open("sqlite", "file:"+path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_txlock=immediate")
+		h.sql, h.err = sql.Open("sqlite", "file:"+path+"?mode=rw&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_txlock=immediate")
 		if h.err == nil {
 			p.open.Add(1)
 			h.sql.SetMaxOpenConns(8)

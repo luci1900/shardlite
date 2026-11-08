@@ -1,17 +1,31 @@
-// Package journal is where a node's journal can live. The authoritative copy of every
-// journal is in blob storage: the fence is created there, and a journal is
-// complete without anything else (docs/internals.md, Node journals and
-// snapshots). The narrow Backend this package holds sits behind the one Store every caller
-// writes through, which gives a backend the same handling of a lost response.
-// Blob storage is the only backend today, and the place a faster journal store
-// would plug in.
+// Package journal holds a node's journal: where its segments are stored and
+// the writer that writes them. The authoritative copy of every journal is in
+// blob storage: the fence is created there, and a journal is complete without
+// anything else (docs/internals.md, Node journals and snapshots).
 //
-// A journal's segments are numbered. A segment is created once and never
-// modified, so there are no updates and no conditional deletes: deleting one
-// is the caller's choice of garbage, through journal expiry.
+// The storage side is a narrow Backend behind the one Store every caller writes
+// through, which gives a backend the same handling of a lost response. Blob
+// storage is the only backend today, and the place a faster journal store would
+// plug in. A journal's segments are numbered. A segment is created once and
+// never modified, so there are no updates and no conditional deletes: deleting
+// one is the caller's choice of garbage, through journal expiry.
 //
-// The fence that an adopter puts above a dead writer's range lives in
-// blob storage: one store decides the journal's races.
+// The writing side is the Writer, which queues the LTX files capture produces
+// and writes them as numbered segments, one per flush interval, each holding
+// every shard's files from that interval. Scan, ReadFooter and ReadEntryInto
+// read segments back, Bounds finds the lowest and highest number present, and
+// Fence is what an adopter does to a dead writer's journal.
+//
+// Layout of a segment:
+//
+//	LTX file bytes, exactly as capture queued them, back to back
+//	footer: JSON array of Entry
+//	8 bytes: footer length, big-endian
+//	8 bytes: magic "SHLSEG01"
+//
+// An empty segment is a fence (see docs/internals.md, Fencing). The fence that
+// an adopter puts above a dead writer's range lives in blob storage: one store
+// decides the journal's races.
 package journal
 
 import (

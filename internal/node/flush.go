@@ -13,10 +13,10 @@ import (
 
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/cluster"
-	"github.com/luci1900/shardlite/internal/coord"
+	"github.com/luci1900/shardlite/internal/journal"
 	"github.com/luci1900/shardlite/internal/kind"
+	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/notify"
-	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/shard"
 )
 
@@ -41,7 +41,7 @@ const (
 //     completed capture, or whose header can't be read, is synced
 //     (Shard.Capture), each in a goroutine of the cycle's own, a bounded number
 //     at a time;
-//  2. once all of those have queued their commits in the segment writer, the
+//  2. once all of those have queued their commits in the journal writer, the
 //     writer is flushed: one segment for the whole node;
 //  3. the cycle completes: shards whose capture and flush succeeded are marked
 //     captured if the lease is still good, and the counter advances.
@@ -52,9 +52,9 @@ const (
 // chunk waits for is the kind's tier (docs/guide.md, Durability).
 type Flusher struct {
 	tab      *table           // the shards it syncs
-	writer   *segment.Writer  // the node's journal, flushed once per cycle
-	keeper   *coord.Keeper    // the lease, which an acknowledgement needs
-	conf     *coord.Confirmer // reads the lease, to confirm that the node still owns what it read
+	writer   *journal.Writer  // the node's journal, flushed once per cycle
+	keeper   *lease.Keeper    // the lease, which an acknowledgement needs
+	conf     *lease.Confirmer // reads the lease, to confirm that the node still owns what it read
 	log      *slog.Logger
 	interval time.Duration
 	min      time.Duration // shortest time between two cycle starts
@@ -87,7 +87,7 @@ type FlushOptions struct {
 	NoEarly bool
 }
 
-func newFlusher(tab *table, writer *segment.Writer, keeper *coord.Keeper, conf *coord.Confirmer, log *slog.Logger, opts FlushOptions) *Flusher {
+func newFlusher(tab *table, writer *journal.Writer, keeper *lease.Keeper, conf *lease.Confirmer, log *slog.Logger, opts FlushOptions) *Flusher {
 	return &Flusher{tab: tab, writer: writer, keeper: keeper, conf: conf, log: log,
 		interval: opts.Interval, min: opts.Min, coalesce: opts.Coalesce, noEarly: opts.NoEarly,
 		kick: make(chan struct{}, 1), exited: make(chan struct{})}
@@ -332,7 +332,7 @@ func (f *Flusher) Wait(ctx context.Context, mark uint64) error {
 // the node has confirmed that it still owns its shards, and fails once the
 // node's lease is lost. A process that reads, calls sync and answers its client
 // is then linearizable.
-func (m *Catalog) Barrier(ctx context.Context) error {
+func (m *Shardset) Barrier(ctx context.Context) error {
 	mark := m.flush.Mark()
 	if err := m.flush.Wait(ctx, mark); err != nil {
 		return err
@@ -341,7 +341,7 @@ func (m *Catalog) Barrier(ctx context.Context) error {
 }
 
 // Name is the node's own name.
-func (m *Catalog) Name() cluster.Node { return m.n.Name }
+func (m *Shardset) Name() cluster.Node { return m.n.Name }
 
 // Gate holds a chunk of a shard's output until what the shard committed before
 // it is durable (docs/internals.md, Durability gates):
@@ -355,7 +355,7 @@ func (m *Catalog) Name() cluster.Node { return m.n.Name }
 //
 // Call it once the chunk has been read from the app. sync is the kind's tier
 // or a Shardlite-Sync override.
-func (m *Catalog) Gate(ctx context.Context, h *Hold, sync kind.Sync) error {
+func (m *Shardset) Gate(ctx context.Context, h *Hold, sync kind.Sync) error {
 	err := h.a.gate(ctx, sync, h.proven.Load())
 	if err == nil && sync == kind.SyncStorage {
 		h.proven.Store(true)
@@ -363,8 +363,7 @@ func (m *Catalog) Gate(ctx context.Context, h *Hold, sync kind.Sync) error {
 	return err
 }
 
-// gate is Gate for the shard's own output, and System.Sync with the kind's
-// tier. proven says an earlier chunk of the request has confirmed ownership.
+// gate is Gate for the shard's own output. proven says an earlier chunk of the request has confirmed ownership.
 func (a *actor) gate(ctx context.Context, sync kind.Sync, proven bool) error {
 	return a.d.flush.gate(ctx, &a.cap, sync, proven)
 }
@@ -426,9 +425,9 @@ func (f *Flusher) confirm(ctx context.Context, mark uint64) error {
 			switch err := round.Err(); {
 			case err == nil:
 				return f.keeper.Check()
-			case errors.Is(err, coord.ErrLeaseLost):
+			case errors.Is(err, lease.ErrLost):
 				return f.keeper.Check()
-			case errors.Is(err, coord.ErrConfirmerStopped):
+			case errors.Is(err, lease.ErrConfirmerStopped):
 				return errFlusherStopped
 			default:
 				return tierUnmet("sync is storage, but the node could not confirm that it still owns its shards: " + err.Error())

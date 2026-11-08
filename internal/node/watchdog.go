@@ -20,7 +20,7 @@ func JournalExpiry(deltaAge time.Duration) time.Duration {
 // tailAlertEvery is how often a shard repeats the tail-age alert.
 const tailAlertEvery = time.Minute
 
-// watchdog is the part of the Catalog that raises the tail-age alert, on its own
+// watchdog is the part of the shardset that raises the tail-age alert, on its own
 // timer, apart from the shards' loops, since a shard whose delta keeps failing
 // (or hangs, holding its loop) must still raise it. Its period is on the Clock,
 // and the ages it compares are real time.

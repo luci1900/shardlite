@@ -37,10 +37,9 @@ func TestFaultRandomCrashes(t *testing.T) {
 		{"restore-before-rename", func() { r.activation(kill.RestoreBeforeRename) }},
 	}
 	for _, point := range activationPoints {
-		scenarios = append(scenarios, scenario{string(point), func() { r.activation(point) }})
-		if point != kill.Restored {
-			scenarios = append(scenarios, scenario{"cached " + string(point), func() { r.cachedActivation(point) }})
-		}
+		scenarios = append(scenarios,
+			scenario{string(point), func() { r.activation(point) }},
+			scenario{"released " + string(point), func() { r.releasedActivation(point) }})
 	}
 	for round := range rounds {
 		s := scenarios[rng.IntN(len(scenarios))]

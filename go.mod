@@ -7,10 +7,12 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.33.9
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.3
 	github.com/aws/smithy-go v1.28.5
+	github.com/dunglas/httpsfv v1.1.2
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/superfly/ltx v0.5.2
 	golang.org/x/sync v0.22.0
 	golang.org/x/sys v0.47.0
+	golang.org/x/time v0.16.0
 	modernc.org/sqlite v1.49.1
 	pgregory.net/rapid v1.2.0
 )

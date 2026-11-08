@@ -12,7 +12,7 @@ import (
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/blobtest"
-	"github.com/luci1900/shardlite/internal/coord"
+	"github.com/luci1900/shardlite/internal/lease"
 )
 
 // leaseProbe watches the node's lease in the store: it counts the reads of it,
@@ -31,7 +31,7 @@ type bypassKey struct{}
 func probeLease(r *mrig) *leaseProbe {
 	p := new(leaseProbe)
 	r.local.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
-		if after || key != coord.Key("n1") || ctx.Value(bypassKey{}) != nil {
+		if after || key != lease.Key("n1") || ctx.Value(bypassKey{}) != nil {
 			return nil
 		}
 		if op == blobtest.OpGet {
@@ -60,8 +60,8 @@ func probeLease(r *mrig) *leaseProbe {
 func markLease(t *testing.T, r *mrig) {
 	t.Helper()
 	ctx := context.WithValue(context.Background(), bypassKey{}, true)
-	reg := coord.NewRegistry(r.local, "n2", coord.RegistryOptions{TTL: time.Hour, Blob: blob.Options{Backoff: time.Millisecond}})
-	l2, err := reg.Acquire(ctx, coord.NodeInfo{Name: "n2"})
+	reg := lease.NewRegistry(r.local, "n2", lease.RegistryOptions{TTL: time.Hour, Blob: blob.Options{Backoff: time.Millisecond}})
+	l2, err := reg.Acquire(ctx, lease.NodeInfo{Name: "n2"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +80,7 @@ func markLease(t *testing.T, r *mrig) {
 func TestStorageAnswersConfirmOwnership(t *testing.T) {
 	t.Parallel()
 	r := newSRigWith(t, manualFlush)
-	r.create("test.wallet/c1")
+	r.create("wallet/c1")
 	probe := probeLease(r.mrig)
 	reads := &probe.reads
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
@@ -89,7 +89,7 @@ func TestStorageAnswersConfirmOwnership(t *testing.T) {
 		}
 		io.WriteString(w, "done")
 	})
-	target := map[string]string{"Shardlite-Target": "test.wallet/c1"}
+	target := map[string]string{"Shardlite-Target": "wallet/c1"}
 
 	// Nothing to commit: no cycle, and one read of the lease for the whole response.
 	r.withoutCycle(func() {
@@ -129,7 +129,7 @@ func TestStorageAnswersConfirmOwnership(t *testing.T) {
 func TestSegmentConfirmsAWaitingAnswer(t *testing.T) {
 	t.Parallel()
 	r := newSRigWith(t, manualFlush)
-	r.create("test.wallet/c1", "test.wallet/c2")
+	r.create("wallet/c1", "wallet/c2")
 	probe := probeLease(r.mrig)
 	reads := &probe.reads
 	hold := make(chan struct{})
@@ -150,7 +150,7 @@ func TestSegmentConfirmsAWaitingAnswer(t *testing.T) {
 	go func() {
 		// The headers are the first chunk: the body would wait for the held read.
 		q, _ := http.NewRequest("GET", r.pub+"/r", nil)
-		q.Header.Set("Shardlite-Target", "test.wallet/c1")
+		q.Header.Set("Shardlite-Target", "wallet/c1")
 		resp, err := r.client.Do(q)
 		if err != nil {
 			done <- 0
@@ -162,7 +162,7 @@ func TestSegmentConfirmsAWaitingAnswer(t *testing.T) {
 	apptest.Eventually(t, apptest.Timeout, "the lease read to begin", func() bool { return reads.Load() == 1 })
 	// Another shard's write makes the next cycle create a segment, after the
 	// read began its wait.
-	go r.req("POST", r.pub, "/w?write=1", map[string]string{"Shardlite-Target": "test.wallet/c2"}, "")
+	go r.req("POST", r.pub, "/w?write=1", map[string]string{"Shardlite-Target": "wallet/c2"}, "")
 	apptest.Eventually(t, apptest.Timeout, "the write to wait for a cycle", func() bool { return r.m.flush.waiting.Load() > 0 })
 	r.cycle()
 	select {
@@ -181,14 +181,14 @@ func TestSegmentConfirmsAWaitingAnswer(t *testing.T) {
 func TestHiddenPauseFailsStorageReads(t *testing.T) {
 	t.Parallel()
 	r := newSRigWith(t, manualFlush)
-	r.create("test.wallet/p1")
+	r.create("wallet/p1")
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		if v := q.URL.Query().Get("sync"); v != "" {
 			w.Header().Set("Shardlite-Sync", v)
 		}
 		io.WriteString(w, "done")
 	})
-	target := map[string]string{"Shardlite-Target": "test.wallet/p1"}
+	target := map[string]string{"Shardlite-Target": "wallet/p1"}
 	probeLease(r.mrig).paused.Store(true)
 	if resp, _ := r.req("GET", r.pub, "/r", target, ""); resp.StatusCode != 200 {
 		t.Fatalf("before the mark: %d", resp.StatusCode)
@@ -205,8 +205,8 @@ func TestHiddenPauseFailsStorageReads(t *testing.T) {
 	if resp, _ := r.req("GET", r.pub, "/r", target, ""); resp.StatusCode == 200 {
 		t.Fatal("a storage read answered with its lease marked by another node")
 	}
-	if err := r.n.Keeper.Check(); !errors.Is(err, coord.ErrLeaseLost) {
-		t.Fatalf("keeper: %v, want ErrLeaseLost", err)
+	if err := r.n.Keeper.Check(); !errors.Is(err, lease.ErrLost) {
+		t.Fatalf("keeper: %v, want ErrLost", err)
 	}
 }
 
@@ -215,14 +215,14 @@ func TestHiddenPauseFailsStorageReads(t *testing.T) {
 func TestUnconfirmedAnswerIsAnError(t *testing.T) {
 	t.Parallel()
 	r := newSRigWith(t, manualFlush)
-	r.create("test.wallet/e1")
+	r.create("wallet/e1")
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		if v := q.URL.Query().Get("sync"); v != "" {
 			w.Header().Set("Shardlite-Sync", v)
 		}
 		io.WriteString(w, "done")
 	})
-	target := map[string]string{"Shardlite-Target": "test.wallet/e1"}
+	target := map[string]string{"Shardlite-Target": "wallet/e1"}
 	fail := &probeLease(r.mrig).fail
 	fail.Store(true)
 	resp, body := r.req("GET", r.pub, "/r", target, "")
@@ -257,10 +257,10 @@ func TestBarrierConfirmsOwnership(t *testing.T) {
 		t.Fatalf("%d lease reads for a barrier on an idle node, want 1", got)
 	}
 	markLease(t, r)
-	if err := r.m.Barrier(ctx); !errors.Is(err, coord.ErrLeaseLost) {
-		t.Fatalf("Barrier = %v, want ErrLeaseLost", err)
+	if err := r.m.Barrier(ctx); !errors.Is(err, lease.ErrLost) {
+		t.Fatalf("Barrier = %v, want ErrLost", err)
 	}
-	if err := r.n.Keeper.Check(); !errors.Is(err, coord.ErrLeaseLost) {
-		t.Fatalf("keeper: %v, want ErrLeaseLost", err)
+	if err := r.n.Keeper.Check(); !errors.Is(err, lease.ErrLost) {
+		t.Fatalf("keeper: %v, want ErrLost", err)
 	}
 }

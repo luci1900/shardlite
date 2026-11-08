@@ -16,7 +16,7 @@ import (
 // segment entries (one per AppendFile call).
 func logFiles(t *testing.T, e *env, label string) {
 	t.Helper()
-	entries, seqs := e.entriesFor(t, "test.users/1")
+	entries, seqs := e.entriesFor(t, "users/1")
 	for i, en := range entries {
 		b, err := harness.ReadEntry(context.Background(), e.journal, seqs[i], en)
 		if err != nil {
@@ -36,7 +36,7 @@ func TestFilesFromActivationToFirstWrite(t *testing.T) {
 	e := newEnv(t)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
-	app.Must(t, "open", "a", path) // the app's own tables: its migration
+	app.Must(t, "create", "a", path) // the app's own tables: its migration
 	sh := newShard(t, e, path)
 	ctx := context.Background()
 	if err := sh.Sync(ctx); err != nil {

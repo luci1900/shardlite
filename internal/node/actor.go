@@ -5,20 +5,17 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/luci1900/shardlite/internal/capture"
+	"github.com/luci1900/shardlite/internal/journal"
 	"github.com/luci1900/shardlite/internal/kill"
-	"github.com/luci1900/shardlite/internal/kind"
 	"github.com/luci1900/shardlite/internal/notify"
-	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/service"
 	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
-	"github.com/luci1900/shardlite/internal/system"
 	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
@@ -33,29 +30,27 @@ type LifecycleOptions struct {
 	DeltaSize     int64         // shardfile.DefaultDeltaSize if zero
 	MaxFiles      int           // files a manifest may list before the next snapshot rebases the shard, shardfile.DefaultMaxFiles if zero
 	SnapshotEvery time.Duration // how often each active shard looks whether it needs a snapshot (a delta or a rebase), and the tail alert is checked, 2 s if zero
-	HoldOff       time.Duration // how long to leave a shard alone after it couldn't be deactivated, 5 s if zero
+	HoldOff       time.Duration // how long to leave a shard alone after it couldn't be deactivated, 5 s if zero (a shard the app holds open waits twice as long at each look, up to its kind's idle timeout)
 	// At is called at each kill point (see Faults), nil in production.
 	At          func(kill.Point)
 	IdleRecheck time.Duration // the first wait before an idle shard that its reminders keep active is looked at again (it doubles up to 10 s), 1 s if zero
 }
 
 // actorDeps is what the shards' loops use, shared by every shard: the parts of
-// the Catalog and of the node that a shard calls, and the node-wide limits. The
-// Catalog makes it, and no shard reaches the Catalog itself.
+// the shardset and of the node that a shard calls, and the node-wide limits.
+// The shardset makes it, and no shard reaches the shardset itself.
 type actorDeps struct {
 	opts    LifecycleOptions
 	kinds   *Kinds
-	sys     systemKinds                                 // the system kinds' registry: fixed ids, migrations and handlers
-	call    func(*http.Request) (*http.Response, error) // the node's calls to system shards (routing)
 	clock   Clock
 	log     *slog.Logger
 	stats   *Stats
 	tab     *table
-	cache   *cache
+	data    string // the node's data directory, where the shards' files are made (pathFor)
 	flush   *Flusher
 	rem     *reminders
 	files   *shardfile.Files
-	writer  *segment.Writer
+	writer  *journal.Writer
 	tempDir *tempfile.Dir // the node's temporary files (Config.TempDir)
 
 	// deletedKinds holds the kinds that have had a shard deleted for holding
@@ -64,13 +59,11 @@ type actorDeps struct {
 	deletedKinds sync.Map
 
 	// base is the context everything the shards do runs on: it ends only once
-	// the Catalog has let go of them (or abandoned them).
+	// the shardset has let go of them (or abandoned them).
 	base context.Context
 
-	// The node-wide limits, which shards' loops take a place in.
-	deactivations chan struct{}
-	snapshots     chan struct{}
-	rebases       chan struct{}
+	// sems are the node-wide limits, which shards' loops take a place in.
+	sems sems
 }
 
 func (d *actorDeps) now() time.Time { return d.clock.Now() }
@@ -80,9 +73,9 @@ func (d *actorDeps) now() time.Time { return d.clock.Now() }
 // loop while the shard is captured. The loop does one operation at a time:
 // activation (its first job), a delta or rebase when its delta timer says so,
 // deactivation once its idle timer finds it unused for its kind's timeout, and
-// the deactivations, evictions and deletes that other goroutines ask for (do).
-// Everything it does runs on the shards' base context, not on the context the
-// table gives it, so stopping the shards doesn't cut off a release.
+// the deactivations and deletes that other goroutines ask for (do).
+// Everything runs on the shards' base context, not on the context the table gives it, so stopping the shards doesn't cut
+// off a release.
 //
 // References are not the loop's: requests take them in the shard's entry. The
 // shard's state is in plain parts, each with the methods that change it: its
@@ -98,9 +91,6 @@ type actor struct {
 	h    *shardfile.Handle
 	read *shardfile.Handle // the manifest Acquire read before adding the entry, nil if it read none; activation starts from it
 
-	sys *kind.Kind   // the shard's system kind, nil for an app kind's shard (whose settings are looked up as they are used, since a reload may change them)
-	app http.Handler // its system app, built for this activation
-
 	ctx   context.Context // the table's context for the loop, which the reminders loop runs on (set as the loop starts)
 	ops   chan func()     // requests for the lifecycle loop (do)
 	ready chan struct{}   // closed once the shard is activated
@@ -115,11 +105,7 @@ type actor struct {
 }
 
 func newActor(d *actorDeps, e *entry) *actor {
-	a := &actor{d: d, e: e, Name: e.name, ops: make(chan func()), ready: make(chan struct{}), ended: make(chan struct{})}
-	if a.sys = d.sys[a.Name.Kind()]; a.sys != nil {
-		a.app = a.sys.Handler(&system.System{Name: a.Name, Tx: a.tx, Call: a.call, Sync: func(ctx context.Context) error { return a.gate(ctx, kind.SyncStorage, false) }})
-	}
-	return a
+	return &actor{d: d, e: e, Name: e.name, ops: make(chan func()), ready: make(chan struct{}), ended: make(chan struct{})}
 }
 
 // captureState is the shard's capture as the rest of the node sees it: the
@@ -203,15 +189,21 @@ func (c *captureState) hasNewFrames() bool {
 }
 
 // idleState is the idle timer's bookkeeping: when a shard that was held off is
-// looked at again, whether the app held the file at the last deactivation, and
-// how long the shard's reminders have kept it. Only the lifecycle loop changes
-// it (tests read nextLook).
+// looked at again, whether the app held the file at the last deactivation, how
+// long the shard's reminders have kept it, and how long the app has kept its
+// file open. Only the lifecycle loop changes it (tests read nextLook).
 type idleState struct {
 	nextLook  atomic.Int64  // when an idle shard that was held off is looked at again (Unix ns, 0 until it first is)
 	held      bool          // the last deactivation found the app holding the file
 	heldSince time.Time     // when live rows were first found holding the shard
 	warned    time.Time     // when that was last logged
 	wait      time.Duration // the next wait while live rows hold it
+
+	// The app's hold on the file, which the idle path finds when a release finds
+	// the file open. It starts over when a request has used the shard since.
+	appSince  time.Time     // when the idle path first found the app holding the file, zero if it hasn't
+	appWait   time.Duration // the next wait before looking at the held shard again
+	appWarned bool          // the hold has been warned of and counted
 }
 
 // holdOff delays the next look by d, and returns d.
@@ -237,6 +229,33 @@ func (s *idleState) keptBy(live bool, now time.Time, recheck time.Duration) (hel
 		return true, now.Sub(s.heldSince)
 	}
 	return true, 0
+}
+
+// appUsed starts the app's hold over if a request has used the shard since the
+// hold was first found (lastUse), since the app is plainly using the shard then.
+func (s *idleState) appUsed(lastUse time.Time) {
+	if lastUse.After(s.appSince) {
+		s.appSince, s.appWait, s.appWarned = time.Time{}, 0, false
+	}
+}
+
+// appHeld notes that the idle path found the app holding the shard's file at
+// now. wait is how long to leave the shard alone: holdOff at the first look,
+// doubling at each up to idle (each look is a whole release and resume). warn
+// is true once for a hold, at the first look after it has outlasted one more
+// idle timeout, which a pool that closes its connections late (Go's
+// database/sql can keep one for up to about twice SetConnMaxIdleTime) is not
+// meant to reach.
+func (s *idleState) appHeld(now time.Time, holdOff, idle time.Duration) (wait time.Duration, warn bool) {
+	if s.appSince.IsZero() {
+		s.appSince = now
+	}
+	s.appWait = min(max(2*s.appWait, holdOff), idle)
+	if !s.appWarned && now.Sub(s.appSince) >= idle {
+		s.appWarned = true
+		return s.appWait, true
+	}
+	return s.appWait, false
 }
 
 // loopSlot is the shard's reminders loop: the one running (the last one stays
@@ -285,6 +304,7 @@ func (a *actor) Serve(ctx context.Context) {
 	a.ctx = ctx
 	d := a.d
 	if err := a.activate(d.base); err != nil {
+		a.discardFiles()
 		d.tab.remove(a.e, err)
 		return
 	}
@@ -312,7 +332,7 @@ func (a *actor) Serve(ctx context.Context) {
 
 	var idle <-chan time.Time
 	stopIdle := func() bool { return false }
-	if !d.opts.NoIdle && a.sys == nil { // a system shard's fixed id never goes idle
+	if !d.opts.NoIdle {
 		idle, stopIdle = d.clock.NewTimer(a.idleTimeout())
 	}
 	defer func() { stopIdle() }()
@@ -345,8 +365,10 @@ func (a *actor) idleTimeout() time.Duration {
 }
 
 // lookIdle is what the idle timer does: a shard nobody has used for its kind's
-// idle timeout is let go of, unless its reminders keep it or it can't be. It
-// returns when to look again.
+// idle timeout is let go of, unless its reminders keep it or it can't be. A
+// shard whose file the app still has open stays active (the idle path never goes
+// ahead over an open file, only a stop does), and is looked at again after a
+// wait that doubles up to the idle timeout. It returns when to look again.
 func (a *actor) lookIdle(ctx context.Context) time.Duration {
 	d := a.d
 	idle := a.idleTimeout()
@@ -360,7 +382,8 @@ func (a *actor) lookIdle(ctx context.Context) time.Duration {
 	if a.holds(ctx) {
 		return a.idle.holdOff(d.now(), a.idle.wait) // due reminders keep the shard active
 	}
-	ok, err := a.deactivate(ctx)
+	a.idle.appUsed(last)
+	ok, err := a.deactivate(ctx, capture.ResumeIfHeld)
 	switch {
 	case err != nil:
 		if ctx.Err() == nil {
@@ -368,7 +391,14 @@ func (a *actor) lookIdle(ctx context.Context) time.Duration {
 		}
 		return a.idle.holdOff(d.now(), d.opts.HoldOff)
 	case !ok && a.idle.held:
-		return a.idle.holdOff(d.now(), d.opts.HoldOff) // the app still has the file open
+		// The app still has the file open. The shard stays active until it closes
+		// it, and the next look after that lets go.
+		wait, warn := a.idle.appHeld(d.now(), d.opts.HoldOff, idle)
+		if warn {
+			d.stats.HeldPastIdle.Add(1)
+			d.log.Warn("the app has kept the shard's file open past its idle timeout, so the shard stays active until the app closes it: close connections within the kind's idle timeout", "shard", a.Name, "idle_timeout", idle)
+		}
+		return a.idle.holdOff(d.now(), wait)
 	}
 	return idle // let go of, or a request took it meanwhile
 }
@@ -384,18 +414,18 @@ func (a *actor) snapshot(ctx context.Context) {
 	}
 	a.tail.count(d.stats, sh.TailBytes())
 	defer func() { a.tail.count(d.stats, sh.TailBytes()) }()
-	if !acquireSem(ctx, d.snapshots) {
+	if !acquireSem(ctx, d.sems.snapshot) {
 		return
 	}
-	defer func() { <-d.snapshots }()
+	defer func() { <-d.sems.snapshot }()
 	policy := shardfile.Policy{MaxFiles: d.opts.MaxFiles, MaxBytes: d.opts.DeltaSize}
 	if a.h.RebaseDue(policy) {
 		// A rebase moves the whole database through a temporary file, so only a
 		// few run at once whatever the snapshot limit.
-		if !acquireSem(ctx, d.rebases) {
+		if !acquireSem(ctx, d.sems.rebase) {
 			return
 		}
-		defer func() { <-d.rebases }()
+		defer func() { <-d.sems.rebase }()
 	}
 	hooks := shardfile.Hooks{BeforeUpdate: a.reminderAtDelta, At: d.opts.At}
 	if _, err := a.h.MaybeSnapshot(ctx, sh, d.opts.DeltaAge, policy, hooks); err != nil && ctx.Err() == nil {
@@ -447,71 +477,16 @@ func (a *actor) quiet(ctx context.Context) error {
 	return errors.Join(lerr, err)
 }
 
-// deactivateNow lets go of the shard through its loop, as an idle deactivation
-// does but whether or not it has been idle, and returns once its loop has ended
-// and its name is free. The node keeps owning it, cached. It reports false if
-// the shard is in use or the app has it open. A shard that was let go of
-// meanwhile, or never activated, counts as let go of.
-func (a *actor) deactivateNow(ctx context.Context) (bool, error) {
-	type result struct {
-		ok  bool
-		err error
-	}
-	r, err := do(ctx, a.ops, a.ended, func() result {
-		ok, err := a.deactivate(ctx)
-		return result{ok, err}
-	})
-	if errors.Is(err, errLoopEnded) {
-		select {
-		case <-a.ready:
-		default:
-			return true, nil // never activated: nothing to let go of
-		}
-		if a.gone {
-			return true, nil
-		}
-		return false, errShardsStopped
-	}
-	if err != nil {
-		return false, err
-	}
-	if r.ok {
-		if err := a.waitEnded(ctx); err != nil {
-			return false, err
-		}
-	}
-	return r.ok, r.err
-}
-
-// evict lets go of the shard through its loop, as deactivateNow does, and
-// gives up its ownership too: once it is deactivated it is dropped as the cache
-// drops an evicted shard (its manifest released by compare-and-swap, then its
-// files), before its name is free, so the next node to need it claims it. It
-// returns once the loop has ended. A shard in use is not evicted (ErrBusy), nor
-// one the app has open (ErrAppHolds). done is false if the shard was let go of
-// meanwhile (or never activated): the caller looks again.
+// evict lets go of the shard through its loop, as an idle deactivation does but
+// whether or not it has been idle, and going ahead over a file the app has open
+// (the stop's way of letting go): the manifest update that records its last delta
+// releases it (deactivate), and its files are deleted before its name is free, so the
+// next node to need it claims it. It returns once the loop has ended. A shard in use
+// is not let go of (ErrBusy), and ErrAppHolds says the app committed during the
+// release. done is false if the shard was let go of meanwhile (or never activated):
+// the caller looks again.
 func (a *actor) evict(ctx context.Context) (done bool, err error) {
-	err, lerr := do(ctx, a.ops, a.ended, func() error {
-		if a.gone {
-			return errLoopEnded
-		}
-		ok, err := a.deactivate(ctx)
-		switch {
-		case err != nil:
-			return err
-		case !ok && a.idle.held:
-			return fmt.Errorf("%w: %s", ErrAppHolds, a.Name)
-		case !ok:
-			return fmt.Errorf("%w: %s", ErrBusy, a.Name)
-		}
-		// Cached now, or deleted for holding nothing. If the drop fails the shard
-		// stays cached here.
-		row, ok, err := a.d.cache.idx.get(a.Name)
-		if err == nil && ok && row.State == stateCached {
-			err = a.d.cache.drop(ctx, row)
-		}
-		return err
-	})
+	err, lerr := do(ctx, a.ops, a.ended, func() error { return a.evictNow(ctx) })
 	if lerr != nil {
 		err = lerr
 	}
@@ -522,6 +497,24 @@ func (a *actor) evict(ctx context.Context) (done bool, err error) {
 		return true, err
 	}
 	return true, a.waitEnded(ctx)
+}
+
+// evictNow is the work of evict, in the lifecycle loop: the shard is deactivated
+// and released, and errLoopEnded says it was let go of already.
+func (a *actor) evictNow(ctx context.Context) error {
+	if a.gone {
+		return errLoopEnded
+	}
+	ok, err := a.deactivate(ctx, capture.GoAheadIfHeld)
+	switch {
+	case err != nil:
+		return err
+	case !ok && a.idle.held:
+		return fmt.Errorf("%w: %s", ErrAppHolds, a.Name)
+	case !ok:
+		return fmt.Errorf("%w: %s", ErrBusy, a.Name)
+	}
+	return nil
 }
 
 // waitEnded waits for the lifecycle loop of a shard that was let go of to end:

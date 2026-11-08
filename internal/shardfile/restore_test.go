@@ -13,15 +13,14 @@ import (
 	"github.com/luci1900/shardlite/internal/harness"
 	"github.com/luci1900/shardlite/internal/journal"
 	"github.com/luci1900/shardlite/internal/pos"
-	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
 )
 
 // entries returns every segment entry of a shard.
-func entries(t *testing.T, e *harness.Env, name string) (out []segment.Entry) {
+func entries(t *testing.T, e *harness.Env, name string) (out []journal.Entry) {
 	t.Helper()
-	err := segment.Scan(context.Background(), e.Journal, 1, 0, func(_ pos.Seg, en segment.Entry) error {
+	err := journal.Scan(context.Background(), e.Journal, 1, 0, func(_ pos.Seg, en journal.Entry) error {
 		if en.Shard.String() == name {
 			out = append(out, en)
 		}
@@ -46,7 +45,7 @@ func letGo(t *testing.T, e *harness.Env, app *apptest.App, sh *capture.Shard) {
 	t.Helper()
 	app.Must(t, "close", "a")
 	app.Exit()
-	released, _, err := sh.Release(context.Background(), nil)
+	released, _, err := sh.Release(context.Background(), nil, capture.ResumeIfHeld)
 	if err != nil || !released {
 		t.Fatalf("release: released=%v err=%v", released, err)
 	}
@@ -200,10 +199,10 @@ func TestRestoreThenCapture(t *testing.T) {
 }
 
 // entrySeq finds the segment holding an entry.
-func entrySeq(t *testing.T, e *harness.Env, want segment.Entry) pos.Seg {
+func entrySeq(t *testing.T, e *harness.Env, want journal.Entry) pos.Seg {
 	t.Helper()
 	var found pos.Seg
-	err := segment.Scan(context.Background(), e.Journal, 1, 0, func(seq pos.Seg, en segment.Entry) error {
+	err := journal.Scan(context.Background(), e.Journal, 1, 0, func(seq pos.Seg, en journal.Entry) error {
 		if en == want {
 			found = seq
 		}

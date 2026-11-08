@@ -18,9 +18,9 @@ import (
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/harness"
+	"github.com/luci1900/shardlite/internal/journal"
 	"github.com/luci1900/shardlite/internal/kill"
 	"github.com/luci1900/shardlite/internal/pos"
-	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
@@ -260,7 +260,7 @@ func (r *replayer) wait(ch chan struct{}, what string) {
 func (r *replayer) openApp() {
 	r.t.Helper()
 	if !r.appOpen {
-		r.app.Must(r.t, "open", "a", r.e.Path(name))
+		r.app.Must(r.t, "create", "a", r.e.Path(name))
 		r.appOpen = true
 	}
 }
@@ -370,7 +370,7 @@ func (r *replayer) release(steps []traceStep, i int) int {
 		}
 		r.app.Must(t, "close", "a")
 		r.appOpen = false
-		released, f, err := r.sh.Release(ctx, read)
+		released, f, err := r.sh.Release(ctx, read, capture.ResumeIfHeld)
 		if err != nil || !released {
 			t.Fatalf("step %d: the model releases, capture: released=%v err=%v", i, released, err)
 		}
@@ -384,7 +384,7 @@ func (r *replayer) release(steps []traceStep, i int) int {
 	}
 	r.openApp()
 	r.inflight = steps[i+1 : j]
-	released, _, err := r.sh.Release(ctx, read)
+	released, _, err := r.sh.Release(ctx, read, capture.ResumeIfHeld)
 	if err != nil || released {
 		t.Fatalf("step %d: the model resumes, capture: released=%v err=%v", j, released, err)
 	}
@@ -567,7 +567,7 @@ func (r *replayer) replayUpTo(path string, limit pos.Position) {
 	}
 	ctx := context.Background()
 	var last pos.Position
-	err = segment.Scan(ctx, r.e.Journal, 1, 0, func(seq pos.Seg, en segment.Entry) error {
+	err = journal.Scan(ctx, r.e.Journal, 1, 0, func(seq pos.Seg, en journal.Entry) error {
 		if en.Shard.String() != name || en.Last() <= last || en.Last() > limit {
 			return nil
 		}

@@ -1,4 +1,8 @@
-// Package apptest starts internal/testapp as a child process and talks to it.
+// Package apptest starts internal/testapp as a child process and talks to it,
+// along with the waiting helpers tests use (Eventually and Log). It differs
+// from harness, which builds the in-process shardlite pieces (the blob store,
+// the journal and the files layer) a test runs on and uses apptest for the app
+// side of them.
 package apptest
 
 import (

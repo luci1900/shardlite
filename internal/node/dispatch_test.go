@@ -11,9 +11,12 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/apptest"
+	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/blobtest"
-	"github.com/luci1900/shardlite/internal/remindex"
-	"github.com/luci1900/shardlite/internal/system/dispatch"
+	"github.com/luci1900/shardlite/internal/dueindex"
+	"github.com/luci1900/shardlite/internal/reconcile"
+	"github.com/luci1900/shardlite/internal/shard"
+	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
 // ringer makes n's app hand out its shards' paths (for requests that aren't
@@ -58,16 +61,16 @@ func remind(t *testing.T, n *clusterNode, paths chan string, shard string, due i
 }
 
 // dispatchCluster is a cluster on one fake clock whose leases never look old and
-// whose nodes wake inactive shards through _dispatch.
+// whose nodes wake inactive shards through the dispatcher.
 func dispatchCluster(t *testing.T, clk *fakeClock) *testCluster {
-	return newClusterWith(t, 2, func(o *CatalogOptions) {
+	return newClusterWith(t, 2, func(o *ShardsetOptions) {
 		o.Clock = clk
 		o.Leases.TTL = 1000 * time.Hour
 	})
 }
 
 // idleWithReminder puts a timer row due at due into shard on n and waits until the
-// shard is cached there. Its manifest then names the reminder and the reminder
+// shard is let go of there. Its manifest then names the reminder and the reminder
 // index has the entry for it.
 func idleWithReminder(t *testing.T, clk *fakeClock, n *clusterNode, paths chan string, shard string, due int64) {
 	t.Helper()
@@ -78,21 +81,37 @@ func idleWithReminder(t *testing.T, clk *fakeClock, n *clusterNode, paths chan s
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mf.NextReminder != remindex.MinuteOf(due) {
-		t.Fatalf("%s's manifest has next_reminder %d, want %d", shard, mf.NextReminder, remindex.MinuteOf(due))
+	if mf.NextReminder != dueindex.MinuteOf(due) {
+		t.Fatalf("%s's manifest has next_reminder %d, want %d", shard, mf.NextReminder, dueindex.MinuteOf(due))
 	}
 }
 
-// entriesOf lists the shard's entries in the reminder index.
-func entriesOf(t *testing.T, n *clusterNode, shard string) []remindex.Entry {
+// allEntries lists every entry in the reminder index, whatever its minute and lane.
+func allEntries(t *testing.T, store *blob.Store) []shardfile.Reminder {
 	t.Helper()
-	all, err := remindex.New(n.m.Load().n.Store).Due(context.Background(), time.Now().AddDate(10, 0, 0), 100000)
-	if err != nil {
-		t.Fatal(err)
+	var out []shardfile.Reminder
+	for i := range shard.Lanes {
+		got, err := shardfile.ReminderIndex(store).Due(context.Background(), shard.Lane(i), time.Now().AddDate(10, 0, 0), 100000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, d := range got {
+			r, err := shardfile.ParseReminder(d)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, r)
+		}
 	}
-	var out []remindex.Entry
-	for _, e := range all {
-		if e.Shard.String() == shard {
+	return out
+}
+
+// entriesOf lists the shard's entries in the reminder index.
+func entriesOf(t *testing.T, n *clusterNode, name string) []shardfile.Reminder {
+	t.Helper()
+	var out []shardfile.Reminder
+	for _, e := range allEntries(t, n.m.Load().n.Store) {
+		if e.Shard.String() == name {
 			out = append(out, e)
 		}
 	}
@@ -100,36 +119,40 @@ func entriesOf(t *testing.T, n *clusterNode, shard string) []remindex.Entry {
 }
 
 // A shard deactivated with a reminder an hour out is dispatched in that minute
-// and woken, with no wake loop: its owner's cached copy is reactivated.
+// and woken, with no wake loop: the dispatch claims the released shard on the node
+// the placer picks, and that node's app answers the wake.
 func TestDispatchWakesAnIdleShard(t *testing.T) {
 	clk := newFakeClock()
 	c := dispatchCluster(t, clk)
 	n0, n1 := c.nodes[0], c.nodes[1]
 	app := apptest.Start(t)
-	paths, rung := ringer(t, n0, app)
-	n1.serve(func(w http.ResponseWriter, q *http.Request) { t.Errorf("n1's app was called: %v", q.Header) })
+	paths, rung0 := ringer(t, n0, app)
+	_, rung1 := ringer(t, n1, app)
+	rung := func() int32 { return rung0.Load() + rung1.Load() }
 	due := clk.Now().Unix() + 3600
-	idleWithReminder(t, clk, n0, paths, "test.brief/d", due)
-	if got := entriesOf(t, n0, "test.brief/d"); len(got) != 1 || got[0].Minute != remindex.MinuteOf(due) {
+	idleWithReminder(t, clk, n0, paths, "brief/d", due)
+	if got := entriesOf(t, n0, "brief/d"); len(got) != 1 || got[0].Minute != dueindex.MinuteOf(due) {
 		t.Fatalf("entries %+v, want one for the minute of %d", got, due)
 	}
 
 	clk.Advance(time.Duration(due-clk.Now().Unix()-120) * time.Second)
-	if rung.Load() != 0 {
+	if rung() != 0 {
 		t.Fatal("the shard was woken before it was due")
 	}
-	advanceUntil(t, clk, 100*time.Millisecond, "the row to be delivered", func() bool { return rung.Load() == 1 })
+	advanceUntil(t, clk, 100*time.Millisecond, "the row to be delivered", func() bool { return rung() == 1 })
 	if late := clk.Now().Unix() - due; late > 150 {
 		t.Fatalf("delivered %d s late, want within about a minute", late)
 	}
 	// The shard's next manifest write finds no reminder, so the entry is not kept
 	// beyond its dispatch: it is moved while the shard is active, and pruned after.
-	advanceUntil(t, clk, 100*time.Millisecond, "deactivation", func() bool { return !n0.m.Load().IsActive(shardName("test.brief/d")) })
-	if mf, _, err := n0.m.Load().n.Files.GetManifest(context.Background(), shardName("test.brief/d")); err != nil || mf.NextReminder != 0 {
+	advanceUntil(t, clk, 100*time.Millisecond, "deactivation", func() bool {
+		return !n0.m.Load().IsActive(shardName("brief/d")) && !n1.m.Load().IsActive(shardName("brief/d"))
+	})
+	if mf, _, err := n0.m.Load().n.Files.GetManifest(context.Background(), shardName("brief/d")); err != nil || mf.NextReminder != 0 {
 		t.Fatalf("manifest %+v (%v), want no next_reminder after the wake", mf, err)
 	}
-	if rung.Load() != 1 {
-		t.Fatalf("the handler ran %d times", rung.Load())
+	if rung() != 1 {
+		t.Fatalf("the handler ran %d times", rung())
 	}
 }
 
@@ -143,40 +166,77 @@ func TestFailedEntryKeepsTheShardActive(t *testing.T) {
 	paths, _ := ringer(t, n0, app)
 	var refused atomic.Int32
 	n0.onStore(func(_ context.Context, op blobtest.Op, key string, after bool) error {
-		if op == blobtest.OpCreate && strings.HasPrefix(key, remindex.Prefix) && !after {
+		if op == blobtest.OpCreate && strings.HasPrefix(key, shardfile.ReminderPrefix) && !after {
 			refused.Add(1)
 			return errors.New("storage is down")
 		}
 		return nil
 	})
-	remind(t, n0, paths, "test.brief/f", clk.Now().Unix()+3600)
+	remind(t, n0, paths, "brief/f", clk.Now().Unix()+3600)
 	advanceUntil(t, clk, 100*time.Millisecond, "the entry to be refused", func() bool { return refused.Load() > 0 })
-	if !n0.m.Load().IsActive(shardName("test.brief/f")) {
+	if !n0.m.Load().IsActive(shardName("brief/f")) {
 		t.Fatal("the shard went idle without its entry")
 	}
 	n0.onStore(func(context.Context, blobtest.Op, string, bool) error { return nil })
-	advanceUntil(t, clk, 100*time.Millisecond, "deactivation", func() bool { return !n0.m.Load().IsActive(shardName("test.brief/f")) })
-	if got := entriesOf(t, n0, "test.brief/f"); len(got) != 1 {
+	advanceUntil(t, clk, 100*time.Millisecond, "deactivation", func() bool { return !n0.m.Load().IsActive(shardName("brief/f")) })
+	if got := entriesOf(t, n0, "brief/f"); len(got) != 1 {
 		t.Fatalf("entries %+v, want one", got)
 	}
 }
 
-// The shard of a node that stopped is dispatched in its minute to a live node
-// without waiting for any lease to expire: its released lease counts as dead.
-func TestDispatchClaimsAStoppedNodesShard(t *testing.T) {
+// A due shard that nobody owns, and that the dispatching node doesn't have, is
+// claimed by the call that dispatches it on the other node, which the placer
+// picks, and woken there. The dispatching node is the one that ranks first for
+// the shard's lane, and only it dispatches. (The shard of a node that stopped is
+// claimed once the lease scan counts the node dead, which
+// TestAdopterEntryWakesAKilledOwnersActiveShard covers.)
+func TestDispatchClaimsAShardNobodyOwns(t *testing.T) {
 	clk := newFakeClock()
 	c := dispatchCluster(t, clk)
-	n0, n1 := c.nodes[0], c.nodes[1]
 	app := apptest.Start(t)
-	paths, rung0 := ringer(t, n0, app)
-	_, rung1 := ringer(t, n1, app)
+	rungOn := map[*clusterNode]*atomic.Int32{}
+	pathsOn := map[*clusterNode]chan string{}
+	for _, n := range c.nodes {
+		pathsOn[n], rungOn[n] = ringer(t, n, app)
+	}
+	const name = "brief/s"
+	// The nodes agree on who ranks first for the shard's lane once each has listed the
+	// cluster, and the shard goes idle on the other node.
+	advanceUntil(t, clk, 100*time.Millisecond, "both nodes to list the cluster", func() bool {
+		for _, n := range c.nodes {
+			if len(n.m.Load().liveNodes()) != len(c.nodes) {
+				return false
+			}
+		}
+		return true
+	})
+	runner := reconcile.Runner(c.nodes[0].m.Load().liveNodes(), shardName(name).Lane())
+	var dispatcher, other *clusterNode
+	for _, n := range c.nodes {
+		if n.env.Name == runner {
+			dispatcher = n
+		} else {
+			other = n
+		}
+	}
+	// The placer picks at random among the live nodes, itself included, so this
+	// one is made to pick the other node.
+	dispatcher.placeOn(other.env.Name)
+	for _, n := range c.nodes {
+		waitCounter(t, "the dispatcher to have run on "+string(n.env.Name), &n.m.Load().dispatching.Passes, 1)
+	}
 	due := clk.Now().Unix() + 3600
-	idleWithReminder(t, clk, n0, paths, "test.brief/s", due)
-	n0.Stop()
+	idleWithReminder(t, clk, other, pathsOn[other], name, due)
 	clk.Advance(time.Duration(due-clk.Now().Unix()) * time.Second)
-	advanceUntil(t, clk, 100*time.Millisecond, "the row to be delivered on n1", func() bool { return rung1.Load() == 1 })
-	if rung0.Load() != 0 {
-		t.Fatal("the node that stopped delivered it")
+	advanceUntil(t, clk, 100*time.Millisecond, "the row to be delivered on the other node", func() bool { return rungOn[other].Load() == 1 })
+	if rungOn[dispatcher].Load() != 0 {
+		t.Fatal("the dispatching node claimed a shard the placer put elsewhere")
+	}
+	if got := dispatcher.m.Load().dispatcher.Dispatched.Load(); got == 0 {
+		t.Fatal("the node that ranks first for the lane sent no dispatch")
+	}
+	if got := other.m.Load().dispatcher.Dispatched.Load(); got != 0 {
+		t.Fatalf("the other node sent %d dispatches for a lane it doesn't run", got)
 	}
 }
 
@@ -184,9 +244,9 @@ func TestDispatchClaimsAStoppedNodesShard(t *testing.T) {
 // writes a delta for, and _dispatch wakes an active shard whose reminder was only
 // in the dead node's journal. Leases expire in real time here.
 func TestAdopterEntryWakesAKilledOwnersActiveShard(t *testing.T) {
-	c := newClusterEnv(t, 2, map[string]string{"SHARDLITE_LEASE_TTL": "1s"}, func(o *CatalogOptions) {
+	c := newClusterEnv(t, 2, map[string]string{"SHARDLITE_LEASE_TTL": "1s"}, func(o *ShardsetOptions) {
 		o.Leases.Every = 50 * time.Millisecond
-		o.Dispatch = &dispatch.Options{Idle: time.Second}
+		o.Dispatch = &reconcile.Options{Every: time.Second}
 	})
 	n0, n1 := c.nodes[0], c.nodes[1]
 	app := apptest.Start(t)
@@ -199,9 +259,9 @@ func TestAdopterEntryWakesAKilledOwnersActiveShard(t *testing.T) {
 		paths <- remindIn(t, app, q)
 	})
 	_, rung1 := ringer(t, n1, app)
-	remind(t, n0, paths, "test.users/k", time.Now().Unix())
+	remind(t, n0, paths, "users/k", time.Now().Unix())
 	apptest.Eventually(t, apptest.Timeout, "the reminder's commit to be in the journal", func() bool {
-		a := n0.m.Load().tab.load(shardName("test.users/k"))
+		a := n0.m.Load().tab.load(shardName("users/k"))
 		return a != nil && a.a != nil && !a.a.cap.hasNewFrames()
 	})
 	n0.Kill()

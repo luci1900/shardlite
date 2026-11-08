@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -34,7 +35,7 @@ import (
 
 // srig is a node serving in front of a fake app. The fake app is in the test
 // process, but it never opens a shard itself: commits go through the separate
-// testapp process (see catalog_test.go for why).
+// testapp process (see shardset_test.go for why).
 type srig struct {
 	*mrig
 	fake    *httptest.Server
@@ -42,7 +43,7 @@ type srig struct {
 	decl    atomic.Value // string: what the fake app's ready route answers
 	sick    atomic.Bool  // the ready route answers 500
 	srv     *Server
-	stop    func() // stops the public and control servers and the ready poll and joins them
+	stop    func() // stops the public and control servers and the declaration poll and joins them
 	pub     string // http://host:port
 	ctl     string
 	sock    string
@@ -57,7 +58,7 @@ type srig struct {
 
 func newSRig(t *testing.T) *srig { return newSRigWith(t, nil) }
 
-func newSRigWith(t *testing.T, mutate func(*CatalogOptions)) *srig {
+func newSRigWith(t *testing.T, mutate func(*ShardsetOptions)) *srig {
 	t.Helper()
 	r := &srig{mrig: newUnstartedMRig(t, nil), opened: map[string]bool{}}
 	r.decl.Store(testKinds)
@@ -84,7 +85,7 @@ func newSRigWith(t *testing.T, mutate func(*CatalogOptions)) *srig {
 	t.Cleanup(r.fake.Close)
 	r.newRouting = r.serverRouting
 	r.startNode()
-	r.startShards(mutate)
+	r.startShardset(mutate)
 	r.startServer()
 
 	r.client = &http.Client{Timeout: 20 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}}
@@ -97,12 +98,12 @@ func newSRigWith(t *testing.T, mutate func(*CatalogOptions)) *srig {
 
 // serverRouting makes the server the shards are built with, and returns its
 // routing, with its wake of the app behind the hook.
-func (r *srig) serverRouting(m *Catalog) routing {
+func (r *srig) serverRouting(m *Shardset) routing {
 	u, _ := url.Parse(r.fake.URL)
 	r.srv = NewServer(m, m.opts.Kinds, m.n.Keeper, ServerOptions{App: u, ReadyEvery: 20 * time.Millisecond, Grace: 500 * time.Millisecond})
 	wake := r.srv.wakeApp
-	return routing{call: r.srv.call, dispatch: r.srv.dispatch, wake: func(ctx context.Context, a *actor) (int, error) {
-		if h := r.wakeHook.Load(); h != nil && a.sys == nil { // a system shard's wake isn't the app's
+	return routing{call: r.srv.call, wake: func(ctx context.Context, a *actor) (int, error) {
+		if h := r.wakeHook.Load(); h != nil {
 			return (*h)(ctx, func() (int, error) { return wake(ctx, a) })
 		}
 		return wake(ctx, a)
@@ -130,7 +131,7 @@ func (r *srig) startServer() {
 	var g errgroup.Group
 	g.Go(func() error { return srv.publicServer(pub).Serve(ctx) })
 	g.Go(func() error { return srv.controlServer(ctl, sock).Serve(ctx) })
-	g.Go(func() error { return srv.ready.Serve(ctx) })
+	g.Go(func() error { return srv.declarations.Serve(ctx) })
 	var once sync.Once
 	r.stop = func() { once.Do(func() { cancel(); g.Wait() }) }
 	r.t.Cleanup(r.stop)
@@ -189,7 +190,7 @@ func (r *srig) req(method, base, path string, hdr map[string]string, body string
 func TestServerRouting(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
-	r.create("test.slow/h", "test.slow/r1", "test.slow/q")
+	r.create("slow/h", "slow/r1", "slow/q")
 	var last atomic.Pointer[http.Request]
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		last.Store(q.Clone(context.Background()))
@@ -200,20 +201,24 @@ func TestServerRouting(t *testing.T) {
 	})
 
 	// The query parameter routes and is stripped; client-sent Shardlite-* headers never reach the app.
-	resp, body := r.req("GET", r.pub, "/hello?a=1&shardlite-target=test.slow/r1&b=2", map[string]string{
-		"Shardlite-Caller": "test.users/9", "Shardlite-File": "/etc/passwd", "Shardlite-Foo": "1", "Shardlite-If-Active": "true", "Shardlite-Sync": "none",
-		"Shardlite-Opened": "test.users/evil",
+	resp, body := r.req("GET", r.pub, "/hello?a=1&shardlite-target=slow/r1&b=2", map[string]string{
+		"Shardlite-Caller": "users/9", "Shardlite-File": "/etc/passwd", "Shardlite-Foo": "1", "Shardlite-If-Active": "true", "Shardlite-Sync": "none",
+		"Shardlite-Opened": "users/evil",
 	}, "")
 	q := last.Load()
 	if resp.StatusCode != 200 || body != "hello" || q == nil {
 		t.Fatalf("%d %q", resp.StatusCode, body)
 	}
 	// The app is told what the node opened, not what the client named, and a client's own Shardlite-Opened gave way to it.
-	if q.Header.Get("Shardlite-Opened") != "test.slow/r1" || q.Header.Get("Shardlite-Target") != "" || q.URL.RawQuery != "a=1&b=2" || q.URL.Path != "/hello" {
+	if q.Header.Get("Shardlite-Opened") != "slow/r1" || q.Header.Get("Shardlite-Target") != "" || q.URL.RawQuery != "a=1&b=2" || q.URL.Path != "/hello" {
 		t.Fatalf("app saw %s %v", q.URL, q.Header)
 	}
-	if p := q.Header.Get("Shardlite-File"); p == "/etc/passwd" || !strings.Contains(p, "slow") || !strings.HasSuffix(p, ".db") {
+	if p := q.Header.Get("Shardlite-File"); p == "/etc/passwd" || !strings.HasSuffix(p, ".db") {
 		t.Fatalf("Shardlite-File = %q", p)
+	}
+	// The path is the kind's directory and the id, with no app segment.
+	if p := q.Header.Get("Shardlite-File"); filepath.Base(filepath.Dir(p)) != "slow" || !strings.HasPrefix(filepath.Base(p), "r1.") {
+		t.Fatalf("Shardlite-File = %q, want .../slow/r1.*.db", p)
 	}
 	for _, h := range []string{"Shardlite-Caller", "Shardlite-Foo", "Shardlite-If-Active", "Shardlite-Sync"} {
 		if q.Header.Get(h) != "" {
@@ -233,19 +238,19 @@ func TestServerRouting(t *testing.T) {
 	}
 
 	// The header wins over the query parameter, which is stripped anyway.
-	r.req("GET", r.pub, "/p?shardlite-target=test.slow/q", map[string]string{"Shardlite-Target": "test.slow/h"}, "")
-	if q := last.Load(); q.Header.Get("Shardlite-Opened") != "test.slow/h" || q.Header.Get("Shardlite-Target") != "" || q.URL.RawQuery != "" {
+	r.req("GET", r.pub, "/p?shardlite-target=slow/q", map[string]string{"Shardlite-Target": "slow/h"}, "")
+	if q := last.Load(); q.Header.Get("Shardlite-Opened") != "slow/h" || q.Header.Get("Shardlite-Target") != "" || q.URL.RawQuery != "" {
 		t.Fatalf("%v %q", q.Header, q.URL.RawQuery)
 	}
 
 	// No shard: a plain reverse proxy.
-	r.req("GET", r.pub, "/news", map[string]string{"Shardlite-Target": "", "Shardlite-Opened": "test.users/evil"}, "")
+	r.req("GET", r.pub, "/news", map[string]string{"Shardlite-Target": "", "Shardlite-Opened": "users/evil"}, "")
 	if q := last.Load(); q.Header.Get("Shardlite-Target") != "" || q.Header.Get("Shardlite-Opened") != "" || q.Header.Get("Shardlite-File") != "" || q.URL.Path != "/news" {
 		t.Fatalf("shardless request: %v", q.Header)
 	}
 
 	// The node's paths are not the clients'.
-	for _, p := range []string{"/_shardlite/sync", "/_shardlite/shards/test.slow/r1", "/_SHARDLITE/sync", "//_shardlite/sync", "/a/../_shardlite/sync", "/_shardlite"} {
+	for _, p := range []string{"/_shardlite/sync", "/_shardlite/shards/slow/r1", "/_SHARDLITE/sync", "//_shardlite/sync", "/a/../_shardlite/sync", "/_shardlite"} {
 		last.Store(nil)
 		for _, m := range []string{"GET", "POST", "DELETE"} {
 			if resp, _ := r.req(m, r.pub, p, nil, ""); resp.StatusCode != 404 || last.Load() != nil {
@@ -259,7 +264,7 @@ func TestServerRouting(t *testing.T) {
 	}
 
 	// Kinds.
-	if resp, _ := r.req("GET", r.pub, "/x", map[string]string{"Shardlite-Target": "test.typo/1"}, ""); resp.StatusCode != 404 {
+	if resp, _ := r.req("GET", r.pub, "/x", map[string]string{"Shardlite-Target": "typo/1"}, ""); resp.StatusCode != 404 {
 		t.Fatalf("undeclared kind: %d", resp.StatusCode)
 	}
 	if resp, _ := r.req("GET", r.pub, "/x", map[string]string{"Shardlite-Target": "users"}, ""); resp.StatusCode != 400 {
@@ -270,11 +275,11 @@ func TestServerRouting(t *testing.T) {
 		t.Fatalf("delete on the control API: %d", resp.StatusCode)
 	}
 	// With gRPC the errors the node makes are gRPC statuses.
-	resp, _ = r.req("POST", r.pub, "/svc/Method", map[string]string{"Shardlite-Target": "test.typo/1", "Content-Type": "application/grpc"}, "")
+	resp, _ = r.req("POST", r.pub, "/svc/Method", map[string]string{"Shardlite-Target": "typo/1", "Content-Type": "application/grpc"}, "")
 	if resp.StatusCode != 200 || resp.Header.Get("Grpc-Status") != "5" || resp.Header.Get("Grpc-Message") == "" {
 		t.Fatalf("grpc error: %d %v", resp.StatusCode, resp.Header)
 	}
-	resp, _ = r.req("POST", r.ctl, "/svc/Method", map[string]string{"Shardlite-Target": "test.typo/1", "Content-Type": "application/grpc+proto"}, "")
+	resp, _ = r.req("POST", r.ctl, "/svc/Method", map[string]string{"Shardlite-Target": "typo/1", "Content-Type": "application/grpc+proto"}, "")
 	if resp.Header.Get("Grpc-Status") != "5" {
 		t.Fatalf("grpc error on the control API: %v", resp.Header)
 	}
@@ -286,7 +291,7 @@ func TestServerRouting(t *testing.T) {
 func TestServerKeepsForwardedHeadersFromTheLoadBalancer(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
-	r.create("test.slow/x1")
+	r.create("slow/x1")
 	var last atomic.Pointer[http.Request]
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		last.Store(q.Clone(context.Background()))
@@ -294,7 +299,7 @@ func TestServerKeepsForwardedHeadersFromTheLoadBalancer(t *testing.T) {
 	})
 	seen := func(hdr map[string]string) (xff, proto, host string) {
 		t.Helper()
-		hdr["Shardlite-Target"] = "test.slow/x1"
+		hdr["Shardlite-Target"] = "slow/x1"
 		if resp, _ := r.req("GET", r.pub, "/x", hdr, ""); resp.StatusCode != 200 {
 			t.Fatalf("status %d", resp.StatusCode)
 		}
@@ -320,7 +325,7 @@ func TestServerKeepsForwardedHeadersFromTheLoadBalancer(t *testing.T) {
 func TestServerLeavesCompressionToTheClient(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
-	r.create("test.slow/z1")
+	r.create("slow/z1")
 	var asked atomic.Value // the request's Accept-Encoding
 	var zipped bytes.Buffer
 	zw := gzip.NewWriter(&zipped)
@@ -334,7 +339,7 @@ func TestServerLeavesCompressionToTheClient(t *testing.T) {
 
 	c := &http.Client{Timeout: 20 * time.Second, Transport: &http.Transport{DisableKeepAlives: true, DisableCompression: true}}
 	q, _ := http.NewRequest("GET", r.pub+"/z", nil)
-	q.Header.Set("Shardlite-Target", "test.slow/z1")
+	q.Header.Set("Shardlite-Target", "slow/z1")
 	resp, err := c.Do(q)
 	if err != nil {
 		t.Fatal(err)
@@ -354,7 +359,7 @@ func TestServerLeavesCompressionToTheClient(t *testing.T) {
 func TestServerStripsUnderscoreHeaders(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
-	r.create("test.slow/u1")
+	r.create("slow/u1")
 	var last atomic.Pointer[http.Request]
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		last.Store(q.Clone(context.Background()))
@@ -364,7 +369,7 @@ func TestServerStripsUnderscoreHeaders(t *testing.T) {
 	})
 
 	resp, _ := r.req("GET", r.pub, "/x", map[string]string{
-		"Shardlite-Target": "test.slow/u1", "Shardlite-Opened": "test.users/evil", "Shardlite_Opened": "test.users/evil", "Shardlite_Caller": "test.users/9", "SHARDLITE_FOO": "1", "X-Plain": "z",
+		"Shardlite-Target": "slow/u1", "Shardlite-Opened": "users/evil", "Shardlite_Opened": "users/evil", "Shardlite_Caller": "users/9", "SHARDLITE_FOO": "1", "X-Plain": "z",
 	}, "")
 	q := last.Load()
 	if resp.StatusCode != 200 || q == nil {
@@ -375,7 +380,7 @@ func TestServerStripsUnderscoreHeaders(t *testing.T) {
 			t.Fatalf("%s: %v reached the app", k, v)
 		}
 	}
-	if q.Header.Get("Shardlite-Opened") != "test.slow/u1" || q.Header.Get("Shardlite-Target") != "" {
+	if q.Header.Get("Shardlite-Opened") != "slow/u1" || q.Header.Get("Shardlite-Target") != "" {
 		t.Fatalf("app saw Shardlite-Opened %q and Shardlite-Target %q", q.Header.Get("Shardlite-Opened"), q.Header.Get("Shardlite-Target"))
 	}
 	if q.Header.Get("X-Plain") != "z" {
@@ -396,24 +401,31 @@ func TestServerStripsUnderscoreHeaders(t *testing.T) {
 // a forward goes to, is told the target to route by.
 func TestRewriteNamesTheShardByWhereItGoes(t *testing.T) {
 	t.Parallel()
-	s := &Server{opts: ServerOptions{App: &url.URL{Scheme: "http", Host: "app.invalid"}}}
+	log := slog.New(slog.DiscardHandler)
+	m := &Shardset{n: &Node{Config: Config{Name: "n0"}}, tab: newTable(log), log: log}
+	s := &Server{m: m, opts: ServerOptions{App: &url.URL{Scheme: "http", Host: "app.invalid"}}}
 	rewrite := func(peer string) http.Header {
 		in := httptest.NewRequest("GET", "/x", nil)
-		in.Header.Set("Shardlite-Opened", "test.users/evil")
+		in.Header.Set("Shardlite-Opened", "users/evil")
+		in.Header.Set(hdrNode, "n9")
+		in.Header.Set(hdrPlacement, placementAvoid)
 		in.Header.Set("Shardlite-File", "/etc/passwd")
-		info := &reqInfo{name: shardName("test.slow/w1"), path: "/data/w1.db", peer: peer}
+		info := &reqInfo{name: shardName("slow/w1"), path: "/data/w1.db", peer: peer}
 		in = in.WithContext(context.WithValue(in.Context(), ctxKey{}, info))
 		pr := &httputil.ProxyRequest{In: in, Out: in.Clone(in.Context())}
 		s.rewrite(pr)
 		return pr.Out.Header
 	}
 	app := rewrite("")
-	if app.Get("Shardlite-Opened") != "test.slow/w1" || app.Get("Shardlite-File") != "/data/w1.db" || app.Get("Shardlite-Target") != "" {
+	if app.Get("Shardlite-Opened") != "slow/w1" || app.Get("Shardlite-File") != "/data/w1.db" || app.Get("Shardlite-Target") != "" || app.Get(hdrNode) != "" || app.Get(hdrPlacement) != "" {
 		t.Fatalf("the app was sent %v", app)
 	}
 	fwd := rewrite("n1.invalid:1")
-	if fwd.Get("Shardlite-Target") != "test.slow/w1" || fwd.Get("Shardlite-Opened") != "" || fwd.Get("Shardlite-File") != "" {
+	if fwd.Get("Shardlite-Target") != "slow/w1" || fwd.Get("Shardlite-Opened") != "" || fwd.Get("Shardlite-File") != "" {
 		t.Fatalf("the owner's node was sent %v", fwd)
+	}
+	if fwd.Get(hdrNode) != "n0" || len(fwd.Values(hdrPlacement)) != 0 {
+		t.Fatalf("the owner's node was sent %v, want n0 as the sender and no placement", fwd)
 	}
 }
 
@@ -427,40 +439,40 @@ func TestServerControlAPI(t *testing.T) {
 	})
 
 	// A call: the opened shard, the caller (passed on), no X-Forwarded-For.
-	resp, body := r.req("POST", r.ctl, "/invite?x=1", map[string]string{"Shardlite-Target": "test.slow/c1", "Shardlite-Caller": "test.users/5", "Shardlite-Foo": "1"}, "payload")
+	resp, body := r.req("POST", r.ctl, "/invite?x=1", map[string]string{"Shardlite-Target": "slow/c1", "Shardlite-Caller": "users/5", "Shardlite-Foo": "1"}, "payload")
 	q := last.Load()
-	if resp.StatusCode != 200 || body != "ok" || q.Header.Get("Shardlite-Opened") != "test.slow/c1" || q.Header.Get("Shardlite-Target") != "" || q.Header.Get("Shardlite-Caller") != "test.users/5" ||
+	if resp.StatusCode != 200 || body != "ok" || q.Header.Get("Shardlite-Opened") != "slow/c1" || q.Header.Get("Shardlite-Target") != "" || q.Header.Get("Shardlite-Caller") != "users/5" ||
 		q.Header.Get("Shardlite-Foo") != "" || q.Header.Get("X-Forwarded-For") != "" || q.URL.Path != "/invite" || q.Method != "POST" {
 		t.Fatalf("%d %q %v", resp.StatusCode, body, q.Header)
 	}
 	// A call with no shard behind it is from "app".
-	r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "test.slow/c1"}, "")
+	r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "slow/c1"}, "")
 	if last.Load().Header.Get("Shardlite-Caller") != "app" {
 		t.Fatalf("caller: %v", last.Load().Header)
 	}
 	// ...and a client's request has none.
-	r.req("GET", r.pub, "/x", map[string]string{"Shardlite-Target": "test.slow/c1", "Shardlite-Caller": "app"}, "")
+	r.req("GET", r.pub, "/x", map[string]string{"Shardlite-Target": "slow/c1", "Shardlite-Caller": "app"}, "")
 	if last.Load().Header.Get("Shardlite-Caller") != "" {
 		t.Fatalf("a client request carries a caller: %v", last.Load().Header)
 	}
 	if resp, _ := r.req("GET", r.ctl, "/x", nil, ""); resp.StatusCode != 400 {
 		t.Fatalf("call with no target: %d", resp.StatusCode)
 	}
-	if resp, _ := r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "test.slow/c1", "Shardlite-Caller": "nonsense"}, ""); resp.StatusCode != 400 {
+	if resp, _ := r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "slow/c1", "Shardlite-Caller": "nonsense"}, ""); resp.StatusCode != 400 {
 		t.Fatalf("bad caller: %d", resp.StatusCode)
 	}
 
 	// If-Active: a shard that isn't running isn't started.
 	last.Store(nil)
-	resp, _ = r.req("GET", r.ctl, "/presence", map[string]string{"Shardlite-Target": "test.slow/c2", "Shardlite-If-Active": "true"}, "")
-	if resp.StatusCode != 404 || last.Load() != nil || r.m.IsActive(shardName("test.slow/c2")) {
-		t.Fatalf("If-Active on an inactive shard: %d, activated=%v", resp.StatusCode, r.m.IsActive(shardName("test.slow/c2")))
+	resp, _ = r.req("GET", r.ctl, "/presence", map[string]string{"Shardlite-Target": "slow/c2", "Shardlite-If-Active": "true"}, "")
+	if resp.StatusCode != 404 || last.Load() != nil || r.m.IsActive(shardName("slow/c2")) {
+		t.Fatalf("If-Active on an inactive shard: %d, activated=%v", resp.StatusCode, r.m.IsActive(shardName("slow/c2")))
 	}
-	r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "test.slow/c2"}, "")
-	if resp, _ := r.req("GET", r.ctl, "/presence", map[string]string{"Shardlite-Target": "test.slow/c2", "Shardlite-If-Active": "true"}, ""); resp.StatusCode != 200 {
+	r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "slow/c2"}, "")
+	if resp, _ := r.req("GET", r.ctl, "/presence", map[string]string{"Shardlite-Target": "slow/c2", "Shardlite-If-Active": "true"}, ""); resp.StatusCode != 200 {
 		t.Fatalf("If-Active on an active shard: %d", resp.StatusCode)
 	}
-	resp, _ = r.req("POST", r.ctl, "/g", map[string]string{"Shardlite-Target": "test.slow/c3", "Shardlite-If-Active": "true", "Content-Type": "application/grpc"}, "")
+	resp, _ = r.req("POST", r.ctl, "/g", map[string]string{"Shardlite-Target": "slow/c3", "Shardlite-If-Active": "true", "Content-Type": "application/grpc"}, "")
 	if resp.Header.Get("Grpc-Status") != "5" {
 		t.Fatalf("grpc If-Active: %v", resp.Header)
 	}
@@ -476,7 +488,7 @@ func TestServerControlAPI(t *testing.T) {
 	}
 	resp2.Body.Close()
 	q2, _ = http.NewRequest("GET", "http://unix/x", nil)
-	q2.Header.Set("Shardlite-Target", "test.slow/c1")
+	q2.Header.Set("Shardlite-Target", "slow/c1")
 	if resp2, err = uc.Do(q2); err != nil || resp2.StatusCode != 200 {
 		t.Fatalf("call over the socket: %v %v", resp2, err)
 	}
@@ -487,7 +499,7 @@ func TestServerControlAPI(t *testing.T) {
 func TestServerStreamsWithoutBuffering(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
-	r.create("test.slow/sse")
+	r.create("slow/sse")
 	// The app holds back the second event until the test has the first. A proxy
 	// that buffers never delivers it, and the safety timer lets go.
 	gate := make(chan struct{})
@@ -510,7 +522,7 @@ func TestServerStreamsWithoutBuffering(t *testing.T) {
 		}
 	})
 	q, _ := http.NewRequest("GET", r.pub+"/events", nil)
-	q.Header.Set("Shardlite-Target", "test.slow/sse")
+	q.Header.Set("Shardlite-Target", "slow/sse")
 	resp, err := r.client.Do(q)
 	if err != nil {
 		t.Fatal(err)
@@ -526,7 +538,7 @@ func TestServerStreamsWithoutBuffering(t *testing.T) {
 	}
 	release()
 	// While the stream is open the shard is held and stays active.
-	if !r.m.IsActive(shardName("test.slow/sse")) {
+	if !r.m.IsActive(shardName("slow/sse")) {
 		t.Fatal("not active during the stream")
 	}
 	rest, _ := io.ReadAll(br)
@@ -539,9 +551,9 @@ func TestServerStreamsWithoutBuffering(t *testing.T) {
 func TestServerUpgrade(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
-	r.create("test.slow/ws")
+	r.create("slow/ws")
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
-		if q.Header.Get("Upgrade") != "websocket" || q.Header.Get("Shardlite-Opened") != "test.slow/ws" {
+		if q.Header.Get("Upgrade") != "websocket" || q.Header.Get("Shardlite-Opened") != "slow/ws" {
 			http.Error(w, "bad", 400)
 			return
 		}
@@ -563,7 +575,7 @@ func TestServerUpgrade(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	fmt.Fprintf(conn, "GET /ws?shardlite-target=test.slow/ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+	fmt.Fprintf(conn, "GET /ws?shardlite-target=slow/ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
 	br := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(br, nil)
 	if err != nil || resp.StatusCode != 101 || resp.Header.Get("Shardlite-Secret") != "" {
@@ -576,12 +588,12 @@ func TestServerUpgrade(t *testing.T) {
 			t.Fatalf("%q %v", line, err)
 		}
 	}
-	if !r.m.IsActive(shardName("test.slow/ws")) {
+	if !r.m.IsActive(shardName("slow/ws")) {
 		t.Fatal("an open connection should keep the shard active")
 	}
 	conn.Close()
 	// Once it is closed the shard is free to go.
-	apptest.Eventually(t, apptest.Timeout, "the hold to be released", func() bool { return r.refs("test.slow/ws") == 0 })
+	apptest.Eventually(t, apptest.Timeout, "the hold to be released", func() bool { return r.refs("slow/ws") == 0 })
 }
 
 // The app's 1xx responses (103 Early Hints) are dropped: ReverseProxy would
@@ -590,7 +602,7 @@ func TestServerUpgrade(t *testing.T) {
 func TestServerDropsInformationalResponses(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
-	r.create("test.slow/e1")
+	r.create("slow/e1")
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		w.Header().Set("Link", "</style.css>; rel=preload")
 		w.Header().Set("Shardlite-Secret", "x")
@@ -606,7 +618,7 @@ func TestServerDropsInformationalResponses(t *testing.T) {
 		return nil
 	}}
 	q, _ := http.NewRequestWithContext(httptrace.WithClientTrace(context.Background(), trace), "GET", r.pub+"/e", nil)
-	q.Header.Set("Shardlite-Target", "test.slow/e1")
+	q.Header.Set("Shardlite-Target", "slow/e1")
 	resp, err := r.client.Do(q)
 	if err != nil {
 		t.Fatal(err)
@@ -631,7 +643,7 @@ func TestServerDropsInformationalResponses(t *testing.T) {
 func TestServerShutdownEndsAndJoinsRequests(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
-	r.create("test.slow/ws")
+	r.create("slow/ws")
 	var started, ended apptest.Log[string]
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		started.Add(q.URL.Path)
@@ -664,7 +676,7 @@ func TestServerShutdownEndsAndJoinsRequests(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	fmt.Fprintf(conn, "GET /ws?shardlite-target=test.slow/ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+	fmt.Fprintf(conn, "GET /ws?shardlite-target=slow/ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
 	br := bufio.NewReader(conn)
 	if resp, err := http.ReadResponse(br, nil); err != nil || resp.StatusCode != 101 {
 		t.Fatalf("upgrade: %v %v", resp, err)
@@ -695,13 +707,13 @@ func TestServerShutdownEndsAndJoinsRequests(t *testing.T) {
 		}()
 		return ch
 	}
-	r.create("test.slow/finish")
-	slow := call(r.ctl, "/slow", "test.slow/call") // through the control server
-	finish := call(r.pub, "/finish", "test.slow/finish")
+	r.create("slow/finish")
+	slow := call(r.ctl, "/slow", "slow/call") // through the control server
+	finish := call(r.pub, "/finish", "slow/finish")
 	started.WaitFor(t, 10*time.Second, "the requests to reach the app", func(p []string) bool {
 		return slices.Contains(p, "/ws") && slices.Contains(p, "/slow") && slices.Contains(p, "/finish")
 	})
-	for _, target := range []string{"test.slow/ws", "test.slow/call", "test.slow/finish"} {
+	for _, target := range []string{"slow/ws", "slow/call", "slow/finish"} {
 		if n := refs(target); n < 1 {
 			t.Fatalf("%s: %d references before the servers stop", target, n)
 		}
@@ -709,7 +721,7 @@ func TestServerShutdownEndsAndJoinsRequests(t *testing.T) {
 
 	r.stop()
 	// Joined: nothing is left holding a shard the moment the servers have stopped.
-	for _, target := range []string{"test.slow/ws", "test.slow/call", "test.slow/finish"} {
+	for _, target := range []string{"slow/ws", "slow/call", "slow/finish"} {
 		if n := refs(target); n != 0 {
 			t.Fatalf("%s: %d references after the servers stopped", target, n)
 		}
@@ -733,7 +745,7 @@ func TestServerShutdownEndsAndJoinsRequests(t *testing.T) {
 func TestServerGRPC(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
-	r.create("test.slow/rpc")
+	r.create("slow/rpc")
 	var proto atomic.Int32
 	// The app holds back its second frame until the test has the first. A node
 	// that buffers the response never delivers it, and the safety timer lets go.
@@ -745,7 +757,7 @@ func TestServerGRPC(t *testing.T) {
 	defer safety.Stop()
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		proto.Store(int32(q.ProtoMajor))
-		if q.Header.Get("Te") != "trailers" || q.Header.Get("Shardlite-Opened") != "test.slow/rpc" {
+		if q.Header.Get("Te") != "trailers" || q.Header.Get("Shardlite-Opened") != "slow/rpc" {
 			http.Error(w, "bad", 400)
 			return
 		}
@@ -763,7 +775,7 @@ func TestServerGRPC(t *testing.T) {
 	q, _ := http.NewRequest("POST", r.pub+"/svc/Method", strings.NewReader("request"))
 	q.Header.Set("Content-Type", "application/grpc")
 	q.Header.Set("Te", "trailers")
-	q.Header.Set("Shardlite-Target", "test.slow/rpc")
+	q.Header.Set("Shardlite-Target", "slow/rpc")
 	resp, err := r.h2c.Do(q) // the client reaches the node over h2c too
 	if err != nil {
 		t.Fatal(err)
@@ -794,7 +806,7 @@ func TestServerGRPC(t *testing.T) {
 	// An error the node makes, over h2c: a gRPC status, not an HTTP error.
 	q, _ = http.NewRequest("POST", r.pub+"/svc/Method", strings.NewReader(""))
 	q.Header.Set("Content-Type", "application/grpc")
-	q.Header.Set("Shardlite-Target", "test.typo/1")
+	q.Header.Set("Shardlite-Target", "typo/1")
 	resp2, err := r.h2c.Do(q)
 	if err != nil {
 		t.Fatal(err)
@@ -809,12 +821,12 @@ func TestServerGRPC(t *testing.T) {
 func TestServerAppDown(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
-	r.create("test.slow/d1")
+	r.create("slow/d1")
 	r.fake.Close()
-	if resp, _ := r.req("GET", r.pub, "/x", map[string]string{"Shardlite-Target": "test.slow/d1"}, ""); resp.StatusCode != 502 {
+	if resp, _ := r.req("GET", r.pub, "/x", map[string]string{"Shardlite-Target": "slow/d1"}, ""); resp.StatusCode != 502 {
 		t.Fatalf("app down: %d", resp.StatusCode)
 	}
-	if resp, _ := r.req("POST", r.pub, "/x", map[string]string{"Shardlite-Target": "test.slow/d1", "Content-Type": "application/grpc"}, ""); resp.Header.Get("Grpc-Status") != "14" {
+	if resp, _ := r.req("POST", r.pub, "/x", map[string]string{"Shardlite-Target": "slow/d1", "Content-Type": "application/grpc"}, ""); resp.Header.Get("Grpc-Status") != "14" {
 		t.Fatalf("app down, grpc: %v", resp.Header)
 	}
 	apptest.Eventually(t, apptest.Timeout, "not ready", func() bool { ok, _ := r.srv.Ready(); return !ok })
@@ -840,9 +852,9 @@ func TestServerReadiness(t *testing.T) {
 
 	// A declaration that stops being valid: not ready, though the kinds of the
 	// last good declaration keep serving.
-	r.declare(`{"app": "test", "kinds": {broken`)
+	r.declare(`{"kinds": {broken`)
 	apptest.Eventually(t, apptest.Timeout, "not ready with a bad declaration", func() bool { return !ready() })
-	if _, err := r.kinds.Lookup("test.slow"); err != nil {
+	if _, err := r.kinds.Lookup("slow"); err != nil {
 		t.Fatal("kinds lost")
 	}
 	r.declare(testKinds)
@@ -854,26 +866,26 @@ func TestServerReadiness(t *testing.T) {
 func TestOnlyPublicKindsForClients(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
-	r.create("test.users/1")
-	r.declare(`{"app": "test", "kinds": {"users": {"public": true, "sync": "none"}, "secret": {"sync": "none"}}}`)
-	apptest.Eventually(t, apptest.Timeout, "the new declaration", func() bool { _, err := r.kinds.Lookup("test.secret"); return err == nil })
+	r.create("users/1")
+	r.declare(`{"kinds": {"users": {"public": true, "sync": "none"}, "secret": {"sync": "none"}}}`)
+	apptest.Eventually(t, apptest.Timeout, "the new declaration", func() bool { _, err := r.kinds.Lookup("secret"); return err == nil })
 	r.app_(func(w http.ResponseWriter, q *http.Request) { io.WriteString(w, "ok") })
 
-	hidden, hbody := r.req("GET", r.pub, "/x", map[string]string{"Shardlite-Target": "test.secret/1"}, "")
-	missing, mbody := r.req("GET", r.pub, "/x", map[string]string{"Shardlite-Target": "test.nosuch/1"}, "")
-	if hidden.StatusCode != missing.StatusCode || strings.ReplaceAll(hbody, "test.secret", "test.nosuch") != mbody {
+	hidden, hbody := r.req("GET", r.pub, "/x", map[string]string{"Shardlite-Target": "secret/1"}, "")
+	missing, mbody := r.req("GET", r.pub, "/x", map[string]string{"Shardlite-Target": "nosuch/1"}, "")
+	if hidden.StatusCode != missing.StatusCode || strings.ReplaceAll(hbody, "secret", "nosuch") != mbody {
 		t.Fatalf("not public: %d %q, undeclared: %d %q", hidden.StatusCode, hbody, missing.StatusCode, mbody)
 	}
-	if q, _ := r.req("GET", r.pub, "/x?shardlite-target=test.secret/1", nil, ""); q.StatusCode != missing.StatusCode {
+	if q, _ := r.req("GET", r.pub, "/x?shardlite-target=secret/1", nil, ""); q.StatusCode != missing.StatusCode {
 		t.Fatalf("by query parameter: %d", q.StatusCode)
 	}
-	if r.m.IsActive(shardName("test.secret/1")) {
+	if r.m.IsActive(shardName("secret/1")) {
 		t.Fatal("a client activated a shard of a kind that is not public")
 	}
-	if resp, body := r.req("GET", r.pub, "/x", map[string]string{"Shardlite-Target": "test.users/1"}, ""); resp.StatusCode != 200 || body != "ok" {
+	if resp, body := r.req("GET", r.pub, "/x", map[string]string{"Shardlite-Target": "users/1"}, ""); resp.StatusCode != 200 || body != "ok" {
 		t.Fatalf("public kind: %d %q", resp.StatusCode, body)
 	}
-	if resp, body := r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "test.secret/1"}, ""); resp.StatusCode != 200 || body != "ok" {
+	if resp, body := r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "secret/1"}, ""); resp.StatusCode != 200 || body != "ok" {
 		t.Fatalf("call from the app: %d %q", resp.StatusCode, body)
 	}
 }

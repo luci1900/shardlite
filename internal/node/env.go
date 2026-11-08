@@ -24,8 +24,7 @@ type Env struct {
 	Prefix      string        // SHARDLITE_PREFIX: prefix of every object path, for example "staging/"
 	Flush       time.Duration // SHARDLITE_FLUSH: flush interval, 250ms
 	IdleTimeout time.Duration // SHARDLITE_IDLE_TIMEOUT: default for kinds with no idle_timeout of their own (the built-in default if unset)
-	Data        string        // SHARDLITE_DATA: directory of shard files (the local cache)
-	CacheLimit  int64         // SHARDLITE_CACHE_LIMIT: bytes of deactivated shards to keep, 0 for no limit
+	Data        string        // SHARDLITE_DATA: directory of the active shards' files
 	LeaseTTL    time.Duration // SHARDLITE_LEASE_TTL: 10s
 	FlushMin    time.Duration // SHARDLITE_FLUSH_MIN: the shortest time between two flush cycle starts, DefaultFlushMin
 	DeltaAge    time.Duration // SHARDLITE_DELTA_AGE: how old a shard's tail gets before a delta is written, 15m. A tail 3 times older raises an alert, and journal segments expire after the larger of 24h and 12 times this
@@ -89,13 +88,6 @@ func ParseEnv(getenv func(string) string) (Env, error) {
 			return e, fmt.Errorf("SHARDLITE_DELTA_SIZE is %q, want a size like 1MB", v)
 		}
 		e.DeltaSize = n
-	}
-	if v := getenv("SHARDLITE_CACHE_LIMIT"); v != "" {
-		n, err := parseBytes(v)
-		if err != nil {
-			return e, fmt.Errorf("SHARDLITE_CACHE_LIMIT: %w", err)
-		}
-		e.CacheLimit = n
 	}
 	for _, r := range []struct{ name, v string }{{"SHARDLITE_BLOB", e.Blob}, {"SHARDLITE_DATA", e.Data}} {
 		if r.v == "" {

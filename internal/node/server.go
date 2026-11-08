@@ -21,9 +21,9 @@ import (
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/cluster"
-	"github.com/luci1900/shardlite/internal/coord"
 	"github.com/luci1900/shardlite/internal/kind"
-	"github.com/luci1900/shardlite/internal/pos"
+	"github.com/luci1900/shardlite/internal/lease"
+	"github.com/luci1900/shardlite/internal/reconcile"
 	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
@@ -35,19 +35,17 @@ const (
 	hdrOpened    = "Shardlite-Opened" // node to app: the shard the node opened for the request
 	hdrFile      = "Shardlite-File"
 	hdrCaller    = "Shardlite-Caller"
-	hdrRelay     = "Shardlite-Relay" // app to node: the request is a client's, relayed
 	hdrSync      = "Shardlite-Sync"
 	hdrIfActive  = "Shardlite-If-Active"
 	hdrIfExists  = "Shardlite-If-Exists"
 	hdrHops      = "Shardlite-Hops"
-	hdrOrigin    = "Shardlite-Origin" // on a forward: "client", "call", "relay" or "node"
+	hdrOrigin    = "Shardlite-Origin" // on a forward: "client", "call" or "node"
 	hdrOwner     = "Shardlite-Owner"  // on a 421: the owner the node found
 	queryTarget  = "shardlite-target"
 	apiPrefix    = "/_shardlite/"
 	readyPath    = "/_shardlite/ready" // the node's, to the load balancer
 	appReadyPath = "/_shardlite/ready" // the app's, which the node polls
-	nodePath     = "/_shardlite/node"
-	callerApp    = "app" // Shardlite-Caller of a call that has no shard behind it
+	callerApp    = "app"               // Shardlite-Caller of a call that has no shard behind it
 )
 
 // ServerOptions configure a Server.
@@ -64,13 +62,13 @@ type ServerOptions struct {
 	// AnswerTimeout is how long a forward waits for the owner's node to
 	// acknowledge it before the owner counts as unreachable, 1 s if zero.
 	AnswerTimeout time.Duration
-	// Clock, if set, is what GET /_shardlite/node reports of the node's clock.
-	Clock  *coord.ClockWatch
-	Logger *slog.Logger
+	Logger        *slog.Logger
 }
 
 // The timeouts of the node's HTTP transports and servers.
 const (
+	// defaultGrace is how long stopping a server waits for requests in flight before it ends them.
+	defaultGrace = 10 * time.Second
 	// dialTimeout bounds opening a connection to the app or a peer. A peer that is
 	// down should fail a forward in seconds, not when TCP gives up.
 	dialTimeout = 5 * time.Second
@@ -94,31 +92,30 @@ const DefaultMaxHops = 32
 // shard, proxy to the app with Shardlite-Opened and Shardlite-File, and hold
 // the app's output at the shard's durability gate.
 type Server struct {
-	m      *Catalog
+	m      *Shardset
 	kinds  *Kinds
-	keeper *coord.Keeper
+	keeper *lease.Keeper
 	opts   ServerOptions
 	log    *slog.Logger
 	proxy  *httputil.ReverseProxy
 	// forwarder sends requests for shards other nodes own to their peer
 	// listeners: over h2c, one multiplexed connection per pair of nodes, but an
 	// upgrade over HTTP/1.1 on a connection of its own.
-	forwarder *httputil.ReverseProxy
-	peers     *http.Client // the node's own requests to other nodes (dispatches)
-	ready     *ready       // a service of Run's: the poll of the app's ready route
+	forwarder    *httputil.ReverseProxy
+	declarations *declarations // a service of Run's: the poll of the app's ready route
 }
 
 // NewServer makes the node's servers. The app counts as unhealthy until its
-// ready route has answered with a declaration (once Run serves s.ready). An
+// ready route has answered with a declaration (once Run serves s.declarations). An
 // app address of nil (a node that serves no kinds) runs no poll.
-func NewServer(m *Catalog, kinds *Kinds, keeper *coord.Keeper, opts ServerOptions) *Server {
+func NewServer(m *Shardset, kinds *Kinds, keeper *lease.Keeper, opts ServerOptions) *Server {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
 	orDefault(&opts.ReadyEvery, time.Second)
 	orDefault(&opts.MaxHops, DefaultMaxHops)
 	orDefault(&opts.ReminderTimeout, 30*time.Second)
-	orDefault(&opts.Grace, 10*time.Second)
+	orDefault(&opts.Grace, defaultGrace)
 	orDefault(&opts.AnswerTimeout, time.Second)
 	s := &Server{m: m, kinds: kinds, keeper: keeper, opts: opts, log: opts.Logger}
 
@@ -129,12 +126,12 @@ func NewServer(m *Catalog, kinds *Kinds, keeper *coord.Keeper, opts ServerOption
 	h1.Protocols = new(http.Protocols)
 	h1.Protocols.SetHTTP1(true)
 	h2c := newPeerTransport()
-	// The ready poll shares h1 (the app's ready route speaks HTTP/1.1). A node
+	// The declaration poll shares h1 (the app's ready route speaks HTTP/1.1). A node
 	// without an app address serves no kinds and polls nothing.
 	if opts.App != nil {
 		u := *opts.App
 		u.Path = strings.TrimRight(u.Path, "/") + appReadyPath
-		s.ready = &ready{kinds: kinds, url: u.String(), every: opts.ReadyEvery, client: &http.Client{Transport: h1, Timeout: 2 * time.Second}, log: opts.Logger}
+		s.declarations = &declarations{kinds: kinds, url: u.String(), every: opts.ReadyEvery, client: &http.Client{Transport: h1, Timeout: 2 * time.Second}, log: opts.Logger}
 	}
 
 	s.proxy = &httputil.ReverseProxy{
@@ -153,7 +150,6 @@ func NewServer(m *Catalog, kinds *Kinds, keeper *coord.Keeper, opts ServerOption
 		ErrorHandler:   s.forwardError,
 		FlushInterval:  -1,
 	}
-	s.peers = &http.Client{Transport: splitTransport{h1: h1, h2c: h2c, peer: true}}
 	return s
 }
 
@@ -212,8 +208,8 @@ func (s *Server) controlServer(lns ...net.Listener) *httpServer {
 }
 
 // peerServer serves other nodes on ln, which is only reachable from them.
-func (s *Server) peerServer(ln net.Listener, name cluster.Node) *httpServer {
-	return &httpServer{name: "peer server", log: s.log, lns: []net.Listener{ln}, handler: s.PeerHandler(name), grace: s.opts.Grace}
+func (s *Server) peerServer(ln net.Listener) *httpServer {
+	return &httpServer{name: "peer server", log: s.log, lns: []net.Listener{ln}, handler: s.PeerHandler(), grace: s.opts.Grace}
 }
 
 // Serve serves until ctx ends or a listener fails, then stops: it stops
@@ -329,57 +325,40 @@ func (s *Server) PublicHandler() http.Handler {
 // ControlHandler serves the app on this host: the node's API under
 // /_shardlite/, and calls to shards, which are requests with a
 // Shardlite-Target that go through the same path as clients' (and may carry
-// Shardlite-Caller, Shardlite-If-Active and Shardlite-Sync). A request marked
-// Shardlite-Relay: true is a client's request the app relays, served with the
-// client's limits. Any other value is refused, since reading it as a call would
-// widen what the client can reach.
+// Shardlite-Caller, Shardlite-If-Active and Shardlite-Sync).
 func (s *Server) ControlHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if isAPIPath(r.URL.Path) {
 			s.api(w, r)
 			return
 		}
-		o := origin{kind: fromCall}
-		if v := r.Header.Get(hdrRelay); v != "" {
-			if !strings.EqualFold(v, "true") {
-				writeError(w, r, false, http.StatusBadRequest, "bad Shardlite-Relay")
-				return
-			}
-			o.kind = fromRelay
-		}
-		s.route(w, r, o)
+		s.route(w, r, origin{kind: fromCall})
 	})
 }
 
-// PeerHandler serves other nodes: it says who this node is, and serves the
-// requests they forward, each with the origin it had on the forwarding node.
+// PeerHandler serves other nodes: the requests they forward, each with the
+// origin it had on the forwarding node.
 // Node-only headers are honoured here and nowhere else.
-func (s *Server) PeerHandler(name cluster.Node) http.Handler {
+func (s *Server) PeerHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == nodePath && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
-			s.nodeRoute(w, name)
-			return
-		}
-		if r.URL.Path == dispatchPath && r.Method == http.MethodPost {
-			s.serveDispatch(w, r)
-			return
-		}
-		o := origin{forwarded: true}
+		// Every answer says avoid while the node drains, the 102 included, and a
+		// request names its sender and may say the same.
+		from, avoid := s.m.placer.received(remoteHost(r), r.Header)
+		s.m.stampPlacement(w.Header())
+		o := origin{forwarded: true, from: from, avoid: avoid}
 		switch r.Header.Get(hdrOrigin) {
 		case originClient:
 			o.kind = fromClient
 		case originCall:
 			o.kind = fromCall
-		case originRelay:
-			o.kind = fromRelay
 		case originNode:
 			o.kind = fromNode
 		default:
 			writeError(w, r, true, http.StatusNotFound, "not found")
 			return
 		}
-		// Only the node's own requests use paths under /_shardlite/ (a system app's
-		// that only the node may send), and only another node forwards them here.
+		// Only the node's own requests use paths under /_shardlite/ (the dispatcher's
+		// activation), and only another node forwards them here.
 		if isAPIPath(r.URL.Path) && o.kind != fromNode {
 			writeError(w, r, true, http.StatusNotFound, "not found")
 			return
@@ -391,46 +370,21 @@ func (s *Server) PeerHandler(name cluster.Node) http.Handler {
 	})
 }
 
+// remoteHost is the address a request connected from, without the port, for the log.
+func remoteHost(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
 // The values of Shardlite-Origin.
 const (
 	originClient = "client"
 	originCall   = "call"
-	originRelay  = "relay"
 	originNode   = "node"
 )
-
-// NodeInfoReply is the answer of GET /_shardlite/node.
-type NodeInfoReply struct {
-	Name  cluster.Node `json:"name"`
-	Epoch pos.Epoch    `json:"epoch"`
-	// Clock is how the node's clock stands against the store's, nil when the
-	// node does not check it.
-	Clock *ClockInfo `json:"clock,omitempty"`
-}
-
-// ClockInfo is the clock watch's report (coord.ClockReport).
-type ClockInfo struct {
-	// OffsetMillis is the store's time less the node's, good to a second.
-	OffsetMillis int64 `json:"offset_ms"`
-	Samples      int   `json:"samples"`
-	// Warning is set when the offset is over a second, either way.
-	Warning bool `json:"warning,omitempty"`
-	// Blind is set when the store's responses carry no usable time.
-	Blind bool `json:"blind,omitempty"`
-}
-
-// nodeRoute answers GET /_shardlite/node, on the peer listener for other
-// nodes and on the control API for whoever runs the node: who this node is and
-// how its clock stands against the store's.
-func (s *Server) nodeRoute(w http.ResponseWriter, name cluster.Node) {
-	w.Header().Set("Content-Type", "application/json")
-	reply := NodeInfoReply{Name: name, Epoch: s.keeper.Lease().Epoch}
-	if c := s.opts.Clock; c != nil {
-		r := c.Report()
-		reply.Clock = &ClockInfo{OffsetMillis: r.Offset.Milliseconds(), Samples: r.Samples, Warning: r.Warning, Blind: r.Blind}
-	}
-	json.NewEncoder(w).Encode(reply)
-}
 
 // isAPIPath reports whether the path is under /_shardlite/, however it is
 // spelled: cleaned of dot segments and repeated slashes and compared without
@@ -462,8 +416,6 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
-	case r.URL.Path == nodePath && (r.Method == http.MethodGet || r.Method == http.MethodHead):
-		s.nodeRoute(w, s.m.Name())
 	default:
 		writeError(w, r, false, http.StatusNotFound, "no such endpoint")
 	}
@@ -473,13 +425,12 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 type reqInfo struct {
 	name       shard.Name // zero for a shardless request
 	path       string
-	caller     string     // "" on a client request and on a relay
+	caller     string     // "" on a client request
 	callerName shard.Name // the calling shard, zero when the caller is the app
 	hold       *Hold
 	public     bool // a client's request to the public handler
-	relay      bool // a client's request the app relayed (the client's limits, hops counted)
 	own        bool // the node's own request (a delivery), answered in process
-	node       bool // the node's request for a system shard (fromNode)
+	node       bool // the node's own request (fromNode): the dispatcher's activation of any shard
 	// forwarded is a request another node forwarded here. owner is the node that
 	// owns the target when that isn't this one, and peer the address it is
 	// forwarded to.
@@ -506,7 +457,7 @@ type reqInfo struct {
 type ctxKey struct{}
 
 // route works out the shard, activates it and proxies. o says who asked: the
-// handlers set it from the request, and the node's own requests (send.go) say
+// handlers set it from the request, and the node's own requests (origin.go) say
 // what they are.
 func (s *Server) route(w http.ResponseWriter, r *http.Request, o origin) {
 	// The header, then the query parameter. Either way the parameter is stripped,
@@ -527,7 +478,8 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, o origin) {
 		}
 		name = n
 	}
-	info := &reqInfo{name: name, public: o.kind == fromClient, relay: o.kind == fromRelay, own: o.internal(), node: o.kind == fromNode, forwarded: o.forwarded}
+	info := &reqInfo{name: name, public: o.kind == fromClient, own: o.internal(), node: o.kind == fromNode, forwarded: o.forwarded}
+	activate := info.node && r.URL.Path == reconcile.Activate
 	// The proxy can leave goroutines behind that are still reading through a gate
 	// when the handler returns: the second copier of an upgraded connection, or
 	// the transport writing a request body. Their gates end with the request's
@@ -558,8 +510,8 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, o origin) {
 			s.forward(w, r, info)
 			return
 		}
-		if info.hold.a.sys != nil {
-			s.serveSystem(w, r, info)
+		if activate {
+			serveActivate(w, info.hold.started)
 			return
 		}
 	}
@@ -588,21 +540,15 @@ func (s *Server) answer(w http.ResponseWriter, r *http.Request, own bool, err er
 	s.fail(w, r, own, err)
 }
 
-// parseCall reads what a call or relay says about itself into info: its caller
-// (a relay has none) and its hops.
+// parseCall reads what a call says about itself into info: its caller and its
+// hops.
 func (s *Server) parseCall(r *http.Request, o origin, info *reqInfo) error {
-	if o.control() {
+	if o.call() {
 		if info.name.IsZero() {
-			return &statusError{http.StatusBadRequest, "a call or relay needs a Shardlite-Target"}
+			return &statusError{http.StatusBadRequest, "a call needs a Shardlite-Target"}
 		}
 		info.caller = r.Header.Get(hdrCaller)
 		switch {
-		case o.kind == fromRelay:
-			// The client's request has no caller, and the handler treats it as one, so a
-			// relay naming one is the app mixing the two up.
-			if info.caller != "" {
-				return &statusError{http.StatusBadRequest, "a relay carries no Shardlite-Caller"}
-			}
 		case info.caller == "" || info.caller == callerApp:
 			info.caller = callerApp
 		default:
@@ -623,7 +569,7 @@ func (s *Server) parseCall(r *http.Request, o origin, info *reqInfo) error {
 	// (an app that doesn't pass the header on starts again at 0). It is refused
 	// before anything is gated or activated. A forward carries the hops its node
 	// worked out: forwarding is not a hop.
-	if v := r.Header.Get(hdrHops); v != "" && (o.control() || o.forwarded) {
+	if v := r.Header.Get(hdrHops); v != "" && (o.call() || o.forwarded) {
 		d, err := strconv.Atoi(v)
 		if err != nil || d < 0 {
 			return &statusError{http.StatusBadRequest, "bad Shardlite-Hops"}
@@ -640,10 +586,9 @@ func (s *Server) parseCall(r *http.Request, o origin, info *reqInfo) error {
 	return nil
 }
 
-// checkTarget refuses a target a client may not name (a relay of a client's
-// request included), and a call that wants only shards that are already active
-// when the target isn't active here. If another node owns it, it may be active
-// there, and the call goes to it.
+// checkTarget refuses a target a client may not name, and a call that wants
+// only shards that are already active when the target isn't active here. If
+// another node owns it, it may be active there, and the call goes to it.
 func (s *Server) checkTarget(r *http.Request, o origin, info *reqInfo) error {
 	if o.client() {
 		if err := s.kinds.CheckPublic(info.name); err != nil {
@@ -681,7 +626,7 @@ func (s *Server) holdShards(r *http.Request, o origin, info *reqInfo) error {
 	// as the call lasts, waits for what that shard committed (docs/internals.md,
 	// Durability gates). The caller stays active until the call ends. The node's
 	// own requests aren't gated: their row is durable already. Nor is a forwarded
-	// call: the caller's node gates it. A relay has no caller to gate.
+	// call: the caller's node gates it.
 	if o.call() && info.caller != callerApp && !o.internal() && !o.forwarded {
 		cg, err := s.gateCaller(r, info)
 		if err != nil {
@@ -701,25 +646,37 @@ func (s *Server) holdShards(r *http.Request, o origin, info *reqInfo) error {
 		info.owner = owner
 		return nil
 	}
-	// Clients never create a shard (nor does a relay of their request), and a call
-	// can ask not to (Shardlite-If-Exists). Shardlite-If-Active is the same ask,
-	// made before the table is looked at.
+	// Clients never create a shard, and a call can ask not to
+	// (Shardlite-If-Exists). Shardlite-If-Active is the same ask, made before the
+	// table is looked at.
 	existing := o.client() || (o.call() && strings.EqualFold(r.Header.Get(hdrIfExists), "true"))
-	var hold *Hold
-	var err error
-	if existing {
-		hold, err = s.m.acquireExisting(r.Context(), info.name)
-	} else {
-		hold, err = s.m.Acquire(r.Context(), info.name)
+	// A call from a shard may claim its target on another node, picked at random: the
+	// caller's node is wherever the caller happens to live, so it is no reason to
+	// put the callee there. So may the node's own request, which the dispatcher
+	// sends for a due shard that nobody owns: the shard belongs on any node,
+	// not on whichever node ranks first for its lane. A client's request has its session
+	// on this node, as does a call with no shard behind it (a login), and the shard
+	// belongs here. A wake is for the node it is made on, and a forward has been
+	// placed already.
+	anywhere := (o.kind == fromNode || (o.kind == fromCall && !info.callerName.IsZero())) && !o.forwarded
+	// A client's request forwarded here for a shard that nobody owns went by the forwarding
+	// node's owner cache, which is stale: whoever owned the shard let it go (at its idle timeout
+	// or at a stop) and the cache still names it. The client's session is on the forwarding
+	// node, so the shard is claimed there: the only forwards this node claims for are the ones
+	// a draining node placed (they carry Shardlite-Placement: avoid).
+	var sendBack cluster.Node
+	if o.forwarded && o.client() && o.from != "" && !o.avoid {
+		sendBack = o.from
 	}
+	hold, err := s.m.take(r.Context(), info.name, acquireOpts{existing: existing, anywhere: anywhere, sendBack: sendBack})
 	if errors.Is(err, blob.ErrNotFound) {
 		// The same answer as a kind the client may not name, so it says nothing of
 		// kinds or ids. A flood of misses must not be a flood of log lines.
 		s.log.Debug("no shard to reach: it does not exist, and this request may not create it", "target", info.name)
 		return fmt.Errorf("%w: %q", ErrUnknownKind, info.name.Kind())
 	}
-	if oe, ok := errors.AsType[*shardfile.OwnedElsewhereError](err); ok && o.kind != fromWake {
-		info.owner = oe.Owner
+	if node, ok := forwardTo(err); ok && o.kind != fromWake {
+		info.owner = node
 		return nil
 	}
 	if errors.Is(err, shardfile.ErrOwnerNotAdopted) {
@@ -829,12 +786,12 @@ func (s *Server) rewrite(pr *httputil.ProxyRequest) {
 	}
 	pr.Out.Header.Set(hdrHops, strconv.Itoa(info.hops))
 	if info.peer != "" {
+		s.m.stampNode(pr.Out.Header)
+		s.m.stampPlacement(pr.Out.Header)
 		origin := originCall
 		switch {
 		case info.public:
 			origin = originClient
-		case info.relay:
-			origin = originRelay
 		case info.node:
 			origin = originNode
 			fallthrough
@@ -861,12 +818,10 @@ func (s *Server) rewrite(pr *httputil.ProxyRequest) {
 		pr.Out.Header.Set(hdrCaller, info.caller)
 	}
 	switch {
-	case info.forwarded || info.relay:
+	case info.forwarded:
 		// The forwarding node added the client: the app sees what it would have seen
-		// there. A relay carries them as the app sent them, which are what the client's
-		// request carried when the app received it. The control API is local and the
-		// app is trusted, so the node adds nothing of its own (the app's address would
-		// only lengthen the chain).
+		// there. The control API is local and the app is trusted, so the node adds
+		// nothing of its own (the app's address would only lengthen the chain).
 		passOn(pr, "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto")
 	case info.public:
 		// The load balancer is the trust boundary: its chain is extended with its
@@ -965,11 +920,12 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, own bool, err erro
 			status = http.StatusNotFound
 		case errors.Is(err, ErrBadTarget):
 			status = http.StatusBadRequest
-		case errors.Is(err, ErrAppHolds), errors.Is(err, errMoved),
-			errors.Is(err, coord.ErrLeaseLost), errors.Is(err, coord.ErrLeaseExpired),
+		case errors.Is(err, ErrAppHolds), errors.Is(err, errMoved), errors.Is(err, errShardsStopped),
+			errors.Is(err, lease.ErrLost), errors.Is(err, lease.ErrExpired),
 			errors.Is(err, shardfile.ErrBadFile):
 			// A shard whose files are not the ones it holds cannot be served, and
-			// neither can a shard the node may not serve yet.
+			// neither can a shard the node may not serve yet or one it is no longer
+			// starting (the stop is letting go of its shards while it still answers).
 			status = http.StatusServiceUnavailable
 		case errors.Is(err, context.DeadlineExceeded):
 			status = http.StatusGatewayTimeout

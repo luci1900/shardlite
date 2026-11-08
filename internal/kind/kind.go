@@ -1,21 +1,15 @@
 // Package kind is what a shard kind is (docs/guide.md, Shard kinds): its
-// settings, and for a system kind (docs/internals.md, System kinds) its fixed
-// ids, migrations and system app. An app's declaration (app.go) parses into it
-// and each system kind's package constructs it, so both are declared with the
-// same settings and the same defaults. The zero value of each setting is the
-// safe one. The names of apps, kinds and shards are in internal/shard, which
-// the node and the system kinds share.
+// settings. An app's declaration (app.go) parses into it. The zero value of each
+// setting is the safe one. The names of kinds and shards are in
+// internal/shard.
 package kind
 
 import (
 	"fmt"
-	"io/fs"
-	"net/http"
 	"strings"
 	"time"
 
 	"github.com/luci1900/shardlite/internal/shard"
-	"github.com/luci1900/shardlite/internal/system"
 )
 
 // Sync is a kind's durability tier (docs/guide.md, Durability): the place
@@ -75,21 +69,4 @@ type Kind struct {
 	Sync        Sync
 	IdleTimeout time.Duration // how long an unused shard stays active, the node's default if zero
 	Public      bool          // clients may name it; otherwise only calls reach it
-
-	// IDs are the fixed ids, each starting with "_". The node keeps every one
-	// claimed and active somewhere in the cluster, so it never goes idle.
-	IDs []shard.ID
-	// Migrations hold the kind's schema as numbered files (see package migrate),
-	// applied at every activation after the reserved tables.
-	Migrations fs.FS
-	// Handler builds the system app of one shard. It is called once per
-	// activation and does nothing else: a handler starts no goroutines and keeps
-	// nothing past a request. The wake is POST /_shardlite/reminders, as for an
-	// app. A kind with a Handler is a system kind, served in process, and it is
-	// nil for a kind the app serves.
-	Handler func(*system.System) http.Handler
 }
-
-// SystemKind is the name of one of the node's own kinds: the kind's own name
-// under the node's app.
-func SystemKind(k string) shard.Kind { return shard.Qualify(shard.SystemApp, k) }

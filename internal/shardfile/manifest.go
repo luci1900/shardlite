@@ -14,10 +14,11 @@ import (
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/cluster"
-	"github.com/luci1900/shardlite/internal/coord"
+	"github.com/luci1900/shardlite/internal/dueindex"
 	"github.com/luci1900/shardlite/internal/journal"
+	"github.com/luci1900/shardlite/internal/kill"
+	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/pos"
-	"github.com/luci1900/shardlite/internal/remindex"
 	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/tempfile"
 )
@@ -34,7 +35,7 @@ type Manifest struct {
 	// there is none (docs/internals.md, Manifest). The owner's deltas, rebases and
 	// deactivations set it, with its entry in the reminder index created before the
 	// write. Claims and releases keep it.
-	NextReminder remindex.Minute `json:"next_reminder,omitempty"`
+	NextReminder dueindex.Minute `json:"next_reminder,omitempty"`
 	// Rev counts the manifest's writes, so no two versions have the same bytes and
 	// ETag. The reminder index's pruning rule relies on a changed version staying changed.
 	Rev uint64 `json:"rev,omitempty"`
@@ -107,15 +108,21 @@ func (m *Manifest) clone() *Manifest {
 // A shard's manifest and files each have a prefix, under the state and data roles
 // (docs/internals.md, Data and state).
 const (
-	ManifestPrefix = "state/shards/" // the shards' manifests (state, one per shard)
-	FilesPrefix    = "data/shards/"  // all shards' LTX files (data)
+	ManifestPrefix = "state/shards/" // the shards' manifests (state, one per shard), by lane
+	FilesPrefix    = "data/shards/"  // all shards' LTX files (data), by lane
 )
 
-// ManifestKey is the object key of a shard's manifest.
-func ManifestKey(n shard.Name) string { return ManifestPrefix + n.String() }
+// ManifestKey is the object key of a shard's manifest: state/shards/{lane}/{kind}/{id}.
+// It leads with the shard's lane as its files and indexes do, so a spike of claims
+// spreads over the store's key ranges.
+func ManifestKey(n shard.Name) string { return ManifestPrefix + n.Lane().String() + "/" + n.String() }
 
-// ShardPrefix is the key prefix of all of a shard's LTX files.
-func ShardPrefix(n shard.Name) string { return FilesPrefix + n.String() + "/" }
+// LanePrefix is the key prefix of the LTX files of all the shards in a lane.
+func LanePrefix(l shard.Lane) string { return FilesPrefix + l.String() + "/" }
+
+// ShardPrefix is the key prefix of all of a shard's LTX files:
+// data/shards/{lane}/{kind}/{id}/.
+func ShardPrefix(n shard.Name) string { return LanePrefix(n.Lane()) + n.String() + "/" }
 
 // GenerationPrefix is the key prefix of the LTX files of one generation of a shard.
 func GenerationPrefix(n shard.Name, generation shard.Gen) string {
@@ -191,7 +198,7 @@ type Files struct {
 	// caller at a time.
 	Backend blob.Backend
 	Node    cluster.Node // the node whose journal new shards write to
-	Leases  *coord.Registry
+	Leases  *lease.Registry
 	// JournalOptions tune the retries of the journals' stores (Journal). Zero
 	// is the journal store's own defaults.
 	JournalOptions journal.Options
@@ -199,8 +206,12 @@ type Files struct {
 	// files of a restore, the commits of a restored tail). It is in the data
 	// directory, and required.
 	Temp *tempfile.Dir
-	// Now is the time adoption records its reminders at, time.Now if nil.
+	// Now is the time adoption records its reminders at and the orphan index's
+	// entries are made at, time.Now if nil.
 	Now func() time.Time
+	// OrphanAge is the age rule (AgeRule): how old an LTX file that no manifest lists
+	// must be before the collector deletes it. DefaultAgeRule if zero.
+	OrphanAge time.Duration
 
 	journals   map[cluster.Node]*journal.Store // one store per journal this node has touched
 	journalsMu sync.Mutex
@@ -313,10 +324,10 @@ func (f *Files) Create(ctx context.Context, n shard.Name) (h *Handle, created bo
 // version the write CASes against, and a failure fails the write. A reminder in
 // the minute the manifest already has (Unix minutes) needs no new entry: the entry that backs
 // the old one backs it too, since an entry is never deleted while it is backed.
-func (h *Handle) setReminder(ctx context.Context, next *Manifest, reminder remindex.Minute) error {
+func (h *Handle) setReminder(ctx context.Context, next *Manifest, reminder dueindex.Minute) error {
 	if reminder > 0 && reminder != h.Manifest.NextReminder {
-		e := remindex.Entry{Minute: reminder, Shard: h.Name, Base: remindex.BaseOf(h.ETag)}
-		if err := remindex.New(h.F.Blob).Create(ctx, e); err != nil {
+		e := Reminder{Minute: reminder, Shard: h.Name, Base: BaseOf(h.ETag)}
+		if err := ReminderIndex(h.F.Blob).Create(ctx, e.Entry()); err != nil {
 			return err
 		}
 	}
@@ -329,17 +340,21 @@ func (h *Handle) setReminder(ctx context.Context, next *Manifest, reminder remin
 // tail, which has no delta to carry the shard's next reminder: a reminder that went
 // stale, or an adoption's, would otherwise leave the manifest naming a time
 // the shard has nothing due at, and the dispatcher waking it for nothing. It
-// writes nothing if the manifest has that already.
-func (h *Handle) SetReminder(ctx context.Context, reminder remindex.Minute) error {
+// writes nothing if the manifest has that already. With release the same update gives the shard up
+// (see Hooks.Release), and nothing is written only if a write of that kind landed already.
+func (h *Handle) SetReminder(ctx context.Context, reminder dueindex.Minute, release bool) error {
 	if err := h.settle(ctx); err != nil {
 		return err
 	}
-	if h.Manifest.NextReminder == reminder {
+	if release && h.Manifest.Owner == "" || !release && h.Manifest.NextReminder == reminder {
 		return nil
 	}
 	next := h.Manifest.clone()
 	if err := h.setReminder(ctx, next, reminder); err != nil {
 		return err
+	}
+	if release {
+		giveUp(next)
 	}
 	return h.update(ctx, "reminder", next)
 }
@@ -360,8 +375,12 @@ func (h *Handle) update(ctx context.Context, op string, next *Manifest) error {
 			// blob.Store has already tried to settle this on a context of its own, so
 			// this is an outcome nobody could learn.
 			h.unknown = next
-			if h.settle(ctx) == nil && h.Manifest == next {
+			serr := h.settle(ctx)
+			if serr == nil && h.Manifest == next {
 				return nil // it landed
+			}
+			if errors.Is(serr, ErrMovedOn) {
+				return fmt.Errorf("%s of %s: %w", op, ManifestKey(h.Name), serr)
 			}
 		}
 		return fmt.Errorf("%s of %s: %w", op, ManifestKey(h.Name), err)
@@ -370,10 +389,18 @@ func (h *Handle) update(ctx context.Context, op string, next *Manifest) error {
 	return nil
 }
 
+// Unsettled reports whether the handle has an update whose outcome it has not
+// learned (every answer was lost and the stored manifest could not be read). The
+// shard may be unowned then if the update gave it up.
+func (h *Handle) Unsettled() bool { return h.unknown != nil }
+
 // settle finds out what became of an update whose outcome was unknown: if the
-// stored manifest is the one that was written, the handle adopts it. If it is
-// anything else the handle keeps its version, and a conflict on the next write
-// is somebody else's change. It reads nothing if there is nothing unknown.
+// stored manifest is the one that was written, the handle adopts it, and if it is
+// still the handle's version the update didn't land. Anything else means the
+// update landed and the manifest has moved on since (another node claimed a shard
+// the update gave up, or adopted one it didn't), so the shard is not this node's
+// and settle returns ErrMovedOn: it must be neither served nor resumed. It reads
+// nothing if there is nothing unknown.
 func (h *Handle) settle(ctx context.Context) error {
 	if h.unknown == nil {
 		return nil
@@ -384,14 +411,22 @@ func (h *Handle) settle(ctx context.Context) error {
 	}
 	want, _ := json.Marshal(h.unknown)
 	got, _ := json.Marshal(cur)
-	if bytes.Equal(want, got) {
-		h.Manifest, h.ETag = h.unknown, etag
-	}
+	written := h.unknown
 	h.unknown = nil
+	switch {
+	case bytes.Equal(want, got):
+		h.Manifest, h.ETag = written, etag
+	case etag != h.ETag:
+		return fmt.Errorf("%w: %s", ErrMovedOn, ManifestKey(h.Name))
+	}
 	return nil
 }
 
 var (
+	// ErrMovedOn means an update whose outcome was unknown turned out to have
+	// landed and the manifest has changed since, by another node: the shard is
+	// not this node's any more.
+	ErrMovedOn = errors.New("shardfile: the manifest moved on after an update with an unknown outcome")
 	// ErrOwnedElsewhere means another node owns the shard: its lease shows
 	// nothing that lets the shard be claimed. Claim returns it as an
 	// *OwnedElsewhereError, which names the owner.
@@ -446,6 +481,10 @@ func (h *Handle) Claim(ctx context.Context) error {
 // activation that starts it empty. Its positions start again at 1, and an
 // earlier activation that failed after its first sync may have left commits at
 // those positions in the journal: in a new generation they are never read.
+//
+// It makes no orphan entry: the manifest it moves off lists no commits, so any
+// files of the old generation are uploads that never reached it, and each one's
+// upload made its own entry first.
 func (h *Handle) StartOver(ctx context.Context) error {
 	next := h.Manifest.clone()
 	next.Generation = NewGeneration()
@@ -484,22 +523,13 @@ func (h *Handle) CheckClaimable(ctx context.Context) error {
 // comparing clocks: its node has a newer epoch, or another incarnation has
 // marked the lease (which an adopter does only once it has seen the lease go
 // unrenewed for a TTL).
-func ownerDead(l *coord.NodeLease, m *Manifest) bool {
-	owner := coord.Incarnation{Node: m.Owner, Epoch: m.NodeEpoch}
+func ownerDead(l *lease.Record, m *Manifest) bool {
+	owner := lease.Incarnation{Node: m.Owner, Epoch: m.NodeEpoch}
 	return l.Epoch > m.NodeEpoch || (l.AdoptedBy != nil && *l.AdoptedBy != owner)
 }
 
-// ReleaseOwnership gives the shard up: no owner and no journal. The caller has
-// written a delta for the whole tail first, so nothing is left in any journal, and
-// the next node to activate the shard claims it like any unowned shard.
-func (h *Handle) ReleaseOwnership(ctx context.Context) error {
-	if err := h.settle(ctx); err != nil {
-		return err
-	}
-	next := h.Manifest.clone()
-	next.Owner, next.NodeEpoch, next.Journal = "", 0, ""
-	return h.update(ctx, "release", next)
-}
+// giveUp is the edit that releases a shard: no owner and no journal.
+func giveUp(m *Manifest) { m.Owner, m.NodeEpoch, m.Journal = "", 0, "" }
 
 // DeleteShard removes a shard the caller holds a handle on: its manifest is
 // deleted by conditional delete at the handle's version (a conflict, if somebody
@@ -507,12 +537,17 @@ func (h *Handle) ReleaseOwnership(ctx context.Context) error {
 // A crash in between leaves files nobody refers to. The next request creates a
 // new shard with a new generation, so it never reads the old one's data. Any
 // tail left in the node journal is never read again (its generation no longer
-// matches any manifest).
-func (h *Handle) DeleteShard(ctx context.Context) error {
+// matches any manifest). That leftover is what the generation's entry in the orphan
+// index is for, created before the manifest is deleted.
+func (h *Handle) DeleteShard(ctx context.Context, hooks Hooks) error {
 	f := h.F
 	if err := h.settle(ctx); err != nil {
 		return err
 	}
+	if err := h.orphanEntry(ctx, h.Manifest.Generation); err != nil {
+		return err
+	}
+	hooks.at(kill.OrphanEntryBeforeDeleteShard)
 	if err := f.manifests().Delete(ctx, h.Name, h.ETag); err != nil && !errors.Is(err, blob.ErrNotFound) {
 		return err
 	}

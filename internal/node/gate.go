@@ -14,7 +14,7 @@ import (
 // what a calling shard sends (a request body, an upgraded connection's writes)
 // on the caller.
 type gate struct {
-	m    *Catalog
+	m    *Shardset
 	hold *Hold
 	sync kind.Sync
 	ctx  context.Context

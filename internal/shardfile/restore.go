@@ -17,14 +17,13 @@ import (
 	"github.com/luci1900/shardlite/internal/cluster"
 	"github.com/luci1900/shardlite/internal/journal"
 	"github.com/luci1900/shardlite/internal/pos"
-	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
 type journalRef struct {
 	seq   pos.Seg
-	entry segment.Entry
+	entry journal.Entry
 }
 
 // JournalIndex lists which segment entries belong to which shard. It carries
@@ -52,10 +51,10 @@ func (f *Files) LoadLeasedJournal(ctx context.Context, node cluster.Node) (*Jour
 // LoadJournal reads the footers of a node's segments from number from on. With
 // to zero it stops at the first number that doesn't exist, and otherwise it
 // reads through to (the fence of an adoption) and fails on a missing number
-// (segment.Scan).
+// (journal.Scan).
 func (f *Files) LoadJournal(ctx context.Context, node cluster.Node, from, to pos.Seg) (*JournalIndex, error) {
 	idx := &JournalIndex{store: f.Journal(node), byShard: map[shard.Name][]journalRef{}}
-	err := segment.Scan(ctx, idx.store, from, to, func(seq pos.Seg, e segment.Entry) error {
+	err := journal.Scan(ctx, idx.store, from, to, func(seq pos.Seg, e journal.Entry) error {
 		idx.byShard[e.Shard] = append(idx.byShard[e.Shard], journalRef{seq: seq, entry: e})
 		return nil
 	})
@@ -99,7 +98,7 @@ func (idx *JournalIndex) tail(ctx context.Context, f *Files, n shard.Name, gener
 			}
 			tail.Logs = []*tempfile.Log{log}
 		}
-		body, err := segment.ReadEntryInto(ctx, idx.store, ref.seq, e, tail.Logs[0])
+		body, err := journal.ReadEntryInto(ctx, idx.store, ref.seq, e, tail.Logs[0])
 		if err != nil {
 			tail.Close()
 			return capture.TailFiles{}, err

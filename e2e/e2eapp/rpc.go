@@ -30,16 +30,16 @@ import (
 //	Chat     bidirectional: replies "ok:"+token to each token after its commit
 //	Fail     unary: "code message"; ends with that status and a trailer
 //	Hold     unary: waits until the call is cancelled (or "ms" passes) and records what it saw
-//	Relay    unary: "to token"; debits this shard, then calls Add on another shard through the control API
+//	Transfer unary: "to token"; debits this shard, then calls Add on another shard through the control API
 //	Who      unary: reports the opened shard, caller and hops the app was called with
 //
 // gRPC has no path to put an id in, so a call says which shard it is for in
 // x-shard metadata, which is this app's own key and sits beside the
 // shardlite-target hint. (A real gRPC app would more likely put the id in its
-// messages. Reading it would mean looking at the first message before relaying
-// a stream, which a server SDK would do and this sketch leaves out.) The shard
-// is worked out and relayed by the same wrapper as the HTTP routes, in front of
-// the gRPC server.
+// messages. Reading it would mean looking at the first message before checking
+// it against the opened shard, which a server SDK would do and this sketch
+// leaves out.) The shard is worked out and checked against the one the node
+// opened by the same wrapper as the HTTP routes, in front of the gRPC server.
 
 type rawHeadersKey struct{}
 
@@ -66,15 +66,7 @@ type Debug struct {
 	WSEnded     int            `json:"ws_ended"`
 	WSClose     []WSCloseRec   `json:"ws_closes"` // how each connection ended, in order
 	OpenDBs     int            `json:"open_dbs"`  // shard databases the app has open right now
-	Relays      []RelayRec     `json:"relays"`    // the requests the app relayed to another shard, in order
 	Served      map[string]int `json:"served"`    // how many requests the app has served on each shard, by the shard the node opened
-}
-
-// RelayRec is a request the app relayed: the node opened Opened for it (empty if
-// it opened nothing), and it was for For.
-type RelayRec struct {
-	Opened string `json:"opened"`
-	For    string `json:"for"`
 }
 
 // WSCloseRec is how a WebSocket connection of the app ended.
@@ -156,7 +148,7 @@ func (a *App) newGRPC() *grpc.Server {
 			unary("Add", a.rpcAdd),
 			unary("Fail", a.rpcFail),
 			unary("Hold", a.rpcHold),
-			unary("Relay", a.rpcRelay),
+			unary("Transfer", a.rpcTransfer),
 			unary("Who", a.rpcWho),
 		},
 		Streams: []grpc.StreamDesc{
@@ -217,9 +209,9 @@ func (a *App) rpcHold(ctx context.Context, _ *shardReq, in string) (string, erro
 	}
 }
 
-// rpcRelay debits this shard, then credits another one through the control
+// rpcTransfer debits this shard, then credits another one through the control
 // API with a gRPC client: "to token".
-func (a *App) rpcRelay(ctx context.Context, s *shardReq, in string) (string, error) {
+func (a *App) rpcTransfer(ctx context.Context, s *shardReq, in string) (string, error) {
 	to, tok, _ := strings.Cut(in, " ")
 	if to == "" || tok == "" {
 		return "", status.Error(codes.InvalidArgument, "want \"to token\"")

@@ -1,5 +1,7 @@
-// Package harness sets up the pieces tests share: an in-memory blob store, a
-// segment writer, a files layer and test apps.
+// Package harness sets up the in-process pieces tests share: an in-memory blob
+// store, the journal's writer, a files layer and shards on top of them. It
+// differs from apptest, which only runs the test app as a child process and
+// talks to it (the harness starts the app for a shard through apptest).
 package harness
 
 import (
@@ -16,10 +18,9 @@ import (
 	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/cluster"
-	"github.com/luci1900/shardlite/internal/coord"
 	"github.com/luci1900/shardlite/internal/journal"
+	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/pos"
-	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/service"
 	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
@@ -27,7 +28,7 @@ import (
 )
 
 // ReadEntry returns the LTX file bytes of one journal entry.
-func ReadEntry(ctx context.Context, js *journal.Store, seq pos.Seg, e segment.Entry) ([]byte, error) {
+func ReadEntry(ctx context.Context, js *journal.Store, seq pos.Seg, e journal.Entry) ([]byte, error) {
 	rc, err := js.GetRange(ctx, seq, e.Offset, e.Length)
 	if err != nil {
 		return nil, err
@@ -51,28 +52,28 @@ type Env struct {
 	Store   *blob.Store
 	Journal *journal.Store // the node's own journal
 	Files   *shardfile.Files
-	W       *segment.Writer
+	W       *journal.Writer
 	Node    cluster.Node
-	Reg     *coord.Registry
-	Lease   coord.NodeLease
+	Reg     *lease.Registry
+	Lease   lease.Record
 }
 
-// New returns an Env with a segment writer, which writes only when flushed
+// New returns an Env with a journal writer, which writes only when flushed
 // (capture.Shard.Sync flushes it).
 func New(t testing.TB) *Env {
 	t.Helper()
 	local := blobtest.WithHook(blob.NewMemory())
-	reg := coord.NewRegistry(local, "n1", coord.RegistryOptions{})
-	lease, err := reg.Acquire(context.Background(), coord.NodeInfo{Name: "n1"})
+	reg := lease.NewRegistry(local, "n1", lease.RegistryOptions{})
+	rec, err := reg.Acquire(context.Background(), lease.NodeInfo{Name: "n1"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := blob.NewStore(local, "n1", lease.Epoch, blob.Options{Backoff: time.Millisecond})
+	store := blob.NewStore(local, "n1", rec.Epoch, blob.Options{Backoff: time.Millisecond})
 	jopts := journal.Options{Backoff: time.Millisecond}
-	e := &Env{T: t, Dir: t.TempDir(), Blob: local, Store: store, Node: "n1", Reg: reg, Lease: lease,
+	e := &Env{T: t, Dir: t.TempDir(), Blob: local, Store: store, Node: "n1", Reg: reg, Lease: rec,
 		Files: &shardfile.Files{Blob: store, Backend: local, Node: "n1", Leases: reg, JournalOptions: jopts, Temp: tempfile.NewDir(t.TempDir())}}
 	e.Journal = e.Files.Journal(e.Node)
-	e.W = segment.NewWriter(e.Journal, segment.Options{})
+	e.W = journal.NewWriter(e.Journal, journal.WriterOptions{})
 	t.Cleanup(service.Background(slog.Default(), e.W))
 	return e
 }
@@ -97,7 +98,7 @@ func (e *Env) Adopter(writer, node cluster.Node) *journal.Store {
 	return journal.NewStore(journal.NewBlob(e.Blob, node), writer, e.Store.Epoch(), journal.Options{Backoff: time.Millisecond})
 }
 
-// Path returns the local path for a shard name like game.users/42.
+// Path returns the local path for a shard name like users/42.
 func (e *Env) Path(shard string) string {
 	return filepath.Join(e.Dir, fmt.Sprintf("%s.db", filepath.Base(filepath.Dir(shard))+"-"+filepath.Base(shard)))
 }
@@ -135,6 +136,6 @@ func (e *Env) Activate(h *shardfile.Handle, restored *capture.Restored) *capture
 func (e *Env) StartApp(shard string) *apptest.App {
 	e.T.Helper()
 	app := apptest.Start(e.T)
-	app.Must(e.T, "open", "a", e.Path(shard))
+	app.Must(e.T, "create", "a", e.Path(shard))
 	return app
 }

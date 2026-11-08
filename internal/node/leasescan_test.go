@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -13,22 +14,25 @@ import (
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/cluster"
-	"github.com/luci1900/shardlite/internal/coord"
+	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/notify"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/tempfile"
 )
 
 // runScan serves a lease scan for node "w" (epoch 1) on b until the test ends.
-// These tests give it no tails to adopt.
-func runScan(t *testing.T, b blob.Backend, opts LeaseScanOptions) *leaseScan {
+// These tests give it no tails to adopt. tune changes the scan before it runs.
+func runScan(t *testing.T, b blob.Backend, opts LeaseScanOptions, tune ...func(*leaseScan)) *leaseScan {
 	t.Helper()
-	reg := coord.NewRegistry(b, "w", coord.RegistryOptions{})
+	reg := lease.NewRegistry(b, "w", lease.RegistryOptions{})
 	store := blob.NewStore(b, "w", 1, blob.Options{})
 	s := &leaseScan{
 		reg: reg, files: &shardfile.Files{Blob: store, Backend: b, Node: "w", Leases: reg, Temp: tempfile.NewDir(t.TempDir())}, store: store,
-		self: func() coord.Incarnation { return coord.Incarnation{Node: "w", Epoch: 1} }, nodeErr: func() error { return nil },
+		self: func() lease.Incarnation { return lease.Incarnation{Node: "w", Epoch: 1} }, nodeErr: func() error { return nil },
 		clock: realClock{}, opts: opts, log: slog.New(slog.DiscardHandler), scans: &notify.Counter{}, adopted: &notify.Counter{},
+	}
+	for _, f := range tune {
+		f(s)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	var g errgroup.Group
@@ -37,13 +41,47 @@ func runScan(t *testing.T, b blob.Backend, opts LeaseScanOptions) *leaseScan {
 	return s
 }
 
+// deaths records the nodes a scan tells died about, in order.
+type deaths struct {
+	mu    sync.Mutex
+	nodes []cluster.Node
+}
+
+func (d *deaths) tell(n cluster.Node) {
+	d.mu.Lock()
+	d.nodes = append(d.nodes, n)
+	d.mu.Unlock()
+}
+
+func (d *deaths) count(n cluster.Node) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	count := 0
+	for _, x := range d.nodes {
+		if x == n {
+			count++
+		}
+	}
+	return count
+}
+
+// listingAfter waits for the scan's next listing and returns it.
+func listingAfter(t *testing.T, s *leaseScan) map[string]NodeView {
+	t.Helper()
+	if err := s.scans.Wait(context.Background(), s.scans.Load()+1); err != nil {
+		t.Fatal(err)
+	}
+	synctest.Wait() // the listing is published, and any adoption it started is over
+	return view(s)
+}
+
 // keep takes node's lease and renews it every interval until the test ends. If
 // stall is given, the node's second renewal comes that much later than usual
 // (a pause, after which it renews as before).
 func keep(t *testing.T, b blob.Backend, node cluster.Node, interval time.Duration, stall ...time.Duration) {
 	t.Helper()
-	reg := coord.NewRegistry(b, node, coord.RegistryOptions{})
-	l, err := reg.Acquire(context.Background(), coord.NodeInfo{Name: node})
+	reg := lease.NewRegistry(b, node, lease.RegistryOptions{})
+	l, err := reg.Acquire(context.Background(), lease.NodeInfo{Name: node})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,8 +155,8 @@ func TestLeaseScanTimesItsWatchFromTheRead(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		b := blobtest.WithHook(blob.NewMemory())
-		reg := coord.NewRegistry(b, "z", coord.RegistryOptions{})
-		l, err := reg.Acquire(context.Background(), coord.NodeInfo{Name: "z"})
+		reg := lease.NewRegistry(b, "z", lease.RegistryOptions{})
+		l, err := reg.Acquire(context.Background(), lease.NodeInfo{Name: "z"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -127,7 +165,7 @@ func TestLeaseScanTimesItsWatchFromTheRead(t *testing.T) {
 		// (TTL less the 2 s margin) its lease is good until 21.5 s.
 		var once atomic.Bool
 		b.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
-			if op == blobtest.OpGet && key == coord.Key("z") && !after && once.CompareAndSwap(false, true) {
+			if op == blobtest.OpGet && key == lease.Key("z") && !after && once.CompareAndSwap(false, true) {
 				time.Sleep(2500 * time.Millisecond)
 				if _, err := reg.Renew(ctx, l, l.NodeInfo); err != nil {
 					t.Error(err)
@@ -166,11 +204,11 @@ func TestLeaseScanFindsTheDead(t *testing.T) {
 		// renewed every 15 s would be dead whenever a watch of the scan fell between
 		// two of its renewals, which depends on when the scan happens to list.
 		keep(t, b, "slow", 3*time.Second, 10*time.Second)
-		if _, err := coord.NewRegistry(b, "gone", coord.RegistryOptions{}).Acquire(context.Background(), coord.NodeInfo{Name: "gone"}); err != nil {
+		if _, err := lease.NewRegistry(b, "gone", lease.RegistryOptions{}).Acquire(context.Background(), lease.NodeInfo{Name: "gone"}); err != nil {
 			t.Fatal(err)
 		}
-		left := coord.NewRegistry(b, "left", coord.RegistryOptions{})
-		l, err := left.Acquire(context.Background(), coord.NodeInfo{Name: "left"})
+		left := lease.NewRegistry(b, "left", lease.RegistryOptions{})
+		l, err := left.Acquire(context.Background(), lease.NodeInfo{Name: "left"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -200,6 +238,94 @@ func TestLeaseScanFindsTheDead(t *testing.T) {
 			if got[name].Dead {
 				t.Fatalf("%s is dead: %+v", name, got)
 			}
+		}
+	})
+}
+
+// A node found dead and then adopted stays dead in every listing after, though
+// the adopter's mark and finish are writes to its lease, and died runs once. The
+// adoption is made once. A node that restarts is listed live at its first
+// listing after its lease shows a new epoch, and dies again on its own.
+func TestLeaseScanKeepsAnAdoptedNodeDead(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		b := blob.NewMemory()
+		gone := lease.NewRegistry(b, "gone", lease.RegistryOptions{})
+		if _, err := gone.Acquire(context.Background(), lease.NodeInfo{Name: "gone"}); err != nil {
+			t.Fatal(err)
+		}
+		var d deaths
+		s := runScan(t, b, LeaseScanOptions{Every: 2 * time.Second, TTL: 10 * time.Second}, func(s *leaseScan) { s.died = d.tell })
+		synctest.Wait()
+		if view(s)["gone"].Dead {
+			t.Fatal("a lease written a moment ago is dead")
+		}
+		if err := s.adopted.Wait(context.Background(), 1); err != nil {
+			t.Fatal(err)
+		}
+		l, err := gone.Get(context.Background(), "gone")
+		if err != nil || l.Adopted < l.Epoch {
+			t.Fatalf("the lease after the adoption: %+v %v", l, err)
+		}
+		// Every listing from here on, a TTL and more of them, shows it dead.
+		for range 15 {
+			if got := listingAfter(t, s); !got["gone"].Dead {
+				t.Fatalf("an adopted node is listed live: %+v", got)
+			}
+		}
+		if got := d.count("gone"); got != 1 {
+			t.Fatalf("died ran %d times for one death", got)
+		}
+		if got := s.adopted.Load(); got != 1 {
+			t.Fatalf("%d adoptions of one death", got)
+		}
+
+		// It restarts: the new epoch is its own write.
+		if _, err := gone.Acquire(context.Background(), lease.NodeInfo{Name: "gone"}); err != nil {
+			t.Fatal(err)
+		}
+		if got := listingAfter(t, s); got["gone"].Dead {
+			t.Fatalf("a restarted node is listed dead at the first listing after its restart: %+v", got)
+		}
+		// It never renews, so it dies again, and that is a second death.
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		if !view(s)["gone"].Dead || d.count("gone") != 2 {
+			t.Fatalf("the restarted node: %+v, died %d times", view(s)["gone"], d.count("gone"))
+		}
+	})
+}
+
+// A node whose lease is released is dead and stays dead, with nothing to adopt,
+// and died runs once.
+func TestLeaseScanKeepsAReleasedNodeDead(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		b := blob.NewMemory()
+		left := lease.NewRegistry(b, "left", lease.RegistryOptions{})
+		l, err := left.Acquire(context.Background(), lease.NodeInfo{Name: "left"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := left.Release(context.Background(), l); err != nil {
+			t.Fatal(err)
+		}
+		var d deaths
+		s := runScan(t, b, LeaseScanOptions{Every: 2 * time.Second, TTL: 10 * time.Second}, func(s *leaseScan) { s.died = d.tell })
+		synctest.Wait()
+		for !view(s)["left"].Dead {
+			listingAfter(t, s)
+		}
+		for range 15 {
+			if got := listingAfter(t, s); !got["left"].Dead {
+				t.Fatalf("a released node is listed live: %+v", got)
+			}
+		}
+		if got := d.count("left"); got != 1 {
+			t.Fatalf("died ran %d times for one release", got)
+		}
+		if got := s.adopted.Load(); got != 0 {
+			t.Fatalf("%d adoptions of a released lease", got)
 		}
 	})
 }

@@ -12,9 +12,9 @@ import (
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/cluster"
-	"github.com/luci1900/shardlite/internal/coord"
 	"github.com/luci1900/shardlite/internal/journal"
 	"github.com/luci1900/shardlite/internal/kind"
+	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
@@ -43,11 +43,11 @@ func TestTailOlderThanTheAlertAgeRaisesIt(t *testing.T) {
 	r := newMRig(t)
 	r.crash()
 	const deltaAge, expiry = 170 * time.Millisecond, 2 * time.Second // the alert is at 510 ms
-	r.startShards(func(o *CatalogOptions) { o.Lifecycle.DeltaAge = deltaAge })
+	r.startShardset(func(o *ShardsetOptions) { o.Lifecycle.DeltaAge = deltaAge })
 	r.startExpiry(expiry)
 
 	ctx := context.Background()
-	ref := r.acquire("test.slow/tail")
+	ref := r.acquire("slow/tail")
 	defer ref.Release()
 	r.write(ref, "a")
 	if err := r.m.Gate(ctx, ref, kind.SyncStorage); err != nil {
@@ -76,9 +76,9 @@ func TestTailAlertWhenDeltasFail(t *testing.T) {
 	t.Parallel()
 	r := newMRig(t)
 	r.crash()
-	r.startShards(func(o *CatalogOptions) { o.Lifecycle.DeltaAge = 100 * time.Millisecond }) // the alert is at 300 ms
+	r.startShardset(func(o *ShardsetOptions) { o.Lifecycle.DeltaAge = 100 * time.Millisecond }) // the alert is at 300 ms
 	ctx := context.Background()
-	ref := r.acquire("test.slow/failing")
+	ref := r.acquire("slow/failing")
 	defer ref.Release()
 	r.write(ref, "a")
 	if err := r.m.Gate(ctx, ref, kind.SyncStorage); err != nil {
@@ -103,11 +103,11 @@ func TestRestartAfterSegmentsExpired(t *testing.T) {
 	t.Parallel()
 	r := newMRig(t)
 	r.crash()
-	r.startShards(func(o *CatalogOptions) { o.Lifecycle.DeltaAge = 30 * time.Millisecond })
+	r.startShardset(func(o *ShardsetOptions) { o.Lifecycle.DeltaAge = 30 * time.Millisecond })
 	ctx := context.Background()
 
 	want := map[string]string{}
-	for _, name := range []string{"test.wallet/1", "test.wallet/2", "test.users/3"} {
+	for _, name := range []string{"wallet/1", "wallet/2", "users/3"} {
 		ref := r.acquire(name)
 		r.write(ref, name)
 		for range 3 {
@@ -128,7 +128,7 @@ func TestRestartAfterSegmentsExpired(t *testing.T) {
 		}
 		return true
 	})
-	r.afterSnapshotLooks(2, "test.wallet/1", "test.wallet/2", "test.users/3") // a few more looks of the delta timers
+	r.afterSnapshotLooks(2, "wallet/1", "wallet/2", "users/3") // a few more looks of the delta timers
 	dataBefore, _ := r.segments()
 	if dataBefore == 0 {
 		t.Fatal("no segments")
@@ -150,7 +150,7 @@ func TestRestartAfterSegmentsExpired(t *testing.T) {
 	if r.n.Adopted.Fence == 0 || len(r.n.Adopted.Lost) != 0 {
 		t.Fatalf("adoption: %+v", r.n.Adopted)
 	}
-	r.startShards(nil)
+	r.startShardset(nil)
 	for name, dump := range want {
 		ref := r.acquire(name)
 		if got := r.liveDump(ref.Path()); got != dump {
@@ -221,7 +221,7 @@ func TestExpiryStartsAfterAdoption(t *testing.T) {
 	r := newMRig(t)
 	r.skew.Store(int64(24 * time.Hour)) // everything written from here on is a day old
 	ctx := context.Background()
-	ref := r.acquire("test.wallet/1")
+	ref := r.acquire("wallet/1")
 	r.write(ref, "a")
 	r.app.Must(t, "insert", "a", "2", "100")
 	if err := r.m.Gate(ctx, ref, kind.SyncStorage); err != nil {
@@ -241,7 +241,7 @@ func TestExpiryStartsAfterAdoption(t *testing.T) {
 	}
 	r.startExpiry(200 * time.Millisecond)
 	apptest.Eventually(t, apptest.Timeout, "the old segments to expire", func() bool { d, _ := r.segments(); return d == 0 })
-	if got := r.dumpBlob("test.wallet/1"); got != want {
+	if got := r.dumpBlob("wallet/1"); got != want {
 		t.Fatal("the shard restores differently")
 	}
 }
@@ -276,7 +276,7 @@ func TestExpiryDeletesOldSegmentsKeepsFencesAndRecent(t *testing.T) {
 	fence := r.putSegment("n1", 1002, "")
 	r.putSegment("n1", 1003, "recent")
 	foreign := r.putSegment("other", 1, "someone else's")
-	lease := coord.Key("n1")
+	key := lease.Key("n1")
 
 	// With a fake now: the first two are older than the age, the third is not.
 	// (Their real modification times are all about now.)
@@ -299,7 +299,7 @@ func TestExpiryDeletesOldSegmentsKeepsFencesAndRecent(t *testing.T) {
 	if !r.exists(foreign) {
 		t.Fatal("another node's journal was swept")
 	}
-	if !r.exists(lease) {
+	if !r.exists(key) {
 		t.Fatal("the lease was swept")
 	}
 	// Nothing left to delete.

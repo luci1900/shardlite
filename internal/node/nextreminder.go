@@ -6,8 +6,8 @@ import (
 	"fmt"
 
 	"github.com/luci1900/shardlite/internal/capture"
+	"github.com/luci1900/shardlite/internal/dueindex"
 	"github.com/luci1900/shardlite/internal/pos"
-	"github.com/luci1900/shardlite/internal/remindex"
 )
 
 // A shard's next_reminder: when it next needs waking, read from its own tables at
@@ -65,29 +65,25 @@ func nextReminderOf(ctx context.Context, tx *sql.Tx, since, now int64, marker bo
 // position at): exact if its snapshot was at end, and now otherwise, since the
 // shard's state at end is then unknown and now is never late. It rounds down to
 // the minute, which the index is in.
-func (a *actor) recordedFor(w int64, at, end pos.Position) remindex.Minute {
-	if a.sys == nil && at == end {
-		return remindex.MinuteOf(w)
+func (a *actor) recordedFor(w int64, at, end pos.Position) dueindex.Minute {
+	if at == end {
+		return dueindex.MinuteOf(w)
 	}
 	return a.recordedNow()
 }
 
 // recordedNow is the next_reminder for a shard whose state at the end is
 // unknown: now, since now is never late. It rounds down to the minute, which
-// the index is in, and is 0 for a system shard, which the claimer brings back
-// and never has an entry.
-func (a *actor) recordedNow() remindex.Minute {
-	if a.sys != nil {
-		return 0 // the claimer brings a system shard back, never an entry
-	}
-	return remindex.MinuteOf(a.d.now().Unix())
+// the index is in.
+func (a *actor) recordedNow() dueindex.Minute {
+	return dueindex.MinuteOf(a.d.now().Unix())
 }
 
 // reminderAtDelta is what a background delta or rebase does before its manifest
 // update: it reads the next reminder once the tail is taken, and records it if the
 // read was exactly the state the files reach (and now otherwise). A failure fails
 // the delta, which the delta timer tries again.
-func (a *actor) reminderAtDelta(ctx context.Context, end pos.Position) (remindex.Minute, error) {
+func (a *actor) reminderAtDelta(ctx context.Context, end pos.Position) (dueindex.Minute, error) {
 	w, at, err := a.nextReminder(ctx)
 	if err != nil {
 		return 0, err

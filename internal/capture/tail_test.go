@@ -20,9 +20,9 @@ func tailShard(t *testing.T) (*capture.Shard, *apptest.App, *env, *tempfile.Dir,
 	e := newEnv(t)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
-	app.Must(t, "open", "a", path)
+	app.Must(t, "create", "a", path)
 	dir := tempDir(t)
-	sh, err := capture.New(capture.Config{TempDir: dir, Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w})
+	sh, err := capture.New(capture.Config{TempDir: dir, Name: shardName("users/1"), Path: path, Generation: "g1", Writer: e.w})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +185,7 @@ func TestAFailedAppendFailsTheSyncAndTheNextOneStartsANewLog(t *testing.T) {
 			t.Fatalf("a gap in the tail before position %d", tail.Files[i].Position)
 		}
 	}
-	replayed := e.replayTo(t, "test.users/1")
+	replayed := e.replayTo(t, "users/1")
 	if want, got := apptest.Dump(t, path), sqlitetest.Dump(t, replayed); want != got {
 		t.Fatalf("replayed database differs from the app's (%d and %d bytes)", len(want), len(got))
 	}

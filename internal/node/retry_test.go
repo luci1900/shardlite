@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/cluster"
-	"github.com/luci1900/shardlite/internal/coord"
+	"github.com/luci1900/shardlite/internal/lease"
 )
 
 // echoes makes the node's app answer every request with its name and the body it got.
@@ -61,9 +61,9 @@ func (n *clusterNode) believe(target string, node cluster.Node, addr string) {
 	m := n.m.Load()
 	m.addrs.mu.Lock()
 	if m.addrs.leases == nil {
-		m.addrs.leases = map[cluster.Node]*coord.NodeLease{}
+		m.addrs.leases = map[cluster.Node]*lease.Record{}
 	}
-	m.addrs.leases[node] = &coord.NodeLease{NodeInfo: coord.NodeInfo{Name: node, Address: addr}, Renewed: time.Now(), TTL: time.Hour}
+	m.addrs.leases[node] = &lease.Record{NodeInfo: lease.NodeInfo{Name: node, Address: addr}, Renewed: time.Now(), TTL: time.Hour}
 	m.addrs.mu.Unlock()
 	m.owners.Add(shardName(target), node)
 }
@@ -95,19 +95,19 @@ func TestStaleOwnerIsCorrected(t *testing.T) {
 	n0, n1, n2 := c.nodes[0], c.nodes[1], c.nodes[2]
 	n0stale := n0.echoes()
 	n2.echoes()
-	n0.create("test.brief/m")
-	post(t, n0, "test.brief/m", "")
-	if resp, _ := post(t, n1, "test.brief/m", ""); resp.Header.Get("X-Served-By") != "n0" {
+	n0.create("brief/m")
+	post(t, n0, "brief/m", "")
+	if resp, _ := post(t, n1, "brief/m", ""); resp.Header.Get("X-Served-By") != "n0" {
 		t.Fatalf("before the move: %v", resp.Header)
 	}
-	moveShard(t, n0, n2, "test.brief/m")
+	moveShard(t, n0, n2, "brief/m")
 	before := n0stale.Load()
-	resp, body := post(t, n1, "test.brief/m", "hello")
+	resp, body := post(t, n1, "brief/m", "hello")
 	moved(t, resp, body)
-	if owner, _ := n1.m.Load().owners.Get(shardName("test.brief/m")); owner != "n2" {
+	if owner, _ := n1.m.Load().owners.Get(shardName("brief/m")); owner != "n2" {
 		t.Fatalf("the cache names %q", owner)
 	}
-	if resp, body = post(t, n1, "test.brief/m", "hello"); resp.StatusCode != 200 || resp.Header.Get("X-Served-By") != "n2" || body != `n2 got "hello"` {
+	if resp, body = post(t, n1, "brief/m", "hello"); resp.StatusCode != 200 || resp.Header.Get("X-Served-By") != "n2" || body != `n2 got "hello"` {
 		t.Fatalf("after the move: %d %v %q", resp.StatusCode, resp.Header, body)
 	}
 	if n0stale.Load() != before {
@@ -121,18 +121,18 @@ func TestMovedWithoutAnOwner(t *testing.T) {
 	c := newCluster(t, 3)
 	n1, n2 := c.nodes[1], c.nodes[2]
 	n2.echoes()
-	n2.create("test.users/w")
-	ask(t, n2, "test.users/w")
-	n1.believe("test.users/w", "ghost", moved421(t, ""))
-	resp, body := post(t, n1, "test.users/w", "hi")
+	n2.create("users/w")
+	ask(t, n2, "users/w")
+	n1.believe("users/w", "ghost", moved421(t, ""))
+	resp, body := post(t, n1, "users/w", "hi")
 	moved(t, resp, body)
-	if owner, ok := n1.m.Load().owners.Get(shardName("test.users/w")); ok {
+	if owner, ok := n1.m.Load().owners.Get(shardName("users/w")); ok {
 		t.Fatalf("the cache still names %q", owner)
 	}
-	if resp, body = post(t, n1, "test.users/w", "hi"); resp.StatusCode != 200 || body != `n2 got "hi"` {
+	if resp, body = post(t, n1, "users/w", "hi"); resp.StatusCode != 200 || body != `n2 got "hi"` {
 		t.Fatalf("%d %q", resp.StatusCode, body)
 	}
-	if owner, _ := n1.m.Load().owners.Get(shardName("test.users/w")); owner != "n2" {
+	if owner, _ := n1.m.Load().owners.Get(shardName("users/w")); owner != "n2" {
 		t.Fatalf("the cache names %q", owner)
 	}
 }
@@ -144,15 +144,15 @@ func TestStaleEntryNamingThisNode(t *testing.T) {
 	n0, n1 := c.nodes[0], c.nodes[1]
 	stale := n0.echoes()
 	n1.echoes()
-	n1.create("test.users/t")
-	ask(t, n1, "test.users/t")
-	n1.m.Load().owners.Add(shardName("test.users/t"), "n0")
-	resp, body := post(t, n1, "test.users/t", "mine")
+	n1.create("users/t")
+	ask(t, n1, "users/t")
+	n1.m.Load().owners.Add(shardName("users/t"), "n0")
+	resp, body := post(t, n1, "users/t", "mine")
 	moved(t, resp, body)
-	if owner, ok := n1.m.Load().owners.Get(shardName("test.users/t")); ok {
+	if owner, ok := n1.m.Load().owners.Get(shardName("users/t")); ok {
 		t.Fatalf("the cache still names %q", owner)
 	}
-	if resp, body = post(t, n1, "test.users/t", "mine"); resp.StatusCode != 200 || resp.Header.Get("X-Served-By") != "n1" || body != `n1 got "mine"` {
+	if resp, body = post(t, n1, "users/t", "mine"); resp.StatusCode != 200 || resp.Header.Get("X-Served-By") != "n1" || body != `n1 got "mine"` {
 		t.Fatalf("%d %v %q", resp.StatusCode, resp.Header, body)
 	}
 	if stale.Load() != 0 {

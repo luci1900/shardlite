@@ -23,7 +23,6 @@ import (
 	"github.com/luci1900/shardlite/internal/harness"
 	"github.com/luci1900/shardlite/internal/journal"
 	"github.com/luci1900/shardlite/internal/pos"
-	"github.com/luci1900/shardlite/internal/segment"
 	"github.com/luci1900/shardlite/internal/service"
 	shardpkg "github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
@@ -52,29 +51,29 @@ type env struct {
 	dir     string
 	meta    string
 	journal *journal.Store
-	w       *segment.Writer
+	w       *journal.Writer
 }
 
-// newEnv is a shard's storage with a segment writer, which writes only when
+// newEnv is a shard's storage with a journal writer, which writes only when
 // flushed (Sync flushes it, as the node's flush cycle does).
 func newEnv(t *testing.T) *env {
 	t.Helper()
 	local := blobtest.WithHook(blob.NewMemory())
 	js := journal.NewStore(journal.NewBlob(local, "n1"), "n1", 1, journal.Options{Backoff: time.Millisecond})
-	w := segment.NewWriter(js, segment.Options{})
+	w := journal.NewWriter(js, journal.WriterOptions{})
 	serveWriter(t, w)
 	return &env{dir: t.TempDir(), meta: t.TempDir(), journal: js, w: w}
 }
 
 // serveWriter serves w, as the node's tree does, until the test ends.
-func serveWriter(t *testing.T, w *segment.Writer) {
+func serveWriter(t *testing.T, w *journal.Writer) {
 	t.Cleanup(service.Background(slog.Default(), w))
 }
 
 // entriesFor returns every segment entry of a shard, in journal order.
-func (e *env) entriesFor(t *testing.T, shard string) (out []segment.Entry, seqs []pos.Seg) {
+func (e *env) entriesFor(t *testing.T, shard string) (out []journal.Entry, seqs []pos.Seg) {
 	t.Helper()
-	err := segment.Scan(context.Background(), e.journal, 1, 0, func(seq pos.Seg, en segment.Entry) error {
+	err := journal.Scan(context.Background(), e.journal, 1, 0, func(seq pos.Seg, en journal.Entry) error {
 		if en.Shard.String() == shard {
 			out, seqs = append(out, en), append(seqs, seq)
 		}
@@ -115,9 +114,9 @@ func TestCommitsAppearAsEntries(t *testing.T) {
 	e := newEnv(t)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
-	app.Must(t, "open", "a", path)
+	app.Must(t, "create", "a", path)
 
-	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w})
+	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName("users/1"), Path: path, Generation: "g1", Writer: e.w})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +127,7 @@ func TestCommitsAppearAsEntries(t *testing.T) {
 			t.Fatalf("sync %d: %v", i, err)
 		}
 	}
-	entries, _ := e.entriesFor(t, "test.users/1")
+	entries, _ := e.entriesFor(t, "users/1")
 	if len(entries) < 20 {
 		t.Fatalf("got %d entries for 20 commits", len(entries))
 	}
@@ -149,8 +148,8 @@ func TestReplayEqualsApp(t *testing.T) {
 	e := newEnv(t)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
-	app.Must(t, "open", "a", path)
-	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w})
+	app.Must(t, "create", "a", path)
+	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName("users/1"), Path: path, Generation: "g1", Writer: e.w})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +170,7 @@ func TestReplayEqualsApp(t *testing.T) {
 		t.Fatal(err)
 	}
 	replayed := filepath.Join(e.dir, "replayed.db")
-	e.replay(t, "test.users/1", replayed)
+	e.replay(t, "users/1", replayed)
 	want, got := apptest.Dump(t, path), sqlitetest.Dump(t, replayed)
 	if want != got {
 		t.Fatalf("replayed database differs from the app's\nwant %d bytes, got %d bytes", len(want), len(got))
@@ -195,8 +194,8 @@ func TestManyShardsOneSegmentPerFlush(t *testing.T) {
 	caps := make([]*capture.Shard, shards)
 	for i := range shards {
 		path := filepath.Join(e.dir, fmt.Sprintf("s%d.db", i))
-		apps[i%len(apps)].Must(t, "open", fmt.Sprint(i), path)
-		sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName(fmt.Sprintf("test.users/%d", i)), Path: path, Generation: "g", Writer: e.w})
+		apps[i%len(apps)].Must(t, "create", fmt.Sprint(i), path)
+		sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName(fmt.Sprintf("users/%d", i)), Path: path, Generation: "g", Writer: e.w})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -231,7 +230,7 @@ func TestManyShardsOneSegmentPerFlush(t *testing.T) {
 		t.Fatalf("%d segments for %d rounds", flushes, rounds)
 	}
 	var entries int
-	segment.Scan(ctx, e.journal, 1, 0, func(pos.Seg, segment.Entry) error { entries++; return nil })
+	journal.Scan(ctx, e.journal, 1, 0, func(pos.Seg, journal.Entry) error { entries++; return nil })
 	if perSeg := float64(entries) / float64(e.w.Flushes()); perSeg < 3 {
 		t.Fatalf("%.1f entries per segment: shards are not sharing segments", perSeg)
 	}
@@ -313,13 +312,13 @@ func TestSyncOutlivesItsCaller(t *testing.T) {
 	e := newEnv(t)
 	local := blobtest.WithHook(blob.NewMemory())
 	e.journal = journal.NewStore(journal.NewBlob(local, "n1"), "n1", 1, journal.Options{Backoff: time.Millisecond})
-	e.w = segment.NewWriter(e.journal, segment.Options{Retry: time.Millisecond})
+	e.w = journal.NewWriter(e.journal, journal.WriterOptions{Retry: time.Millisecond})
 	serveWriter(t, e.w)
 
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
-	app.Must(t, "open", "a", path)
-	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w})
+	app.Must(t, "create", "a", path)
+	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName("users/1"), Path: path, Generation: "g1", Writer: e.w})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -357,13 +356,13 @@ func TestSyncOutlivesItsCaller(t *testing.T) {
 
 	// Nothing asks again, yet the commit arrives: the writer never drops a queued file.
 	apptest.Eventually(t, 5*time.Second, "the commit to reach the journal after the caller left", func() bool {
-		entries, _ := e.entriesFor(t, "test.users/1")
+		entries, _ := e.entriesFor(t, "users/1")
 		return len(entries) == len(tailOf(t, sh).Files)
 	})
 	if err := sh.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
-	entries, _ := e.entriesFor(t, "test.users/1")
+	entries, _ := e.entriesFor(t, "users/1")
 	var last pos.Position
 	for _, en := range entries {
 		if en.Position != last+1 {
@@ -384,8 +383,8 @@ func TestTailFromFollowsTheTail(t *testing.T) {
 	e := newEnv(t)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
-	app.Must(t, "open", "a", path)
-	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w})
+	app.Must(t, "create", "a", path)
+	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName("users/1"), Path: path, Generation: "g1", Writer: e.w})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -400,15 +399,15 @@ func TestTailFromFollowsTheTail(t *testing.T) {
 			t.Fatal(err)
 		}
 		apptest.Eventually(t, 5*time.Second, "the commit to reach the journal", func() bool {
-			entries, _ := e.entriesFor(t, "test.users/1")
+			entries, _ := e.entriesFor(t, "users/1")
 			return len(entries) == len(tailOf(t, sh).Files)
 		})
 		if i == 0 {
-			_, seqs := e.entriesFor(t, "test.users/1")
+			_, seqs := e.entriesFor(t, "users/1")
 			first = seqs[0]
 		}
 	}
-	_, seqs := e.entriesFor(t, "test.users/1")
+	_, seqs := e.entriesFor(t, "users/1")
 	got := sh.TailFrom()
 	if got == 0 || got > first || got < 1 {
 		t.Fatalf("TailFrom = %d, first entry is in segment %d", got, first)
@@ -431,12 +430,12 @@ func TestCommitsInOneWindowKeepOnlyTheLatestPages(t *testing.T) {
 	e := newEnv(t)
 	app := apptest.Start(t)
 	path := filepath.Join(e.dir, "users-1.db")
-	app.Must(t, "open", "a", path)
+	app.Must(t, "create", "a", path)
 	app.Must(t, "exec", "a", "CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)")
 	for i := range 40 {
 		app.Must(t, "exec", "a", fmt.Sprintf("INSERT INTO t (id, v) VALUES (%d, randomblob(1000))", i))
 	}
-	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName("test.users/1"), Path: path, Generation: "g1", Writer: e.w})
+	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName("users/1"), Path: path, Generation: "g1", Writer: e.w})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -445,7 +444,7 @@ func TestCommitsInOneWindowKeepOnlyTheLatestPages(t *testing.T) {
 	if err := sh.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
-	before, _ := e.entriesFor(t, "test.users/1")
+	before, _ := e.entriesFor(t, "users/1")
 
 	const commits = 300
 	for range commits {
@@ -454,7 +453,7 @@ func TestCommitsInOneWindowKeepOnlyTheLatestPages(t *testing.T) {
 	if err := sh.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
-	entries, seqs := e.entriesFor(t, "test.users/1")
+	entries, seqs := e.entriesFor(t, "users/1")
 	// The window may be cut into more than one file, but never one per commit.
 	var totalPages, totalBytes, dbPages int
 	for i := len(before); i < len(entries); i++ {
@@ -577,7 +576,7 @@ func TestReleaseReadsTheFinalState(t *testing.T) {
 			}
 			var n int
 			return db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_schema WHERE name = 't'`).Scan(&n)
-		})
+		}, capture.ResumeIfHeld)
 		app.Close()
 		if err != nil || !released {
 			t.Fatalf("commit during the read %v: released %v, err %v", commitDuring, released, err)

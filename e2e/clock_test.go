@@ -1,36 +1,14 @@
 package e2e
 
 import (
-	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/s3test"
 )
-
-// clockReport is the clock object of the control API's node reply.
-type clockReport struct {
-	Samples int  `json:"samples"`
-	Warning bool `json:"warning"`
-}
-
-func (s *stack) nodeClock(t testing.TB) clockReport {
-	t.Helper()
-	resp, err := http.Get("http://" + s.ctl + "/_shardlite/node")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	var reply struct{ Clock *clockReport }
-	if err := json.NewDecoder(resp.Body).Decode(&reply); err != nil || reply.Clock == nil {
-		t.Fatalf("the node's reply has no clock: %v", err)
-	}
-	return *reply.Clock
-}
 
 // add posts a token to a shard and returns the status, the body and the retry hint.
 func (s *stack) add(shard, token string) (int, string, string) {
@@ -55,28 +33,22 @@ func TestSkewedClockOnlyWarns(t *testing.T) {
 	skew.Set(3 * time.Second) // within the 5s lease TTL, past the second that warns
 	s := newStack(t, "SHARDLITE_S3_ENDPOINT="+skew.URL)
 	// (The stack has a prefix of its own on the same store the proxy fronts.)
-	s.create(t, "e2e.users/u1", "e2e.wallet/w1")
+	s.create(t, "users/u1", "wallet/w1")
 
 	// Within the limit nothing changes, but the operator is told.
-	apptest.Eventually(t, 20*time.Second, "the node to warn of the offset", func() bool {
-		c := s.nodeClock(t)
-		return c.Samples > 0 && c.Warning
-	})
-	for _, shard := range []string{"e2e.users/u1", "e2e.wallet/w1"} {
+	s.node.waitFor(t, "more than a second from the store's", 20*time.Second)
+	for _, shard := range []string{"users/u1", "wallet/w1"} {
 		if code, body, _ := s.add(shard, "before-"+shard); code != 200 {
 			t.Fatalf("%s with a constant offset: %d %q", shard, code, body)
 		}
 	}
 
-	// A step: the node warns and every answer goes on.
+	// A step: every answer goes on (the node warned already and says nothing more).
 	skew.Set(40 * time.Second)
-	for _, shard := range []string{"e2e.users/u1", "e2e.wallet/w1"} {
+	for _, shard := range []string{"users/u1", "wallet/w1"} {
 		if code, body, _ := s.add(shard, "during-"+shard); code != 200 {
 			t.Fatalf("%s under a step: %d %q", shard, code, body)
 		}
-	}
-	if !s.nodeClock(t).Warning {
-		t.Fatal("the node does not report the offset")
 	}
 
 	// Past the TTL the node does not start.

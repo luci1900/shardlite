@@ -68,7 +68,7 @@ func (a *App) checkpoints(w http.ResponseWriter, r *http.Request, s *shardReq) {
 	// A connection of its own with a short busy timeout: the node's read
 	// transaction makes the app's FULL, RESTART and TRUNCATE checkpoints wait for
 	// it on every call.
-	db, err := sql.Open("sqlite", "file:"+s.file+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(20)&_pragma=synchronous(NORMAL)&_txlock=immediate")
+	db, err := sql.Open("sqlite", "file:"+s.file+"?mode=rw&_pragma=journal_mode(WAL)&_pragma=busy_timeout(20)&_pragma=synchronous(NORMAL)&_txlock=immediate")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -98,7 +98,7 @@ func (a *App) checkpoints(w http.ResponseWriter, r *http.Request, s *shardReq) {
 func (a *App) churn(w http.ResponseWriter, r *http.Request, s *shardReq) {
 	n := intParam(r, "n", 300)
 	for i := range n {
-		db, err := sql.Open("sqlite", "file:"+s.file+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_txlock=immediate")
+		db, err := sql.Open("sqlite", "file:"+s.file+"?mode=rw&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_txlock=immediate")
 		if err == nil {
 			_, err = db.ExecContext(r.Context(), `INSERT INTO rows (token, payload) VALUES (?, zeroblob(64))`, fmt.Sprintf("c%d", i))
 			if cerr := db.Close(); err == nil {

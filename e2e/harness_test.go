@@ -25,8 +25,8 @@ import (
 	"github.com/luci1900/shardlite/e2e/e2eapp"
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/coord"
 	"github.com/luci1900/shardlite/internal/journal"
+	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/s3test"
 	shardpkg "github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
@@ -179,7 +179,15 @@ type stack struct {
 
 func newStack(t testing.TB, nodeEnv ...string) *stack {
 	t.Helper()
-	s := &stack{t: t, store: s3test.Setup(t), dir: t.TempDir(), env: nodeEnv}
+	return newStackOn(t, s3test.Setup(t), nodeEnv...)
+}
+
+// newStackOn is newStack on a bucket and prefix that exist already: a second
+// node of the same cluster, which sets SHARDLITE_NODE in nodeEnv to a name of
+// its own.
+func newStackOn(t testing.TB, store s3test.Store, nodeEnv ...string) *stack {
+	t.Helper()
+	s := &stack{t: t, store: store, dir: t.TempDir(), env: nodeEnv}
 	s.nodeBin = apptest.Build(t, "./cmd/shardlite", nodeTags...)
 	appBin := buildApp(t)
 	if err := os.WriteFile(s.declarePath(), []byte(declarationJSON), 0o644); err != nil {
@@ -291,7 +299,7 @@ func newVerifier(t testing.TB, s *stack) *verifier {
 	return &verifier{t, &shardfile.Files{
 		Blob: blob.NewStore(l, "verifier", 1, blob.Options{}), Backend: l, Node: "verifier",
 		JournalOptions: journal.Options(blob.Options{}),
-		Leases:         coord.NewRegistry(l, "verifier", coord.RegistryOptions{}), Temp: tempfile.NewDir(t.TempDir()),
+		Leases:         lease.NewRegistry(l, "verifier", lease.RegistryOptions{}), Temp: tempfile.NewDir(t.TempDir()),
 	}}
 }
 
@@ -337,8 +345,7 @@ func (v *verifier) tokens(shard string) (toks map[string]bool, ok bool, err erro
 	return toks, true, rs.Err()
 }
 
-// shards lists every app shard that has a manifest. System shards (their
-// kinds start with _) hold the node's own tables, not the app's.
+// shards lists every shard that has a manifest.
 func (v *verifier) shards() []string {
 	v.t.Helper()
 	var out []string
@@ -346,10 +353,7 @@ func (v *verifier) shards() []string {
 		if err != nil {
 			v.t.Fatal(err)
 		}
-		shard := strings.TrimPrefix(info.Key, shardfile.ManifestPrefix)
-		if strings.HasPrefix(shard, "_") {
-			continue
-		}
+		_, shard, _ := strings.Cut(strings.TrimPrefix(info.Key, shardfile.ManifestPrefix), "/") // the key leads with the lane
 		if _, _, err := v.files.GetManifest(context.Background(), shardName(shard)); errors.Is(err, blob.ErrNotFound) {
 			continue
 		}

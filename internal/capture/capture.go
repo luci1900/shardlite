@@ -51,7 +51,7 @@ type Restored struct {
 	Checksums *Checksums
 }
 
-// Writer is what a shard needs of the node's journal (segment.Writer).
+// Writer is what a shard needs of the node's journal (journal.Writer).
 type Writer interface {
 	NextSeq() pos.Seg
 	AppendFile(name shard.Name, generation shard.Gen, position pos.Position, ltxFile tempfile.File) error
@@ -64,7 +64,7 @@ const DefaultRestartFrames = 1000
 
 // Config describes one shard to capture.
 type Config struct {
-	Name       shard.Name // kind/id, for example game.users/42
+	Name       shard.Name // kind/id, for example users/42
 	Path       string     // the SQLite file
 	Generation shard.Gen
 	Writer     Writer
@@ -156,6 +156,8 @@ type Shard struct {
 	back Frame
 	// snaps is the number of snapshots being read, which hold off a restart.
 	snaps int
+	// openAtRelease is set by a release that went ahead over a handle another process kept open (OpenAtRelease).
+	openAtRelease bool
 }
 
 // ErrClosed is what Capture, Use and Snapshot return for a shard whose
@@ -208,8 +210,8 @@ func New(cfg Config) (sh *Shard, err error) {
 		return nil, err
 	}
 	// The checksums of the database: the ones the restore computed for a
-	// restored shard, the ones the cache index holds for a cached one, and the
-	// ones read from the file for a shard whose are not known.
+	// restored shard, and the ones read from the file for a shard whose are not
+	// known.
 	switch {
 	case cfg.Restored == nil:
 		s.cks = NewChecksums() // a new shard: an empty database
@@ -383,8 +385,8 @@ var sqliteDriver = &sqlite.Driver{}
 // Left in place, they are what a release trusts and the next activation
 // reuses: the app's next open reuses the -shm, so a commit after the final
 // sync shows in the wal-index header Release compares (settle), and the WAL
-// left beside the file is folded into the database at the next activation of
-// a cached shard (foldWAL). Deleted instead, which is what SQLite does when
+// left beside the file is folded into the database when capture is resumed
+// (foldWAL). Deleted instead, which is what SQLite does when
 // the last connection closes, the app's next open would make a new -shm the
 // header comparison never sees, and a commit made in between would be let go
 // uncaptured.
@@ -446,7 +448,7 @@ func (s *Shard) endRead() {
 // closeConns closes the connections and then the descriptors, in that order:
 // closing a descriptor drops the connections' locks. A connection that closes
 // last on the database checkpoints it; the WAL and the -shm stay in place for
-// the next activation to fold (persistWAL).
+// the next capture to fold (persistWAL).
 func (s *Shard) closeConns() {
 	s.endRead()
 	if s.rtx != nil {
@@ -835,7 +837,7 @@ func (s *Shard) writeAll(info Info) error {
 }
 
 // Capture syncs the shard: new commits become LTX files, and the files are
-// queued in the segment writer and in the shard's tail. It returns when they
+// queued in the journal writer and in the shard's tail. It returns when they
 // are all queued, however many that is, without waiting for any segment. The
 // commits are durable once the writer has been flushed after this returns.
 //
@@ -865,7 +867,7 @@ func (s *Shard) maybeRestart(ctx context.Context) {
 }
 
 // Sync is Capture followed by a wait until the segments holding the commits are
-// in blob storage (it flushes the segment writer).
+// in blob storage (it flushes the journal writer).
 func (s *Shard) Sync(ctx context.Context) error {
 	if err := s.Capture(ctx); err != nil {
 		return err
@@ -1160,20 +1162,36 @@ func (s *Shard) Abandon() {
 	s.do(context.Background(), func() error { s.end(); return nil })
 }
 
-// Release is how the node lets go of a shard (deactivation, move, eviction).
+// IfHeld says what Release does when another process still has the shard open.
+type IfHeld int
+
+const (
+	// ResumeIfHeld is the zero value: capture is reopened where it left off and
+	// Release reports the shard as not released.
+	ResumeIfHeld IfHeld = iota
+	// GoAheadIfHeld lets go though the other process keeps its handle, which the
+	// node does only at a stop (the app is stopping too, and a commit through
+	// the handle afterwards is lost). The wal-index header is still compared
+	// before and after, so a commit made during the release resumes capture
+	// as it does for ResumeIfHeld. OpenAtRelease says whether the file was open.
+	GoAheadIfHeld
+)
+
+// Release is how the node lets go of a shard (a deactivation or a stop).
 // It does a final sync and closes every connection and file handle the node has
 // on the shard, waits until the files the final sync queued are in blob storage,
 // and only then asks whether another process still has the shard open (see
 // walsidecar.go for why the order matters).
 //
-// If one does, or the wait failed, capture is reopened where it left off and
-// Release returns false: the node must not let go. Otherwise the activation is
+// If one does (and ifHeld is ResumeIfHeld), a commit was made after the final
+// sync, or the wait failed, capture is reopened where it left off and Release
+// returns false: the node must not let go. Otherwise the activation is
 // over and Release returns true. If the close or the reopen fails, the
 // activation is over too, and Release returns the error (Open says which).
 //
 // read, if not nil, reads the database at its final state, beside the check
 // for empty (see Released.At). An error from it only makes At 0.
-func (s *Shard) Release(ctx context.Context, read func(*sql.DB) error) (released bool, f Released, err error) {
+func (s *Shard) Release(ctx context.Context, read func(*sql.DB) error, ifHeld IfHeld) (released bool, f Released, err error) {
 	var c closed
 	if err := s.do(ctx, func() error {
 		var err error
@@ -1191,7 +1209,7 @@ func (s *Shard) Release(ctx context.Context, read func(*sql.DB) error) (released
 	// The last step runs even if ctx ended: the shard has to end up in one state.
 	err = s.do(context.WithoutCancel(ctx), func() error {
 		var err error
-		released, err = s.settle(c, ferr)
+		released, err = s.settle(c, ferr, ifHeld)
 		return err
 	})
 	if err != nil || !released {
@@ -1225,22 +1243,30 @@ type Uncertain struct{}
 
 func (*Uncertain) released() {}
 
+// OpenAtRelease says whether a Release told to go ahead (GoAheadIfHeld) let go of
+// the shard though another process still had it open. It is false for a shard that
+// was not released, or released with nobody holding it.
+func (s *Shard) OpenAtRelease() (open bool) {
+	s.call(func() { open = s.openAtRelease })
+	return open
+}
+
 // settle is the last step of Release, under the lock, with nothing of the node's
 // open on the shard: the -shm check, then the header compared with the one
 // read after the final sync. It ends the activation if the shard can be let
 // go of, and otherwise reopens capture.
-func (s *Shard) settle(c closed, ferr error) (released bool, err error) {
+func (s *Shard) settle(c closed, ferr error, ifHeld IfHeld) (released bool, err error) {
 	held, perr := s.side.Held()
 	// A commit after the final sync changes the header, even if the app has
 	// closed the file since (the mapping outlives a deleted -shm). If the app
 	// opened it again, SQLite reset -shm and the header reads differently or not
-	// at all. Either way the commit isn't captured, so capture resumes.
+	// at all. Either way the commit isn't captured, so capture resumes, whether
+	// or not the node goes ahead over an open file.
 	hdr, herr := s.header()
 	s.unmap()
-	if herr != nil || c.hdrErr != nil || hdr != c.hdr {
-		held = true
-	}
-	if ferr == nil && perr == nil && !held {
+	changed := herr != nil || c.hdrErr != nil || hdr != c.hdr
+	if ferr == nil && perr == nil && !changed && (!held || ifHeld == GoAheadIfHeld) {
+		s.openAtRelease = held
 		s.end()
 		return true, nil
 	}
