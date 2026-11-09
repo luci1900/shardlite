@@ -39,6 +39,7 @@ func TestShardWithABadFileIsNotServed(t *testing.T) {
 	if !strings.Contains(body, "not the one the shard holds") {
 		t.Fatalf("the shard with a damaged file: %s", body)
 	}
+	wantReason(t, resp, reasonBadFile)
 }
 
 // damageFile flips a byte in the middle of a shard's last file.

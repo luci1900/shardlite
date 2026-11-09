@@ -146,7 +146,7 @@ func TestClientsGet404ForDeletedShards(t *testing.T) {
 	// Marked for deletion.
 	ref := r.acquire("users/d1")
 	r.write(ref, "a")
-	r.app.Must(t, "exec", "a", "CREATE TABLE _shardlite_delete (x)")
+	r.app.Must(t, "exec", "a", `INSERT OR IGNORE INTO _shardlite_delete VALUES (1)`)
 	r.app.Must(t, "close", "a")
 	ref.Release()
 	gone("users/d1")

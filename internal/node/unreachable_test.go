@@ -33,6 +33,7 @@ func TestKilledOwnerFailsFast(t *testing.T) {
 			if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") != "1" || !strings.Contains(body, "does not answer") {
 				t.Errorf("%d (Retry-After %q) %q", resp.StatusCode, resp.Header.Get("Retry-After"), body)
 			}
+			wantReason(t, resp, reasonOwnerUnreachable)
 		})
 	}
 	g.Wait()
@@ -41,6 +42,7 @@ func TestKilledOwnerFailsFast(t *testing.T) {
 	if got := resp.Header.Get("Grpc-Status"); got != "14" {
 		t.Fatalf("gRPC: grpc-status %q, want 14 (UNAVAILABLE)", got)
 	}
+	wantReason(t, resp, reasonOwnerUnreachable)
 	if got := n1.m.Load().Stats.Unanswered.Load(); got != 21 {
 		t.Fatalf("%d forwards counted as unanswered, want 21", got)
 	}

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/apptest"
+	"github.com/luci1900/shardlite/internal/peers"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
@@ -63,7 +64,7 @@ func TestForwardIsServedByTheOwner(t *testing.T) {
 		})
 	}
 	hdr := map[string]string{
-		"Shardlite-Foo": "1", "Shardlite-Caller": "users/9", "Shardlite-Hops": "7", "Shardlite-Deadline": "5",
+		"Shardlite-Foo": "1", "Shardlite-Caller": "users/9", "Shardlite-Hops": "7", hdrContext: ctxOf("users/9", 7), "Shardlite-Deadline": "5",
 		"Traceparent":     "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
 		"X-Forwarded-For": "203.0.113.9", "X-Forwarded-Proto": "https", "Content-Type": "text/plain", "X-Custom": "a",
 	}
@@ -82,12 +83,64 @@ func TestForwardIsServedByTheOwner(t *testing.T) {
 		t.Fatalf("the forward was served by %s", fwd.node)
 	}
 	if local.uri != "/items?x=1&y=2" || local.body != "hello" || local.hdr.Get("Shardlite-Opened") != "users/f1" ||
-		local.hdr.Get("Shardlite-Hops") != "0" || local.hdr.Get("Shardlite-Foo") != "" || local.hdr.Get("Shardlite-Caller") != "" ||
+		local.hdr.Get(hdrContext) != ctxOf("users/f1", 0) || local.hdr.Get("Shardlite-Hops") != "" || local.hdr.Get("Shardlite-Foo") != "" || local.hdr.Get("Shardlite-Caller") != "" ||
 		local.hdr.Get("Shardlite-Deadline") != "" || local.hdr.Get("X-Forwarded-For") != "203.0.113.9, 127.0.0.1" {
 		t.Fatalf("the local request: %+v", local)
 	}
 	if fwd.uri != local.uri || fwd.body != local.body || fmt.Sprint(fwd.hdr) != fmt.Sprint(local.hdr) {
 		t.Fatalf("forwarded:\n%+v\nlocal:\n%+v", fwd, local)
+	}
+}
+
+// An error the owner's node makes reaches the client through the forwarding
+// node with the owner's Shardlite-Error. An answer of the owner's app does not
+// get one, though the app sets the header itself.
+func TestForwardPassesTheOwnersReasonThrough(t *testing.T) {
+	c := newCluster(t, 2)
+	n0, n1 := c.nodes[0], c.nodes[1]
+	var abort atomic.Bool
+	n0.serve(func(w http.ResponseWriter, q *http.Request) {
+		if abort.Load() {
+			panic(http.ErrAbortHandler) // the app took the request, then closed the connection with no answer
+		}
+		w.Header().Set("Shardlite-Error", "app-unreachable")
+		w.WriteHeader(http.StatusBadGateway)
+	})
+	n0.create("users/e1")
+	through := "http://" + n1.Public
+
+	// The owner's node fails after its app had the request: its own 502 and its reason.
+	abort.Store(true)
+	direct, _ := send(t, "POST", "http://"+n0.Public+"/", map[string]string{"Shardlite-Target": "users/e1"}, "hi")
+	fwd, _ := send(t, "POST", through+"/", map[string]string{"Shardlite-Target": "users/e1"}, "hi")
+	for name, resp := range map[string]*http.Response{"direct": direct, "forwarded": fwd} {
+		if resp.StatusCode != http.StatusBadGateway || resp.Header.Get("Retry-After") != "" {
+			t.Errorf("%s: %d (Retry-After %q), want a bare 502", name, resp.StatusCode, resp.Header.Get("Retry-After"))
+		}
+		wantReason(t, resp, reasonAppFailed)
+	}
+	// The same, as gRPC.
+	if resp := grpcRequest(t, through+"/svc/M", "users/e1", nil); resp.Header.Get("Grpc-Status") != "14" {
+		t.Errorf("gRPC through a forward: %v", resp.Header)
+	} else {
+		wantReason(t, resp, reasonAppFailed)
+	}
+
+	// The owner's node refuses the request before its app has it.
+	fwd, _ = send(t, "GET", through+"/", map[string]string{"Shardlite-Target": "typo/1"}, "")
+	if fwd.StatusCode != http.StatusNotFound {
+		t.Errorf("an undeclared kind: %d", fwd.StatusCode)
+	}
+	wantReason(t, fwd, reasonUnknownShard)
+
+	// The owner's app answers with an error of its own, and sets the header itself: no reason.
+	abort.Store(false)
+	fwd, _ = send(t, "POST", through+"/", map[string]string{"Shardlite-Target": "users/e1"}, "hi")
+	if fwd.StatusCode != http.StatusBadGateway {
+		t.Fatalf("the app's 502 reached the client as %d", fwd.StatusCode)
+	}
+	if got, ok := fwd.Header[hdrError]; ok {
+		t.Errorf("the app's own error carries Shardlite-Error %q", got)
 	}
 }
 
@@ -230,7 +283,7 @@ func TestForwardedCallIsGatedOnBothNodes(t *testing.T) {
 	go func() {
 		q, _ := http.NewRequest("POST", "http://"+n0.Control+"/call", strings.NewReader("the call"))
 		q.Header.Set("Shardlite-Target", "wallet/d")
-		q.Header.Set("Shardlite-Caller", "wallet/c")
+		q.Header.Set(hdrContext, ctxOf("wallet/c", 0))
 		resp, err := clusterClient.Do(q)
 		if err != nil {
 			answered <- err.Error()
@@ -391,7 +444,7 @@ func TestForwardIfActive(t *testing.T) {
 	p := <-paths
 	app.Must(t, "open", p, p)
 	app.Must(t, "insert", p, "1", "64") // written, so it is kept when it goes idle
-	call := map[string]string{"Shardlite-Target": "brief/x", "Shardlite-Caller": "app", "Shardlite-If-Active": "true"}
+	call := map[string]string{"Shardlite-Target": "brief/x", "Shardlite-If-Active": "true"}
 	if resp, _ := send(t, "GET", "http://"+n1.Control+"/presence", call, ""); resp.StatusCode != 200 || resp.Header.Get("X-Served-By") != "n0" {
 		t.Fatalf("If-Active for a shard active on its owner: %d %v", resp.StatusCode, resp.Header)
 	}
@@ -548,14 +601,14 @@ func TestSendBackRuleReadsThePlacementOfAForward(t *testing.T) {
 		status int
 		owner  string // the node the 421 names
 	}{
-		{"a client's forward", map[string]string{"Shardlite-Origin": originClient, hdrNode: "n1"}, 421, "n1"},
-		{"a client's forward from a draining node", map[string]string{"Shardlite-Origin": originClient, hdrNode: "n1", hdrPlacement: placementAvoid}, 200, ""},
-		{"a client's forward that avoids with a parameter", map[string]string{"Shardlite-Origin": originClient, hdrNode: "n1", hdrPlacement: placementAvoid + ";for=5"}, 200, ""},
-		{"a client's forward with a bad placement", map[string]string{"Shardlite-Origin": originClient, hdrNode: "n1", hdrPlacement: "yes"}, 421, "n1"},
-		{"a client's forward that avoids with no name", map[string]string{"Shardlite-Origin": originClient, hdrPlacement: placementAvoid}, 200, ""},
+		{"a client's forward", map[string]string{"Shardlite-Origin": originClient, peers.HeaderNode: "n1"}, 421, "n1"},
+		{"a client's forward from a draining node", map[string]string{"Shardlite-Origin": originClient, peers.HeaderNode: "n1", peers.HeaderPlacement: peers.PlacementAvoid}, 200, ""},
+		{"a client's forward that avoids with a parameter", map[string]string{"Shardlite-Origin": originClient, peers.HeaderNode: "n1", peers.HeaderPlacement: peers.PlacementAvoid + ";for=5"}, 200, ""},
+		{"a client's forward with a bad placement", map[string]string{"Shardlite-Origin": originClient, peers.HeaderNode: "n1", peers.HeaderPlacement: "yes"}, 421, "n1"},
+		{"a client's forward that avoids with no name", map[string]string{"Shardlite-Origin": originClient, peers.HeaderPlacement: peers.PlacementAvoid}, 200, ""},
 		{"a client's forward with no name", map[string]string{"Shardlite-Origin": originClient}, 200, ""},
-		{"a client's forward with a bad name", map[string]string{"Shardlite-Origin": originClient, hdrNode: "n 1"}, 200, ""},
-		{"a call's forward", map[string]string{"Shardlite-Origin": originCall, hdrNode: "n1"}, 200, ""},
+		{"a client's forward with a bad name", map[string]string{"Shardlite-Origin": originClient, peers.HeaderNode: "n 1"}, 200, ""},
+		{"a call's forward", map[string]string{"Shardlite-Origin": originCall, peers.HeaderNode: "n1"}, 200, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			target := "users/" + strings.NewReplacer(" ", "-", "'", "", ";", "").Replace(tc.name)
@@ -582,22 +635,96 @@ func TestForwardLearnsAvoidFromTheOwnersAnswers(t *testing.T) {
 	forward := func() {
 		t.Helper()
 		resp, body := send(t, "GET", "http://"+n1.Public+"/x", map[string]string{"Shardlite-Target": "users/a"}, "")
-		if resp.StatusCode != 200 || body != "served" || len(resp.Header.Values(hdrPlacement)) != 0 {
-			t.Fatalf("the forward: %d %q, placement %v", resp.StatusCode, body, resp.Header.Values(hdrPlacement))
+		if resp.StatusCode != 200 || body != "served" || len(resp.Header.Values(peers.HeaderPlacement)) != 0 {
+			t.Fatalf("the forward: %d %q, placement %v", resp.StatusCode, body, resp.Header.Values(peers.HeaderPlacement))
 		}
 	}
 	forward()
-	if p1.avoids("n0") {
+	if p1.Avoids("n0") {
 		t.Fatal("n1 avoids n0 though it doesn't drain")
 	}
 	n0.m.Load().Drain()
 	forward()
-	if !p1.avoids("n0") {
+	if !p1.Avoids("n0") {
 		t.Fatal("n1 did not hear that n0 drains")
 	}
 	n0.m.Load().draining.Store(false)
 	forward()
-	if p1.avoids("n0") {
+	if p1.Avoids("n0") {
 		t.Fatal("n1 still avoids n0 after an answer without the header")
+	}
+}
+
+// A call forwarded to the owner arrives at the owner's app with the caller its
+// context names and a context of the owner's own, one hop deeper than the
+// caller's. A call with no context is the app's, at hop 1.
+func TestForwardedCallKeepsItsContext(t *testing.T) {
+	c := newCluster(t, 2)
+	n0, n1 := c.nodes[0], c.nodes[1]
+	got := make(chan http.Header, 1)
+	n0.serve(func(w http.ResponseWriter, q *http.Request) { got <- q.Header.Clone() })
+	n0.create("users/k1")
+	for _, tc := range []struct {
+		name, ctx, caller, want string
+	}{
+		{"from a shard", ctxOf("wallet/k2", 4), "wallet/k2", ctxOf("users/k1", 5)},
+		{"from the app", "", callerApp, ctxOf("users/k1", 1)},
+		{"with a key it does not know", `shard="wallet/k2", hops=4, later=?1`, "wallet/k2", ctxOf("users/k1", 5)},
+	} {
+		hdr := map[string]string{"Shardlite-Target": "users/k1"}
+		if tc.ctx != "" {
+			hdr[hdrContext] = tc.ctx
+		}
+		if resp, body := send(t, "GET", "http://"+n1.Control+"/x", hdr, ""); resp.StatusCode != 200 {
+			t.Fatalf("%s: %d %q", tc.name, resp.StatusCode, body)
+		}
+		if h := <-got; h.Get("Shardlite-Caller") != tc.caller || h.Get(hdrContext) != tc.want || h.Get("Shardlite-Hops") != "" {
+			t.Fatalf("%s: the owner's app saw %v, want caller %q and context %q", tc.name, h, tc.caller, tc.want)
+		}
+	}
+}
+
+// The peer listener reads a forward's context as the control API reads a
+// call's. A forward with none is a call from the app (hop 1) or a client's
+// request (hop 0), as its origin says, and a context that is bad is a 400 that
+// doesn't reach the app.
+func TestPeerListenerReadsTheContextOfAForward(t *testing.T) {
+	c := newCluster(t, 1)
+	n0 := c.nodes[0]
+	got := make(chan http.Header, 1)
+	n0.serve(func(w http.ResponseWriter, q *http.Request) { got <- q.Header.Clone() })
+	n0.create("users/k3")
+	for _, tc := range []struct {
+		name, origin, ctx string
+		status            int
+		caller, want      string
+	}{
+		{"a call's context", originCall, ctxOf("wallet/k4", 6), 200, "wallet/k4", ctxOf("users/k3", 7)},
+		{"a call from the app", originCall, "", 200, callerApp, ctxOf("users/k3", 1)},
+		{"a client's request", originClient, "", 200, "", ctxOf("users/k3", 0)},
+		{"a context that does not parse", originCall, "shard=", 400, "", ""},
+		{"a context with no hops", originCall, `shard="wallet/k4"`, 400, "", ""},
+		{"a context with a bad shard", originCall, `shard="nokind", hops=1`, 400, "", ""},
+		{"a chain that is too long", originCall, ctxOf("wallet/k4", DefaultMaxHops), 508, "", ""},
+	} {
+		hdr := map[string]string{"Shardlite-Origin": tc.origin, "Shardlite-Target": "users/k3"}
+		if tc.ctx != "" {
+			hdr[hdrContext] = tc.ctx
+		}
+		ans := n0.peerDo("GET", "/x", hdr, "")
+		if ans.status != tc.status {
+			t.Fatalf("%s: %d, want %d", tc.name, ans.status, tc.status)
+		}
+		if tc.status != 200 {
+			select {
+			case h := <-got:
+				t.Fatalf("%s: the request reached the app: %v", tc.name, h)
+			default:
+			}
+			continue
+		}
+		if h := <-got; h.Get("Shardlite-Caller") != tc.caller || h.Get(hdrContext) != tc.want {
+			t.Fatalf("%s: the app saw %v, want caller %q and context %q", tc.name, h, tc.caller, tc.want)
+		}
 	}
 }

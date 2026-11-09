@@ -151,6 +151,27 @@ func TestProtocolsThroughTheNode(t *testing.T) {
 	}
 	mustHave("a transfer", "wallet/w5", "debit:x1")
 	mustHave("a transfer", "wallet/w6", "credit:x1")
+	// The app passes the context of the request it serves on to its call, so the
+	// hop limit (32) sees the whole chain. Serving hop 31, the call is hop 32, the
+	// last one allowed. Serving hop 32, it would be hop 33, and the node refuses
+	// it with 508, which the app answers as a bad gateway.
+	for _, c := range []struct {
+		hops int
+		want int
+	}{{30, 200}, {31, 502}} {
+		q, _ := http.NewRequest("POST", "http://"+s.ctl+at("wallet/w5", "/transfer")+fmt.Sprintf("?to=wallet/w6&token=h%d", c.hops), nil)
+		q.Header.Set("Shardlite-Target", "wallet/w5")
+		q.Header.Set("Shardlite-Context", fmt.Sprintf(`shard="wallet/w6", hops=%d`, c.hops))
+		resp, err := http.DefaultClient.Do(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != c.want || (c.want == 502 && !strings.Contains(string(b), "508")) {
+			t.Fatalf("a transfer at hop %d: %d %q, want %d", c.hops+1, resp.StatusCode, b, c.want)
+		}
+	}
 	// A durable send: the row, the call and its reminder are one transaction on
 	// the sender. The node wakes the sender's reminders handler once that is
 	// durable, and the handler calls the receiver, which does its work once.
@@ -211,8 +232,8 @@ func TestProtocolsThroughTheNode(t *testing.T) {
 		t.Fatalf("the new kind from a client: %d", st)
 	}
 
-	// Graceful stop: every shard is let go of (the app closes its handles when idle) and the lease is released.
-	apptest.Eventually(t, apptest.Timeout, "the app to close its databases", func() bool { return s.appDebug().OpenDBs == 0 })
+	// Graceful stop: every shard is let go of (the app closes each request's database when the request ends) and the lease is released.
+	apptest.Eventually(t, apptest.Timeout, "the app to finish its requests and close their databases", func() bool { return s.appDebug().Serving == 0 })
 	if err := s.node.term(30 * time.Second); err != nil {
 		t.Fatalf("node exit: %v\n%s", err, s.node.out.String())
 	}

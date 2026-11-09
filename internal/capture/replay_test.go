@@ -27,10 +27,12 @@ import (
 // restartAt is the model's RESTART_AT: a sync of a WAL of more frames restarts it.
 const restartAt = 2
 
-// snapshotPages is the pages of the replayed database: the test app's own and
-// the two tables' roots. The model's two pages are the tables' (the last two),
-// and the pages before them, which no commit changes, are read first.
-const snapshotPages = 5
+// snapshotPages is the pages of the replayed database: the reserved tables'
+// (which the create command makes, as the node's activation does), the test
+// app's own and the two tables' roots. The model's two pages are the tables'
+// (the last two), and the pages before them, which no commit changes, are read
+// first.
+const snapshotPages = 9
 
 // traceStep is one state of a trace of specs/capture.qnt, as `quint run --mbt
 // --out-itf` writes it (see testdata/traces): the action that led to it, what it

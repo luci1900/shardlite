@@ -2,7 +2,6 @@ package node
 
 import (
 	"context"
-	"errors"
 	"github.com/luci1900/shardlite/internal/apptest"
 	"net/http"
 	"strings"
@@ -10,10 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/blobtest"
-	"github.com/luci1900/shardlite/internal/cluster"
-	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
@@ -118,45 +114,6 @@ func TestStoppedOwnersEntriesAreForgotten(t *testing.T) {
 		if resp, body := post(t, n1, shard, ""); resp.StatusCode != 200 || resp.Header.Get("X-Served-By") != "n1" {
 			t.Fatalf("%s: %d %q", shard, resp.StatusCode, body)
 		}
-	}
-}
-
-// The address cache reads a lease once, and again when the listing shows the node
-// wrote its lease after the cached one would have expired.
-func TestAddressCache(t *testing.T) {
-	now := time.Now()
-	var reads int
-	address := "a:1"
-	var list atomic.Pointer[NodeList]
-	a := &addresses{
-		get: func(_ context.Context, node cluster.Node) (*lease.Record, error) {
-			reads++
-			if node == "gone" {
-				return nil, blob.ErrNotFound
-			}
-			return &lease.Record{NodeInfo: lease.NodeInfo{Name: node, Address: address}, Renewed: now, TTL: 10 * time.Second}, nil
-		},
-		nodes: list.Load,
-	}
-	ctx := context.Background()
-	want := func(addr string, reads_ int) {
-		t.Helper()
-		got, err := a.address(ctx, "n1")
-		if err != nil || got != addr || reads != reads_ {
-			t.Fatalf("address %q (%v) after %d reads, want %q after %d", got, err, reads, addr, reads_)
-		}
-	}
-	want("a:1", 1)
-	want("a:1", 1)
-	// A renewal: written before the cached lease would have expired.
-	list.Store(&NodeList{Nodes: []NodeView{{Listed: lease.Listed{Name: "n0"}}, {Listed: lease.Listed{Name: "n1", LastModified: now.Add(5 * time.Second)}}}})
-	want("a:1", 1)
-	// The node was gone for longer than its TTL and came back elsewhere.
-	address = "b:2"
-	list.Store(&NodeList{Nodes: []NodeView{{Listed: lease.Listed{Name: "n1", LastModified: now.Add(30 * time.Second)}}}})
-	want("b:2", 2)
-	if _, err := a.address(ctx, "gone"); !errors.Is(err, blob.ErrNotFound) {
-		t.Fatalf("a node with no lease: %v", err)
 	}
 }
 

@@ -1,24 +1,14 @@
 package node
 
 import (
-	"bufio"
-	"bytes"
-	"compress/gzip"
 	"context"
 	"errors"
-	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/http/httptrace"
-	"net/http/httputil"
-	"net/textproto"
 	"net/url"
-	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -46,7 +36,6 @@ type srig struct {
 	stop    func() // stops the public and control servers and the declaration poll and joins them
 	pub     string // http://host:port
 	ctl     string
-	sock    string
 	client  *http.Client
 	h2c     *http.Client
 
@@ -115,22 +104,11 @@ func (r *srig) startServer() {
 	srv := r.srv
 	pub, _ := net.Listen("tcp", "127.0.0.1:0")
 	ctl, _ := net.Listen("tcp", "127.0.0.1:0")
-	// Unix socket paths are short (104 bytes on macOS): not t.TempDir().
-	dir, err := os.MkdirTemp("", "s")
-	if err != nil {
-		r.t.Fatal(err)
-	}
-	r.t.Cleanup(func() { os.RemoveAll(dir) })
-	r.sock = dir + "/c.sock"
-	sock, err := net.Listen("unix", r.sock)
-	if err != nil {
-		r.t.Fatal(err)
-	}
 	r.pub, r.ctl = "http://"+pub.Addr().String(), "http://"+ctl.Addr().String()
 	ctx, cancel := context.WithCancel(context.Background())
 	var g errgroup.Group
 	g.Go(func() error { return srv.publicServer(pub).Serve(ctx) })
-	g.Go(func() error { return srv.controlServer(ctl, sock).Serve(ctx) })
+	g.Go(func() error { return srv.controlServer(ctl).Serve(ctx) })
 	g.Go(func() error { return srv.declarations.Serve(ctx) })
 	var once sync.Once
 	r.stop = func() { once.Do(func() { cancel(); g.Wait() }) }
@@ -203,7 +181,7 @@ func TestServerRouting(t *testing.T) {
 	// The query parameter routes and is stripped; client-sent Shardlite-* headers never reach the app.
 	resp, body := r.req("GET", r.pub, "/hello?a=1&shardlite-target=slow/r1&b=2", map[string]string{
 		"Shardlite-Caller": "users/9", "Shardlite-File": "/etc/passwd", "Shardlite-Foo": "1", "Shardlite-If-Active": "true", "Shardlite-Sync": "none",
-		"Shardlite-Opened": "users/evil",
+		"Shardlite-Opened": "users/evil", hdrContext: ctxOf("users/evil", 7),
 	}, "")
 	q := last.Load()
 	if resp.StatusCode != 200 || body != "hello" || q == nil {
@@ -212,6 +190,10 @@ func TestServerRouting(t *testing.T) {
 	// The app is told what the node opened, not what the client named, and a client's own Shardlite-Opened gave way to it.
 	if q.Header.Get("Shardlite-Opened") != "slow/r1" || q.Header.Get("Shardlite-Target") != "" || q.URL.RawQuery != "a=1&b=2" || q.URL.Path != "/hello" {
 		t.Fatalf("app saw %s %v", q.URL, q.Header)
+	}
+	// ...and so did a client's Shardlite-Context: the app's is the node's own, for the shard it opened.
+	if got := q.Header.Values(hdrContext); len(got) != 1 || got[0] != ctxOf("slow/r1", 0) {
+		t.Fatalf("Shardlite-Context = %q, want %q", got, ctxOf("slow/r1", 0))
 	}
 	if p := q.Header.Get("Shardlite-File"); p == "/etc/passwd" || !strings.HasSuffix(p, ".db") {
 		t.Fatalf("Shardlite-File = %q", p)
@@ -285,150 +267,6 @@ func TestServerRouting(t *testing.T) {
 	}
 }
 
-// The load balancer is the trust boundary: the app sees the chain it sent with
-// its own address added, and the protocol and host the client used. Without
-// them the app sees the node's own view of the request.
-func TestServerKeepsForwardedHeadersFromTheLoadBalancer(t *testing.T) {
-	t.Parallel()
-	r := newSRig(t)
-	r.create("slow/x1")
-	var last atomic.Pointer[http.Request]
-	r.app_(func(w http.ResponseWriter, q *http.Request) {
-		last.Store(q.Clone(context.Background()))
-		io.WriteString(w, "ok")
-	})
-	seen := func(hdr map[string]string) (xff, proto, host string) {
-		t.Helper()
-		hdr["Shardlite-Target"] = "slow/x1"
-		if resp, _ := r.req("GET", r.pub, "/x", hdr, ""); resp.StatusCode != 200 {
-			t.Fatalf("status %d", resp.StatusCode)
-		}
-		q := last.Load()
-		return q.Header.Get("X-Forwarded-For"), q.Header.Get("X-Forwarded-Proto"), q.Header.Get("X-Forwarded-Host")
-	}
-
-	xff, proto, host := seen(map[string]string{
-		"X-Forwarded-For": "203.0.113.9, 198.51.100.7", "X-Forwarded-Proto": "https", "X-Forwarded-Host": "app.example.com",
-	})
-	if xff != "203.0.113.9, 198.51.100.7, 127.0.0.1" || proto != "https" || host != "app.example.com" {
-		t.Fatalf("with the load balancer's headers: %q %q %q", xff, proto, host)
-	}
-	xff, proto, host = seen(map[string]string{})
-	if xff != "127.0.0.1" || proto != "http" || host != strings.TrimPrefix(r.pub, "http://") {
-		t.Fatalf("without them: %q %q %q", xff, proto, host)
-	}
-}
-
-// A proxy passes bodies through as they are: it adds no Accept-Encoding to the
-// app's request for a client that sent none, and it hands on a compressed
-// answer without decoding it.
-func TestServerLeavesCompressionToTheClient(t *testing.T) {
-	t.Parallel()
-	r := newSRig(t)
-	r.create("slow/z1")
-	var asked atomic.Value // the request's Accept-Encoding
-	var zipped bytes.Buffer
-	zw := gzip.NewWriter(&zipped)
-	io.WriteString(zw, "hello")
-	zw.Close()
-	r.app_(func(w http.ResponseWriter, q *http.Request) {
-		asked.Store(q.Header.Get("Accept-Encoding"))
-		w.Header().Set("Content-Encoding", "gzip")
-		w.Write(zipped.Bytes())
-	})
-
-	c := &http.Client{Timeout: 20 * time.Second, Transport: &http.Transport{DisableKeepAlives: true, DisableCompression: true}}
-	q, _ := http.NewRequest("GET", r.pub+"/z", nil)
-	q.Header.Set("Shardlite-Target", "slow/z1")
-	resp, err := c.Do(q)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if ae := asked.Load(); ae != "" {
-		t.Fatalf("the app saw Accept-Encoding %v (nil if it saw no request)", ae)
-	}
-	if resp.Header.Get("Content-Encoding") != "gzip" || !bytes.Equal(body, zipped.Bytes()) {
-		t.Fatalf("the answer was changed on the way: %q %x", resp.Header.Get("Content-Encoding"), body)
-	}
-}
-
-// CGI-style frameworks give Shardlite_Caller the same variable as
-// Shardlite-Caller, so the underscore spelling must not get through either way.
-func TestServerStripsUnderscoreHeaders(t *testing.T) {
-	t.Parallel()
-	r := newSRig(t)
-	r.create("slow/u1")
-	var last atomic.Pointer[http.Request]
-	r.app_(func(w http.ResponseWriter, q *http.Request) {
-		last.Store(q.Clone(context.Background()))
-		w.Header().Set("Shardlite_Foo", "x")
-		w.Header().Set("SHARDLITE_BAR", "y")
-		w.Header().Set("X-Plain", "y")
-	})
-
-	resp, _ := r.req("GET", r.pub, "/x", map[string]string{
-		"Shardlite-Target": "slow/u1", "Shardlite-Opened": "users/evil", "Shardlite_Opened": "users/evil", "Shardlite_Caller": "users/9", "SHARDLITE_FOO": "1", "X-Plain": "z",
-	}, "")
-	q := last.Load()
-	if resp.StatusCode != 200 || q == nil {
-		t.Fatalf("%d", resp.StatusCode)
-	}
-	for k, v := range q.Header {
-		if strings.HasPrefix(strings.ToLower(k), "shardlite") && k != "Shardlite-Opened" && k != "Shardlite-File" && k != "Shardlite-Hops" {
-			t.Fatalf("%s: %v reached the app", k, v)
-		}
-	}
-	if q.Header.Get("Shardlite-Opened") != "slow/u1" || q.Header.Get("Shardlite-Target") != "" {
-		t.Fatalf("app saw Shardlite-Opened %q and Shardlite-Target %q", q.Header.Get("Shardlite-Opened"), q.Header.Get("Shardlite-Target"))
-	}
-	if q.Header.Get("X-Plain") != "z" {
-		t.Fatal("ordinary headers must pass")
-	}
-	for k, v := range resp.Header {
-		if strings.HasPrefix(strings.ToLower(k), "shardlite") {
-			t.Fatalf("response header %s: %v reached the client", k, v)
-		}
-	}
-	if resp.Header.Get("X-Plain") != "y" {
-		t.Fatal("ordinary headers must pass")
-	}
-}
-
-// The shard a request is for is told differently depending on who gets it: the
-// app is told what the node opened (with its file), and the owner's node, which
-// a forward goes to, is told the target to route by.
-func TestRewriteNamesTheShardByWhereItGoes(t *testing.T) {
-	t.Parallel()
-	log := slog.New(slog.DiscardHandler)
-	m := &Shardset{n: &Node{Config: Config{Name: "n0"}}, tab: newTable(log), log: log}
-	s := &Server{m: m, opts: ServerOptions{App: &url.URL{Scheme: "http", Host: "app.invalid"}}}
-	rewrite := func(peer string) http.Header {
-		in := httptest.NewRequest("GET", "/x", nil)
-		in.Header.Set("Shardlite-Opened", "users/evil")
-		in.Header.Set(hdrNode, "n9")
-		in.Header.Set(hdrPlacement, placementAvoid)
-		in.Header.Set("Shardlite-File", "/etc/passwd")
-		info := &reqInfo{name: shardName("slow/w1"), path: "/data/w1.db", peer: peer}
-		in = in.WithContext(context.WithValue(in.Context(), ctxKey{}, info))
-		pr := &httputil.ProxyRequest{In: in, Out: in.Clone(in.Context())}
-		s.rewrite(pr)
-		return pr.Out.Header
-	}
-	app := rewrite("")
-	if app.Get("Shardlite-Opened") != "slow/w1" || app.Get("Shardlite-File") != "/data/w1.db" || app.Get("Shardlite-Target") != "" || app.Get(hdrNode) != "" || app.Get(hdrPlacement) != "" {
-		t.Fatalf("the app was sent %v", app)
-	}
-	fwd := rewrite("n1.invalid:1")
-	if fwd.Get("Shardlite-Target") != "slow/w1" || fwd.Get("Shardlite-Opened") != "" || fwd.Get("Shardlite-File") != "" {
-		t.Fatalf("the owner's node was sent %v", fwd)
-	}
-	if fwd.Get(hdrNode) != "n0" || len(fwd.Values(hdrPlacement)) != 0 {
-		t.Fatalf("the owner's node was sent %v, want n0 as the sender and no placement", fwd)
-	}
-}
-
 func TestServerControlAPI(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
@@ -438,16 +276,17 @@ func TestServerControlAPI(t *testing.T) {
 		io.WriteString(w, "ok")
 	})
 
-	// A call: the opened shard, the caller (passed on), no X-Forwarded-For.
-	resp, body := r.req("POST", r.ctl, "/invite?x=1", map[string]string{"Shardlite-Target": "slow/c1", "Shardlite-Caller": "users/5", "Shardlite-Foo": "1"}, "payload")
+	// A call: the opened shard, the caller (from the context), no X-Forwarded-For.
+	resp, body := r.req("POST", r.ctl, "/invite?x=1", map[string]string{"Shardlite-Target": "slow/c1", hdrContext: ctxOf("users/5", 1), "Shardlite-Foo": "1"}, "payload")
 	q := last.Load()
 	if resp.StatusCode != 200 || body != "ok" || q.Header.Get("Shardlite-Opened") != "slow/c1" || q.Header.Get("Shardlite-Target") != "" || q.Header.Get("Shardlite-Caller") != "users/5" ||
+		q.Header.Get(hdrContext) != ctxOf("slow/c1", 2) ||
 		q.Header.Get("Shardlite-Foo") != "" || q.Header.Get("X-Forwarded-For") != "" || q.URL.Path != "/invite" || q.Method != "POST" {
 		t.Fatalf("%d %q %v", resp.StatusCode, body, q.Header)
 	}
-	// A call with no shard behind it is from "app".
-	r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "slow/c1"}, "")
-	if last.Load().Header.Get("Shardlite-Caller") != "app" {
+	// A call with no shard behind it is from "app", and a Shardlite-Caller the app sends is no caller.
+	r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "slow/c1", "Shardlite-Caller": "users/5"}, "")
+	if last.Load().Header.Get("Shardlite-Caller") != "app" || last.Load().Header.Get(hdrContext) != ctxOf("slow/c1", 1) {
 		t.Fatalf("caller: %v", last.Load().Header)
 	}
 	// ...and a client's request has none.
@@ -458,7 +297,7 @@ func TestServerControlAPI(t *testing.T) {
 	if resp, _ := r.req("GET", r.ctl, "/x", nil, ""); resp.StatusCode != 400 {
 		t.Fatalf("call with no target: %d", resp.StatusCode)
 	}
-	if resp, _ := r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "slow/c1", "Shardlite-Caller": "nonsense"}, ""); resp.StatusCode != 400 {
+	if resp, _ := r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "slow/c1", hdrContext: `shard="nonsense", hops=0`}, ""); resp.StatusCode != 400 {
 		t.Fatalf("bad caller: %d", resp.StatusCode)
 	}
 
@@ -476,362 +315,113 @@ func TestServerControlAPI(t *testing.T) {
 	if resp.Header.Get("Grpc-Status") != "5" {
 		t.Fatalf("grpc If-Active: %v", resp.Header)
 	}
-
-	// The control API is also on a Unix socket.
-	uc := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(ctx, "unix", r.sock)
-	}}}
-	q2, _ := http.NewRequest("POST", "http://unix/_shardlite/sync", nil)
-	resp2, err := uc.Do(q2)
-	if err != nil || resp2.StatusCode != 204 {
-		t.Fatalf("sync over the socket: %v %v", resp2, err)
-	}
-	resp2.Body.Close()
-	q2, _ = http.NewRequest("GET", "http://unix/x", nil)
-	q2.Header.Set("Shardlite-Target", "slow/c1")
-	if resp2, err = uc.Do(q2); err != nil || resp2.StatusCode != 200 {
-		t.Fatalf("call over the socket: %v %v", resp2, err)
-	}
-	resp2.Body.Close()
 }
 
-// Server-sent events leave the node chunk by chunk.
-func TestServerStreamsWithoutBuffering(t *testing.T) {
-	t.Parallel()
-	r := newSRig(t)
-	r.create("slow/sse")
-	// The app holds back the second event until the test has the first. A proxy
-	// that buffers never delivers it, and the safety timer lets go.
-	gate := make(chan struct{})
-	var once sync.Once
-	release := func() { once.Do(func() { close(gate) }) }
-	var buffered atomic.Bool
-	safety := time.AfterFunc(10*time.Second, func() { buffered.Store(true); release() })
-	defer safety.Stop()
-	r.app_(func(w http.ResponseWriter, q *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		fl := w.(http.Flusher)
-		for i := 1; i <= 3; i++ {
-			fmt.Fprintf(w, "data: %d\n\n", i)
-			fl.Flush()
-			select {
-			case <-gate:
-			case <-q.Context().Done():
-				return
-			}
-		}
-	})
-	q, _ := http.NewRequest("GET", r.pub+"/events", nil)
-	q.Header.Set("Shardlite-Target", "slow/sse")
-	resp, err := r.client.Do(q)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	br := bufio.NewReader(resp.Body)
-	line, err := br.ReadString('\n')
-	if err != nil || line != "data: 1\n" {
-		t.Fatalf("%q %v", line, err)
-	}
-	if buffered.Load() {
-		t.Fatal("the first event came only when the app finished: the proxy buffers")
-	}
-	release()
-	// While the stream is open the shard is held and stays active.
-	if !r.m.IsActive(shardName("slow/sse")) {
-		t.Fatal("not active during the stream")
-	}
-	rest, _ := io.ReadAll(br)
-	if !strings.Contains(string(rest), "data: 3") {
-		t.Fatalf("rest: %q", rest)
+// wantReason checks the Shardlite-Error of a response.
+func wantReason(t *testing.T, resp *http.Response, want reason) {
+	t.Helper()
+	if got := resp.Header.Get(hdrError); got != string(want) {
+		t.Errorf("Shardlite-Error is %q, want %q (status %d)", got, want, resp.StatusCode)
 	}
 }
 
-// An upgraded connection (a WebSocket) is a byte stream the node copies.
-func TestServerUpgrade(t *testing.T) {
-	t.Parallel()
-	r := newSRig(t)
-	r.create("slow/ws")
-	r.app_(func(w http.ResponseWriter, q *http.Request) {
-		if q.Header.Get("Upgrade") != "websocket" || q.Header.Get("Shardlite-Opened") != "slow/ws" {
-			http.Error(w, "bad", 400)
-			return
-		}
-		conn, rw, err := w.(http.Hijacker).Hijack()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nShardlite-Secret: x\r\n\r\n")
-		rw.Flush()
-		sc := bufio.NewScanner(rw)
-		for sc.Scan() {
-			rw.WriteString("echo " + sc.Text() + "\n")
-			rw.Flush()
-		}
-	})
-	conn, err := net.Dial("tcp", strings.TrimPrefix(r.pub, "http://"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	fmt.Fprintf(conn, "GET /ws?shardlite-target=slow/ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
-	br := bufio.NewReader(conn)
-	resp, err := http.ReadResponse(br, nil)
-	if err != nil || resp.StatusCode != 101 || resp.Header.Get("Shardlite-Secret") != "" {
-		t.Fatalf("%v %v", resp, err)
-	}
-	for _, m := range []string{"one", "two"} {
-		fmt.Fprintf(conn, "%s\n", m)
-		line, err := br.ReadString('\n')
-		if err != nil || line != "echo "+m+"\n" {
-			t.Fatalf("%q %v", line, err)
-		}
-	}
-	if !r.m.IsActive(shardName("slow/ws")) {
-		t.Fatal("an open connection should keep the shard active")
-	}
-	conn.Close()
-	// Once it is closed the shard is free to go.
-	apptest.Eventually(t, apptest.Timeout, "the hold to be released", func() bool { return r.refs("slow/ws") == 0 })
-}
-
-// The app's 1xx responses (103 Early Hints) are dropped: ReverseProxy would
-// write them before the gate and the stripping of Shardlite-* headers, and a
-// shard's output must pass the gate before the client sees any of it.
-func TestServerDropsInformationalResponses(t *testing.T) {
-	t.Parallel()
-	r := newSRig(t)
-	r.create("slow/e1")
-	r.app_(func(w http.ResponseWriter, q *http.Request) {
-		w.Header().Set("Link", "</style.css>; rel=preload")
-		w.Header().Set("Shardlite-Secret", "x")
-		w.WriteHeader(http.StatusEarlyHints)
-		w.Header().Del("Link")
-		w.Header().Del("Shardlite-Secret")
-		io.WriteString(w, "done")
-	})
-
-	var informational atomic.Int32
-	trace := &httptrace.ClientTrace{Got1xxResponse: func(int, textproto.MIMEHeader) error {
-		informational.Add(1)
-		return nil
-	}}
-	q, _ := http.NewRequestWithContext(httptrace.WithClientTrace(context.Background(), trace), "GET", r.pub+"/e", nil)
-	q.Header.Set("Shardlite-Target", "slow/e1")
-	resp, err := r.client.Do(q)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 || string(body) != "done" {
-		t.Fatalf("%d %q", resp.StatusCode, body)
-	}
-	if n := informational.Load(); n != 0 {
-		t.Fatalf("the client got %d informational responses", n)
-	}
-	if resp.Header.Get("Link") != "" || resp.Header.Get("Shardlite-Secret") != "" {
-		t.Fatalf("headers of the dropped response were left behind: %v", resp.Header)
-	}
-}
-
-// Stopping the servers ends what is left of their requests and joins them: a
-// WebSocket, which Shutdown alone would leave open, and a request still running
-// after the grace period. A request that finishes within the grace period gets
-// its answer. Once the servers have stopped, no request holds a shard.
-func TestServerShutdownEndsAndJoinsRequests(t *testing.T) {
-	t.Parallel()
-	r := newSRig(t)
-	r.create("slow/ws")
-	var started, ended apptest.Log[string]
-	r.app_(func(w http.ResponseWriter, q *http.Request) {
-		started.Add(q.URL.Path)
-		defer ended.Add(q.URL.Path)
-		switch q.URL.Path {
-		case "/ws":
-			conn, rw, err := w.(http.Hijacker).Hijack()
-			if err != nil {
-				return
-			}
-			defer conn.Close()
-			rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
-			rw.Flush()
-			sc := bufio.NewScanner(rw)
-			for sc.Scan() {
-				rw.WriteString("echo " + sc.Text() + "\n")
-				rw.Flush()
-			}
-		case "/slow":
-			<-q.Context().Done() // until the node gives up on it
-		case "/finish":
-			time.Sleep(100 * time.Millisecond) // within the grace period
-			io.WriteString(w, "done")
-		}
-	})
-	refs := r.refs
-
-	conn, err := net.Dial("tcp", strings.TrimPrefix(r.pub, "http://"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	fmt.Fprintf(conn, "GET /ws?shardlite-target=slow/ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
-	br := bufio.NewReader(conn)
-	if resp, err := http.ReadResponse(br, nil); err != nil || resp.StatusCode != 101 {
-		t.Fatalf("upgrade: %v %v", resp, err)
-	}
-	fmt.Fprintf(conn, "one\n")
-	if line, err := br.ReadString('\n'); err != nil || line != "echo one\n" {
-		t.Fatalf("%q %v", line, err)
-	}
-
-	type answer struct {
-		status int
-		body   string
-		err    error
-	}
-	call := func(base, path, target string) chan answer {
-		ch := make(chan answer, 1)
-		go func() {
-			q, _ := http.NewRequest("GET", base+path, nil)
-			q.Header.Set("Shardlite-Target", target)
-			resp, err := r.client.Do(q)
-			if err != nil {
-				ch <- answer{err: err}
-				return
-			}
-			defer resp.Body.Close()
-			b, err := io.ReadAll(resp.Body)
-			ch <- answer{resp.StatusCode, string(b), err}
-		}()
-		return ch
-	}
-	r.create("slow/finish")
-	slow := call(r.ctl, "/slow", "slow/call") // through the control server
-	finish := call(r.pub, "/finish", "slow/finish")
-	started.WaitFor(t, 10*time.Second, "the requests to reach the app", func(p []string) bool {
-		return slices.Contains(p, "/ws") && slices.Contains(p, "/slow") && slices.Contains(p, "/finish")
-	})
-	for _, target := range []string{"slow/ws", "slow/call", "slow/finish"} {
-		if n := refs(target); n < 1 {
-			t.Fatalf("%s: %d references before the servers stop", target, n)
-		}
-	}
-
-	r.stop()
-	// Joined: nothing is left holding a shard the moment the servers have stopped.
-	for _, target := range []string{"slow/ws", "slow/call", "slow/finish"} {
-		if n := refs(target); n != 0 {
-			t.Fatalf("%s: %d references after the servers stopped", target, n)
-		}
-	}
-	if a := <-finish; a.err != nil || a.status != 200 || a.body != "done" {
-		t.Fatalf("a request that finished within the grace period: %+v", a)
-	}
-	if a := <-slow; a.err == nil && a.status == 200 {
-		t.Fatalf("a request still running after the grace period was not ended: %+v", a)
-	}
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	if _, err := br.ReadString('\n'); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
-		t.Fatalf("the WebSocket is still open: %v", err)
-	}
-	ended.WaitFor(t, 10*time.Second, "the app's handlers to end", func(p []string) bool {
-		return slices.Contains(p, "/ws") && slices.Contains(p, "/slow")
-	})
-}
-
-// gRPC: h2c to the app, trailers passed through, streaming without buffering.
-func TestServerGRPC(t *testing.T) {
-	t.Parallel()
-	r := newSRig(t)
-	r.create("slow/rpc")
-	var proto atomic.Int32
-	// The app holds back its second frame until the test has the first. A node
-	// that buffers the response never delivers it, and the safety timer lets go.
-	gate := make(chan struct{})
-	var once sync.Once
-	release := func() { once.Do(func() { close(gate) }) }
-	var buffered atomic.Bool
-	safety := time.AfterFunc(10*time.Second, func() { buffered.Store(true); release() })
-	defer safety.Stop()
-	r.app_(func(w http.ResponseWriter, q *http.Request) {
-		proto.Store(int32(q.ProtoMajor))
-		if q.Header.Get("Te") != "trailers" || q.Header.Get("Shardlite-Opened") != "slow/rpc" {
-			http.Error(w, "bad", 400)
-			return
-		}
-		io.Copy(io.Discard, q.Body)
-		w.Header().Set("Content-Type", "application/grpc")
-		w.Header().Set("Trailer", "Grpc-Status, Grpc-Message, Shardlite-Trailer")
-		w.Write([]byte("frame1"))
-		w.(http.Flusher).Flush()
-		<-gate
-		w.Write([]byte("frame2"))
-		w.Header().Set("Grpc-Status", "0")
-		w.Header().Set("Grpc-Message", "fine")
-		w.Header().Set("Shardlite-Trailer", "x")
-	})
-	q, _ := http.NewRequest("POST", r.pub+"/svc/Method", strings.NewReader("request"))
-	q.Header.Set("Content-Type", "application/grpc")
-	q.Header.Set("Te", "trailers")
-	q.Header.Set("Shardlite-Target", "slow/rpc")
-	resp, err := r.h2c.Do(q) // the client reaches the node over h2c too
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.ProtoMajor != 2 {
-		t.Fatalf("client protocol %d", resp.ProtoMajor)
-	}
-	buf := make([]byte, 6)
-	if _, err := io.ReadFull(resp.Body, buf); err != nil || string(buf) != "frame1" {
-		t.Fatalf("%q %v", buf, err)
-	}
-	if buffered.Load() {
-		t.Fatal("the first frame came only when the app finished: buffered")
-	}
-	release()
-	rest, _ := io.ReadAll(resp.Body)
-	if string(rest) != "frame2" {
-		t.Fatalf("rest %q", rest)
-	}
-	if resp.Trailer.Get("Grpc-Status") != "0" || resp.Trailer.Get("Grpc-Message") != "fine" || resp.Trailer.Get("Shardlite-Trailer") != "" {
-		t.Fatalf("trailers: %v", resp.Trailer)
-	}
-	if proto.Load() != 2 {
-		t.Fatalf("the app was reached over HTTP/%d, want h2c", proto.Load())
-	}
-
-	// An error the node makes, over h2c: a gRPC status, not an HTTP error.
-	q, _ = http.NewRequest("POST", r.pub+"/svc/Method", strings.NewReader(""))
-	q.Header.Set("Content-Type", "application/grpc")
-	q.Header.Set("Shardlite-Target", "typo/1")
-	resp2, err := r.h2c.Do(q)
-	if err != nil {
-		t.Fatal(err)
-	}
-	io.Copy(io.Discard, resp2.Body)
-	resp2.Body.Close()
-	if resp2.StatusCode != 200 || resp2.Header.Get("Grpc-Status") != "5" {
-		t.Fatalf("%d %v %v", resp2.StatusCode, resp2.Header, resp2.Trailer)
-	}
-}
-
-func TestServerAppDown(t *testing.T) {
+// Every error the node makes carries its reason in Shardlite-Error, on the public,
+// control and peer listeners, and as a header beside grpc-status on a gRPC answer.
+func TestServerErrorsCarryTheirReason(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
 	r.create("slow/d1")
-	r.fake.Close()
-	if resp, _ := r.req("GET", r.pub, "/x", map[string]string{"Shardlite-Target": "slow/d1"}, ""); resp.StatusCode != 502 {
-		t.Fatalf("app down: %d", resp.StatusCode)
+	peer := httptest.NewServer(r.srv.PeerHandler())
+	t.Cleanup(peer.Close)
+	call := map[string]string{"Shardlite-Target": "slow/d1"}
+	with := func(extra ...string) map[string]string {
+		h := map[string]string{}
+		for k, v := range call {
+			h[k] = v
+		}
+		for i := 0; i < len(extra); i += 2 {
+			h[extra[i]] = extra[i+1]
+		}
+		return h
 	}
-	if resp, _ := r.req("POST", r.pub, "/x", map[string]string{"Shardlite-Target": "slow/d1", "Content-Type": "application/grpc"}, ""); resp.Header.Get("Grpc-Status") != "14" {
-		t.Fatalf("app down, grpc: %v", resp.Header)
+	for _, tc := range []struct {
+		name, base, path string
+		hdr              map[string]string
+		status           int
+		reason           reason
+	}{
+		{"a malformed name, public", r.pub, "/x", map[string]string{"Shardlite-Target": "nokind"}, 400, reasonBadRequest},
+		{"a malformed name, control", r.ctl, "/x", map[string]string{"Shardlite-Target": "nokind"}, 400, reasonBadRequest},
+		{"a bad caller", r.ctl, "/x", with(hdrContext, `shard="nokind", hops=0`), 400, reasonBadRequest},
+		{"a context that does not parse", r.ctl, "/x", with(hdrContext, "shard="), 400, reasonBadRequest},
+		{"a context with no hops", r.ctl, "/x", with(hdrContext, `shard="users/1"`), 400, reasonBadRequest},
+		{"an undeclared kind, public", r.pub, "/x", map[string]string{"Shardlite-Target": "typo/1"}, 404, reasonUnknownShard},
+		{"an undeclared kind, control", r.ctl, "/x", with("Shardlite-Target", "typo/1"), 404, reasonUnknownShard},
+		{"a missing shard a client names", r.pub, "/x", map[string]string{"Shardlite-Target": "slow/nobody"}, 404, reasonUnknownShard},
+		{"a missing shard a call must not create", r.ctl, "/x", with("Shardlite-Target", "slow/nobody", hdrIfExists, "true"), 404, reasonUnknownShard},
+		{"an inactive shard", r.ctl, "/x", with("Shardlite-Target", "slow/nobody", hdrIfActive, "true"), 404, reasonNotActive},
+		{"a path the public listener refuses", r.pub, "/_shardlite/sync", nil, 404, reasonNoEndpoint},
+		{"a path the control listener lacks", r.ctl, "/_shardlite/nothing", nil, 404, reasonNoEndpoint},
+		{"a peer request that is no forward", peer.URL, "/x", map[string]string{"Shardlite-Target": "slow/d1"}, 404, reasonNoEndpoint},
+		{"calls chained too far", r.ctl, "/x", with(hdrContext, ctxOf("users/1", 1000)), 508, reasonHops},
+	} {
+		resp, _ := r.req("GET", tc.base, tc.path, tc.hdr, "")
+		if resp.StatusCode != tc.status {
+			t.Errorf("%s: %d, want %d", tc.name, resp.StatusCode, tc.status)
+		}
+		wantReason(t, resp, tc.reason)
 	}
-	apptest.Eventually(t, apptest.Timeout, "not ready", func() bool { ok, _ := r.srv.Ready(); return !ok })
-	if resp, _ := r.req("GET", r.pub, "/_shardlite/ready", nil, ""); resp.StatusCode != 503 {
-		t.Fatalf("ready with the app down: %d", resp.StatusCode)
+
+	// As gRPC metadata: a response header beside grpc-status.
+	resp, _ := r.req("POST", r.pub, "/svc/M", map[string]string{"Shardlite-Target": "typo/1", "Content-Type": "application/grpc"}, "")
+	if resp.Header.Get("Grpc-Status") != "5" {
+		t.Errorf("gRPC: %v", resp.Header)
+	}
+	wantReason(t, resp, reasonUnknownShard)
+}
+
+// An error the app answers with has no Shardlite-Error, whatever its status, and an
+// app that sets the header itself has it removed, since the header means the node
+// answered.
+func TestServerAppErrorsHaveNoReason(t *testing.T) {
+	t.Parallel()
+	r := newSRig(t)
+	r.create("slow/d1")
+	peer := httptest.NewServer(r.srv.PeerHandler())
+	t.Cleanup(peer.Close)
+	var status atomic.Int32
+	var forge atomic.Bool
+	r.app_(func(w http.ResponseWriter, q *http.Request) {
+		if forge.Load() {
+			w.Header().Set("Shardlite-Error", "app-unreachable")
+			w.Header().Set("Shardlite_Error", "timeout")
+		}
+		w.WriteHeader(int(status.Load()))
+	})
+	for _, forged := range []bool{false, true} {
+		forge.Store(forged)
+		for _, code := range []int{404, 502, 503} {
+			status.Store(int32(code))
+			for _, tc := range []struct {
+				name, base string
+				hdr        map[string]string
+			}{
+				{"public", r.pub, map[string]string{"Shardlite-Target": "slow/d1"}},
+				{"public, shardless", r.pub, nil},
+				{"control", r.ctl, map[string]string{"Shardlite-Target": "slow/d1"}},
+				{"peer", peer.URL, map[string]string{"Shardlite-Target": "slow/d1", "Shardlite-Origin": originClient}},
+			} {
+				resp, _ := r.req("GET", tc.base, "/x", tc.hdr, "")
+				if resp.StatusCode != code {
+					t.Fatalf("%s: the app's %d reached the client as %d", tc.name, code, resp.StatusCode)
+				}
+				for k := range resp.Header {
+					if strings.EqualFold(strings.ReplaceAll(k, "_", "-"), hdrError) {
+						t.Errorf("%s, the app's %d (forged %v): header %q reached the client", tc.name, code, forged, k)
+					}
+				}
+			}
+		}
 	}
 }
 

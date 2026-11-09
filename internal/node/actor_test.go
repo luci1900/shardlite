@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"github.com/luci1900/shardlite/internal/apptest"
+	"github.com/luci1900/shardlite/internal/harness"
 	"runtime"
 	"strings"
 	"sync"
@@ -236,7 +237,7 @@ func TestADeltaNeverDelaysARequest(t *testing.T) {
 // count again.
 func TestIdleDeactivationOnTheFakeClock(t *testing.T) {
 	t.Parallel()
-	clk := newFakeClock()
+	clk := harness.NewFakeClock()
 	r := newMRigWith(t, withClock(clk)) // users' idle timeout is 300 ms
 	ref := r.acquire("users/fi1")
 	r.write(ref, "a")

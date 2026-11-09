@@ -19,11 +19,14 @@ import (
 func main() {
 	listen := flag.String("listen", "127.0.0.1:0", "address to serve on")
 	control := flag.String("control", "127.0.0.1:2282", "the node's control API")
-	idle := flag.Duration("idle-close", 200*time.Millisecond, "close a shard's database after this long unused (within the shortest idle timeout the app declares)")
 	declare := flag.String("declare", "", "file holding the app's declaration, read on every request to the ready route (the built-in declaration if empty)")
 	flag.Parse()
 
-	app := e2eapp.New(e2eapp.Options{Control: *control, IdleClose: *idle, Declare: *declare})
+	app, err := e2eapp.New(e2eapp.Options{Control: *control, Declare: *declare})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	defer app.Close()
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {

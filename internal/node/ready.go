@@ -29,6 +29,7 @@ func (s *Server) readyRoute(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusOK
 	if !ok {
 		status = http.StatusServiceUnavailable
+		w.Header().Set(hdrError, string(reasonNotReady))
 	}
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(status)

@@ -60,7 +60,7 @@ func (s *stack) buildShard(shard string, mb, rows, rowBytes int) int {
 	if err := s.node.term(5 * time.Minute); err != nil {
 		s.t.Fatalf("stopping the node: %v", err)
 	}
-	apptest.Eventually(s.t, apptest.Timeout, "the app to close its databases", func() bool { return s.appDebug().OpenDBs == 0 })
+	apptest.Eventually(s.t, apptest.Timeout, "the app to finish its requests and close their databases", func() bool { return s.appDebug().Serving == 0 })
 	s.t.Logf("built a shard of %d commits in %v", commits, time.Since(t0).Round(time.Second))
 	return commits
 }
@@ -100,7 +100,7 @@ func TestFaultMeasureMemory(t *testing.T) {
 	s.startNode()
 	took := s.activate(shard)
 	t.Logf("restore: %v, node peak memory %.0f MB", took.Round(time.Millisecond), s.maxrssMB())
-	apptest.Eventually(t, apptest.Timeout, "the app to close its databases", func() bool { return s.appDebug().OpenDBs == 0 })
+	apptest.Eventually(t, apptest.Timeout, "the app to finish its requests and close their databases", func() bool { return s.appDebug().Serving == 0 })
 
 	// Restoring, then replacing the files with one base.
 	s.env = append(s.env, "SHARDLITE_FAULT_MAX_FILES=1")
@@ -137,7 +137,7 @@ func TestFaultMeasureLargeShard(t *testing.T) {
 	took := s.activate(shard)
 	w.Stop()
 	t.Logf("1. restore and activate a %d MB shard: %v; %s", mb, took.Round(time.Millisecond), w)
-	apptest.Eventually(t, apptest.Timeout, "the app to close its databases", func() bool { return s.appDebug().OpenDBs == 0 })
+	apptest.Eventually(t, apptest.Timeout, "the app to finish its requests and close their databases", func() bool { return s.appDebug().Serving == 0 })
 	t.Logf("   node peak memory %.0f MB", s.maxrssMB())
 
 	// 2. An import in one transaction into an empty shard, then a VACUUM.

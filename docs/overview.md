@@ -9,7 +9,7 @@ A player shard is like a save file per player, always saved, backed up and share
 
 This is the Orleans / Durable Objects model, with SQLite as the state and two differences that matter for games: apps can be written in any language or framework (even Unreal dedicated servers), and clients can connect directly to the process holding a shard over UDP or WebRTC, not only through an HTTP proxy.
 
-Shardlite keeps Orleans' operational trade-offs. Blob storage (S3 or compatible) is the source of truth, run by someone else, and the final check against duplicate owners. Nodes keep only working copies of their active shards on local disk, so they are disposable. Shardlite is a router in front of blob storage, not a database to operate.
+Shardlite keeps Orleans' operational trade-offs. Blob storage (S3 or compatible) is the source of truth, run by someone else, and the final check against duplicate owners. Nodes keep only working copies of their active shards on local disk, so they are disposable (running them is in [deployment](deployment.md)). Shardlite is a router in front of blob storage, not a database to operate.
 
 An actor's state is always its SQLite file, never objects in memory, so activation and deactivation move a file rather than an object graph:
 

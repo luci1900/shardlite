@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blobtest"
+	"github.com/luci1900/shardlite/internal/harness"
 	"github.com/luci1900/shardlite/internal/journal"
 )
 
@@ -106,7 +107,7 @@ func TestGateOnStreamingCallBody(t *testing.T) {
 			pr, pw := io.Pipe()
 			req, _ := http.NewRequest("POST", r.ctl+"/stream", pr)
 			req.Header.Set("Shardlite-Target", "slow/callee")
-			req.Header.Set("Shardlite-Caller", "wallet/st1")
+			req.Header.Set(hdrContext, ctxOf("wallet/st1", 0))
 			req.Header.Set("Content-Type", tc.ctype)
 			client := r.client
 			if tc.h2 {
@@ -179,14 +180,14 @@ func TestUpgradedCallFromAShardIsRefused(t *testing.T) {
 	for _, tc := range []struct {
 		caller string
 		want   int
-	}{{"wallet/up1", http.StatusBadRequest}, {"users/up2", http.StatusBadRequest}, {"app", http.StatusSwitchingProtocols}, {"", http.StatusSwitchingProtocols}} {
+	}{{"wallet/up1", http.StatusBadRequest}, {"users/up2", http.StatusBadRequest}, {"", http.StatusSwitchingProtocols}} {
 		conn, err := net.Dial("tcp", strings.TrimPrefix(r.ctl, "http://"))
 		if err != nil {
 			t.Fatal(err)
 		}
 		caller := ""
 		if tc.caller != "" {
-			caller = "Shardlite-Caller: " + tc.caller + "\r\n"
+			caller = hdrContext + ": " + ctxOf(tc.caller, 0) + "\r\n"
 		}
 		fmt.Fprintf(conn, "GET /ws HTTP/1.1\r\nHost: x\r\nShardlite-Target: slow/up\r\n%sUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n", caller)
 		rs, err := http.ReadResponse(bufio.NewReader(conn), nil)
@@ -215,7 +216,10 @@ func TestCallsThatAreNotGated(t *testing.T) {
 	r.commitTo("users/ng1")  // the none tier: the call waits for nothing
 	r.commitTo("wallet/ng2") // storage's, and the header can name storage again
 	do := func(caller string, hdr map[string]string) {
-		h := map[string]string{"Shardlite-Target": "slow/ng", "Shardlite-Caller": caller}
+		h := map[string]string{"Shardlite-Target": "slow/ng"}
+		if caller != "app" {
+			h[hdrContext] = ctxOf(caller, 0)
+		}
 		for k, v := range hdr {
 			h[k] = v
 		}
@@ -281,7 +285,7 @@ func TestCallWithAnUnknownTierIsRefused(t *testing.T) {
 	go func() {
 		req, _ := http.NewRequest("POST", r.ctl+"/x", strings.NewReader("chunk"))
 		req.Header.Set("Shardlite-Target", "slow/ng")
-		req.Header.Set("Shardlite-Caller", "users/ng1")
+		req.Header.Set(hdrContext, ctxOf("users/ng1", 0))
 		req.Header.Set("Shardlite-Sync", "maybe")
 		resp, err := r.client.Do(req)
 		if err != nil {
@@ -306,7 +310,7 @@ func TestCallWithAnUnknownTierIsRefused(t *testing.T) {
 // past its idle timeout, and can deactivate once the call ends.
 func TestCallerStaysActiveForTheCall(t *testing.T) {
 	t.Parallel()
-	clk := newFakeClock()
+	clk := harness.NewFakeClock()
 	r := newSRigWith(t, withClock(clk)) // wallet's idle timeout is 300 ms
 	seen := make(chan seenChunk, 16)
 	started := make(chan struct{})
@@ -317,7 +321,7 @@ func TestCallerStaysActiveForTheCall(t *testing.T) {
 	pr, pw := io.Pipe()
 	req, _ := http.NewRequest("POST", r.ctl+"/stream", pr)
 	req.Header.Set("Shardlite-Target", "slow/callee")
-	req.Header.Set("Shardlite-Caller", "wallet/ia1")
+	req.Header.Set(hdrContext, ctxOf("wallet/ia1", 0))
 	done := make(chan error, 1)
 	go func() {
 		resp, err := r.client.Do(req)
@@ -350,9 +354,10 @@ func TestCallerStaysActiveForTheCall(t *testing.T) {
 
 // --- hops ---
 
-// A client's own Shardlite-Hops never reaches the app, and a Shardlite-Deadline
-// (which the node no longer reads) is stripped like any other Shardlite-* header,
-// from a client and from a call. Neither header gets out in a response.
+// A client's own Shardlite-Hops and Shardlite-Context never reach the app, which
+// gets no Shardlite-Hops at all, and a Shardlite-Deadline (which the node no
+// longer reads) is stripped like any other Shardlite-* header, from a client and
+// from a call. None of them gets out in a response.
 func TestHopsAreTheNodes(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
@@ -361,36 +366,73 @@ func TestHopsAreTheNodes(t *testing.T) {
 	r.app_(func(w http.ResponseWriter, q *http.Request) {
 		last.Store(q.Clone(context.Background()))
 		w.Header().Set("Shardlite-Hops", "9")
+		w.Header().Set(hdrContext, ctxOf("slow/dd1", 9))
 		w.Header().Set("Shardlite-Deadline", "9")
 	})
-	resp, _ := r.req("GET", r.pub, "/x", map[string]string{"Shardlite-Target": "slow/dd1", "Shardlite-Hops": "20", "Shardlite-Deadline": "1"}, "")
+	resp, _ := r.req("GET", r.pub, "/x", map[string]string{"Shardlite-Target": "slow/dd1", "Shardlite-Hops": "20", hdrContext: ctxOf("slow/dd1", 20), "Shardlite-Deadline": "1"}, "")
 	q := last.Load()
-	if resp.StatusCode != 200 || q.Header.Get("Shardlite-Hops") != "0" || q.Header.Get("Shardlite-Deadline") != "" {
-		t.Fatalf("a client request reached the app with hops %q and deadline %q", q.Header.Get("Shardlite-Hops"), q.Header.Get("Shardlite-Deadline"))
+	if resp.StatusCode != 200 || q.Header.Get(hdrContext) != ctxOf("slow/dd1", 0) || q.Header.Get("Shardlite-Hops") != "" || q.Header.Get("Shardlite-Deadline") != "" {
+		t.Fatalf("a client request reached the app with %v", q.Header)
 	}
-	if resp.Header.Get("Shardlite-Hops") != "" || resp.Header.Get("Shardlite-Deadline") != "" {
+	if resp.Header.Get("Shardlite-Hops") != "" || resp.Header.Get(hdrContext) != "" || resp.Header.Get("Shardlite-Deadline") != "" {
 		t.Fatalf("the app's headers got out: %v", resp.Header)
 	}
-	// A shardless request is sent with hops 0 too.
-	r.req("GET", r.pub, "/news", map[string]string{"Shardlite-Hops": "20"}, "")
-	if q := last.Load(); q.Header.Get("Shardlite-Hops") != "0" || q.Header.Get("Shardlite-Deadline") != "" {
+	// A shardless request has no context, whatever the client sent.
+	r.req("GET", r.pub, "/news", map[string]string{"Shardlite-Hops": "20", hdrContext: ctxOf("slow/dd1", 20)}, "")
+	if q := last.Load(); q.Header.Get(hdrContext) != "" || q.Header.Get("Shardlite-Hops") != "" || q.Header.Get("Shardlite-Deadline") != "" {
 		t.Fatalf("shardless: %v", q.Header)
 	}
-	// A call is one deeper than the call it says it is serving, and starts at 0 when it says nothing.
+	// A call is one deeper than the request its context says it is serving, and a call with none is from the app, at hop 1.
+	r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "slow/dd1", hdrContext: ctxOf("users/dd2", 4)}, "")
+	if c := last.Load().Header.Get(hdrContext); c != ctxOf("slow/dd1", 5) {
+		t.Fatalf("context of a call from hops 4: %q", c)
+	}
 	r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "slow/dd1", "Shardlite-Hops": "4"}, "")
-	if d := last.Load().Header.Get("Shardlite-Hops"); d != "5" {
-		t.Fatalf("hops of a call from hops 4: %q", d)
-	}
-	r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "slow/dd1"}, "")
-	if d := last.Load().Header.Get("Shardlite-Hops"); d != "0" {
-		t.Fatalf("hops of a call with none: %q", d)
-	}
-	if resp, _ := r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "slow/dd1", "Shardlite-Hops": "x"}, ""); resp.StatusCode != 400 {
-		t.Fatalf("bad hops: %d", resp.StatusCode)
+	if h := last.Load().Header; h.Get(hdrContext) != ctxOf("slow/dd1", 1) || h.Get("Shardlite-Hops") != "" || h.Get("Shardlite-Caller") != "app" {
+		t.Fatalf("a call with no context, with a Shardlite-Hops of its own: %v", h)
 	}
 	// A Shardlite-Deadline on a call is stripped, not read: a value that isn't a number is no error.
 	if resp, _ := r.req("GET", r.ctl, "/x", map[string]string{"Shardlite-Target": "slow/dd1", "Shardlite-Deadline": "soon"}, ""); resp.StatusCode != 200 || last.Load().Header.Get("Shardlite-Deadline") != "" {
 		t.Fatalf("a call with a deadline: %d %q", resp.StatusCode, last.Load().Header.Get("Shardlite-Deadline"))
+	}
+}
+
+// A call's context names its caller, with hops one more than the context's. A
+// context that doesn't parse or lacks a key is a 400, and a key the node doesn't
+// know is ignored.
+func TestCallContext(t *testing.T) {
+	t.Parallel()
+	r := newSRig(t)
+	r.create("slow/cc1")
+	var last atomic.Pointer[http.Request]
+	r.app_(func(w http.ResponseWriter, q *http.Request) { last.Store(q.Clone(context.Background())) })
+	call := func(ctx string) *http.Response {
+		h := map[string]string{"Shardlite-Target": "slow/cc1"}
+		if ctx != "" {
+			h[hdrContext] = ctx
+		}
+		resp, _ := r.req("GET", r.ctl, "/x", h, "")
+		return resp
+	}
+	if resp := call(ctxOf("users/cc2", 2)); resp.StatusCode != 200 || last.Load().Header.Get("Shardlite-Caller") != "users/cc2" || last.Load().Header.Get(hdrContext) != ctxOf("slow/cc1", 3) {
+		t.Fatalf("a call with a context: %d %v", resp.StatusCode, last.Load().Header)
+	}
+	if resp := call(""); resp.StatusCode != 200 || last.Load().Header.Get("Shardlite-Caller") != "app" || last.Load().Header.Get(hdrContext) != ctxOf("slow/cc1", 1) {
+		t.Fatalf("a call without one: %d %v", resp.StatusCode, last.Load().Header)
+	}
+	if resp := call(`shard="users/cc2", hops=2, from="elsewhere", extra`); resp.StatusCode != 200 || last.Load().Header.Get("Shardlite-Caller") != "users/cc2" || last.Load().Header.Get(hdrContext) != ctxOf("slow/cc1", 3) {
+		t.Fatalf("a call with a key the node doesn't know: %d %v", resp.StatusCode, last.Load().Header)
+	}
+	last.Store(nil)
+	for _, bad := range []string{`shard="users/cc2"`, `hops=1`, `shard=, hops=1`, `shard="users", hops=1`, `shard="users/cc2", hops="1"`, `shard="users/cc2", hops=-1`, `users/cc2`} {
+		resp := call(bad)
+		if resp.StatusCode != 400 {
+			t.Errorf("context %q: %d, want 400", bad, resp.StatusCode)
+		}
+		wantReason(t, resp, reasonBadRequest)
+	}
+	if last.Load() != nil {
+		t.Fatal("a call with a bad context reached the app")
 	}
 }
 
@@ -411,8 +453,12 @@ func TestCallLoopStopsAtTheHopLimit(t *testing.T) {
 			return
 		}
 		invocations.Add(1)
-		d, _ := strconv.Atoi(q.Header.Get("Shardlite-Hops"))
-		maxSeen.Store(max(maxSeen.Load(), int64(d)))
+		c, _, err := parseContext(q.Header)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		maxSeen.Store(max(maxSeen.Load(), c.hops))
 		self := q.Header.Get("Shardlite-Opened")
 		other := map[string]string{"slow/la": "slow/lb", "slow/lb": "slow/la"}[self]
 		next := "/ping"
@@ -423,13 +469,12 @@ func TestCallLoopStopsAtTheHopLimit(t *testing.T) {
 			}
 			next += "?left=" + strconv.Itoa(n-1)
 		}
-		c, _ := http.NewRequest("POST", r.ctl+next, nil)
-		c.Header.Set("Shardlite-Target", other)
-		c.Header.Set("Shardlite-Caller", self)
+		call, _ := http.NewRequest("POST", r.ctl+next, nil)
+		call.Header.Set("Shardlite-Target", other)
 		if pass.Load() {
-			c.Header.Set("Shardlite-Hops", q.Header.Get("Shardlite-Hops"))
+			call.Header.Set(hdrContext, q.Header.Get(hdrContext))
 		}
-		resp, err := r.client.Do(c)
+		resp, err := r.client.Do(call)
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
@@ -452,17 +497,17 @@ func TestCallLoopStopsAtTheHopLimit(t *testing.T) {
 		t.Fatalf("the refusal was not logged with the caller and target:\n%s", logged)
 	}
 	// gRPC callers get RESOURCE_EXHAUSTED.
-	g, _ := r.req("POST", r.ctl, "/svc/M", map[string]string{"Shardlite-Target": "slow/la", "Shardlite-Hops": strconv.Itoa(DefaultMaxHops), "Content-Type": "application/grpc"}, "")
+	g, _ := r.req("POST", r.ctl, "/svc/M", map[string]string{"Shardlite-Target": "slow/la", hdrContext: ctxOf("slow/lb", DefaultMaxHops), "Content-Type": "application/grpc"}, "")
 	if g.Header.Get("Grpc-Status") != "8" {
 		t.Fatalf("gRPC: %v", g.Header)
 	}
 
-	// An app that doesn't pass the header on starts again at 0 on every hop.
+	// An app that doesn't pass the context on makes calls from the app, at hop 1 each time.
 	pass.Store(false)
 	invocations.Store(0)
 	maxSeen.Store(0)
 	resp, _ = r.req("POST", r.pub, "/ping?left=60", map[string]string{"Shardlite-Target": "slow/la"}, "")
-	if resp.StatusCode != 200 || invocations.Load() != 61 || maxSeen.Load() != 0 {
+	if resp.StatusCode != 200 || invocations.Load() != 61 || maxSeen.Load() != 1 {
 		t.Fatalf("without passing it on: status %d, %d invocations, deepest %d", resp.StatusCode, invocations.Load(), maxSeen.Load())
 	}
 }

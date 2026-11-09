@@ -105,9 +105,9 @@ func (r *faultRig) audit() {
 func (r *faultRig) restart(extra ...string) {
 	r.t.Helper()
 	r.crash()
-	// The app still has the shard's file open from before the kill, and a new node
-	// refuses a shard another process holds. The app closes idle files within moments.
-	apptest.Eventually(r.t, apptest.Timeout, "the app to close its databases", func() bool { return r.s.appDebug().OpenDBs == 0 })
+	// A request that was in flight at the kill still has its shard's file open until
+	// it returns, and a new node refuses a shard another process holds.
+	apptest.Eventually(r.t, apptest.Timeout, "the app to finish its requests and close their databases", func() bool { return r.s.appDebug().Serving == 0 })
 	r.s.env = append(append([]string(nil), r.base...), extra...)
 	r.s.startNode()
 }

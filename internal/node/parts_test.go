@@ -8,6 +8,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/luci1900/shardlite/internal/harness"
 	"github.com/luci1900/shardlite/internal/service"
 )
 
@@ -26,7 +27,7 @@ func serveJournal(t *testing.T, n *Node) (stop func()) {
 // clock moves.
 func TestWatchdogRunsOnTheClock(t *testing.T) {
 	t.Parallel()
-	clk := newFakeClock()
+	clk := harness.NewFakeClock()
 	st := &Stats{}
 	tab := newTable(slog.New(slog.DiscardHandler))
 	w := &watchdog{tab: tab, clock: clk, every: time.Second, alertAge: time.Minute, log: slog.New(slog.DiscardHandler), stats: st}

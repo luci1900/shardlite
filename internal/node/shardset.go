@@ -21,6 +21,7 @@ import (
 	"github.com/luci1900/shardlite/internal/kind"
 	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/notify"
+	"github.com/luci1900/shardlite/internal/peers"
 	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/reconcile"
 	"github.com/luci1900/shardlite/internal/reconcile/collect"
@@ -53,7 +54,7 @@ type ShardsetOptions struct {
 	Flush     FlushOptions
 	Lifecycle LifecycleOptions
 	Reminders ReminderOptions // docs/guide.md, Reminders
-	Leases    LeaseScanOptions
+	Leases    peers.ScanOptions
 
 	// Dispatch, if set, runs the dispatcher, the reminder index's reconciler, which
 	// wakes the shards whose reminders are due while they are inactive
@@ -130,7 +131,7 @@ type Shardset struct {
 	tab         *table
 	flush       *Flusher
 	rem         *reminders
-	leases      *leaseScan
+	leases      *peers.Scan
 	watch       *watchdog
 	reconcilers *reconcile.Loop       // nil unless Dispatch or Collect is set
 	dispatching *reconcile.Reconciler // the reminder index's, nil unless Dispatch is set
@@ -143,8 +144,8 @@ type Shardset struct {
 	// found out. It is a hint: a wrong entry costs a misdirected request, never
 	// correctness.
 	owners *lru.Cache[shard.Name, cluster.Node]
-	addrs  *addresses // where the nodes listen for forwards
-	placer *placer    // the peers to avoid, and the node for a claim that isn't made here
+	addrs  *peers.Addresses // where the nodes listen for forwards
+	placer *peers.Placer    // the peers to avoid, and the node for a claim that isn't made here
 	// draining is set when the node is told to stop (Drain): readiness fails, its peers are told to place nothing on it (Shardlite-Placement: avoid) and a claim is placed on another node. The placer leaves this node out of its picks while it is set.
 	draining atomic.Bool
 
@@ -160,10 +161,14 @@ type Shardset struct {
 // NewShardset prepares the data directory and clears what a crash
 // left behind. Nothing runs until Serve.
 //
-// The wake of an app for its shard's reminders and the dispatcher's calls
-// are the server's routing, and the server needs the shards, so
-// newRouting is called with the shards while they are being built (the server
-// may only keep them) and what it returns is what the shards are built with.
+// newRouting is the way back into the node's own router, which the Server
+// provides. Its callbacks run a request through that router in process (wake is
+// Server.wakeApp and call is Server.call, both through serveInternal), so neither
+// can be a client built before the Server. The router needs the shards and the
+// shards need the callbacks, so newRouting is called with the shards while they
+// are being built (the Server may only keep them), and what it returns is what
+// the shards are built with. It is how build order is handled when two parts need
+// each other, not an import cycle.
 func NewShardset(n *Node, opts ShardsetOptions, newRouting func(*Shardset) routing) (*Shardset, error) {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
@@ -205,10 +210,11 @@ func NewShardset(n *Node, opts ShardsetOptions, newRouting func(*Shardset) routi
 	rt := newRouting(m)
 	m.rem = newReminders(opts.Reminders, clk, log, st, rt.wake)
 	m.flush = newFlusher(m.tab, n.Writer, n.Keeper, n.Confirmer, log, opts.Flush)
-	m.leases = &leaseScan{
-		reg: n.Registry, files: n.Files, store: n.Store, nodeErr: n.Err,
-		self:  func() lease.Incarnation { l := n.Keeper.Lease(); return l.Incarnation() },
-		clock: clk, opts: opts.Leases, log: log, scans: &st.LeaseScans, adopted: &st.Adoptions, died: m.died,
+	self := func() lease.Incarnation { l := n.Keeper.Lease(); return l.Incarnation() }
+	ad := &adopter{reg: n.Registry, files: n.Files, store: n.Store, self: self, nodeErr: n.Err, clock: clk, log: log, adopted: &st.Adoptions}
+	m.leases = &peers.Scan{
+		Registry: n.Registry, Self: self, Clock: clk, Options: opts.Leases, Log: log,
+		Scans: &st.LeaseScans, Adopt: ad.adopt, Died: m.died,
 	}
 	var rs []*reconcile.Reconciler
 	if opts.Dispatch != nil {
@@ -228,8 +234,11 @@ func NewShardset(n *Node, opts ShardsetOptions, newRouting func(*Shardset) routi
 	if len(rs) > 0 {
 		m.reconcilers = reconcile.New(reconcile.Deps{Clock: clk, Log: log, Mine: m.lanes, Check: n.Keeper.Check}, rs...)
 	}
-	m.placer = newPlacer(n.Name, &m.draining, m.leases.Nodes, clk, opts.Leases.TTL, log, &st.BadPeerHeaders)
-	m.addrs = &addresses{get: n.Registry.Get, nodes: m.leases.Nodes}
+	m.placer = &peers.Placer{
+		Self: n.Name, Draining: &m.draining, Listing: m.leases.Nodes, Clock: clk, TTL: opts.Leases.TTL, Log: log,
+		Bad: &st.BadPeerHeaders, Fault: n.Faults.PeerHeader,
+	}
+	m.addrs = &peers.Addresses{Get: n.Registry.Get, Nodes: m.leases.Nodes}
 	m.watch = &watchdog{tab: m.tab, clock: clk, every: lc.SnapshotEvery, alertAge: tailAlertAge(lc.DeltaAge), log: log, stats: st}
 	var base context.Context
 	base, m.cancelBase = context.WithCancel(context.Background())
@@ -244,9 +253,12 @@ func NewShardset(n *Node, opts ShardsetOptions, newRouting func(*Shardset) routi
 	return m, nil
 }
 
-// routing is what the shardset uses of the server's routing: the wake of an app
-// for its shard's reminders (Server.wakeApp) and the dispatcher's calls
-// (Server.call).
+// routing is the shards' way back into the node's own router, which the Server
+// fills in because the router needs the shards. Both callbacks run a request
+// through that router in process (serveInternal in origin.go, as a wake or as a
+// call from the node), so there is no client to build first. Wake is the wake of
+// an app for its shard's reminders (Server.wakeApp) and call is the dispatcher's
+// request (Server.call).
 type routing struct {
 	wake wakeFunc
 	call func(*http.Request) (*http.Response, error)
@@ -503,7 +515,7 @@ func (m *Shardset) acquire(ctx context.Context, n shard.Name, o acquireOpts) (*H
 			}
 			// Only a shard that is not active here, and that no other live node owns (readManifest has failed for those), is placed. While the node drains every claim is placed, whatever its origin. The placer never picks this node while it drains, so with nowhere else to go the node claims the shard itself.
 			if o.anywhere || m.draining.Load() {
-				if node := m.placer.place(); node != m.n.Name {
+				if node := m.placer.Place(); node != m.n.Name {
 					m.Stats.Placements.Add(1)
 					return nil, &placedError{Shard: n, Node: node}
 				}
@@ -548,7 +560,7 @@ func (m *Shardset) lostClaim(ctx context.Context, n shard.Name, lost error) erro
 	if _, err := m.readManifest(ctx, n, false); err != nil {
 		return err
 	}
-	return &unavailable{fmt.Sprintf("%s was claimed by another node meanwhile: %v", n, lost), 0}
+	return &unavailable{reasonMoved, fmt.Sprintf("%s was claimed by another node meanwhile: %v", n, lost), 0}
 }
 
 // readManifest reads the manifest of a shard that has no entry, for the
@@ -625,7 +637,7 @@ func (m *Shardset) Active() []shard.Name {
 
 // Nodes returns the lease scan's last listing of the cluster's nodes, nil
 // before the first.
-func (m *Shardset) Nodes() *NodeList { return m.leases.Nodes() }
+func (m *Shardset) Nodes() *peers.List { return m.leases.Nodes() }
 
 // died is told each node the lease scan first finds dead. Every entry of the
 // owner cache that names it goes: its shards are claimed elsewhere or here, and
@@ -642,16 +654,14 @@ func (m *Shardset) died(node cluster.Node) {
 
 // isLive reports whether the lease scan's last listing has node and doesn't
 // count it as dead.
-func (m *Shardset) isLive(node cluster.Node) bool { return slices.Contains(m.liveNodes(), node) }
+func (m *Shardset) isLive(node cluster.Node) bool {
+	return slices.Contains(m.leases.Nodes().Live(), node)
+}
 
 // lanes is the lanes this node runs the reconcilers for: the ones it ranks first for among the nodes of the lease scan's last listing (reconcile.Mine), and whether there has been a listing yet.
 func (m *Shardset) lanes() (lanes []shard.Lane, listed bool) {
-	return reconcile.Mine(m.n.Name, m.liveNodes()), m.leases.Nodes() != nil
+	return reconcile.Mine(m.n.Name, m.leases.Nodes().Live()), m.leases.Nodes() != nil
 }
-
-// liveNodes is the names of the nodes the lease scan's last listing doesn't
-// count as dead.
-func (m *Shardset) liveNodes() []cluster.Node { return liveOf(m.leases.Nodes()) }
 
 // Flusher is the flush loop, for the gates.
 func (m *Shardset) Flusher() *Flusher { return m.flush }

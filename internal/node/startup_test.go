@@ -126,13 +126,16 @@ func TestBlobBucket(t *testing.T) {
 		wantErr       bool
 		errorContains string
 	}{
-		"directory":           {map[string]string{"SHARDLITE_BLOB": "/var/blobs"}, "", true, "want s3://bucket"},
-		"directory, endpoint": {map[string]string{"SHARDLITE_BLOB": "/var/blobs", "SHARDLITE_S3_ENDPOINT": "http://x"}, "", true, "want s3://bucket"},
-		"bucket":              {map[string]string{"SHARDLITE_BLOB": "s3://my-bucket"}, "my-bucket", false, ""},
-		"bucket and prefx":    {map[string]string{"SHARDLITE_BLOB": "s3://my-bucket", "SHARDLITE_PREFIX": "staging"}, "my-bucket", false, ""},
-		"endpoint":            {map[string]string{"SHARDLITE_BLOB": "s3://b", "SHARDLITE_S3_ENDPOINT": "http://127.0.0.1:9000"}, "b", false, ""},
-		"path in bucket":      {map[string]string{"SHARDLITE_BLOB": "s3://b/x"}, "", true, "SHARDLITE_PREFIX"},
-		"no bucket":           {map[string]string{"SHARDLITE_BLOB": "s3://"}, "", true, "s3://bucket"},
+		"directory":              {map[string]string{"SHARDLITE_BLOB": "/var/blobs"}, "", true, "want s3://bucket"},
+		"directory, endpoint":    {map[string]string{"SHARDLITE_BLOB": "/var/blobs", "SHARDLITE_S3_ENDPOINT": "http://x"}, "", true, "want s3://bucket"},
+		"bucket":                 {map[string]string{"SHARDLITE_BLOB": "s3://my-bucket"}, "my-bucket", false, ""},
+		"bucket and prefx":       {map[string]string{"SHARDLITE_BLOB": "s3://my-bucket", "SHARDLITE_PREFIX": "staging"}, "my-bucket", false, ""},
+		"endpoint":               {map[string]string{"SHARDLITE_BLOB": "s3://b", "SHARDLITE_S3_ENDPOINT": "http://127.0.0.1:9000"}, "b", false, ""},
+		"path in bucket":         {map[string]string{"SHARDLITE_BLOB": "s3://b/x"}, "", true, "SHARDLITE_PREFIX"},
+		"no bucket":              {map[string]string{"SHARDLITE_BLOB": "s3://"}, "", true, "s3://bucket"},
+		"other scheme":           {map[string]string{"SHARDLITE_BLOB": "gs://bucket"}, "", true, "want s3://bucket"},
+		"memory with a path":     {map[string]string{"SHARDLITE_BLOB": "memory://x"}, "", true, "want s3://bucket"},
+		"memory without slashes": {map[string]string{"SHARDLITE_BLOB": "memory:"}, "", true, "want s3://bucket"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			e, err := envWith(tc.vars)

@@ -914,6 +914,12 @@ func (s *Shard) closeForRelease(ctx context.Context, read func(*sql.DB) error) (
 		c.Released = &Uncertain{}
 	}
 	c.hdr, c.hdrErr = s.header()
+	if eerr != nil && err == nil {
+		// A marked check that could not run (the app dropped _shardlite_delete)
+		// fails the release, so the shard is kept and the error is the caller's
+		// to report, rather than the shard reading as unmarked.
+		err = eerr
+	}
 	return c, err
 }
 
@@ -930,24 +936,31 @@ type closed struct {
 	hdrErr error
 }
 
-// MarkedQuery says whether the app has marked the shard for deletion (a
-// _shardlite_delete table).
-const MarkedQuery = `SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE name = '_shardlite_delete' AND type = 'table')`
+// MarkedQuery says whether the app has marked the shard for deletion (a row in
+// _shardlite_delete). It asks the table rather than sqlite_schema, so a shard
+// whose table is missing (the app dropped it) fails instead of reading as
+// unmarked.
+const MarkedQuery = `SELECT EXISTS (SELECT 1 FROM _shardlite_delete)`
 
 // holdsNothing reports whether the database holds nothing of the app's. Either
-// the app marked it for deletion (a _shardlite_delete table, whatever else is in
-// it), or it has no tables or indexes besides shardlite's (the _shardlite_
-// tables; an index counts as its table's, so the automatic one of a reserved
-// table's text key is ignored), user_version and application_id are both 0, and
-// _shardlite_reminders has no rows (a reminder the node gave up on is the app's
-// data too). marked says which it was. It asks through capture's own connections,
-// so the node opens nothing of the shard's (see walsidecar.go for why that matters).
+// the app marked it for deletion (a row in _shardlite_delete, whatever else is
+// in it), or it has no tables or indexes besides shardlite's (the _shardlite_
+// tables, empty or not; an index counts as its table's, so the automatic one of
+// a reserved table's text key is ignored), user_version and application_id are
+// both 0, and _shardlite_reminders has no rows (a reminder the node gave up on
+// is the app's data too). marked says which it was. It asks through capture's
+// own connections, so the node opens nothing of the shard's (see walsidecar.go
+// for why that matters), and an _shardlite_delete that is missing fails the
+// marked check rather than reading the shard as unmarked.
 func (s *Shard) holdsNothing(ctx context.Context) (empty, marked bool, err error) {
 	sqldb := s.pool
 	if sqldb == nil {
 		return false, false, ErrClosed
 	}
 	if err := sqldb.QueryRowContext(ctx, MarkedQuery).Scan(&marked); err != nil || marked {
+		if err != nil {
+			err = fmt.Errorf("asking for the delete marker: %w", err)
+		}
 		return marked, marked, err
 	}
 	var objects, userVersion, applicationID int64

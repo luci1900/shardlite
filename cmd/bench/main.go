@@ -196,8 +196,8 @@ func run(root, kind string) []result {
 	df := filepath.Join(d, "declaration.json")
 	os.WriteFile(df, []byte(`{"kinds": {"users": {"public": true, "sync": "none", "idle_timeout": "1h"}, "wallet": {"public": true, "idle_timeout": "1h"}}}`), 0o644)
 	pub, ctl := freeAddr(), freeAddr()
-	// The app keeps each shard's database open (its idle close is long) so the measurement is of serving, not of reopening.
-	app := start(*appBin, nil, "-listen", "127.0.0.1:0", "-control", ctl, "-idle-close", "10m", "-declare", df)
+	// The app opens each shard's database for the length of a request, so the measurement includes that open.
+	app := start(*appBin, nil, "-listen", "127.0.0.1:0", "-control", ctl, "-declare", df)
 	defer app.cmd.Process.Kill()
 	appAddr := app.waitFor(`listening (\S+)`, 20*time.Second)[1]
 	node := start(*nodeBin, []string{

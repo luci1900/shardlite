@@ -451,4 +451,4 @@ func (f *Flusher) confirm(ctx context.Context, mark uint64) error {
 // tierUnmet is the error a tier's gate returns when the node cannot meet it:
 // the answer fails with 503 and a retry hint, and a weaker tier is never
 // given instead (docs/guide.md, Durability).
-func tierUnmet(msg string) error { return &unavailable{msg, time.Second} }
+func tierUnmet(msg string) error { return &unavailable{reasonSyncUnmet, msg, time.Second} }

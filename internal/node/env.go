@@ -12,14 +12,14 @@ import (
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
-// Env is the node's configuration from environment variables (docs/guide.md,
+// Env is the node's configuration from environment variables (docs/deployment.md,
 // Environment variables): settings about the environment, set by whoever runs
 // the cluster. The app declares its own settings (its kinds) at its ready
 // route.
 type Env struct {
 	Name        cluster.Node  // SHARDLITE_NODE: the node's name (the host name by default)
-	Advertise   string        // SHARDLITE_ADVERTISE_PEER: how other nodes reach the peer listener (host:port), the peer listener's bound address if unset and not a wildcard
-	Blob        string        // SHARDLITE_BLOB: s3://bucket
+	Advertise   string        // SHARDLITE_ADVERTISE_PEER: how other nodes reach the peer listener (host:port), the peer listener's bound address if unset and not a wildcard, else the one private IPv4 address of the interfaces that are up (required when there is none or several)
+	Blob        string        // SHARDLITE_BLOB: s3://bucket, or memory:// for tests and local development
 	S3Endpoint  string        // SHARDLITE_S3_ENDPOINT: the URL of an S3-compatible store or emulator (AWS if unset)
 	Prefix      string        // SHARDLITE_PREFIX: prefix of every object path, for example "staging/"
 	Flush       time.Duration // SHARDLITE_FLUSH: flush interval, 250ms
@@ -33,7 +33,6 @@ type Env struct {
 	Public      string        // SHARDLITE_LISTEN_PUBLIC: the public listener, :2280
 	Peer        string        // SHARDLITE_LISTEN_PEER: the listener for traffic from other nodes, :2281
 	Control     string        // SHARDLITE_LISTEN_CONTROL: the control API on localhost TCP, 127.0.0.1:2282
-	Socket      string        // SHARDLITE_LISTEN_CONTROL_SOCKET: the control API on a Unix socket, if set
 	MaxHops     int           // SHARDLITE_MAX_HOPS: calls chained past this many hops are refused with 508, 32
 	Pprof       string        // SHARDLITE_LISTEN_PPROF: address for Go's pprof handlers, for diagnosis (off if unset)
 }
@@ -45,7 +44,7 @@ func ParseEnv(getenv func(string) string) (Env, error) {
 		Prefix: getenv("SHARDLITE_PREFIX"),
 		Data:   getenv("SHARDLITE_DATA"), App: getenv("SHARDLITE_APP"),
 		Public:  getenv("SHARDLITE_LISTEN_PUBLIC"),
-		Control: getenv("SHARDLITE_LISTEN_CONTROL"), Peer: getenv("SHARDLITE_LISTEN_PEER"), Socket: getenv("SHARDLITE_LISTEN_CONTROL_SOCKET"), Pprof: getenv("SHARDLITE_LISTEN_PPROF"),
+		Control: getenv("SHARDLITE_LISTEN_CONTROL"), Peer: getenv("SHARDLITE_LISTEN_PEER"), Pprof: getenv("SHARDLITE_LISTEN_PPROF"),
 		Flush: 250 * time.Millisecond, LeaseTTL: 10 * time.Second, FlushMin: DefaultFlushMin, DeltaAge: shardfile.DefaultDeltaAge, DeltaSize: shardfile.DefaultDeltaSize,
 	}
 	if e.Name == "" {
@@ -55,7 +54,7 @@ func ParseEnv(getenv func(string) string) (Env, error) {
 		}
 		e.Name = cluster.Node(h)
 	}
-	// The name goes into object keys as it is (docs/guide.md, the reference).
+	// The name goes into object keys as it is (docs/deployment.md, Environment variables).
 	if !cluster.ValidNode(string(e.Name)) {
 		return e, fmt.Errorf("SHARDLITE_NODE is %q: a node's name is 1 to 128 ASCII letters, digits, '.', '-' and '_'", e.Name)
 	}
@@ -94,8 +93,10 @@ func ParseEnv(getenv func(string) string) (Env, error) {
 			return e, fmt.Errorf("%s is required", r.name)
 		}
 	}
-	if _, err := e.blobBucket(); err != nil {
-		return e, err
+	if !e.inMemory() {
+		if _, err := e.blobBucket(); err != nil {
+			return e, err
+		}
 	}
 	if e.Prefix != "" && !strings.HasSuffix(e.Prefix, "/") {
 		e.Prefix += "/"
@@ -103,11 +104,19 @@ func ParseEnv(getenv func(string) string) (Env, error) {
 	return e, nil
 }
 
+// inMemoryBlob is the SHARDLITE_BLOB setting that runs the node on the
+// in-memory store.
+const inMemoryBlob = "memory://"
+
+// inMemory reports whether the node runs on the in-memory store: one node,
+// with everything gone when it stops.
+func (e Env) inMemory() bool { return e.Blob == inMemoryBlob }
+
 // blobBucket is the bucket of the s3://bucket setting.
 func (e Env) blobBucket() (string, error) {
 	rest, ok := strings.CutPrefix(e.Blob, "s3://")
 	if !ok {
-		return "", fmt.Errorf("SHARDLITE_BLOB is %q, want s3://bucket", e.Blob)
+		return "", fmt.Errorf("SHARDLITE_BLOB is %q, want s3://bucket (or %s for tests)", e.Blob, inMemoryBlob)
 	}
 	if rest == "" || strings.Contains(rest, "/") {
 		return "", fmt.Errorf("SHARDLITE_BLOB is %q, want s3://bucket (the bucket's name alone: SHARDLITE_PREFIX sets a prefix inside it)", e.Blob)

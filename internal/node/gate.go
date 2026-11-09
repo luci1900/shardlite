@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 
@@ -94,4 +95,69 @@ func (c gatedConn) Write(p []byte) (int, error) {
 	}
 	defer c.calls.leave()
 	return c.ReadWriteCloser.Write(p)
+}
+
+// gateCaller holds a call until the calling shard's earlier commits are
+// durable, in the store the caller's tier names (or the one the call says with
+// Shardlite-Sync), and returns the gate for the rest of the call. The gate
+// keeps the caller active: the hold is released when the call ends. It is nil,
+// with nothing held, when the call isn't gated: the caller isn't active on this
+// node (it committed nothing here to wait for).
+func (s *Server) gateCaller(r *http.Request, info *reqInfo) (*gate, error) {
+	hold := s.m.tryHold(info.callerName)
+	if hold == nil {
+		return nil, nil
+	}
+	sync, err := syncSetting(hold, r.Header.Get(hdrSync))
+	if err != nil {
+		hold.Release()
+		return nil, err
+	}
+	g := &gate{m: s.m, hold: hold, sync: sync, ctx: r.Context(), calls: &info.gates}
+	if err := g.wait(1, nil); err != nil { // the request line and headers
+		hold.Release()
+		return nil, err
+	}
+	return g, nil
+}
+
+// syncSetting applies a Shardlite-Sync override ("none" or "storage") to the
+// kind's tier. An unknown name is refused with a 400: copying the kind's tier
+// could quietly give less than what the app said, and the guide's status table
+// already fail a malformed Shardlite-* header.
+func syncSetting(hold *Hold, override string) (kind.Sync, error) {
+	if override != "" {
+		s, err := kind.ParseSync(override)
+		if err != nil {
+			return 0, &statusError{http.StatusBadRequest, reasonBadRequest, fmt.Sprintf("bad Shardlite-Sync: %v", err)}
+		}
+		return s, nil
+	}
+	return hold.Sync(), nil
+}
+
+// modifyResponse is where the app's output meets the gate.
+func (s *Server) modifyResponse(resp *http.Response) error {
+	info, _ := resp.Request.Context().Value(ctxKey{}).(*reqInfo)
+	override := resp.Header.Get(hdrSync)
+	stripShardliteHeaders(resp.Header)
+	if info == nil || info.hold == nil {
+		return nil // shardless: a plain reverse proxy
+	}
+	sync, err := syncSetting(info.hold, override)
+	if err != nil {
+		return err
+	}
+	ctx := resp.Request.Context()
+	// The status line and headers are the first chunk.
+	if err := s.m.Gate(ctx, info.hold, sync); err != nil {
+		return err
+	}
+	g := &gate{m: s.m, hold: info.hold, sync: sync, ctx: ctx, resp: resp, calls: &info.gates}
+	if rwc, ok := resp.Body.(io.ReadWriteCloser); ok && resp.StatusCode == http.StatusSwitchingProtocols {
+		resp.Body = gatedConn{rwc, g, &info.gates}
+	} else {
+		resp.Body = gatedBody{resp.Body, g}
+	}
+	return nil
 }

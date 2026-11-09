@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"net/textproto"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +17,8 @@ import (
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/cluster"
+	"github.com/luci1900/shardlite/internal/lease"
+	"github.com/luci1900/shardlite/internal/peers"
 	"github.com/luci1900/shardlite/internal/reconcile"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
@@ -99,11 +102,14 @@ func TestPeerListenerAnswersSayAvoidWhileDraining(t *testing.T) {
 				answers["102"] = got.early[0]
 			}
 			for which, h := range answers {
-				avoid, err := parsePlacement(h)
-				if err != nil || avoid != draining {
-					t.Errorf("%s, %s (draining %v): placement %v, %v", name, which, draining, h.Values(hdrPlacement), err)
+				var want []string
+				if draining {
+					want = []string{peers.PlacementAvoid}
 				}
-				if v := h.Values(hdrNode); len(v) != 0 {
+				if got := h.Values(peers.HeaderPlacement); !slices.Equal(got, want) {
+					t.Errorf("%s, %s (draining %v): placement %v, want %v", name, which, draining, got, want)
+				}
+				if v := h.Values(peers.HeaderNode); len(v) != 0 {
 					t.Errorf("%s, %s: the answer names its node %v", name, which, v)
 				}
 			}
@@ -131,27 +137,27 @@ func TestPeerListenerCountsBadHeaders(t *testing.T) {
 			t.Fatalf("%v was answered %d", hdr, got.status)
 		}
 	}
-	send(map[string]string{hdrNode: "n8", hdrPlacement: placementAvoid + ";for=5;x=?1"})
-	if st.BadPeerHeaders.Load() != 0 || !p.avoids("n8") {
-		t.Fatalf("a good pair: %d bad, n8 avoided %v", st.BadPeerHeaders.Load(), p.avoids("n8"))
+	send(map[string]string{peers.HeaderNode: "n8", peers.HeaderPlacement: peers.PlacementAvoid + ";for=5;x=?1"})
+	if st.BadPeerHeaders.Load() != 0 || !p.Avoids("n8") {
+		t.Fatalf("a good pair: %d bad, n8 avoided %v", st.BadPeerHeaders.Load(), p.Avoids("n8"))
 	}
 	var bad uint64
 	for _, hdr := range []map[string]string{
-		{hdrNode: "a b"},
-		{hdrNode: "a/b"},
-		{hdrNode: `"n9"`},
-		{hdrPlacement: "???", hdrNode: "n9"},
-		{hdrPlacement: "yes", hdrNode: "n9"},
-		{hdrPlacement: `"avoid"`, hdrNode: "n9"},
-		{hdrPlacement: "?1", hdrNode: "n9"},
-		{hdrPlacement: "3", hdrNode: "n9"},
-		{hdrPlacement: "avoid, avoid", hdrNode: "n9"},
+		{peers.HeaderNode: "a b"},
+		{peers.HeaderNode: "a/b"},
+		{peers.HeaderNode: `"n9"`},
+		{peers.HeaderPlacement: "???", peers.HeaderNode: "n9"},
+		{peers.HeaderPlacement: "yes", peers.HeaderNode: "n9"},
+		{peers.HeaderPlacement: `"avoid"`, peers.HeaderNode: "n9"},
+		{peers.HeaderPlacement: "?1", peers.HeaderNode: "n9"},
+		{peers.HeaderPlacement: "3", peers.HeaderNode: "n9"},
+		{peers.HeaderPlacement: "avoid, avoid", peers.HeaderNode: "n9"},
 	} {
 		send(hdr)
 		bad++
 		waitCounter(t, "a bad header", &st.BadPeerHeaders, bad)
 	}
-	if p.avoids("n9") {
+	if p.Avoids("n9") {
 		t.Fatal("a bad header made the placer avoid n9")
 	}
 }
@@ -168,8 +174,8 @@ func TestPeerHeadersStayBetweenNodes(t *testing.T) {
 			appSaw = append(appSaw, q.Header.Clone())
 			mu.Unlock()
 			// An app can't pass one on to a client either.
-			w.Header().Set(hdrNode, "n9")
-			w.Header().Set(hdrPlacement, placementAvoid)
+			w.Header().Set(peers.HeaderNode, "n9")
+			w.Header().Set(peers.HeaderPlacement, peers.PlacementAvoid)
 			io.WriteString(w, "served")
 		})
 	}
@@ -177,7 +183,7 @@ func TestPeerHeadersStayBetweenNodes(t *testing.T) {
 	n1.create("users/z")
 	n0.m.Load().Drain() // its answers to n1's forwards say avoid
 	target := func(shard string) map[string]string {
-		return map[string]string{"Shardlite-Target": shard, hdrNode: "n9", hdrPlacement: placementAvoid}
+		return map[string]string{"Shardlite-Target": shard, peers.HeaderNode: "n9", peers.HeaderPlacement: peers.PlacementAvoid}
 	}
 
 	type request struct {
@@ -189,13 +195,13 @@ func TestPeerHeadersStayBetweenNodes(t *testing.T) {
 		{"a client's request forwarded to a draining node", "http://" + n1.Public + "/x", target("users/a")},
 		{"a client's request to a shard of the node", "http://" + n1.Public + "/x", target("users/z")},
 		{"a call from the app", "http://" + n1.Control + "/x", target("users/a")},
-		{"a client's request with bad headers", "http://" + n0.Public + "/x", map[string]string{"Shardlite-Target": "users/a", hdrNode: "???", hdrPlacement: "???"}},
+		{"a client's request with bad headers", "http://" + n0.Public + "/x", map[string]string{"Shardlite-Target": "users/a", peers.HeaderNode: "???", peers.HeaderPlacement: "???"}},
 	} {
 		resp, body := send(t, "GET", rq.url, rq.hdr, "")
 		if resp.StatusCode != 200 || body != "served" {
 			t.Fatalf("%s: %d %q", rq.name, resp.StatusCode, body)
 		}
-		for _, h := range []string{hdrNode, hdrPlacement} {
+		for _, h := range []string{peers.HeaderNode, peers.HeaderPlacement} {
 			if _, ok := resp.Header[http.CanonicalHeaderKey(h)]; ok {
 				t.Errorf("%s: the answer to the client carries %s %v", rq.name, h, resp.Header.Values(h))
 			}
@@ -203,7 +209,7 @@ func TestPeerHeadersStayBetweenNodes(t *testing.T) {
 	}
 	mu.Lock()
 	for i, h := range appSaw {
-		for _, name := range []string{hdrNode, hdrPlacement} {
+		for _, name := range []string{peers.HeaderNode, peers.HeaderPlacement} {
 			if v := h.Values(name); len(v) > 0 {
 				t.Errorf("request %d reached an app with %s %v", i, name, v)
 			}
@@ -215,11 +221,11 @@ func TestPeerHeadersStayBetweenNodes(t *testing.T) {
 	mu.Unlock()
 
 	// The forwards were answered by a draining node, so n1 avoids it, and no client or app made either node avoid n9.
-	if !n1.m.Load().placer.avoids("n0") {
+	if !n1.m.Load().placer.Avoids("n0") {
 		t.Error("n1 did not hear that n0 drains")
 	}
 	for _, nd := range c.nodes {
-		if nd.m.Load().placer.avoids("n9") {
+		if nd.m.Load().placer.Avoids("n9") {
 			t.Errorf("%s avoids n9 on a client's or an app's word", nd.env.Name)
 		}
 		if bad := nd.m.Load().Stats.BadPeerHeaders.Load(); bad != 0 {
@@ -248,28 +254,37 @@ func newPlacementCluster(t *testing.T, n int) *testCluster {
 // waitForLive waits until the node's lease scan lists n nodes as alive.
 func waitForLive(t *testing.T, nd *clusterNode, n int) {
 	t.Helper()
-	apptest.Eventually(t, apptest.Timeout, "the lease scan to list the cluster", func() bool { return len(nd.m.Load().liveNodes()) == n })
+	apptest.Eventually(t, apptest.Timeout, "the lease scan to list the cluster", func() bool { return len(nd.m.Load().leases.Nodes().Live()) == n })
 }
 
 // callFrom sends a call for target through the node's control API as the app of
 // a shard (caller) would. An empty caller is a call with no shard behind it.
 func callFrom(t *testing.T, nd *clusterNode, caller, target string) (*http.Response, string) {
 	t.Helper()
-	hdr := map[string]string{"Shardlite-Target": target, "Shardlite-Caller": caller}
-	if caller == "" {
-		hdr["Shardlite-Caller"] = callerApp
+	hdr := map[string]string{"Shardlite-Target": target}
+	if caller != "" {
+		hdr[hdrContext] = ctxOf(caller, 0)
 	}
 	return send(t, "GET", "http://"+nd.Control+"/x", hdr, "")
+}
+
+// listOf is a listing with the nodes alive.
+func listOf(nodes ...cluster.Node) *peers.List {
+	l := &peers.List{}
+	for _, n := range nodes {
+		l.Nodes = append(l.Nodes, peers.Peer{Listed: lease.Listed{Name: n}})
+	}
+	return l
 }
 
 // placeOn makes the node's placer pick peer, or itself if peer is empty.
 func (n *clusterNode) placeOn(peer cluster.Node) {
 	p := n.m.Load().placer
-	p.listing = func() *NodeList { return listOf() }
+	p.Listing = func() *peers.List { return listOf() }
 	if peer != "" {
-		p.listing = func() *NodeList { return listOf(peer) }
-		p.draining = new(atomic.Bool) // so that this node is no candidate
-		p.draining.Store(true)
+		p.Listing = func() *peers.List { return listOf(peer) }
+		p.Draining = new(atomic.Bool) // so that this node is no candidate
+		p.Draining.Store(true)
 	}
 }
 
@@ -303,7 +318,7 @@ func TestCallsFromAShardSpreadNewShards(t *testing.T) {
 		if resp.StatusCode != 200 || body != "served" {
 			t.Fatalf("call %d: %d %q", i, resp.StatusCode, body)
 		}
-		for _, h := range []string{hdrNode, hdrPlacement} {
+		for _, h := range []string{peers.HeaderNode, peers.HeaderPlacement} {
 			if _, ok := resp.Header[http.CanonicalHeaderKey(h)]; ok {
 				t.Fatalf("call %d: the answer carries %s %v", i, h, resp.Header.Values(h))
 			}

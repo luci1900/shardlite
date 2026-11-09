@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+
+	shardlite "github.com/luci1900/shardlite/sdk/go"
 )
 
 // ws serves a WebSocket on a shard. A text message is recorded in the shard and
@@ -67,7 +69,7 @@ func (a *App) ws(w http.ResponseWriter, r *http.Request, s *shardReq) {
 			err = c.Write(ctx, websocket.MessageText, []byte(strings.Repeat("x", n)))
 		case text == "mark": // marks the shard for deletion when it deactivates
 			reply := "marked"
-			if _, merr := s.db.sql.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS _shardlite_delete (x)`); merr != nil {
+			if merr := shardlite.MarkDeleted(ctx, s.db); merr != nil {
 				reply = "err:" + merr.Error()
 			}
 			err = c.Write(ctx, websocket.MessageText, []byte(reply))

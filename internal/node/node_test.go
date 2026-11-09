@@ -64,50 +64,6 @@ func (r *rig) start(opts ...func(*node.Config)) (*node.Node, error) {
 	return n, err
 }
 
-// A clock more than a lease TTL from the store's refuses the start, and a clock
-// within it starts. The store here keeps its own time, ahead of the process's.
-func TestStartRefusesAClockFarFromTheStores(t *testing.T) {
-	t.Parallel()
-	for name, c := range map[string]struct {
-		skew    time.Duration
-		refused bool
-	}{
-		"within the TTL": {skew: time.Minute, refused: false},
-		"past the TTL":   {skew: 3 * time.Hour, refused: true},
-		"behind":         {skew: -3 * time.Hour, refused: true},
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			clock := lease.NewClockWatch(nil)
-			store := blob.NewMemory(blob.WithClock(func() time.Time { return time.Now().Add(c.skew) }), blob.WithClockSink(clock.Sink))
-			r := newRig(t)
-			r.local = blobtest.WithHook(store)
-			_, err := r.start(func(cfg *node.Config) { cfg.Clock = clock })
-			if c.refused != (err != nil) {
-				t.Fatalf("a clock %v from the store's: err %v, want refused %v", c.skew, err, c.refused)
-			}
-		})
-	}
-}
-
-// What the requests before the lease showed refuses the start before the lease
-// is taken.
-func TestStartRefusesBeforeTakingTheLease(t *testing.T) {
-	t.Parallel()
-	clock := lease.NewClockWatch(nil)
-	for range 5 {
-		start := time.Now()
-		clock.Sink(blob.ClockSample{Store: start.Add(3 * time.Hour).Truncate(time.Second), Start: start, End: start.Add(time.Millisecond)}, nil)
-	}
-	r := newRig(t)
-	if _, err := r.start(func(cfg *node.Config) { cfg.Clock = clock }); err == nil {
-		t.Fatal("started")
-	}
-	if _, err := lease.NewRegistry(r.local, "n1", lease.RegistryOptions{}).Get(context.Background(), "n1"); !errors.Is(err, blob.ErrNotFound) {
-		t.Fatalf("a refused start left a lease behind: %v", err)
-	}
-}
-
 func (r *rig) mustStart() *node.Node {
 	r.t.Helper()
 	n, err := r.start()

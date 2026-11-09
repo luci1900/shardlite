@@ -6,106 +6,14 @@ import (
 	"github.com/luci1900/shardlite/internal/apptest"
 	"net/http"
 	"os"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/dueindex"
+	"github.com/luci1900/shardlite/internal/harness"
 )
-
-// fakeClock is the shards' Clock in tests that move time: nothing that waits
-// on it (a timer, a ticker, a backoff) fires until Advance moves it past.
-type fakeClock struct {
-	mu     sync.Mutex
-	now    time.Time
-	timers map[*fakeTimer]bool
-}
-
-type fakeTimer struct {
-	at    time.Time
-	every time.Duration // a ticker's period, 0 for a timer
-	f     func()
-}
-
-func newFakeClock() *fakeClock {
-	return &fakeClock{now: time.Now().Truncate(time.Minute).Add(10 * time.Second), timers: map[*fakeTimer]bool{}}
-}
-
-func (c *fakeClock) Now() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.now
-}
-
-func (c *fakeClock) add(d, every time.Duration, f func()) (*fakeTimer, bool) {
-	c.mu.Lock()
-	t := &fakeTimer{at: c.now.Add(d), every: every, f: f}
-	c.timers[t] = true
-	c.mu.Unlock()
-	return t, d <= 0
-}
-
-func (c *fakeClock) stopper(t *fakeTimer) func() bool {
-	return func() bool {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		was := c.timers[t]
-		delete(c.timers, t)
-		return was
-	}
-}
-
-func (c *fakeClock) NewTimer(d time.Duration) (<-chan time.Time, func() bool) {
-	ch := make(chan time.Time, 1)
-	t, due := c.add(d, 0, func() { ch <- c.Now() })
-	if due {
-		c.fire(t)
-	}
-	return ch, c.stopper(t)
-}
-
-func (c *fakeClock) NewTicker(d time.Duration) (<-chan time.Time, func()) {
-	ch := make(chan time.Time, 1)
-	t, _ := c.add(d, d, func() {
-		select {
-		case ch <- c.Now():
-		default:
-		}
-	})
-	stop := c.stopper(t)
-	return ch, func() { stop() }
-}
-
-func (c *fakeClock) fire(t *fakeTimer) {
-	c.mu.Lock()
-	was := c.timers[t]
-	if t.every > 0 {
-		t.at = c.now.Add(t.every) // a ticker skips the periods it was behind for
-	} else {
-		delete(c.timers, t)
-	}
-	c.mu.Unlock()
-	if was {
-		t.f()
-	}
-}
-
-func (c *fakeClock) Advance(d time.Duration) {
-	c.mu.Lock()
-	c.now = c.now.Add(d)
-	var due []*fakeTimer
-	for t := range c.timers {
-		if !t.at.After(c.now) {
-			due = append(due, t)
-		}
-	}
-	c.mu.Unlock()
-	for _, t := range due {
-		c.fire(t)
-	}
-}
 
 func withClock(c Clock) func(*ShardsetOptions) {
 	return func(o *ShardsetOptions) { o.Clock = c }
@@ -121,7 +29,7 @@ func (r *srig) remind(target, key string, due int64) {
 
 func TestReminderWakesOnceAfterItsCommitIsDurable(t *testing.T) {
 	t.Parallel()
-	clk := newFakeClock()
+	clk := harness.NewFakeClock()
 	r := newSRigWith(t, both(quick, withClock(clk)))
 	rec := &recorder{}
 	r.record(rec, "wallet/rm1")
@@ -144,7 +52,7 @@ func TestReminderWakesOnceAfterItsCommitIsDurable(t *testing.T) {
 	if clk.Now().Unix() < due {
 		t.Fatalf("woken %d s early", due-clk.Now().Unix())
 	}
-	if d.shardRows != 1 || d.method != "POST" || d.target != "wallet/rm1" || d.hdr.Get("Shardlite-Caller") != "wallet/rm1" {
+	if d.shardRows != 1 || d.method != "POST" || d.target != "wallet/rm1" || d.hdr.Get("Shardlite-Caller") != "wallet/rm1" || d.hdr.Get(hdrContext) != ctxOf("wallet/rm1", 0) {
 		t.Fatalf("wake %+v", d)
 	}
 }
@@ -192,7 +100,7 @@ func TestReminderOfALostCommitNeverWakes(t *testing.T) {
 // earlier, and one set with a later time than the pending one doesn't move it.
 func TestSoonerReminderMovesTheWakeEarlier(t *testing.T) {
 	t.Parallel()
-	clk := newFakeClock()
+	clk := harness.NewFakeClock()
 	r := newSRigWith(t, both(quick, withClock(clk)))
 	rec := &recorder{}
 	r.record(rec, "")
@@ -214,7 +122,7 @@ func TestSoonerReminderMovesTheWakeEarlier(t *testing.T) {
 // repeated after a backoff that doubles, and a success resets it.
 func TestFailingWakeIsRetriedWithBackoff(t *testing.T) {
 	t.Parallel()
-	clk := newFakeClock()
+	clk := harness.NewFakeClock()
 	r := newSRigWith(t, func(o *ShardsetOptions) {
 		o.Clock = clk
 		o.Reminders.Backoff, o.Reminders.MaxBackoff = 10*time.Second, 40*time.Second
@@ -282,7 +190,7 @@ func TestHandlerSettingRemindersDueNowIsWokenWithBackoff(t *testing.T) {
 // that does the work, and each time wakes the shard once.
 func TestRecurringReminder(t *testing.T) {
 	t.Parallel()
-	clk := newFakeClock()
+	clk := harness.NewFakeClock()
 	r := newSRigWith(t, both(quick, withClock(clk)))
 	rec := &recorder{keep: true}
 	r.record(rec, "")
@@ -349,7 +257,7 @@ func TestNodeMakesNoCommitsForReminders(t *testing.T) {
 
 func TestReplacingAndCancellingReminders(t *testing.T) {
 	t.Parallel()
-	clk := newFakeClock()
+	clk := harness.NewFakeClock()
 	r := newSRigWith(t, both(quick, withClock(clk)))
 	rec := &recorder{}
 	r.record(rec, "")
@@ -379,7 +287,7 @@ func TestReminderAnHourAwayWakesTheShard(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []string{"after deactivation", "after a crash", "new machine"} {
 		t.Run(tc, func(t *testing.T) {
-			clk := newFakeClock()
+			clk := harness.NewFakeClock()
 			opts := both(quick, withDispatch, withClock(clk))
 			r := newSRigWith(t, opts)
 			rec := &recorder{}
@@ -429,7 +337,7 @@ func TestReminderAnHourAwayWakesTheShard(t *testing.T) {
 
 func TestReminderDueNowKeepsTheShardActive(t *testing.T) {
 	t.Parallel()
-	clk := newFakeClock()
+	clk := harness.NewFakeClock()
 	// A wake counts as a use of the shard, so the backoff has to be longer than the
 	// idle timeout: with a shorter one a loaded machine wakes the shard at every
 	// step of the clock, the last use never goes stale and the idle timer never
@@ -454,14 +362,15 @@ func TestReminderDueNowKeepsTheShardActive(t *testing.T) {
 	advanceUntil(t, clk, time.Second, "deactivation after the reminder", func() bool { return r.released("users/dn1") })
 }
 
-// markSQL is what the app runs to mark a shard for deletion.
-const markSQL = `CREATE TABLE _shardlite_delete (x)`
+// markSQL is what the app runs to mark a shard for deletion (the SDK's
+// MarkDeleted): a row in the table the node created.
+const markSQL = `INSERT OR IGNORE INTO _shardlite_delete VALUES (1)`
 
 // A marked shard with a reminder due later is deleted at deactivation and the
 // reminder goes with it.
 func TestMarkedShardWithAReminderDueLaterIsDeletedWithIt(t *testing.T) {
 	t.Parallel()
-	clk := newFakeClock()
+	clk := harness.NewFakeClock()
 	r := newSRigWith(t, both(quick, withClock(clk)))
 	rec := &recorder{}
 	r.record(rec, "")
@@ -481,7 +390,7 @@ func TestMarkedShardWithAReminderDueLaterIsDeletedWithIt(t *testing.T) {
 // the handler has handled it, then deleted.
 func TestMarkedShardWithAReminderDueIsDeletedAfterItIsHandled(t *testing.T) {
 	t.Parallel()
-	clk := newFakeClock()
+	clk := harness.NewFakeClock()
 	r := newSRigWith(t, both(quick, withClock(clk)))
 	rec := &recorder{}
 	r.record(rec, "")
@@ -500,7 +409,7 @@ func TestMarkedShardWithAReminderDueIsDeletedAfterItIsHandled(t *testing.T) {
 // reminder due later: the reminder goes with it.
 func TestShutdownDeletesAMarkedShardWithAReminderDueLater(t *testing.T) {
 	t.Parallel()
-	clk := newFakeClock()
+	clk := harness.NewFakeClock()
 	r := newSRigWith(t, both(quick, withClock(clk)))
 	r.sql("lobby/rm3", `INSERT INTO kv (payload) VALUES (x'01')`)
 	r.sql("lobby/rm3", markSQL)

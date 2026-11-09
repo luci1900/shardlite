@@ -2,6 +2,7 @@ package capture_test
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -479,6 +480,346 @@ func TestReleaseSeesACommitAfterTheFinalSync(t *testing.T) {
 	// With nothing new, the node lets go.
 	if released, _, err := sh.Release(ctx, nil, capture.ResumeIfHeld); err != nil || !released {
 		t.Fatalf("nothing new: released=%v err=%v", released, err)
+	}
+}
+
+// walSalts is the salt pair a wal-index header carries (the WAL's own, which
+// change when SQLite restarts the WAL).
+func walSalts(h capture.Header) [8]byte {
+	var s [8]byte
+	copy(s[:], h[32:40])
+	return s
+}
+
+// walFrames is the wal-index header's mxFrame: how many frames of its WAL are
+// committed.
+func walFrames(h capture.Header) uint32 { return binary.NativeEndian.Uint32(h[16:20]) }
+
+// walFileInfo reads a WAL file's own header: its salts and how many frames
+// the FILE holds, stale ones included (a restarted WAL is rewritten from its
+// first frame in place, so the file keeps its high-water size).
+func walFileInfo(t *testing.T, path string) (salts [8]byte, fileFrames int64) {
+	t.Helper()
+	b, err := os.ReadFile(path + "-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b) < 32 {
+		t.Fatalf("%s-wal is %d bytes, shorter than a WAL header", path, len(b))
+	}
+	copy(salts[:], b[16:24])
+	frameSize := int64(24 + binary.BigEndian.Uint32(b[8:12]))
+	fileFrames = int64(len(b)-32) / frameSize
+	return salts, fileFrames
+}
+
+// The release window with a storm in it, the #1540 shape: while capture holds
+// nothing (the connections are closed, the -shm check still to come) the app's
+// automatic checkpoints, set small here, restart the WAL several times, and
+// none of the generations grows as far as the frames capture had read.
+// journal_size_limit is left unset, so the file keeps its high-water size and
+// stale frames sit past the new end, which is what made a position-and-size
+// check pass wrongly in the production report. Nothing here may be decided
+// from sizes: the resumed release proves the WAL from its salts, the proof
+// fails, and the whole database is written as one file counted as one commit.
+// The replayed history is the app's database.
+func TestReleaseResumesAcrossARestartStorm(t *testing.T) {
+	t.Parallel()
+	e := harness.New(t)
+	ctx := context.Background()
+	app := e.StartApp(name)
+	h, _, _ := e.Files.Open(ctx, shardName(name))
+	storm := false
+	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W,
+		Durable: func(ctx context.Context) error {
+			if storm {
+				// Between the connections closing and the -shm check: the app
+				// holds the file alone. Twenty small commits against an
+				// automatic checkpoint of four pages restart the WAL every
+				// few of them, several times over.
+				storm = false
+				app.Must(t, "exec", "a", "PRAGMA wal_autocheckpoint=4")
+				for range 20 {
+					app.Must(t, "insert", "a", "1", "100")
+				}
+			}
+			return e.W.Flush(ctx)
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One commit of many pages, so the WAL capture reads to is far longer
+	// than any generation the storm leaves behind.
+	app.Must(t, "insert", "a", "5", "20000")
+	if err := sh.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	at := sh.Position()
+	before := header(t, sh)
+	beforeFrames := walFrames(before)
+	storm = true
+	if released, _, err := sh.Release(ctx, nil, capture.ResumeIfHeld); err != nil || released {
+		t.Fatalf("release in a restart storm: released=%v err=%v", released, err)
+	}
+	// The resumed sync queued its file after the release's own wait for
+	// durability, so the writer is flushed here before the journal is read.
+	if err := e.W.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	after := header(t, sh)
+	afterSalts, afterFileFrames := walFileInfo(t, e.Path(name))
+	if walSalts(before) == walSalts(after) || walSalts(after) != afterSalts {
+		t.Fatal("the WAL of the wal-index and the WAL file do not agree, or was not restarted in the window")
+	}
+	if afterFrames := walFrames(after); afterFrames >= beforeFrames {
+		t.Fatalf("the storm's last generation holds %d frames, not fewer than the %d capture had read", afterFrames, beforeFrames)
+	}
+	if afterFileFrames <= int64(walFrames(after)) {
+		t.Fatalf("the WAL file holds %d frames for %d live ones: it lost its high-water size, so the test is not testing the size trap", afterFileFrames, walFrames(after))
+	}
+	// The resumed sync wrote the whole database: one file past the position
+	// the release stopped at, every page of it, counted as one commit.
+	var en journal.Entry
+	var seq pos.Seg
+	if err := journal.Scan(ctx, e.Journal, 1, 0, func(s pos.Seg, en2 journal.Entry) error {
+		if en2.Shard.String() == name && en2.Position > at {
+			if en.Position != 0 {
+				t.Fatalf("two files past %d (%d and %d), want one whole-database file", at, en.Position, en2.Position)
+			}
+			en, seq = en2, s
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if seq == 0 {
+		t.Fatal("the storm's commits were not captured as a file of their own")
+	}
+	if en.Position != at+1 || en.Count != 1 {
+		t.Fatalf("the file past %d is %d+%d, want %d+1", at, en.Position, en.Count, at+1)
+	}
+	b, err := harness.ReadEntry(ctx, e.Journal, seq, en)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pages, commit := pageCount(t, b); pages != commit {
+		t.Fatalf("the file after the storm holds %d of the database's %d pages: the whole database was not written", pages, commit)
+	}
+	if got := sh.Position(); got != at+1 {
+		t.Fatalf("position %d after the storm, want %d advanced by the one commit alone", got, at+1)
+	}
+	replayed := filepath.Join(t.TempDir(), "replayed.db")
+	replayInto(t, e, replayed)
+	if want, got := apptest.Dump(t, e.Path(name)), sqlitetest.Dump(t, replayed); want != got {
+		t.Fatal("the history across the restart storm does not restore to the app's database")
+	}
+	// With the app closed and nothing new, the node lets go.
+	app.Must(t, "close", "a")
+	if released, _, err := sh.Release(ctx, nil, capture.ResumeIfHeld); err != nil || !released {
+		t.Fatalf("release after the storm: released=%v err=%v", released, err)
+	}
+}
+
+// The truncate in the window: between the final sync and the resumed one the
+// app runs wal_checkpoint(TRUNCATE), which empties the WAL and starts a new
+// one, then commits pages the new WAL never holds (the truncate copied the
+// earlier commits into the database file, and the new WAL never sees them).
+// The salts say the WAL is not the one capture was reading, so the proof
+// fails and the whole database is written as one file, those pages carried
+// from the database file. The replay equals the app's database.
+func TestReleaseResumesAcrossATruncate(t *testing.T) {
+	t.Parallel()
+	e := harness.New(t)
+	ctx := context.Background()
+	app := e.StartApp(name)
+	h, _, _ := e.Files.Open(ctx, shardName(name))
+	truncate := false
+	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W,
+		Durable: func(ctx context.Context) error {
+			if truncate {
+				truncate = false
+				// busy first in the reply: 0 says the truncate ran and emptied
+				// the WAL rather than finding the file busy.
+				if reply := app.Must(t, "ckpt", "a", "TRUNCATE"); !strings.HasPrefix(reply, "0,") {
+					t.Fatalf("wal_checkpoint(TRUNCATE) answered %s, want busy 0", reply)
+				}
+				for range 3 {
+					app.Must(t, "insert", "a", "1", "100")
+				}
+			}
+			return e.W.Flush(ctx)
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.Must(t, "insert", "a", "5", "20000")
+	if err := sh.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	at := sh.Position()
+	before := header(t, sh)
+	_, beforeFileFrames := walFileInfo(t, e.Path(name))
+	truncate = true
+	if released, _, err := sh.Release(ctx, nil, capture.ResumeIfHeld); err != nil || released {
+		t.Fatalf("release across the truncate: released=%v err=%v", released, err)
+	}
+	// The resumed sync queued its file after the release's own wait for
+	// durability, so the writer is flushed here before the journal is read.
+	if err := e.W.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	after := header(t, sh)
+	afterSalts, afterFileFrames := walFileInfo(t, e.Path(name))
+	if walSalts(before) == walSalts(after) || walSalts(after) != afterSalts {
+		t.Fatal("the WAL was not truncated and restarted in the window")
+	}
+	// The truncate cut the file down to the new commits' frames, far fewer
+	// than it held before: whatever reads the WAL by its file size reads a
+	// shorter WAL than the one capture had read to.
+	if afterFileFrames >= beforeFileFrames || afterFileFrames > 6 {
+		t.Fatalf("the WAL file holds %d frames after the truncate, want the new commits' few (was %d)", afterFileFrames, beforeFileFrames)
+	}
+	// The whole database as one file, counted as one commit: one entry past
+	// the position the release stopped at.
+	var en journal.Entry
+	var seq pos.Seg
+	if err := journal.Scan(ctx, e.Journal, 1, 0, func(s pos.Seg, en2 journal.Entry) error {
+		if en2.Shard.String() == name && en2.Position > at {
+			if en.Position != 0 {
+				t.Fatalf("two files past %d (%d and %d), want one whole-database file", at, en.Position, en2.Position)
+			}
+			en, seq = en2, s
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if seq == 0 {
+		t.Fatal("the commits past the truncate were not captured as a file of their own")
+	}
+	if en.Position != at+1 || en.Count != 1 {
+		t.Fatalf("the file past %d is %d+%d, want %d+1", at, en.Position, en.Count, at+1)
+	}
+	b, err := harness.ReadEntry(ctx, e.Journal, seq, en)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pages, commit := pageCount(t, b)
+	if pages != commit {
+		t.Fatalf("the file after the truncate holds %d of the database's %d pages: the whole database was not written", pages, commit)
+	}
+	// The new WAL never held most of those pages (its few frames are the
+	// window's commits), so the file carried them from the database file.
+	if int64(commit) <= afterFileFrames {
+		t.Fatalf("the database is %d pages and the new WAL %d frames: the truncate did not leave pages for the database file to carry", commit, afterFileFrames)
+	}
+	if got := sh.Position(); got != at+1 {
+		t.Fatalf("position %d after the truncate, want %d advanced by the one commit alone", got, at+1)
+	}
+	replayed := filepath.Join(t.TempDir(), "replayed.db")
+	replayInto(t, e, replayed)
+	if want, got := apptest.Dump(t, e.Path(name)), sqlitetest.Dump(t, replayed); want != got {
+		t.Fatal("the history across the truncate does not restore to the app's database")
+	}
+	app.Must(t, "close", "a")
+	if released, _, err := sh.Release(ctx, nil, capture.ResumeIfHeld); err != nil || !released {
+		t.Fatalf("release after the truncate: released=%v err=%v", released, err)
+	}
+}
+
+// The same-WAL resume, the good branch beside the storm and the truncate:
+// the app keeps the shard open through the window, so the checkpoint a last
+// connection closing runs is not the node's to trigger (the app's connection
+// is not the last), and with the app's automatic checkpoints off its commits
+// stay in the same WAL, salts and all. The resumed release's proof holds
+// (the same salts, at least the frames capture had read), so the sync
+// captures only the new frames: one small file, the position advanced by
+// them alone, not a whole database.
+func TestReleaseResumesFromTheSameWAL(t *testing.T) {
+	t.Parallel()
+	e := harness.New(t)
+	ctx := context.Background()
+	app := e.StartApp(name)
+	h, _, _ := e.Files.Open(ctx, shardName(name))
+	commit := false
+	sh, err := capture.New(capture.Config{TempDir: tempDir(t), Name: shardName(name), Path: e.Path(name), Generation: h.Manifest.Generation, Writer: e.W,
+		Durable: func(ctx context.Context) error {
+			if commit {
+				commit = false
+				// Nothing in the window may restart the WAL: the automatic
+				// checkpoints off, three small commits.
+				app.Must(t, "exec", "a", "PRAGMA wal_autocheckpoint=0")
+				for range 3 {
+					app.Must(t, "insert", "a", "1", "100")
+				}
+			}
+			return e.W.Flush(ctx)
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.Must(t, "insert", "a", "5", "20000")
+	if err := sh.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	at := sh.Position()
+	before := header(t, sh)
+	commit = true
+	if released, _, err := sh.Release(ctx, nil, capture.ResumeIfHeld); err != nil || released {
+		t.Fatalf("release with the app committing in the window: released=%v err=%v", released, err)
+	}
+	// The resumed sync queued its file after the release's own wait for
+	// durability, so the writer is flushed here before the journal is read.
+	if err := e.W.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	after := header(t, sh)
+	if walSalts(before) != walSalts(after) {
+		t.Fatal("the WAL did not survive the window: the commits did not stay in the same one")
+	}
+	if got, want := walFrames(after), walFrames(before)+3; got != want {
+		t.Fatalf("the WAL grew to %d frames in the window, want %d", got, want)
+	}
+	// One delta of the new commits: one file past the release's position,
+	// three commits, and pages fewer than the database holds (not a whole
+	// database write, which is the other branch).
+	var en journal.Entry
+	var seq pos.Seg
+	if err := journal.Scan(ctx, e.Journal, 1, 0, func(s pos.Seg, en2 journal.Entry) error {
+		if en2.Shard.String() == name && en2.Position > at {
+			if en.Position != 0 {
+				t.Fatalf("two files past %d (%d and %d), want one", at, en.Position, en2.Position)
+			}
+			en, seq = en2, s
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if seq == 0 {
+		t.Fatal("the window's commits were not captured as a file of their own")
+	}
+	if en.Position != at+1 || en.Count != 3 {
+		t.Fatalf("the file past %d is %d+%d, want %d+3", at, en.Position, en.Count, at+1)
+	}
+	b, err := harness.ReadEntry(ctx, e.Journal, seq, en)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pages, commitPages := pageCount(t, b); pages >= commitPages {
+		t.Fatalf("the resumed file holds %d pages of a %d page database: the whole database was written where only the new frames were wanted", pages, commitPages)
+	}
+	if got := sh.Position(); got != at+3 {
+		t.Fatalf("position %d after the resume, want %d advanced by the three commits alone", got, at+3)
+	}
+	replayed := filepath.Join(t.TempDir(), "replayed.db")
+	replayInto(t, e, replayed)
+	if want, got := apptest.Dump(t, e.Path(name)), sqlitetest.Dump(t, replayed); want != got {
+		t.Fatal("the history across the same-WAL resume does not restore to the app's database")
+	}
+	app.Must(t, "close", "a")
+	if released, _, err := sh.Release(ctx, nil, capture.ResumeIfHeld); err != nil || !released {
+		t.Fatalf("release after the resume: released=%v err=%v", released, err)
 	}
 }
 

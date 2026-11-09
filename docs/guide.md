@@ -1,6 +1,6 @@
 # shardlite guide
 
-For people who build apps on shardlite and people who run it. The [overview](overview.md) introduces the concepts, and the [reference](#reference) at the end lists every header, endpoint, setting and reserved table. How the node does what it does is in [internals](internals.md).
+For people who build apps on shardlite. Whoever runs the cluster wants [deployment](deployment.md). The [overview](overview.md) introduces the concepts, and the [reference](#reference) at the end lists every header, endpoint and reserved table. How the node does what it does is in [internals](internals.md).
 
 ## Serving
 
@@ -9,11 +9,12 @@ The node routes requests and calls for any shard of a kind the app serves. Any i
 The node sits in front of the app. For each request it works out the shard (see [Routing requests to shards](#routing-requests-to-shards)), activates it if needed and forwards to the app with:
 
 ```
-Shardlite-Opened: users/42
-Shardlite-File:   /data/users/42.k3x9.7f3a9c1e5b20.db
+Shardlite-Opened:  users/42
+Shardlite-File:    /data/users/42.k3x9.7f3a9c1e5b20.db
+Shardlite-Context: shard="users/42", hops=0
 ```
 
-`Shardlite-Opened` is the shard the node opened for this request. It says what the node did, not what the request is for. The app works out which shard a request is for from the request itself (the path, the payload, the first gRPC message). If that is the opened shard, the app uses the open file. If it is another shard, or a shard route came with no hint, the app **refuses** the request with `400` and a body saying the hint doesn't match, and the client fixes its hint. Not `404`, which the node answers for a shard that doesn't exist or a kind clients can't name, so a client would drop a shard it should only re-address, and not `421`, which HTTP/2 clients retry by themselves on a new connection and which nodes use between themselves. A wrong hint is a stale client (it left the guild, the match ended) or a bug, and the refusal tells it so. If the node opened nothing, the request is **shardless**: the app serves it, and a shard it needs is one whose id the app worked out itself ("my guild", "my match") or took from something it verified (a webhook's signed payload), reached by an ordinary call (see [Shardless requests that need a shard](#shardless-requests-that-need-a-shard)). The client's limits (only kinds clients can name, never creating a shard) stay where the node enforces them, on the client's own request.
+`Shardlite-Opened` is the shard the node opened for this request. `Shardlite-Context` names it with the request's hops, and the app passes it back unchanged on the calls it makes while serving the request (see [Calls between shards](#calls-between-shards)). The app works out which shard a request is for from the request itself (the path, the payload, the first gRPC message). If that is the opened shard, the app uses the open file. If it is another shard, or a shard route came with no hint, the app **refuses** the request with `400` and a body saying the hint doesn't match. A wrong hint is a stale client or a bug, and the refusal tells it so: not `404`, which a client would take for a shard to drop, and not `421`, which HTTP/2 clients retry by themselves. If the node opened nothing, the request is **shardless**: the app serves it, and a shard it needs is one whose id the app worked out itself ("my guild") or took from something it verified (a webhook's signed payload), reached by an ordinary call (see [Shardless requests that need a shard](#shardless-requests-that-need-a-shard)).
 
 The proxy handles HTTP, gRPC, server-sent events and WebSocket, passing requests through unchanged apart from `Shardlite-*` headers, which the node strips from client requests and app responses. Client requests for paths under `/_shardlite/` are refused, except the node's own `GET /_shardlite/ready`. Custom UDP, WebRTC and raw TCP go direct to the app's own servers, such as a game server that is a [single writer](#a-single-writer) of its world.
 
@@ -21,23 +22,23 @@ The proxy handles HTTP, gRPC, server-sent events and WebSocket, passing requests
 
 The app and node share a local filesystem on one kernel (the same host, with a shared volume in containers). Network filesystems are not supported, since they break SQLite locking. The app:
 
-- opens `Shardlite-File` with any SQLite driver of 3.37.0 (2021) or later (the reserved tables are STRICT, which older versions cannot open), in read-write mode without create (`mode=rw` in a `file:` URI), and never builds paths itself. The node creates the file before it hands the path out, so an open that fails means the path is no longer the shard's, and an app that created it would make a new empty database that nothing captures. The path changes whenever the node gives the shard a new file (each time it is claimed again), so key a connection pool by the path it was given, not by the shard;
-- uses WAL mode with default locking (not `locking_mode=EXCLUSIVE` or a VFS without shared memory);
+- opens `Shardlite-File` with any SQLite driver of 3.37.0 (2021) or later (the reserved tables are STRICT), in read-write mode without create (`mode=rw` in a `file:` URI), once per request, and never builds paths itself. The node creates the file before it hands the path out, so an open that fails means the path is no longer the shard's, and an app that created it would make an empty database that nothing captures. The path changes whenever the shard gets a new file, so the connection, its statements and its transactions end with the request. Opening per request costs roughly 50 to 100 µs;
+- uses WAL mode with default locking (not `locking_mode=EXCLUSIVE` or a VFS without shared memory) and sets `busy_timeout` (5000 ms, what the SDK runs), since the node takes the write lock now and then and writers would otherwise fail with `SQLITE_BUSY`. A write transaction held across a call waits the five seconds before failing;
 - only runs passive checkpoints, as SQLite's automatic ones are. `FULL`, `RESTART` and `TRUNCATE` always find the shard busy, since the node holds a read transaction on it;
-- closes its connections to a shard within the kind's idle timeout of last using it (for example a pool with `SetConnMaxIdleTime` in Go). Setting `idle_timeout` on every kind and giving the pool the value from the declaration the app serves keeps the two in step. The node lets go of a shard once no request holds it and the app has closed its file. A shard whose file the app still has open stays active, and the node looks at it again after a wait that grows up to the kind's idle timeout. A pool that closes slowly is no problem (Go's `database/sql` can keep a connection for up to about twice `SetConnMaxIdleTime`), but a file still open a whole idle timeout after the node first found it held is a leak: the node logs a warning naming the shard (once for that hold) and counts it, and the shard stays active, costing memory and descriptors, until the app closes the file. Nothing is lost meanwhile, since the node still captures the commits made through the open connection. Only a stop lets go of a shard whose file is open, at once and without waiting, because the app is stopping too. It deletes the file: opening the old path again with `mode=rw` fails, but a commit through a connection that was already open succeeds on the deleted file and is lost, because SQLite in WAL mode doesn't notice a deleted database. The node logs a warning naming the shard when this happens, and the connection is the app's bug;
-- never writes a shard outside a request or a wake, since the node lets go of a shard once no request holds it, and a write from a background thread, a timer or a connection kept open can land on a file nobody captures;
+- closes the request's connection when the request ends. The node lets go of a shard once no request holds it and the app has closed its file. A file the app keeps open holds the shard active (with a warning once the hold outlasts the kind's idle timeout), and only a stop goes ahead over it (see [internals](internals.md#letting-go-of-a-shard));
+- never writes a shard outside a request or a wake, since a write from a background thread, a timer or a connection kept open can land on a file nobody captures;
 - treats tables whose names start with `_shardlite_` as reserved (see [Reserved tables](#reserved-tables));
 - serves `GET /_shardlite/ready` with its declaration (see [Shard kinds](#shard-kinds)), and `POST /_shardlite/reminders` if it sets reminders;
-- follows the [rules for app code](#rules-for-app-code).
+- on a stop, stops accepting requests and finishes the ones in flight, as any web app behind a load balancer does. The node and the app can stop in either order (see [deployment](deployment.md#stop-order)).
 
 ### Schema migrations
 
-Migrations belong to the app, with whatever tooling it already uses. The node knows nothing about schemas. Recommendations:
+Migrations belong to the app, with whatever tooling it already uses. The node knows nothing about schemas. A Go app without tooling can use the `migrate` module (`github.com/luci1900/shardlite/migrate`), which runs in the transaction the app already holds, keeps the version in `user_version` and reads golang-migrate's `{n}_{name}.up.sql` naming.
 
 - Check `PRAGMA user_version` when opening a shard and migrate if needed. Migrations are lazy, so only shards opened since a deploy are on the new version. Refuse shards newer than the app can read.
 - Set `PRAGMA application_id` in the first migration to a hash of the app's identifier and the kind, and check it on open, so a shard is never opened as the wrong kind.
 - Make the tables STRICT, so the save format refuses what it cannot read back.
-- Prefer expand and contract, so a rollback is redeploying the previous release. For changes that can't be additive, ship down migrations too.
+- Prefer expand and contract, so a rollback is redeploying the previous release.
 
 ### Shard kinds
 
@@ -54,15 +55,15 @@ The app declares itself at `GET /_shardlite/ready`, which answers a JSON declara
 }
 ```
 
-The node polls the route, and a 2xx answer that parses as a valid declaration is both the app's health check and the source of its kinds. Keep the declaration in a file in the app's repository and serve it from the route: it is a contract between the app and the cluster, and its diff belongs in version control. The route is under `/_shardlite/`, which the node refuses to clients, so the declaration (which lists kinds clients may not name) reaches only the node. The fields are in the [reference](#declaration).
+The node polls the route, and a 2xx answer that parses as a valid declaration is both the app's health check and the source of its kinds. The declaration is a contract between the app and the cluster, and its diff belongs in version control: an app on an SDK serves the declaration the SDK builds from its kinds, and an app without one keeps the JSON in a file in the repository (the fields are in the [reference](#declaration)). The route is under `/_shardlite/`, which clients can't reach, so the declaration reaches only the node.
 
-- The version is an opaque string the node logs and does nothing else with.
-- Kinds from libraries go in the app's declaration under names the app picks (`matchmaker.queue`). A kind named twice makes the node report not ready, so two libraries can't share one by accident.
-- A node with `SHARDLITE_APP` serves every kind the app declares. One without serves no kinds and answers every request for a shard as undeclared, while still taking part in the [reconcilers](#reconcilers).
-- Clients can only name kinds marked `public`. A client that names any other kind gets the same answer as for an undeclared kind, so it can't tell the kind exists. The node logs why, so a kind that should be `public` is easy to spot in development.
-- Requests and calls for undeclared kinds are refused, which catches typos. A name that doesn't fit the [grammar](#shard-names) is malformed and gets `400`.
-- A changed declaration takes effect at the next poll, for new activations and responses. A poll that fails changes nothing: the node keeps the last good kinds and reports not ready until a good declaration comes.
-- The node reports ready (`GET /_shardlite/ready` on the public listener, which the load balancer polls) only while the app's declaration is current, its lease is good and it isn't draining (see [Running shardlite](#running-shardlite)), so a bad deploy stops at the first node.
+- The version is an opaque string the node logs.
+- Kinds from libraries go in the app's declaration under names the app picks (`matchmaker.queue`). A kind named twice makes the node report not ready.
+- A node with [`SHARDLITE_APP`](deployment.md#environment-variables) serves every kind the app declares. One without serves no kinds and answers every request for a shard as undeclared, while still taking part in the [reconcilers](#reconcilers).
+- Clients can only name kinds marked `public`. Any other kind gets the same answer as an undeclared one, so a client can't tell the kind exists. The node logs why.
+- Requests and calls for undeclared kinds are refused, which catches typos. A name that doesn't fit the [grammar](#shard-names) gets `400`.
+- A changed declaration takes effect at the next poll. A poll that fails changes nothing: the node keeps the last good kinds and reports not ready until a good declaration comes.
+- The node reports ready (`GET /_shardlite/ready` on the public listener, which the load balancer polls) only while the app's declaration is current, its lease is good and it isn't draining.
 
 ## Routing requests to shards
 
@@ -74,15 +75,15 @@ The node takes the shard a client names from fixed conventions, in this order:
 2. **Query parameter:** `?shardlite-target=guildchat/7`, which the node strips. This is the convention for browser WebSockets, which can't set headers.
 3. **No shard.** The node is a plain reverse proxy: login, news, store catalogues and health checks.
 
-The conventions are fixed, not configured per kind or app, so old and new app versions never send the same URL to different shards during a rolling deploy. The header and the parameter are hints. A right one reaches the owner with the file open. A wrong one costs an activation of the shard it names and a refusal from the app (see [Serving](#serving)), since the node routes by the hint before any app code runs. A protocol that routes on its payload (the first gRPC message) sends the hint as well (gRPC as metadata), or is served as shardless and resolved by the app.
+The conventions are fixed, not configured per kind or app, so old and new app versions never send the same URL to different shards during a rolling deploy. The header and the parameter are hints. A right one reaches the owner with the file open. A wrong one costs an activation of the shard it names and a refusal from the app (see [Serving](#serving)). A protocol that routes on its payload (the first gRPC message) sends the hint as well, or is served as shardless and resolved by the app.
 
 ### Kinds clients can name
 
-A client that names a shard reaches its activation before any app code runs. Clients can't create shards, but they can activate or restore any existing shard of a kind they can name, which costs blob storage requests even when the app then rejects the request. An id that doesn't exist costs one blob read, and gets the same `404` as a kind that isn't `public`. Recommendations:
+A client that names a shard reaches its activation before any app code runs. Clients can't create shards, but they can activate or restore any existing shard of a kind they can name, which costs blob storage requests even when the app then rejects the request. An id that doesn't exist costs one blob read and gets the same `404` as a kind that isn't `public`.
 
 - **Make a kind `public` only if clients need to name it,** usually the player's own shard and anything they hold a long-lived connection to. Every other kind is reached through calls from the app after it has authenticated the request.
 - **Give kinds clients can name unguessable ids** (random UUIDs), so ids can't be used to force restores or find out which exist. A kind with guessable ids, such as an index keyed by email, must stay non-public.
-- **Keep hot shared shards behind the app.** A shard many clients can reach sends all their requests to one node and one writer. Split it from the start and put caching or rate limiting in front of it (see [Recommendations](#recommendations-for-app-code)).
+- **Keep hot shared shards behind the app.** A shard many clients can reach sends all their requests to one node and one writer. Split it and put caching or rate limiting in front of it (see [Recommendations](#recommendations-for-app-code)).
 
 Rate limiting at the load balancer is still the defence against a flood.
 
@@ -93,19 +94,19 @@ A shardless route is an ordinary app route. When its request belongs to a shard 
 - **calls the shard** with `Shardlite-Target: users/42`, passing on the client's credentials so the shard authenticates as usual (this works where a redirect doesn't), or
 - **tells the client where the shard is:** a URL that names it (`/login?shardlite-target=users/42`) or a `307` to it. WebSocket handshakes can't follow redirects, so they get the URL in an ordinary response.
 
-Call a new shard before redirecting to it, since a client can only reach a shard that exists. For ids the client chooses, the client picks the id and a shardless handler calls the shard's init route, which records the creator, answers success to the creator on a retry and `409` to anyone else. Rate-limit that route per user, since each new id it accepts is a new shard in storage. These decisions are app code, so old and new versions can disagree: keep them stable across releases and change one over two releases (first make the new target handle requests sent to the old one, then switch).
+Call a new shard before redirecting to it, since a client can only reach a shard that exists. For ids the client chooses, a shardless handler calls the shard's init route, which records the creator, answers success to the creator on a retry and `409` to anyone else. Rate-limit that route per user, since each new id it accepts is a new shard in storage. Keep these decisions stable across releases and change one over two releases (first make the new target handle requests sent to the old one, then switch).
 
 ### Logging in
 
-Players log in with a provider (Steam, PSN, a username and password) and reach one account however they logged in, as a centralised database would do with an accounts table and a table per provider:
+Players log in with a provider (Steam, PSN, a username and password) and reach one account however they logged in:
 
 1. **A kind per provider, split at least 64 ways** (`steam-ids/<hash % 64>`, non-public). Each row maps an identity to an account id, and a provider's own columns (a password hash) live there.
-2. **Login** looks up the row, creating it with a new UUID if it's missing (or after asking the player, if the game does), then calls the account (`users/<uuid>`) with the identity.
+2. **Login** looks up the row, creating it with a new UUID if it's missing, then calls the account (`users/<uuid>`) with the identity.
 3. **The account adds** any identity it's called with to its own list.
 4. **Linking and relinking** change the row (linking only if it isn't linked yet), then call the new account as in login.
 5. **Before the account relies on its list** (to show it, unlink or delete), it drops entries whose row no longer points at it.
 
-The rows are the truth and the account's list is a cache that logins refill, so nothing has to keep them in step. Whether to ask before creating, link codes, merges and a website for relinking are the game's choices on top.
+The rows are the truth and the account's list is a cache that logins refill, so nothing has to keep them in step.
 
 ### Connections and home shards
 
@@ -115,7 +116,7 @@ A WebSocket connection is tied to one shard, its client's **home shard** (normal
 
 The app creates shards and clients reach them. Any id can be called and the first call creates the shard, empty, before the app sees it. A request a client routes to a shard that doesn't exist gets the same `404` as an undeclared kind.
 
-When a shard deactivates holding nothing of the app's (no table, index, `user_version` or `application_id`), the node deletes it, and a client request for it gets `404` until the app calls it again. The first open migrates the schema, so only an app with no migrations yet leaves an empty shard (the node logs the first such deletion of each kind). Clients need one rule: on `404`, go back through the app rather than retry the same target.
+When a shard deactivates holding nothing of the app's (no table, index, `user_version` or `application_id`), the node deletes it, and a client request for it gets `404` until the app calls it again. The first open migrates the schema, so only an app with no migrations yet leaves an empty shard. Clients need one rule: on `404`, go back through the app rather than retry the same target.
 
 ## Durability
 
@@ -126,7 +127,7 @@ Each kind sets `"sync"` in its declaration: `"none"` or `"storage"` (the default
 | `none` | nowhere | can lose the commits not yet in storage, up to a flush interval and a PUT | can lose the same, and every commit storage does not have yet | Postgres with `synchronous_commit = off` |
 | `storage` (the default) | blob storage | covered | covered | Postgres with WAL shipping made synchronous |
 
-`none` adds no latency, and is right for output that can be rebuilt or lost (presence, positions, chat). `storage` adds up to `SHARDLITE_FLUSH_MIN` plus one PUT, shared by the answers waiting: roughly 50–200 ms on S3 Standard. To make it faster, lower `SHARDLITE_FLUSH_MIN`: at 20 ms a busy node writes up to 50 journal PUTs a second while output waits, against 10 at the default.
+`none` adds no latency, and is right for output that can be rebuilt or lost (presence, positions, chat). `storage` adds up to [`SHARDLITE_FLUSH_MIN`](deployment.md#environment-variables) plus one PUT, shared by the answers waiting: roughly 50–200 ms on S3 Standard. Lowering `SHARDLITE_FLUSH_MIN` makes it faster at the cost of more journal PUTs.
 
 Nothing leaves a shard before what it committed earlier met its tier. The node holds responses, streams and calls to other shards alike (a `wallet` shard can't debit gold, call `inventory/42` to grant an item and then lose the debit in a crash). Output from a shard with nothing new to commit passes without waiting on `none`. Every chunk of a stream can wait for its tier, pings included, so real-time kinds should use `none`. The app can override its kind's tier for one response or call with `Shardlite-Sync: none` or `storage`.
 
@@ -143,21 +144,27 @@ Each shard has one owner, which serves every request for it, and SQLite orders i
 
 On `storage` a shard behaves as one copy of the database: once a write is acknowledged, every read that starts afterwards sees it, on whichever node the request lands. `none` promises the same only until the node crashes.
 
-A `storage` answer is confirmed before it leaves: the node knows that nobody else has begun to take its shards since the answer was read. A write is confirmed by its own segment reaching storage. A read waits for a segment the node is writing anyway, or for one read of its own lease, shared by every answer waiting, so an idle node pays one blob GET (tens of milliseconds on S3) and a busy node nothing extra. A request is confirmed once, at its first chunk, so a stream is linearizable at its start and then follows the node's copy in order until the node notices it has lost the shard (within a lease renewal, 3 s by default). An app that needs the shard as it is now polls. If the lease has been taken the node stops, and if it cannot be read the answer fails with `503` and a retry hint.
+A `storage` answer is confirmed before it leaves: the node checks that nobody has begun to take the shard over since the answer was read, which costs an idle node one blob GET and a busy node nothing. A request is confirmed once, at its first chunk, so a stream is linearizable at its start and then follows the node's copy in order (how is in [internals](internals.md#confirming-ownership)). If the lease has been taken the node stops, and if it cannot be read the answer fails with `503` and a retry hint.
 
-"Working clocks" applies to `none`, which answers without confirming. It means clock rates on different nodes agree to within 20% (they need not be synchronised) and no machine is paused in a way its own clocks don't see, which a hypervisor can do. A hot read endpoint that can live with that sends `Shardlite-Sync: none` on its response to skip the confirmation. The node checks what it can: it compares its clock with the store's `Date` header, warns when the offset passes a second and refuses to start past the lease TTL, but nothing checks the rate and no answer fails on the clock.
+"Working clocks" applies to `none`, which answers without confirming. It means clock rates on different nodes agree to within 20% (they need not be synchronised) and no machine is paused in a way its own clocks don't see, which a hypervisor can do. A hot read endpoint that can live with that sends `Shardlite-Sync: none` on its response to skip the confirmation. The node warns when its clock and the store's differ by over a second, but nothing checks the rate and no answer fails on the clock.
 
-The guarantees hold for what goes through the node and what the app reads from the shard's database. An app that answers from its own in-memory copy can serve something older: keep such a cache no longer than an open connection and check `PRAGMA data_version` before using it, or keep a version row that every write bumps. Across shards there are no transactions: two reads of two shards are two separate reads, not a snapshot. Calls happen at most once per attempt, and a [durable send](#durable-send) at least once.
+The guarantees hold for what goes through the node and what the app reads from the shard's database. An app that answers from its own in-memory copy can serve something older: keep such a cache no longer than an open connection and check `PRAGMA data_version` before using it. Across shards there are no transactions: two reads of two shards are two separate reads, not a snapshot. Calls happen at most once per attempt, and a [durable send](#durable-send) at least once.
 
 ## Localhost control API
 
-The app talks to its node over HTTP on localhost TCP or a Unix socket, on a separate listener from the public one, so apps may send `Shardlite-*` headers to it. Most of the API is headers on the app's normal requests: a request with `Shardlite-Target` is a [call](#calls-between-shards). The rest is in the [reference](#control-api).
+The app talks to its node over HTTP on localhost TCP, on a separate listener from the public one, so apps may send `Shardlite-*` headers to it. Most of the API is headers on the app's normal requests: a request with `Shardlite-Target` is a [call](#calls-between-shards). The rest is in the [reference](#control-api).
+
+## Using the SDK
+
+Two SDKs cover the part of this contract that is the same in every app: the Go SDK at `sdk/go` (standard library only) and the TypeScript SDK at `sdk/ts` (no runtime dependencies, so it runs on Node, Bun and Deno). Each one's guide is its own documentation: [sdk/go/doc.go](../sdk/go/doc.go) and [sdk/ts/README.md](../sdk/ts/README.md). The app brings its own SQLite driver, and routing, migrations and retries stay the app's own. Everything stays plain HTTP and SQL, so an app without an SDK works the same.
+
+Both have one shape. An app builds one value from a config (the opener, the kinds, the version) and serves the declaration from it. A route that belongs to a shard calls `Expect` (`expect`) to check what the node opened, or `ExpectCall` for a route that only takes calls and for the wake, and gets the shard's `Opened` or a refusal to answer with `400`. Calls are made on the request's scope, so they carry its context. An app is tested against a real node: `shardlitetest.Start` in Go and `startNode` in TypeScript start one on `memory://`.
 
 ## Deleting shards
 
-A shard deletes itself. When it deactivates holding a table named `_shardlite_delete`, its data goes, and a later call for the same id creates a new, empty shard that never sees the old data. `CREATE TABLE _shardlite_delete (x)` in any transaction marks it. Its due reminders are handled first, and later ones go with it. Until deactivation the shard is served as usual, so the app can check for the table and refuse requests. Uses: matches, trades and lobbies that end.
+A shard deletes itself. When it deactivates marked for deletion, its data goes, and a later call for the same id creates a new, empty shard that never sees the old data. The node creates the `_shardlite_delete` table (see [Reserved tables](#reserved-tables)), and a row in it marks the shard: `INSERT OR IGNORE INTO _shardlite_delete VALUES (1)` in any transaction, which the SDK's `MarkDeleted` runs. Deleting the row unmarks it. Its due reminders are handled first, and later ones go with it. Until deactivation the shard is served as usual, so the app can check for the row and refuse requests. Uses: matches, trades and lobbies that end.
 
-No call deletes a shard from outside, since a delete would race with requests and the app's open files. For a deletion decided outside the shard (account deletion, say), add a route to the shard that finishes its work and creates the marker. The shard is deleted within its idle timeout. Deleting a shard that isn't active is left to the operator, and no command does it yet.
+No call deletes a shard from outside, since a delete would race with requests and the app's open files. For a deletion decided outside the shard (account deletion, say), add a route to the shard that finishes its work and marks the shard. The shard is deleted within its idle timeout. Deleting a shard that isn't active is left to the operator, and no command does it yet.
 
 ## Calls between shards
 
@@ -178,17 +185,18 @@ app (users/42) → POST localhost:2282/invite
                    remote → forward to the owner node → its app/invite
 ```
 
-- **The target is explicit.** The path, method and body pass through unchanged, so this works for REST, GraphQL or gRPC. A call from a shard can't be upgraded to a WebSocket (`400`), so use server-sent events or a gRPC stream for subscriptions. Calls from the app with no shard behind them can upgrade. A local call costs about 0.1 ms and a remote one adds 0.5–2 ms.
-- **The callee knows the caller.** The app sets `Shardlite-Caller: users/42` (copied from the `Shardlite-Opened` it received), or `app` for a call with no shard behind it. The node strips the header from external requests, so it grants access to internal routes, which require it. A route that only takes calls may take its identity from `Shardlite-Opened`. A route clients can reach authenticates every request and works out the shard from the request, whoever sends it.
+- **The target is explicit.** The path, method and body pass through unchanged, so this works for REST, GraphQL or gRPC. A call from a shard can't be upgraded to a WebSocket (`400`), so use server-sent events or a gRPC stream for subscriptions. A local call costs about 0.1 ms and a remote one adds 0.5–2 ms.
+- **The context goes with the call.** The app passes `Shardlite-Context` and `traceparent` back unchanged on every call it makes while serving a request. The node takes the call's caller and hops from the context. A call without one is from the app (no shard behind it, and it can upgrade to a WebSocket).
+- **The callee knows the caller.** The node sets `Shardlite-Caller: users/42` on the request it sends the callee, or `app` for a call from the app. The node strips the header from external requests, so it grants access to internal routes, which require it. A route that only takes calls may take its identity from `Shardlite-Opened`. A route clients can reach authenticates every request and works out the shard from the request, whoever sends it.
 - **Gates apply on both sides.** The caller's gate holds the call until the caller's kind's tier has its commits, and the callee's holds the answer.
 - **Calls activate and create the target,** unless the call sends `Shardlite-If-Active: true` (answer `404` rather than activate, for presence checks and fan-out to members who may be offline) or `Shardlite-If-Exists: true` (answer `404` rather than create). Use `Shardlite-If-Exists` for any call whose id came from a client, so random ids don't create shards through app code.
-- **Hops are limited.** The app passes `Shardlite-Hops` on as it would `traceparent`. The node increments it and refuses past `SHARDLITE_MAX_HOPS` with `508`, which stops runaway recursion.
+- **Hops are limited.** The node adds one hop on each call and refuses past [`SHARDLITE_MAX_HOPS`](deployment.md#environment-variables) with `508`, which stops runaway recursion.
 - **Cancellation propagates.** When a client disconnects or a caller gives up, the node cancels the request on every hop it controls (writes already committed are not rolled back). Timeouts are the app's, set on its own HTTP or gRPC client.
 - **The node never retries a request the app may have seen,** so calls that change state should carry an idempotency key.
 
-**gRPC** works in both directions: the app adds `shardlite-target` metadata (usually with a client interceptor) and the node proxies HTTP/2 without TLS, trailers and streams as they are. Its own errors are gRPC status responses. It never parses messages and doesn't read `grpc-timeout`.
+**gRPC** works in both directions: the app adds `shardlite-target` and `shardlite-context` metadata (usually with a client interceptor) and the node proxies HTTP/2 without TLS, trailers and streams as they are. Its own errors are gRPC status responses. It never parses messages and doesn't read `grpc-timeout`.
 
-**Reaching many shards.** For guild chat or a group invite, call each member's shard in parallel with `Shardlite-If-Active: true` so offline members aren't woken. The app keeps control of retries and timeouts.
+**Reaching many shards.** For guild chat or a group invite, call each member's shard in parallel with `Shardlite-If-Active: true` so offline members aren't woken.
 
 ## Reminders
 
@@ -198,13 +206,13 @@ A reminder is a row a shard sets for itself, with the time it is due: an upgrade
 _shardlite_reminders (key TEXT PRIMARY KEY, due INTEGER NOT NULL) STRICT  -- due in Unix seconds
 ```
 
-- **The rows are the app's.** It inserts, reschedules and deletes them with plain SQL in its own transactions (`INSERT … ON CONFLICT (key) DO UPDATE SET due = excluded.due`, and `DELETE` to cancel). Anything a reminder needs lives in the app's own tables under the same key, so the reminder and its data commit together. The table is STRICT, so a value of the wrong type is refused (a date string in `due` would otherwise wake nobody, ever), though a numeric string or a whole float still converts to an integer.
-- **The wake.** When the earliest due time has come, the node calls `POST /_shardlite/reminders` on the shard's app (no body, `Shardlite-Opened` and `Shardlite-Caller` naming the shard) and gives it 30 seconds to answer. The handler takes its identity from `Shardlite-Opened`, and can trust that the call came from its own node, which answers `404` to every other request under `/_shardlite/`. A wake never acts on a commit that could still be lost.
+- **The rows are the app's.** It inserts, reschedules and deletes them with plain SQL in its own transactions (`INSERT … ON CONFLICT (key) DO UPDATE SET due = excluded.due`, and `DELETE` to cancel). Anything a reminder needs lives in the app's own tables under the same key, so the reminder and its data commit together.
+- **The wake.** When the earliest due time has come, the node calls `POST /_shardlite/reminders` on the shard's app (no body, with `Shardlite-Opened`, `Shardlite-Context` and `Shardlite-Caller` naming the shard) and gives it 30 seconds to answer. The handler takes its identity from `Shardlite-Opened`, and a call it makes carries the wake's context, so it is from the shard. A wake never acts on a commit that could still be lost.
 - **The handler** selects `WHERE due <= unixepoch()` and handles each row in its own transaction, so a row's work and its deletion (or next due time) commit together. It answers `2xx` once everything due is done, and `503` if a row can't be finished.
 - **Retries.** Any other status, no answer in time or rows still due after a `2xx` is a failure, and the next wake waits one second, then twice as long for each failure in a row up to a minute.
 - **Stale reminders.** A reminder due more than a day ago is ignored: it doesn't wake the shard or keep it active. It stays in the table for the app to clean up (`DELETE FROM _shardlite_reminders WHERE due < unixepoch() - 86400`).
 - **Repeats are the app's.** A handler that wants a recurring reminder sets the next `due` in the same transaction as its work. Resolution is a second.
-- **Timing.** A shard that is active is woken within about a second of its time. An inactive one is woken by the cluster, usually within a few seconds of the minute the reminder is due in, later when many shards are due in the same minute or a node has failed. Rely on the minute only. A reminder due now keeps the shard active, so the app closes its connections after handling.
+- **Timing.** A shard that is active is woken within about a second of its time. An inactive one is woken by the cluster, usually within a few seconds of the minute the reminder is due in, later when many are due at once. Rely on the minute only. A reminder due now keeps the shard active until its handler answers.
 
 ### Durable send
 
@@ -227,7 +235,7 @@ on POST /_shardlite/reminders:
   failed = false
   for each (key, target, path, body) in
       SELECT s.* FROM sends s JOIN _shardlite_reminders r USING (key) WHERE r.due <= unixepoch():
-    status = call(target, POST path, body, Shardlite-Caller: this shard, Idempotency-Key: key)
+    status = call(target, POST path, body, Idempotency-Key: key)
     if status is 2xx:
       BEGIN; DELETE FROM sends WHERE key = :key;
              DELETE FROM _shardlite_reminders WHERE key = :key; COMMIT
@@ -236,22 +244,9 @@ on POST /_shardlite/reminders:
   answer 503 if failed, else 200
 ```
 
-The receiver records `(Shardlite-Caller, Idempotency-Key)` in the same transaction as its work, and skips work it has seen:
+The receiver records `(Shardlite-Caller, Idempotency-Key)` in the same transaction as its work and skips work it has seen: it inserts into `seen (caller, key, at)` with `ON CONFLICT DO NOTHING` and, if no row was inserted, commits and answers `200` without doing the work. Entries older than a day can be dropped, since a sender stops trying once its reminder is stale.
 
-```sql
-CREATE TABLE seen (caller TEXT NOT NULL, key TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (caller, key)) STRICT;
-```
-```
-on POST /rewards:
-  BEGIN IMMEDIATE
-    INSERT INTO seen (caller, key, at) VALUES (:caller, :key, unixepoch()) ON CONFLICT DO NOTHING
-    if no row was inserted: COMMIT, answer 200       -- seen before
-    do the work
-  COMMIT; answer 200
-  now and then: DELETE FROM seen WHERE at < unixepoch() - 86400
-```
-
-- **At least once, with the work done once.** A failed call is made again at the next wake. A lost acknowledgement makes the call twice, and the receiver's record makes the work happen once. A sender stops trying once its reminder is stale, so a `seen` entry older than a day can be dropped.
+- **At least once, with the work done once.** A failed call is made again at the next wake. A lost acknowledgement makes the call twice, and the receiver's record makes the work happen once.
 - **Calls that can never succeed** (a `4xx` that retrying won't change) should be dropped or marked failed by the handler, or they are retried until the reminder goes stale.
 - **No ordering.** An app that needs order adds a sequence number per sender and receiver, and the receiver answers `503` to a number that isn't next.
 - **One handler serves every reminder the app sets.** It looks at which of the app's tables has a row under each due key.
@@ -260,24 +255,23 @@ Uses: fan-out in one transaction (rewards for 100 players at the end of a match)
 
 ## Rules for app code
 
-These are part of the contract with shardlite. Apps that break them stall or fail.
+These are part of the contract with shardlite, beyond [what an app must do](#what-an-app-must-do). Apps that break them stall or fail.
 
 - **Requests for the same shard run concurrently,** as on any database, and the shard's transactions are the concurrency control. Do a read and the write that depends on it in one transaction (`BEGIN IMMEDIATE`) or one statement (`UPDATE … SET balance = balance - 10 WHERE balance >= 10`). State kept in app memory per shard isn't protected by SQLite. Orleans and Durable Objects run one turn at a time, and an app that expects that loses updates here.
+- **Start write transactions with `BEGIN IMMEDIATE`, or retry them.** A deferred transaction that reads and then writes fails with `SQLITE_BUSY` if another connection committed in between, and `busy_timeout` doesn't retry that case.
 - **Handle concurrent requests, including calls back into the app itself.** A call to a shard on the same node arrives at the same app as a new request while the calling request waits. A single-threaded synchronous server deadlocks, and thread pools can run out when calls nest, so async servers are the safer choice.
 - **Don't hold a write transaction while calling another shard.** If `users/42` is mid-transaction, calls `guild/7` and the guild calls back, the callback can't get the write lock. Call first and then write, or commit and then call.
-- **Start write transactions with `BEGIN IMMEDIATE`, or retry them.** A deferred transaction that reads and then writes fails with `SQLITE_BUSY` if another connection committed in between, and `busy_timeout` doesn't retry that case. The node's bookkeeping commits now and then, so this is rare but happens.
-- **Open `Shardlite-File` with `mode=rw`, close connections within the kind's idle timeout and never write a shard outside a request or a wake.** The node lets go of a shard once no request holds it and the app has closed its file. A file still open past the idle timeout keeps the shard active (and the node warns once the hold outlasts another idle timeout), and only a stop deletes a file that is open: a reconnect to that path then fails, and a commit through a connection that was already open succeeds on the deleted file and is lost, without an error ([What an app must do](#what-an-app-must-do)). Use the path each request carries, since it changes when the shard is claimed again.
-- **Reconnect whenever a connection closes.** A WebSocket or stream can end at any time (a node restart or drain, which ends every connection of a shard at the stop, or the app closing it at a natural break so that its shard can move), and the close code says nothing more.
+- **Reconnect whenever a connection closes.** A WebSocket or stream can end at any time (a node restart or drain ends every connection of a shard at the stop, or the app closes it at a natural break so that its shard can move), and the close code says nothing more.
 - **Expect calls to fail and set timeouts.** A call can arrive while its target is activating or moving, and its node can fail. Retry where it makes sense.
-- **Work out the shard from the request and refuse on a mismatch** (see [Serving](#serving)). Don't answer from the open file for another shard's request, and don't skip authentication because a request arrived as a call.
+- **Don't skip authentication because a request arrived as a call,** and don't answer from the open file for another shard's request.
 
 ## Recommendations for app code
 
-- **Prefer one shard for a player's data.** Adding tables to the player shard usually beats a kind per feature (`inventory/42` and `quests/42` beside `users/42`): one shard gives one transaction across all of it, one restore at login, one owner and no calls between the parts, while kinds that split one player can land on different nodes and pay a forward for every call between them. A good exception is something large that most requests don't need (a long chat history), which would otherwise make every restore of the player shard slower. What isn't the player's alone (a trade, a guild, a match) has shards of its own anyway.
+- **Prefer one shard for a player's data.** Adding tables to the player shard usually beats a kind per feature (`inventory/42` and `quests/42` beside `users/42`): one shard gives one transaction across all of it, one restore at login and no calls between the parts, while kinds that split one player can land on different nodes and pay a forward for every call between them. A good exception is something large that most requests don't need (a long chat history). What isn't the player's alone (a trade, a guild, a match) has shards of its own anyway.
 - **Choose ids that need no lookup.** A client can choose a new shard's id (a UUIDv7), which makes creating it idempotent. An id built from other data, such as a trade between two players, can be a name-based UUID (v5) of that data.
-- **Call `sync` before acknowledging writes that must not be lost** on a `none` kind. A small commit wrapper on the SQLite driver makes this hard to forget. Use a durable send for calls that must happen.
-- **Drive time-based work from requests.** Energy, cooldowns, deadlines and daily resets can be worked out from timestamps whenever a request touches the shard, so a player who never returns costs nothing. Set a reminder only for things that must happen on time while nobody is connected, and spread reminders that many shards share (add a random delay of a few minutes), since the cluster paces them at about 1,000 a second.
-- **Warm shards a player is about to use** by calling them in the background at login or matchmaking: a cheap route, with `Shardlite-If-Exists: true` so a missing one isn't created, and a cap on how many one request warms. The call activates each shard on its owner (or claims it, if nobody owns it), so the player's first request finds it open.
+- **Acknowledge a write that must not be lost on a `none` kind with `Shardlite-Sync: storage`** on that response (the SDKs' `SetSync` and `syncHeader`). Call `sync` right before a side effect the node cannot see (a queue, an external call). Use a durable send for calls that must happen.
+- **Drive time-based work from requests.** Energy, cooldowns, deadlines and daily resets can be worked out from timestamps whenever a request touches the shard, so a player who never returns costs nothing. Set a reminder only for things that must happen on time while nobody is connected, and spread reminders that many shards share (add a random delay of a few minutes).
+- **Warm shards a player is about to use** by calling them in the background at login or matchmaking: a cheap route, with `Shardlite-If-Exists: true` so a missing one isn't created, and a cap on how many one request warms.
 - **Keep indexes in index shards, updated by durable sends** (`lobbies-index/eu`). Handlers upsert, and readers skip entries older than a timeout.
 - **Delete short-lived shards with the marker,** and a reminder for when an abandoned one should be gone at the latest.
 - **Never give shared state a single shard id.** Split anything many players write (a leaderboard, a queue, a global counter, the [login tables](#logging-in)) at least 64 ways from the start, by meaning first (season, region, mode) and then by hash, with an aggregator shard the buckets report to by durable send. An unused bucket costs nothing, while splitting later is a migration. Cache shared data (a message of the day, a guild's member list) in the app rather than reading its shard every time.
@@ -286,11 +280,11 @@ These are part of the contract with shardlite. Apps that break them stall or fai
 
 ## A single writer
 
-Some processes hold a shard's state in memory for a long time and write it back: a game server running a survival world or an MMO realm, a client syncing a cloud save, a worker that owns a job. Two of them must never both write the same shard, and whatever starts them can't promise that, since a process it thinks is dead (hung, or on a partitioned host) can still be running when its replacement starts. The shard fences them itself with an **epoch**, the same idea the node uses for its own journal:
+Some processes hold a shard's state in memory for a long time and write it back: a game server running a survival world or an MMO realm, a client syncing a cloud save, a worker that owns a job. Two of them must never both write the same shard, and whatever starts them can't promise that, since a process it thinks is dead can still be running when its replacement starts. The shard fences them itself with an **epoch**, the same idea the node uses for its own journal:
 
 - **Open.** The process's first call (`POST /open` on the shard, say) adds one to an epoch the shard keeps in a table of its own and answers it. From then on only the newest process to open the shard can change it.
 - **Save.** Every write carries the epoch, and the shard refuses one that isn't current (`409`, say). An older process finds out at its next save and stops. Its players may see a moment of rollback, and nothing it did after the newer open is kept.
-- **Nothing else.** There is no lease to renew and no close. The next open fences the old writer whether it closed or not, and a crash would skip a close anyway. Which process runs a world and where its players connect is for whatever allocates them to answer, since it knows when one dies.
+- **Nothing else.** There is no lease to renew and no close. The next open fences the old writer whether it closed or not. Which process runs a world and where its players connect is for whatever allocates them to answer.
 
 Keep the kind on `storage` (the default): an open lost in a crash could hand the same epoch to two processes.
 
@@ -298,78 +292,37 @@ Keep one save in flight and coalesce the rest, as game servers already do: while
 
 ### Showing it to players
 
-While a world runs, its players can ask its process. Other requests for it (a character's belongings, how many are on it) call it with `Shardlite-If-Active: true`, which answers `404` instead of activating it, so a large hibernated world isn't restored to answer one. Keep the kind out of `public` so that clients can't name it, and have the world publish what players need to see while it is hibernated by calls to other shards, such as a character summary in the player's shard.
+While a world runs, its players can ask its process. Other requests for it call it with `Shardlite-If-Active: true`, which answers `404` instead of activating it, so a large hibernated world isn't restored to answer one. Keep the kind out of `public`, and have the world publish what players need to see while it is hibernated by calls to other shards, such as a character summary in the player's shard.
 
 ## Running shardlite
 
-Nodes are disposable. Blob storage holds the data, and a node's disk holds only the working copies of its active shards, so a shard that has gone idle takes no disk. Local NVMe is fastest and ephemeral disks are fine.
-
-- **Kubernetes:** the node as a DaemonSet, with `SHARDLITE_APP` pointing at a Service with `internalTrafficPolicy: Local`, and the app pods and node sharing the data directory and the control socket through a `hostPath` volume. A sidecar per pod also works, but every app deploy then restarts the node, and its shards are claimed and restored again as their next requests arrive. Elsewhere the node runs as a systemd unit or similar.
-- **Development and single machines:** one node on RustFS in Docker (the Compose file the tests use). For production on one machine, keep RustFS's buckets in strict durability mode, since a store that acknowledges a write before it is on disk breaks the gates' promise.
-- **Scaling:** add nodes, and new connections and shards land on them (scale by CPU and memory). To remove one, stop it (`SIGTERM` or `SIGINT`) and it drains. Its readiness check fails, so the load balancer takes it out, and its answers and forwards say `Shardlite-Placement: avoid`, which the other nodes learn, so they place nothing on it. A request for a shard it doesn't have is placed on another node. It then stops serving clients and lets go of its shards with its peer and control listeners still up, so requests for them are answered by other nodes, and releases its lease. Each shard is claimed where its next request lands, so they spread over the cluster instead of moving all at once, and a shard that had gone idle was released already and is claimed by whichever node needs it next. A shard with open connections is let go of at the stop, and its clients reconnect through the load balancer to another node, which claims the shard where they are. Give the node a termination grace of at least 60 seconds (Kubernetes' `terminationGracePeriodSeconds` defaults to 30). A quiet node stops in seconds, but a stop waits up to 10 seconds for requests in flight and up to 30 for the shards to be let go of while blob storage is slow, and one killed before it finishes is a crash.
-- **Restarts and upgrades:** stop the node the same way. The new process is treated as a crash and starts with nothing on disk, deleting any shard file left behind (one an app still has open included, so its shard activates at once at a new path), and shards are restored as they activate. During a rolling upgrade, old and new nodes forward to each other and read each other's data.
-- **Failure:** requests for the shards a dead node was serving get a quick `503` with `Retry-After: 1` until it has been adopted and another node has taken over (10–20 s with the default lease TTL). Its idle shards had been released already, so they are claimable at once and need no adoption. A crash loses a `none` kind's last flush and PUT.
-
-### Load balancer
-
-Clients reach nodes through the deployment's own load balancer, which terminates TLS and absorbs hostile traffic. Nodes listen only on the private network. The load balancer sets `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Forwarded-Host` on every request (overwriting what clients send), the node adds the load balancer's address to the end of `X-Forwarded-For`, and the load balancer checks `GET /_shardlite/ready`.
-
-A request that lands on a node that doesn't own its shard is forwarded to the owner (0.5–2 ms), so a load balancer that keeps a client on one node gives the lowest latency, and most deployments should use one. With session affinity (a cookie, which clients must keep), a client's requests reach one node, its first request activates its home shard there, and its later requests find the shard open with no forward. Shards that many clients share (a guild, a zone, a match) are reached through forwards from the other clients' nodes whatever the load balancer does. A call from a shard that creates or activates a shard nobody owns may claim it on another node, picked at random among the live nodes, none of them a node this node avoids (a draining one says so in what it sends, and the node remembers until an answer, the listing or a lease TTL says otherwise again), so a matchmaker doesn't fill its own node with matches. A client's request and a call with no shard behind it (a login) claim on the node that received them. With a controllable load balancer (HAProxy, nginx, Envoy), hashing `Shardlite-Target` (header or query parameter) sends every request for a shard to one node, shared shards included, though a node joining or leaving moves part of the hash and those shards are forwarded until they are next released and claimed where the hash now sends them.
-
-### Blob storage
-
-The supported stores are AWS S3 and, for development, tests and self-hosting, RustFS. A store must support linearizable conditional writes (`If-None-Match` and `If-Match` on writes, `If-Match` on deletes) and custom metadata on conditional writes, returned on `HEAD`. Cloudflare R2 doesn't document conditional deletes, so it fails the startup check until it does. The node tests its store at startup and refuses to start if conditional writes misbehave.
-
-`SHARDLITE_PREFIX` puts every object under a prefix (`staging/`), so several environments can share one bucket. No lifecycle rule is needed: each node deletes its own expired journal segments. Shardlite keeps no history of old files, so a deployment that wants point-in-time restore can turn on bucket versioning. Deleting players who never return is the app's decision.
-
-### Hosts
-
-The node targets Linux only, and apps that use it must run on the same Linux machine (or VM), since they share SQLite files. Game clients and editors can run anywhere. On macOS, run the node, backend and game server in Docker with shard files in a Docker volume (not a bind mount, since SQLite locking isn't reliable across file sharing). On Windows, use WSL2 or Docker with shard files on the Linux filesystem (not under `/mnt/c`).
-
-- **Open files and memory mappings.** Each active shard takes 8 file descriptors and about 7 memory mappings, plus one more descriptor for each segment waiting to be written, which a slow blob store lets pile up. Raise the hard `ulimit -n` and `vm.max_map_count` (65,530 by default, reached at about 10,000 active shards). The node warns at startup if they are too low.
-- **Data directory.** `SHARDLITE_DATA` must be on a local filesystem (the node refuses to start on NFS, SMB or FUSE), with room for the largest shards being restored or rebased (at most 4 rebases at once) and about twice the size of any commit that rewrites a whole database. A shard's tail lives in unnamed files in `{data}/.tmp`, which show in `df` and not in `du`, and a slow blob store keeps the space of an old tail until it catches up.
-- **Clocks.** Run NTP. Leases need only clock rates that agree, but a clock that is far off delays failover. Clocks matter for failover speed and for `none` reads, not for `storage`. The node logs a warning when its clock is more than a second from the store's and again when it comes back, and logs a store that stops sending a `Date` header, since the check is then blind.
-
-### Traffic between nodes
-
-A node has three listeners: public (clients, through the load balancer), peer (other nodes) and control (the app on the same host). The peer listener speaks HTTP without TLS and is trusted to carry node-only headers, so it must be reachable only from other nodes, on a trusted private network or an encrypted one (WireGuard, Tailscale). Never put it behind the load balancer or expose it to clients or the app. Service meshes are not a target, since they add two proxy hops to every call between nodes.
-
-### Load
-
-- **Rebalancing.** New nodes only receive new connections and shards, so shards move themselves, when they are released: at their idle timeout, at the stop of their node and at a failover. The next request for a released shard claims it on the node it arrives at, so with a load balancer that keeps a client on one node (see [Load balancer](#load-balancer)) a shard ends up where its clients are, and with one that hashes `Shardlite-Target` it ends up where the hash sends it. A client's request and a call with no shard behind it claim where they are received, and calls from a shard are claimed at random among the live nodes the caller doesn't avoid. A shard moves only when it is idle, so requests in flight finish first, and a shard with open connections is not idle: it moves only at a stop or a failover, and keeps paying the forward's hop meanwhile if its clients arrive through other nodes. The node never closes a connection for a move, so close long-lived connections at natural breaks (the end of a match, a scene change), never on a timer. A shard whose file the app's own servers keep open (custom UDP, WebRTC and raw TCP) stays active while they do (see [What an app must do](#what-an-app-must-do)), so those servers must not hold a shard's file between requests.
-
-### Cost and latency
-
-Rough estimates, not measurements. On S3 Standard a busy node writes 4 journal PUTs a second at the default flush interval, about 50 USD a month whatever the number of active shards (idle nodes write nothing). A shard deactivating costs one PUT and a manifest write, about 10 USD per million sessions, and a 100 KB player shard is 100 GB of storage per million players. A request for an active shard adds about 0.1 ms, and a shard owned by another node 0.5–2 ms plus the first request's manifest read (10–30 ms). A shard that has gone idle is claimed and restored by its next request, which costs a claim (20–60 ms) and a snapshot download, plus one client retry if the node the request reaches last forwarded that shard to another node. If an owner crashes, its active shards wait up to twice the lease TTL, then claim and restore.
-
-### Observability
-
-The node passes W3C trace context (`traceparent`) through every hop and adds spans of its own (routing, activation, restore, gate waits). It logs an alert if a shard's commits have gone longer than 3× `SHARDLITE_DELTA_AGE` without a snapshot, which means its snapshots are failing, and a warning naming a shard whose file the app has kept open past the shard's idle timeout (see [What an app must do](#what-an-app-must-do)). `SHARDLITE_LISTEN_PPROF` serves Go's pprof handlers.
+How to run the node, its hosts, storage, load balancer and settings are in [deployment](deployment.md).
 
 ## Reference
 
 ### Shard names
 
-A shard is named `kind/id`. A kind's name is one or more segments joined by dots, each a lowercase letter followed by lowercase letters, digits, `-` and `_`, up to 64 characters in all. A dot is an ordinary character that the node never splits at, so a library can name its kinds `matchmaker.queue` by convention and the node sees one kind. A name starting with `_` is the node's own and an app can't declare one. Ids are 1 to 128 ASCII letters, digits, `-` and `_`, enough for numbers, UUIDs and ULIDs. Anything else gets a `400`.
+A shard is named `kind/id`. A kind's name is one or more segments joined by dots, each a lowercase letter followed by lowercase letters, digits, `-` and `_`, up to 64 characters in all. A dot is an ordinary character that the node never splits at, so a library can name its kinds `matchmaker.queue` by convention. A name starting with `_` is the node's own and an app can't declare one. Ids are 1 to 128 ASCII letters, digits, `-` and `_`, enough for numbers, UUIDs and ULIDs. Anything else gets a `400`.
 
 ### Headers
 
-All shardlite headers use the `Shardlite-` prefix. Clients can send `Shardlite-Target`, and every other `Shardlite-*` header from clients is stripped (also with `_` for `-`, as in `Shardlite_Caller`, which CGI-style frameworks read as the same variable). Apps should pass on `traceparent` and `Shardlite-Hops` on calls.
+All shardlite headers use the `Shardlite-` prefix. Clients can send `Shardlite-Target`, and every other `Shardlite-*` header from clients is stripped (also with `_` for `-`, as in `Shardlite_Caller`, which CGI-style frameworks read as the same variable). Apps should pass on `traceparent` and `Shardlite-Context` on calls.
 
 | Header | Set by | Meaning |
 |---|---|---|
 | `Shardlite-Target` | client (a hint), app on calls, node between nodes | the shard to route to |
 | `Shardlite-Opened` | node to app | the shard the node opened for this request |
 | `Shardlite-File` | node to app | the opened shard's file, a path that changes whenever the shard gets a new file (open it with `mode=rw`) |
-| `Shardlite-Caller` | app on calls, node to app | the calling shard, or `app` |
-| `Shardlite-Hops` | app on calls, node to app | calls along one chain |
+| `Shardlite-Context` | node to app, app on calls, node between nodes | a Structured Fields dictionary (RFC 9651) of `shard` (the opened shard) and `hops`. The app passes it back unchanged on calls, and a call without one is from the app. Unknown keys are ignored |
+| `Shardlite-Caller` | node to app | the calling shard, or `app`, as the node read it from the call's context |
 | `Shardlite-If-Active` | app on calls | `true`: answer `404` rather than activate |
 | `Shardlite-If-Exists` | app on calls | `true`: answer `404` rather than create |
 | `Shardlite-Sync` | app on a response or call | `none` or `storage`, overriding the kind's tier once |
+| `Shardlite-Error` | node on its own errors | why the node answered with an error, a reason from the [status codes](#status-codes) table. The node strips every `Shardlite-*` header from the app's responses, so an error without it is the app's |
 
 ### Control API
 
-On `SHARDLITE_LISTEN_CONTROL` (localhost TCP) and `SHARDLITE_LISTEN_CONTROL_SOCKET` (a Unix socket):
+On [`SHARDLITE_LISTEN_CONTROL`](deployment.md#environment-variables) (localhost TCP):
 
 | Request | Meaning |
 |---|---|
@@ -380,15 +333,29 @@ The node polls the app's `GET /_shardlite/ready` and calls `POST /_shardlite/rem
 
 ### Status codes
 
-Errors the node generates itself (sent as gRPC status for gRPC requests):
+Errors the node generates itself (sent as gRPC status for gRPC requests) carry `Shardlite-Error: {reason}`, as a header (beside `grpc-status` for gRPC). An error without it is the app's, whatever its status. An error from the owner's node passes through the node that forwarded the request with the owner's reason.
 
-| Code | When |
-|---|---|
-| `400` | a malformed shard name or `Shardlite-*` header |
-| `404` | an undeclared kind, a kind that isn't `public` named by a client, a client request for a shard that doesn't exist, `Shardlite-If-Active: true` on an inactive shard, `Shardlite-If-Exists: true` on a missing one, or a path under `/_shardlite/` the node doesn't serve |
-| `503` | the owner doesn't answer, or is dead and not adopted yet (`Retry-After: 1`), the shard was released or moved since the node last forwarded to it, which is the usual case for a shard that went idle on its old owner (`Retry-After: 0`: try again at once), the shard was claimed by another node at the same moment (`Retry-After: 0`), a stopping node that cannot place the request elsewhere, or the shard's files failed their checksums |
-| `504` | a timeout inside the node ended the request |
-| `508` | hops past `SHARDLITE_MAX_HOPS` |
+| Code | Reason | When |
+|---|---|---|
+| `400` | `bad-request` | a malformed shard name or `Shardlite-*` header (a `Shardlite-Context` that doesn't parse, lacks `shard` or `hops`, or names a malformed shard), or a call the node refuses as made |
+| `404` | `unknown-shard` | an undeclared kind, a kind that isn't `public` named by a client, a client request for a shard that doesn't exist, or `Shardlite-If-Exists: true` on a missing one |
+| `404` | `not-active` | `Shardlite-If-Active: true` on an inactive shard |
+| `404` | `no-endpoint` | a path under `/_shardlite/` the node doesn't serve |
+| `502` | `app-unreachable` | the node's connection to the app could not be made, so the app never had the request and it is safe to retry (`Retry-After: 1`) |
+| `502` | `app-failed` | the request was sent to the app and the connection failed, so the app may have acted on it (no `Retry-After`) |
+| `502` | `owner-failed` | the same, for a request forwarded to the owner's node after it acknowledged it |
+| `502` | `internal` | any other failure of the node itself, such as storage failing |
+| `503` | `owner-unreachable` | the owner doesn't answer, or is dead and not adopted yet (`Retry-After: 1`) |
+| `503` | `moved` | the shard was released or moved since the node last forwarded to it, or was claimed by another node at the same moment (`Retry-After: 0`: try again at once) |
+| `503` | `draining` | a stopping node that cannot place the request elsewhere |
+| `503` | `lease-lost` | the node's lease is lost or expired |
+| `503` | `bad-file` | the shard's files failed their checksums |
+| `503` | `sync-unmet` | the node cannot meet the durability tier asked for |
+| `503` | `not-ready` | the readiness check, while the app's declaration is missing, the lease is not good or the node drains |
+| `504` | `timeout` | a timeout inside the node ended the request |
+| `508` | `hops` | hops past [`SHARDLITE_MAX_HOPS`](deployment.md#environment-variables) |
+
+Between nodes a forward for a shard the receiving node found isn't its own is answered `421` with `not-owner`, which the forwarding node turns into `503` with `moved`.
 
 ### Declaration
 
@@ -397,36 +364,16 @@ Errors the node generates itself (sent as gRPC status for gRPC requests):
 | Field | Default | Meaning |
 |---|---|---|
 | `sync` | `"storage"` | `"storage"` or `"none"` (see [Durability](#durability)) |
-| `idle_timeout` | `SHARDLITE_IDLE_TIMEOUT` | how long a shard stays active without requests, as a Go duration (`"10m"`) |
+| `idle_timeout` | [`SHARDLITE_IDLE_TIMEOUT`](deployment.md#environment-variables) | how long a shard stays active without requests, as a Go duration (`"10m"`) |
 | `public` | `false` | clients may name the kind |
 
 ### Environment variables
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `SHARDLITE_NODE` | the host name | the node's name (1 to 128 ASCII letters, digits, `.`, `-` and `_`), which names its lease and journal |
-| `SHARDLITE_ADVERTISE_PEER` | the peer listener's address | how other nodes reach the peer listener (`host:port`), required when it listens on a wildcard address (the default) |
-| `SHARDLITE_BLOB` | required | `s3://bucket` |
-| `SHARDLITE_S3_ENDPOINT` | AWS | the URL of an S3-compatible store |
-| `SHARDLITE_PREFIX` | | prefix of every object path, for example `staging/` |
-| `SHARDLITE_APP` | | the app's base URL, polled for its declaration. Without it the node serves no kinds |
-| `SHARDLITE_LISTEN_PUBLIC` | `:2280` | the public listener |
-| `SHARDLITE_LISTEN_PEER` | `:2281` | the listener for traffic from other nodes |
-| `SHARDLITE_LISTEN_CONTROL` | `127.0.0.1:2282` | the control API on localhost TCP |
-| `SHARDLITE_LISTEN_CONTROL_SOCKET` | | the control API on a Unix socket |
-| `SHARDLITE_DATA` | required | the node's directory in the host's disk, for the files of its active shards |
-| `SHARDLITE_FLUSH` | `250ms` | flush interval |
-| `SHARDLITE_FLUSH_MIN` | `100ms` | the shortest time between two flushes, which bounds the wait at a gate |
-| `SHARDLITE_IDLE_TIMEOUT` | built in | idle timeout for kinds that don't set one |
-| `SHARDLITE_LEASE_TTL` | `10s` | node lease TTL |
-| `SHARDLITE_DELTA_AGE` | `15m` | how old a shard's unsnapshotted commits get before a snapshot is written. The tail alert (3×) and journal expiry follow from it |
-| `SHARDLITE_DELTA_SIZE` | `256KB` | how many bytes of unsnapshotted commits make a snapshot due, whatever their age |
-| `SHARDLITE_MAX_HOPS` | `32` | the hop limit for calls |
-| `SHARDLITE_LISTEN_PPROF` | off | address for Go's pprof handlers |
+The settings are listed in [deployment.md's table](deployment.md#environment-variables).
 
 ### Reserved tables
 
-The node creates `_shardlite_reminders` at activation and writes nothing else. A shard whose only content is these tables (and the `sqlite_sequence` that `AUTOINCREMENT` adds), with no rows in shardlite's, counts as never written. The app may create `_shardlite_delete` (any columns), which marks the shard for deletion (see [Deleting shards](#deleting-shards)).
+The node creates `_shardlite_reminders` and `_shardlite_delete` at activation and writes nothing else. A shard whose only content is these tables (and the `sqlite_sequence` that `AUTOINCREMENT` adds), with no rows in shardlite's, counts as never written. A row in `_shardlite_delete` marks the shard for deletion (see [Deleting shards](#deleting-shards)).
 
 ```sql
 CREATE TABLE _shardlite_reminders (
@@ -434,8 +381,11 @@ CREATE TABLE _shardlite_reminders (
   due INTEGER NOT NULL   -- Unix seconds
 ) STRICT;
 CREATE INDEX _shardlite_reminders_due ON _shardlite_reminders (due);
+CREATE TABLE _shardlite_delete (
+  marked INTEGER PRIMARY KEY CHECK (marked = 1)  -- a row, the only one there can be, marks the shard
+) STRICT;
 ```
 
 ### Reconcilers
 
-Every node also does a share of the cluster's own work, the lanes the node ranks first for: the dispatcher wakes the shards whose reminders are due while they are inactive, and the collector deletes LTX files that no manifest lists once they are past the journal's expiry (a day, or longer with a long `SHARDLITE_DELTA_AGE`). Each works from an index under `index/`, whose entries the writes create first, so the work follows what was written rather than the size of the store. They need no setting and serve no route. How they work is in [reconcilers](internals.md#reconcilers).
+Every node also does a share of the cluster's own work: the dispatcher wakes the shards whose reminders are due while they are inactive, and the collector deletes LTX files that no manifest lists once they are past the journal's expiry. They need no setting and serve no route. How they work is in [reconcilers](internals.md#reconcilers).

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/dueindex"
+	"github.com/luci1900/shardlite/internal/harness"
 	"github.com/luci1900/shardlite/internal/reconcile"
 	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
@@ -18,7 +19,7 @@ import (
 // that no manifest lists are deleted, and each entry is deleted with them. Passes
 // repeat every second here, so the entries made after the nodes started are found.
 func TestEachNodeCollectsItsOwnLanes(t *testing.T) {
-	clk := newFakeClock()
+	clk := harness.NewFakeClock()
 	c := newClusterWith(t, 2, func(o *ShardsetOptions) {
 		o.Clock = clk
 		o.Leases.TTL = 1000 * time.Hour

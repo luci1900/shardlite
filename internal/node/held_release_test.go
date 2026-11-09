@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/luci1900/shardlite/internal/harness"
 	"github.com/luci1900/shardlite/internal/kind"
 )
 
@@ -34,7 +35,7 @@ func TestShardIsUsableAfterAReleaseThatDidNotGoThrough(t *testing.T) {
 // heldRig is a rig whose clock the test moves and whose log it can read, with a shard the app has written to and keeps open. The rig's hold off is 100 ms and the users kind's idle timeout 300 ms, so the looks at a shard the app holds come 100 ms, 200 ms and then 300 ms apart (the wait doubles up to the idle timeout), and a hold has outlasted an idle timeout at its third look.
 type heldRig struct {
 	*mrig
-	clk  *fakeClock
+	clk  *harness.FakeClock
 	logs *syncBuffer
 }
 
@@ -42,7 +43,7 @@ const heldWarning = "kept the shard's file open past its idle timeout"
 
 func newHeldRig(t *testing.T) *heldRig {
 	t.Helper()
-	clk, logs := newFakeClock(), &syncBuffer{}
+	clk, logs := harness.NewFakeClock(), &syncBuffer{}
 	return &heldRig{newMRigWith(t, func(o *ShardsetOptions) { withClock(clk)(o); logTo(logs)(o) }), clk, logs}
 }
 

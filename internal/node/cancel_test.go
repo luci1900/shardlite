@@ -76,7 +76,6 @@ func TestCallerCancelsAtTheCalleesGate(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	req, _ := http.NewRequestWithContext(ctx, "POST", r.ctl+"/x", nil)
 	req.Header.Set("Shardlite-Target", "wallet/cx2")
-	req.Header.Set("Shardlite-Caller", "app")
 	done := make(chan error, 1)
 	go func() {
 		resp, err := r.client.Do(req)
@@ -109,7 +108,7 @@ func TestCallerCancelsAtItsOwnGate(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	req, _ := http.NewRequestWithContext(ctx, "POST", r.ctl+"/x", nil)
 	req.Header.Set("Shardlite-Target", "slow/cx3callee")
-	req.Header.Set("Shardlite-Caller", "wallet/cx3")
+	req.Header.Set(hdrContext, ctxOf("wallet/cx3", 0))
 	done := make(chan error, 1)
 	go func() {
 		resp, err := r.client.Do(req)
@@ -150,7 +149,6 @@ func TestCallerCancelsDuringActivation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	req, _ := http.NewRequestWithContext(ctx, "POST", r.ctl+"/x", nil)
 	req.Header.Set("Shardlite-Target", "slow/cx4")
-	req.Header.Set("Shardlite-Caller", "app")
 	done := make(chan error, 1)
 	go func() {
 		resp, err := r.client.Do(req)
@@ -221,7 +219,7 @@ func TestCancelledStreamingCall(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			req, _ := http.NewRequestWithContext(ctx, "POST", r.ctl+"/stream", pr)
 			req.Header.Set("Shardlite-Target", "slow/cx5callee")
-			req.Header.Set("Shardlite-Caller", "wallet/cx5")
+			req.Header.Set(hdrContext, ctxOf("wallet/cx5", 0))
 			client := r.client
 			if tc.h2 {
 				client = r.h2c

@@ -146,11 +146,11 @@ func TestGRPCThroughTheNode(t *testing.T) {
 			t.Errorf("active shard: %v", err)
 		}
 		// The hop limit (32 by default): a call made while serving hop 32 would be hop 33.
-		_, err = unary(onShard(ctx, "wallet/g6", "shardlite-hops", "32"), ctl, "Who", "")
+		_, err = unary(onShard(ctx, "wallet/g6", "shardlite-context", `shard="wallet/g7", hops=32`), ctl, "Who", "")
 		if status.Code(err) != codes.ResourceExhausted {
 			t.Errorf("hop limit: %v, want ResourceExhausted", err)
 		}
-		if out, err := unary(onShard(ctx, "wallet/g6", "shardlite-hops", "31"), ctl, "Who", ""); err != nil || !strings.HasSuffix(out, "hops=32") {
+		if out, err := unary(onShard(ctx, "wallet/g6", "shardlite-context", `shard="wallet/g7", hops=31`), ctl, "Who", ""); err != nil || !strings.HasSuffix(out, `context=shard="wallet/g6", hops=32`) {
 			t.Errorf("last hop allowed: %q %v", out, err)
 		}
 		// A node error in a stream is the stream's status too.
@@ -261,12 +261,20 @@ func TestGRPCThroughTheNode(t *testing.T) {
 			t.Fatal("the transfer returned before both commits were durable")
 		}
 		// The callee sees who called it and one more hop (this is what the app sent).
-		out, err = unary(onShard(ctx, "wallet/r2", "shardlite-caller", "wallet/r1", "shardlite-hops", "3"), ctl, "Who", "")
-		if err != nil || out != "opened=wallet/r2 caller=wallet/r1 hops=4" {
+		out, err = unary(onShard(ctx, "wallet/r2", "shardlite-context", `shard="wallet/r1", hops=3`), ctl, "Who", "")
+		if err != nil || out != `opened=wallet/r2 caller=wallet/r1 context=shard="wallet/r2", hops=4` {
 			t.Fatalf("who: %q %v", out, err)
 		}
+		// The app passes the context of the call it is serving on to the call it makes,
+		// as shardlite-context metadata. Serving a call at hop 31, its call is at hop 32,
+		// the last one allowed. (A call that dropped the context would be a call from the
+		// app, at hop 1, whatever the hops it was serving.)
+		out, err = unary(onShard(ctx, "wallet/r1", "shardlite-context", `shard="wallet/r3", hops=30`), ctl, "Transfer", "wallet/r2 rt3")
+		if err != nil || out != "ok:credit:rt3" {
+			t.Fatalf("transfer one hop under the limit: %q %v", out, err)
+		}
 		// The callee's status passes back: the hop limit, hit by the app's own call.
-		_, err = unary(onShard(ctx, "wallet/r1", "shardlite-hops", "31"), ctl, "Transfer", "wallet/r2 rt2")
+		_, err = unary(onShard(ctx, "wallet/r1", "shardlite-context", `shard="wallet/r3", hops=31`), ctl, "Transfer", "wallet/r2 rt2")
 		if status.Code(err) != codes.ResourceExhausted {
 			t.Fatalf("transfer at the hop limit: %v, want ResourceExhausted", err)
 		}

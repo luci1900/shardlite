@@ -16,6 +16,7 @@ import (
 	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/kill"
 	"github.com/luci1900/shardlite/internal/lease"
+	"github.com/luci1900/shardlite/internal/peers"
 	"github.com/luci1900/shardlite/internal/reconcile"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
@@ -51,12 +52,8 @@ func readiness(t *testing.T, nd *clusterNode) (int, string) {
 func saysAvoid(t *testing.T, nd *clusterNode) bool {
 	t.Helper()
 	h := http.Header{}
-	nd.m.Load().stampPlacement(h)
-	avoid, err := parsePlacement(h)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return avoid
+	nd.m.Load().placer.StampPlacement(h)
+	return h.Get(peers.HeaderPlacement) == peers.PlacementAvoid
 }
 
 // holdRequest sends a request for the target through the node and leaves it in the app until the returned func is called, which it also is when the test ends. The answer is read from the channel.
@@ -92,7 +89,6 @@ func tryCall(nd *clusterNode, target string) (reply, error) {
 		return reply{}, err
 	}
 	q.Header.Set("Shardlite-Target", target)
-	q.Header.Set("Shardlite-Caller", callerApp)
 	resp, err := clusterClient.Do(q)
 	if err != nil {
 		return reply{}, err
@@ -140,9 +136,9 @@ func TestDrainFailsReadinessAndSaysAvoid(t *testing.T) {
 	}
 	// n0 tells n1 to avoid it with the requests it forwards, and n1 would pick it as often as itself but for that.
 	get(t, n0, "users/a")
-	apptest.Eventually(t, apptest.Timeout, "n1 to have n0 in its avoid set", func() bool { return n1.m.Load().placer.avoids("n0") })
+	apptest.Eventually(t, apptest.Timeout, "n1 to have n0 in its avoid set", func() bool { return n1.m.Load().placer.Avoids("n0") })
 	for range 200 {
-		if node := n1.m.Load().placer.place(); node != "n1" {
+		if node := n1.m.Load().placer.Place(); node != "n1" {
 			t.Fatalf("n1 picked %q, want itself", node)
 		}
 	}
@@ -190,6 +186,9 @@ func TestDrainTurnsForwardsAndActivationsAway(t *testing.T) {
 	fwd := n0.peerDo("GET", "/x", map[string]string{"Shardlite-Origin": originClient, "Shardlite-Target": forwarded}, "")
 	if fwd.status != 421 || fwd.final.Get(hdrOwner) != "n1" {
 		t.Errorf("a forward got %d naming %q, want 421 naming n1", fwd.status, fwd.final.Get(hdrOwner))
+	}
+	if got := fwd.final.Get(hdrError); got != string(reasonNotOwner) {
+		t.Errorf("a forward got reason %q, want %q", got, reasonNotOwner)
 	}
 	dis := n0.peerDo("POST", reconcile.Activate, map[string]string{"Shardlite-Origin": originNode, "Shardlite-Target": dispatched, hdrIfExists: "true"}, "")
 	if dis.status != 421 || dis.final.Get(hdrOwner) != "n1" {

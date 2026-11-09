@@ -15,9 +15,10 @@ import (
 // reminder index (docs/internals.md, Manifest and Reminder index).
 
 // nextReminder is when the shard next needs waking, as of one snapshot of its
-// tables: now if it has the delete marker, otherwise the due time of its earliest
-// reminder that isn't stale (never before now, since a reminder due now keeps the
-// shard active), and 0 if there is none. Unix seconds.
+// tables: now if it is marked for deletion (a row in _shardlite_delete),
+// otherwise the due time of its earliest reminder that isn't stale (never
+// before now, since a reminder due now keeps the shard active), and 0 if there
+// is none. Unix seconds.
 //
 // at is the captured position the snapshot is exactly, or 0 if it can't tell
 // (capture.Shard.UseAt). A snapshot that holds commits that aren't captured yet

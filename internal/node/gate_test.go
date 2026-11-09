@@ -265,7 +265,7 @@ func TestGateOnCalls(t *testing.T) {
 			r.commit(q.Header.Get("Shardlite-File"))
 			c, _ := http.NewRequest("POST", r.ctl+"/callee", nil)
 			c.Header.Set("Shardlite-Target", "slow/callee")
-			c.Header.Set("Shardlite-Caller", q.Header.Get("Shardlite-Opened"))
+			c.Header.Set(hdrContext, q.Header.Get(hdrContext))
 			if v := q.URL.Query().Get("callsync"); v != "" {
 				c.Header.Set("Shardlite-Sync", v)
 			}
@@ -323,12 +323,18 @@ func TestSyncEndpointAndLeaseLoss(t *testing.T) {
 	apptest.Eventually(t, apptest.Timeout, "the lease to be lost", func() bool { return r.n.Keeper.Check() != nil })
 	if resp, _ := r.req("POST", r.ctl, "/_shardlite/sync", nil, ""); resp.StatusCode != 503 {
 		t.Fatalf("sync after the lease was lost: %d", resp.StatusCode)
+	} else {
+		wantReason(t, resp, reasonLeaseLost)
 	}
 	if resp, _ := r.req("POST", r.pub, "/w", map[string]string{"Shardlite-Target": "wallet/s2"}, ""); resp.StatusCode != 503 {
 		t.Fatalf("request after the lease was lost: %d", resp.StatusCode)
+	} else {
+		wantReason(t, resp, reasonLeaseLost)
 	}
 	if resp, _ := r.req("GET", r.pub, "/_shardlite/ready", nil, ""); resp.StatusCode != 503 {
 		t.Fatalf("ready after the lease was lost: %d", resp.StatusCode)
+	} else {
+		wantReason(t, resp, reasonNotReady)
 	}
 	_ = errors.New
 }

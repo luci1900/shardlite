@@ -33,6 +33,16 @@ import (
 // tempDir is a new temporary directory for a shard's tail.
 func tempDir(t testing.TB) *tempfile.Dir { return tempfile.NewDir(t.TempDir()) }
 
+// reservedTables is the reserved tables' DDL, the node's internal/node/reserved.sql:
+// a captured shard's file always has the tables (the node's activation makes
+// them), so a test that makes its own file makes them too.
+const reservedTables = `CREATE TABLE IF NOT EXISTS _shardlite_reminders (
+  key TEXT PRIMARY KEY,
+  due INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS _shardlite_reminders_due ON _shardlite_reminders (due);
+CREATE TABLE IF NOT EXISTS _shardlite_delete (marked INTEGER PRIMARY KEY CHECK (marked = 1)) STRICT;`
+
 // tailOf is the shard's tail, closed when the test ends.
 func tailOf(t testing.TB, sh *capture.Shard) capture.TailFiles {
 	t.Helper()
@@ -565,7 +575,7 @@ func TestReleaseReadsTheFinalState(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := app.Exec(`CREATE TABLE t (x)`); err != nil {
+		if _, err := app.Exec(`CREATE TABLE t (x); ` + reservedTables); err != nil {
 			t.Fatal(err)
 		}
 		released, f, err := sh.Release(ctx, func(db *sql.DB) error {

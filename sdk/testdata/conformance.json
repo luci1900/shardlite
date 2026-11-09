@@ -1,0 +1,21 @@
+{
+  "reasons": [
+    "bad-request",
+    "unknown-shard",
+    "not-active",
+    "no-endpoint",
+    "hops",
+    "app-unreachable",
+    "app-failed",
+    "owner-unreachable",
+    "owner-failed",
+    "moved",
+    "draining",
+    "lease-lost",
+    "bad-file",
+    "sync-unmet",
+    "not-ready",
+    "timeout",
+    "internal"
+  ]
+}

@@ -141,7 +141,7 @@ func (a *actor) startCapture(ctx context.Context, restored *capture.Restored) er
 	if restored != nil {
 		d.at(kill.FirstSyncDone)
 	}
-	// The reserved table goes in after the first sync, before the app has the
+	// The reserved tables go in after the first sync, before the app has the
 	// shard.
 	if err := ensureTables(ctx, sh); err != nil {
 		a.cap.uncounted(sh)

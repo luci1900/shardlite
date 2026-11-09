@@ -22,6 +22,7 @@ import (
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/dueindex"
+	"github.com/luci1900/shardlite/internal/harness"
 	"github.com/luci1900/shardlite/internal/journal"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
@@ -305,20 +306,27 @@ func downUntil(up *atomic.Bool) func(int, *http.Request) int {
 
 // --- the table ---
 
-func TestRemindersTableExistsAfterActivation(t *testing.T) {
+func TestReservedTablesExistAfterActivation(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
 	ref := r.acquire("users/t1")
 	defer ref.Release()
 	r.sql("users/t1", `SELECT 1`)
 	out := r.app.Must(t, "query", "q", ref.Path(), `SELECT name FROM sqlite_master WHERE name LIKE '_shardlite%' ORDER BY name`)
-	if want := strconv.Quote("_shardlite_reminders\n_shardlite_reminders_due"); out != want {
+	if want := strconv.Quote("_shardlite_delete\n_shardlite_reminders\n_shardlite_reminders_due"); out != want {
 		t.Fatalf("schema objects %s, want %s", out, want)
 	}
 	cols := r.app.Must(t, "query", "q", ref.Path(), `SELECT group_concat(name || ' ' || type || ' ' || "notnull" || ' ' || pk, ', ') FROM pragma_table_info('_shardlite_reminders') ORDER BY cid`)
 	// key's notnull is STRICT's doing: a primary key column of a STRICT table is
 	// implicitly NOT NULL, where a lax table allowed the NULL quirk.
 	if want := strconv.Quote("key TEXT 1 1, due INTEGER 1 0"); cols != want {
+		t.Fatalf("columns %s, want %s", cols, want)
+	}
+	cols = r.app.Must(t, "query", "q", ref.Path(), `SELECT group_concat(name || ' ' || type || ' ' || "notnull" || ' ' || pk, ', ') FROM pragma_table_info('_shardlite_delete') ORDER BY cid`)
+	// marked is a rowid alias, and the schema of a rowid alias always allows
+	// NULL (it would autogenerate a rowid); the table's check is what rejects
+	// one, so notnull reads 0 where key's read 1.
+	if want := strconv.Quote("marked INTEGER 0 1"); cols != want {
 		t.Fatalf("columns %s, want %s", cols, want)
 	}
 	// The tables of earlier designs are not created.
@@ -362,7 +370,7 @@ func TestActivatingAShardWithTheTableCommitsNothing(t *testing.T) {
 }
 
 // A shard whose only objects are the reserved ones is deleted as never written;
-// a reminder is the app's data.
+// a reminder is the app's data, and so is the marker's row until it is deleted.
 func TestNeverWrittenWithTheReservedTable(t *testing.T) {
 	t.Parallel()
 	r := newSRig(t)
@@ -370,21 +378,33 @@ func TestNeverWrittenWithTheReservedTable(t *testing.T) {
 	ref.Release()
 	apptest.Eventually(t, apptest.Timeout, "idle deactivation", r.inactive("users/t3"))
 	if _, err := r.rawManifest("users/t3"); !errors.Is(err, blob.ErrNotFound) {
-		t.Fatalf("manifest of a shard with only an empty reminders table: %v, want none", err)
+		t.Fatalf("manifest of a shard with only the reserved tables: %v, want none", err)
 	}
 	if r.m.Stats.Deletes.Load() != 1 {
 		t.Fatalf("deletes %d", r.m.Stats.Deletes.Load())
 	}
 
 	// The test app creates two tables of its own when it opens a shard, so these
-	// drop them to leave only the reserved one.
+	// drop them to leave only the reserved ones.
 	r.sql("users/t5", `DROP TABLE kv; DROP TABLE acks`)
 	r.closeInApp("users/t5")
 	apptest.Eventually(t, apptest.Timeout, "deactivation", r.inactive("users/t5"))
 	if _, err := r.rawManifest("users/t5"); !errors.Is(err, blob.ErrNotFound) {
-		t.Fatalf("a shard where the app left only the reserved table was kept: %v", err)
+		t.Fatalf("a shard where the app left only the reserved tables was kept: %v", err)
 	}
 	if r.m.Stats.Deletes.Load() != 2 {
+		t.Fatalf("deletes %d", r.m.Stats.Deletes.Load())
+	}
+
+	// An empty _shardlite_delete is reserved like the reminders table: a shard
+	// the app only marked and unmarked still counts as never written.
+	r.sql("users/t7", `DROP TABLE kv; DROP TABLE acks; INSERT OR IGNORE INTO _shardlite_delete VALUES (1); DELETE FROM _shardlite_delete`)
+	r.closeInApp("users/t7")
+	apptest.Eventually(t, apptest.Timeout, "deactivation", r.inactive("users/t7"))
+	if _, err := r.rawManifest("users/t7"); !errors.Is(err, blob.ErrNotFound) {
+		t.Fatalf("a shard holding only the reserved tables, marked and unmarked, was kept: %v", err)
+	}
+	if r.m.Stats.Deletes.Load() != 3 {
 		t.Fatalf("deletes %d", r.m.Stats.Deletes.Load())
 	}
 
@@ -402,7 +422,7 @@ func TestNeverWrittenWithTheReservedTable(t *testing.T) {
 	if _, err := r.rawManifest("users/t6"); err != nil {
 		t.Fatalf("a shard holding a reminder was deleted: %v", err)
 	}
-	if r.m.Stats.Deletes.Load() != 2 {
+	if r.m.Stats.Deletes.Load() != 3 {
 		t.Fatalf("deletes %d", r.m.Stats.Deletes.Load())
 	}
 }
@@ -440,7 +460,7 @@ func TestWakeIsAPostWithNoBody(t *testing.T) {
 	r.remind("users/ia1", "a", time.Now().Unix())
 	apptest.Eventually(t, apptest.Timeout, "the wake", func() bool { return rec.count() == 1 })
 	d := rec.all()[0]
-	if d.method != "POST" || d.body != "" || d.target != "users/ia1" || d.hdr.Get("Shardlite-Caller") != "users/ia1" || d.hdr.Get("Shardlite-File") == "" || d.hdr.Get("Shardlite-Target") != "" {
+	if d.method != "POST" || d.body != "" || d.target != "users/ia1" || d.hdr.Get("Shardlite-Caller") != "users/ia1" || d.hdr.Get(hdrContext) != ctxOf("users/ia1", 0) || d.hdr.Get("Shardlite-File") == "" || d.hdr.Get("Shardlite-Target") != "" {
 		t.Fatalf("wake %+v", d)
 	}
 	for _, h := range []string{"Idempotency-Key", "Shardlite-Sync", "Shardlite-If-Active", "Shardlite-Reminder-Id", "Content-Type"} {
@@ -489,8 +509,8 @@ func TestRemindersPathIsRefused(t *testing.T) {
 		hdr        map[string]string
 	}{
 		{"client", r.pub, map[string]string{"Shardlite-Target": "slow/rp1"}},
-		{"call", r.ctl, map[string]string{"Shardlite-Target": "slow/rp1", "Shardlite-Caller": "slow/rp1"}},
-		{"call between shards", r.ctl, map[string]string{"Shardlite-Target": "slow/rp2", "Shardlite-Caller": "slow/rp1"}},
+		{"call", r.ctl, map[string]string{"Shardlite-Target": "slow/rp1", hdrContext: ctxOf("slow/rp1", 0)}},
+		{"call between shards", r.ctl, map[string]string{"Shardlite-Target": "slow/rp2", hdrContext: ctxOf("slow/rp1", 0)}},
 	} {
 		for _, p := range []string{remindersPath, "/_SHARDLITE/reminders", "//_shardlite/reminders", "/a/../_shardlite/reminders"} {
 			if resp, _ := r.req("POST", c.base, p, c.hdr, ""); resp.StatusCode != http.StatusNotFound {
@@ -1015,7 +1035,7 @@ func TestLoopStopCancelsAWake(t *testing.T) {
 
 func TestReminderTimerFiresOnTheClock(t *testing.T) {
 	t.Parallel()
-	clk := newFakeClock()
+	clk := harness.NewFakeClock()
 	var tm reminderTimer
 	tm.arm(clk, clk.Now(), 0, false, time.Time{})
 	if tm.armed() {

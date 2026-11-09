@@ -13,11 +13,14 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/lease"
+	"github.com/luci1900/shardlite/internal/peers"
 	"github.com/luci1900/shardlite/internal/reconcile"
 	"github.com/luci1900/shardlite/internal/service"
 )
@@ -32,10 +35,19 @@ type runOptions struct {
 	public   net.Listener  // the public listener, in place of env.Public
 	shardset func(*ShardsetOptions, *Shardset)
 	faults   Faults
+	appClock Clock // the declaration poll's clock, the real one if nil
 }
 
+// ErrAppLost is what Run returns after it stopped because the app was lost: it
+// had answered the declaration poll, and then went appLostAfter without any
+// HTTP answer. The stop is a graceful one (the same as for a context that ends),
+// and the command exits non-zero, so that a supervisor restarts the node to wait
+// for its app.
+var ErrAppLost = errors.New("the app was lost: it stopped answering")
+
 // WithBackend makes Run use b as the blob store in place of the S3 bucket of
-// env.Blob (which is then not read), so tests can run the node on blob.Memory.
+// env.Blob (which is then not read), so tests can run the node on a backend of
+// their own (SHARDLITE_BLOB=memory:// runs it on a plain blob.Memory).
 // The prefix of env.Prefix still applies.
 func WithBackend(b blob.Backend) RunOption {
 	return func(o *runOptions) { o.backend = b }
@@ -52,6 +64,12 @@ func withPublicListener(ln net.Listener) RunOption {
 	return func(o *runOptions) { o.public = ln }
 }
 
+// withAppClock makes the declaration poll tick and tell time by c, so a test
+// moves the 30 seconds an app has to be gone for instead of waiting them.
+func withAppClock(c Clock) RunOption {
+	return func(o *runOptions) { o.appClock = c }
+}
+
 // withShardset calls fn with the shardset's options before it is built (and nil),
 // then again with the shardset, for tests that tune it or look inside.
 func withShardset(fn func(*ShardsetOptions, *Shardset)) RunOption {
@@ -65,7 +83,9 @@ func withShardset(fn func(*ShardsetOptions, *Shardset)) RunOption {
 // shards are let go of and the lease is released, so that a forward or call for a
 // shard on its way out is answered by another node. A lost lease or a fenced writer stops
 // everything at once and keeps the lease, and a failed node doesn't drain.
-// Run returns nil after a shutdown that ctx asked for, and the failure otherwise. It returns only after every
+// Run returns nil after a shutdown that ctx asked for, and the failure otherwise.
+// A node whose app is lost (ErrAppLost) stops as if ctx had ended, through the
+// same path, and returns ErrAppLost. It returns only after every
 // goroutine it started has ended. ready (if not nil) is called with the public,
 // control and peer addresses once the node is serving.
 func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, control, peer string), opts ...RunOption) error {
@@ -73,6 +93,9 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 	for _, o := range opts {
 		o(&ro)
 	}
+	// A lost app ends this context, which is how a stop is asked for.
+	ctx, stopAsked := context.WithCancelCause(ctx)
+	defer stopAsked(nil)
 	appURL, err := url.Parse(env.App)
 	if err != nil || appURL.Host == "" {
 		return fmt.Errorf("SHARDLITE_APP is %q, want the app's base URL such as http://127.0.0.1:9000", env.App)
@@ -80,7 +103,7 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 	kinds := NewKinds(env.IdleTimeout)
 
 	var bucket string
-	if ro.backend == nil {
+	if ro.backend == nil && !env.inMemory() {
 		var err error
 		if bucket, err = env.blobBucket(); err != nil {
 			return err
@@ -94,11 +117,14 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 	if err := checks.refuse(env.Data); err != nil {
 		return err
 	}
-	clock := lease.NewClockWatch(log)
 	raw := ro.backend
+	if raw == nil && env.inMemory() {
+		log.Warn("storage is in memory: it is lost when the node stops", "blob", env.Blob)
+		raw = blob.NewMemory()
+	}
 	if raw == nil {
 		var err error
-		if raw, err = blob.NewS3(ctx, blob.S3Options{Bucket: bucket, Endpoint: env.S3Endpoint, ClockSink: clock.Sink}); err != nil {
+		if raw, err = blob.NewS3(ctx, blob.S3Options{Bucket: bucket, Endpoint: env.S3Endpoint, Logger: log}); err != nil {
 			return err
 		}
 	}
@@ -118,7 +144,7 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 	if err != nil {
 		return err
 	}
-	address, err := peerAddress(env.Advertise, peer)
+	address, err := peerAddress(env.Advertise, peer, upAddrs)
 	if err != nil {
 		peer.Close()
 		return err
@@ -132,7 +158,6 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 		Lease:   lease.RegistryOptions{TTL: env.LeaseTTL},
 		Keeper:  lease.KeeperOptions{Interval: env.LeaseTTL / 3, Margin: env.LeaseTTL / 5},
 		Logger:  log,
-		Clock:   clock,
 		TempDir: tempDir,
 		Faults:  ro.faults,
 		// Orphans are left alone for as long as the journal keeps its segments: past that a
@@ -178,14 +203,6 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 		return fail(err)
 	}
 	lns = append(lns, control)
-	var socket net.Listener
-	if env.Socket != "" {
-		os.Remove(env.Socket)
-		if socket, err = net.Listen("unix", env.Socket); err != nil {
-			return fail(err)
-		}
-		lns = append(lns, socket)
-	}
 	// Diagnosis only: if it can't be bound, the node goes on without it.
 	var pprof net.Listener
 	if env.Pprof != "" {
@@ -202,7 +219,7 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 		Kinds: kinds, Data: env.Data, Logger: log,
 		Flush:     FlushOptions{Interval: env.Flush, Min: env.FlushMin},
 		Lifecycle: LifecycleOptions{DeltaAge: env.DeltaAge, DeltaSize: env.DeltaSize, At: ro.faults.At, MaxFiles: ro.faults.MaxFiles},
-		Leases:    LeaseScanOptions{TTL: env.LeaseTTL},
+		Leases:    peers.ScanOptions{TTL: env.LeaseTTL},
 		Dispatch:  &reconcile.Options{},
 		Collect:   &reconcile.Options{},
 	}
@@ -210,7 +227,10 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 		ro.shardset(&so, nil)
 	}
 	m, err := NewShardset(n, so, func(m *Shardset) routing {
-		srv = NewServer(m, kinds, n.Keeper, ServerOptions{App: appURL, MaxHops: env.MaxHops, Grace: ro.grace, Logger: log})
+		srv = NewServer(m, kinds, n.Keeper, ServerOptions{
+			App: appURL, MaxHops: env.MaxHops, Grace: ro.grace, Logger: log,
+			Clock: ro.appClock, AppLost: func() { stopAsked(ErrAppLost) },
+		})
 		return routing{wake: srv.wakeApp, call: srv.call}
 	})
 	if err != nil {
@@ -257,7 +277,7 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 		front.Add(&httpServer{name: "pprof", log: log, lns: []net.Listener{pprof}, handler: http.DefaultServeMux, grace: ro.grace})
 	}
 	callers := service.New(context.Background(), log)
-	callers.Add(srv.controlServer(control, socket))
+	callers.Add(srv.controlServer(control))
 	callers.Add(srv.peerServer(peer))
 	var callersErr error
 	stopCallers := sync.OnceFunc(func() { callersErr = stopStage(log, "the control and peer servers", callers) })
@@ -340,6 +360,9 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 	if cause == nil {
 		cause = callersErr
 	}
+	if cause == nil && errors.Is(context.Cause(ctx), ErrAppLost) {
+		cause = ErrAppLost
+	}
 	return cause
 }
 
@@ -375,19 +398,82 @@ func serving(log *slog.Logger, name string) (stopped func()) {
 	return func() { log.Debug("service stopped", "service", name) }
 }
 
+// privateIPv4 are the ranges peerAddress accepts. They are Consul's rule for its
+// own address (go-sockaddr's private IPv4: RFC 6890's special-purpose ranges less
+// the ones that aren't forwardable, so loopback and link-local are out).
+var privateIPv4 = []netip.Prefix{
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("192.88.99.0/24"),
+}
+
 // peerAddress is how other nodes reach the peer listener: the setting, or the
-// listener's own address when that names a host.
-func peerAddress(set string, peer net.Listener) (string, error) {
+// listener's own address when that names a host. On a wildcard address it is the
+// one private IPv4 address among the node's interfaces (as Consul finds its own),
+// joined with the listener's port. With none or several it can't tell which
+// other nodes can reach, so it refuses. There is no IPv6 rule: IPv6 deployments
+// set the address.
+func peerAddress(set string, peer net.Listener, interfaceAddrs func() ([]netip.Addr, error)) (string, error) {
 	if set != "" {
 		return set, nil
 	}
 	addr := peer.Addr().String()
-	host, _, err := net.SplitHostPort(addr)
+	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return "", err
 	}
-	if ip, err := netip.ParseAddr(host); err != nil || ip.IsUnspecified() {
-		return "", fmt.Errorf("SHARDLITE_LISTEN_PEER listens on %s, which other nodes can't reach: set SHARDLITE_ADVERTISE_PEER to the host:port they should use", addr)
+	bound, err := netip.ParseAddr(host)
+	if err == nil && !bound.IsUnspecified() {
+		return addr, nil
 	}
-	return addr, nil
+	all, err := interfaceAddrs()
+	if err != nil {
+		return "", fmt.Errorf("SHARDLITE_LISTEN_PEER listens on %s, which other nodes can't reach, and the node's addresses can't be listed (%w): set SHARDLITE_ADVERTISE_PEER to the host:port they should use", addr, err)
+	}
+	var found []string
+	for _, ip := range all {
+		ip = ip.Unmap()
+		if ip.Is4() && slices.ContainsFunc(privateIPv4, func(p netip.Prefix) bool { return p.Contains(ip) }) {
+			found = append(found, ip.String())
+		}
+	}
+	switch len(found) {
+	case 1:
+		return net.JoinHostPort(found[0], port), nil
+	case 0:
+		return "", fmt.Errorf("SHARDLITE_LISTEN_PEER listens on %s, which other nodes can't reach, and it has no private IPv4 address: set SHARDLITE_ADVERTISE_PEER to the host:port they should use", addr)
+	default:
+		return "", fmt.Errorf("SHARDLITE_LISTEN_PEER listens on %s, which other nodes can't reach, and it has several private IPv4 addresses (%s): set SHARDLITE_ADVERTISE_PEER to the host:port they should use", addr, strings.Join(found, ", "))
+	}
+}
+
+// upAddrs lists the addresses of the interfaces that are up.
+func upAddrs() ([]netip.Addr, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+	var out []netip.Addr
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			return nil, err
+		}
+		for _, a := range addrs {
+			var ip net.IP
+			if n, ok := a.(*net.IPNet); ok {
+				ip = n.IP
+			}
+			if ip, ok := netip.AddrFromSlice(ip); ok {
+				out = append(out, ip)
+			}
+		}
+	}
+	return out, nil
 }

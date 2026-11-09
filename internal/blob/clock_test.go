@@ -3,7 +3,9 @@ package blob_test
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -12,27 +14,173 @@ import (
 	"github.com/luci1900/shardlite/internal/blob"
 )
 
-// sampled collects what a backend hands its clock sink.
-type sampled struct {
-	mu      sync.Mutex
-	samples []blob.ClockSample
-	errs    []error
+// logged is a handler that keeps the messages it is given, with their levels.
+type logged struct {
+	mu   sync.Mutex
+	msgs []string
 }
 
-func (s *sampled) sink(c blob.ClockSample, err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err != nil {
-		s.errs = append(s.errs, err)
-		return
+func (l *logged) Enabled(context.Context, slog.Level) bool { return true }
+func (l *logged) WithAttrs([]slog.Attr) slog.Handler       { return l }
+func (l *logged) WithGroup(string) slog.Handler            { return l }
+func (l *logged) Handle(_ context.Context, r slog.Record) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.msgs = append(l.msgs, r.Level.String()+" "+r.Message)
+	return nil
+}
+
+func (l *logged) log() *slog.Logger { return slog.New(l) }
+
+// lines are the messages so far.
+func (l *logged) lines() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.msgs)
+}
+
+// count is how many messages contain s.
+func (l *logged) count(s string) int {
+	n := 0
+	for _, m := range l.lines() {
+		if strings.Contains(m, s) {
+			n++
+		}
 	}
-	s.samples = append(s.samples, c)
+	return n
 }
 
-func (s *sampled) counts() (samples, errs int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.samples), len(s.errs)
+const (
+	warnsOff    = "WARN the node's clock is more than a second from the store's"
+	backWithin  = "INFO the node's clock is within a second of the store's again"
+	warnsBlind  = "WARN the store's responses carry no usable time"
+	seesTimeNow = "INFO the store's responses carry a time again"
+)
+
+// sampleOff is a sample of a store whose clock is ahead of the node's by off, as
+// a store sends it, in whole seconds.
+func sampleOff(off, round time.Duration) blob.ClockSample {
+	start := time.Now()
+	mid := start.Add(round / 2)
+	return blob.ClockSample{Store: mid.Add(off).Truncate(time.Second), Start: start, End: start.Add(round)}
+}
+
+func feed(c *blob.ClockCheck, n int, off, round time.Duration) {
+	for range n {
+		c.Observe(sampleOff(off, round), nil)
+	}
+}
+
+// A run of samples over a second off warns once, and one back within it says so,
+// whichever way the clock is off. Noise within the second is quiet.
+func TestClockWarnsOnARunOverASecond(t *testing.T) {
+	t.Parallel()
+	for name, off := range map[string]time.Duration{"store ahead": 3 * time.Second, "store behind": -3 * time.Second} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			var l logged
+			c := blob.NewClockCheck(l.log())
+			feed(c, blob.ClockRun, 0, 10*time.Millisecond)
+			feed(c, blob.ClockRun, 400*time.Millisecond, 10*time.Millisecond)
+			if got := l.lines(); len(got) != 0 {
+				t.Fatalf("noise within a second was logged: %q", got)
+			}
+			feed(c, blob.ClockRun-1, off, 10*time.Millisecond)
+			if got := l.lines(); len(got) != 0 {
+				t.Fatalf("a run one short of %d warned: %q", blob.ClockRun, got)
+			}
+			feed(c, 1, off, 10*time.Millisecond)
+			if l.count(warnsOff) != 1 {
+				t.Fatalf("the run did not warn once: %q", l.lines())
+			}
+			feed(c, 3*blob.ClockRun, off, 10*time.Millisecond)
+			if len(l.lines()) != 1 {
+				t.Fatalf("a long run warned again: %q", l.lines())
+			}
+			feed(c, 1, 0, 10*time.Millisecond)
+			if l.count(backWithin) != 1 || len(l.lines()) != 2 {
+				t.Fatalf("one sample back within a second did not recover once: %q", l.lines())
+			}
+			feed(c, blob.ClockRun, 0, 10*time.Millisecond)
+			if len(l.lines()) != 2 {
+				t.Fatalf("a quiet clock logged: %q", l.lines())
+			}
+			// And it can warn again.
+			feed(c, blob.ClockRun, off, 10*time.Millisecond)
+			if l.count(warnsOff) != 2 {
+				t.Fatalf("a second run did not warn: %q", l.lines())
+			}
+		})
+	}
+}
+
+// A sample within a second breaks a run, so scattered outliers never warn.
+func TestClockRunNeedsToBeUnbroken(t *testing.T) {
+	t.Parallel()
+	var l logged
+	c := blob.NewClockCheck(l.log())
+	for range 3 {
+		feed(c, blob.ClockRun-1, 3*time.Second, 10*time.Millisecond)
+		feed(c, 1, 0, 10*time.Millisecond)
+	}
+	if got := l.lines(); len(got) != 0 {
+		t.Fatalf("scattered outliers were logged: %q", got)
+	}
+}
+
+// A run of responses with no usable time goes blind and says so once, and a
+// time again ends it. One miss among samples is not a run.
+func TestClockGoesBlind(t *testing.T) {
+	t.Parallel()
+	var l logged
+	c := blob.NewClockCheck(l.log())
+	miss := errors.New("no date")
+	for range blob.ClockRun - 1 {
+		c.Observe(blob.ClockSample{}, miss)
+	}
+	feed(c, 1, 0, 10*time.Millisecond) // breaks the run
+	for range blob.ClockRun - 1 {
+		c.Observe(blob.ClockSample{}, miss)
+	}
+	if got := l.lines(); len(got) != 0 {
+		t.Fatalf("short runs of misses were logged: %q", got)
+	}
+	c.Observe(blob.ClockSample{}, miss)
+	if l.count(warnsBlind) != 1 {
+		t.Fatalf("a run of misses did not warn: %q", l.lines())
+	}
+	for range 3 * blob.ClockRun {
+		c.Observe(blob.ClockSample{}, miss)
+	}
+	if len(l.lines()) != 1 {
+		t.Fatalf("a long run of misses warned again: %q", l.lines())
+	}
+	feed(c, 1, 0, 10*time.Millisecond)
+	if l.count(seesTimeNow) != 1 || len(l.lines()) != 2 {
+		t.Fatalf("a time did not end the blindness once: %q", l.lines())
+	}
+}
+
+// A round trip over a second is no sample: it neither adds to a run nor breaks
+// one, and a clock that is off is not recovered by it.
+func TestClockIgnoresLongRoundTrips(t *testing.T) {
+	t.Parallel()
+	var l logged
+	c := blob.NewClockCheck(l.log())
+	feed(c, 3*blob.ClockRun, 3*time.Second, 1500*time.Millisecond)
+	if got := l.lines(); len(got) != 0 {
+		t.Fatalf("long round trips warned: %q", got)
+	}
+	feed(c, blob.ClockRun-1, 3*time.Second, 10*time.Millisecond)
+	feed(c, 3, 0, 1500*time.Millisecond) // would break the run if it counted
+	feed(c, 1, 3*time.Second, 10*time.Millisecond)
+	if l.count(warnsOff) != 1 {
+		t.Fatalf("long round trips broke the run: %q", l.lines())
+	}
+	feed(c, 3, 0, 1500*time.Millisecond)
+	if len(l.lines()) != 1 {
+		t.Fatalf("a long round trip recovered the clock: %q", l.lines())
+	}
 }
 
 // withDate is a response carrying a Date header as given (none if empty).
@@ -43,23 +191,24 @@ func withDate(r *http.Response, date string) *http.Response {
 	return r
 }
 
-func sampledS3(t *testing.T, rt http.RoundTripper) (*blob.S3, *sampled) {
+// httpDate is the time as a store sends it.
+func httpDate(t time.Time) string { return t.UTC().Format(http.TimeFormat) }
+
+func loggedS3(t *testing.T, rt http.RoundTripper) (*blob.S3, *logged) {
 	t.Helper()
-	var got sampled
-	b, err := blob.NewS3(context.Background(), blob.S3Options{Bucket: "b", Endpoint: "http://s3.invalid", HTTPClient: &http.Client{Transport: rt}, ClockSink: got.sink})
+	var l logged
+	b, err := blob.NewS3(context.Background(), blob.S3Options{Bucket: "b", Endpoint: "http://s3.invalid", HTTPClient: &http.Client{Transport: rt}, Logger: l.log()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return b, &got
+	return b, &l
 }
 
-// Every response gives a sample: the header's time, and a window that holds the
-// exchange. An error's response carries a time as a good one does.
+// Every response is a sample, an error's too: a run of any of them with a store
+// a minute ahead warns once.
 func TestS3SamplesEveryResponse(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	const date = "Tue, 15 Nov 1994 08:12:31 GMT"
-	want := time.Date(1994, 11, 15, 8, 12, 31, 0, time.UTC)
 	for name, resp := range map[string]func() *http.Response{
 		"success": func() *http.Response { return s3Object(`"e"`, "") },
 		"error":   func() *http.Response { return s3Error(http.StatusNotFound, "NoSuchKey") },
@@ -67,22 +216,15 @@ func TestS3SamplesEveryResponse(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			b, got := sampledS3(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			b, l := loggedS3(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
 				wrote(r)
-				return withDate(resp(), date), nil
+				return withDate(resp(), httpDate(time.Now().Add(time.Minute))), nil
 			}))
-			before := time.Now()
-			b.Head(ctx, "k")
-			after := time.Now()
-			if n, errs := got.counts(); n != 1 || errs != 0 {
-				t.Fatalf("%d samples and %d failures, want one sample", n, errs)
+			for range blob.ClockRun {
+				b.Head(ctx, "k")
 			}
-			s := got.samples[0]
-			if !s.Store.Equal(want) {
-				t.Fatalf("store time %v, want %v", s.Store, want)
-			}
-			if s.Start.Before(before) || s.End.Before(s.Start) || s.End.After(after) {
-				t.Fatalf("window [%v, %v] is not inside the call [%v, %v]", s.Start, s.End, before, after)
+			if l.count(warnsOff) != 1 || len(l.lines()) != 1 {
+				t.Fatalf("%d responses a minute off: %q", blob.ClockRun, l.lines())
 			}
 		})
 	}
@@ -92,9 +234,9 @@ func TestS3SamplesEveryResponse(t *testing.T) {
 func TestS3SamplesEveryCall(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	b, got := sampledS3(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	b, l := loggedS3(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		wrote(r)
-		return withDate(s3Object(`"e"`, ""), "Tue, 15 Nov 1994 08:12:31 GMT"), nil
+		return withDate(s3Object(`"e"`, ""), httpDate(time.Now().Add(-time.Minute))), nil
 	}))
 	id := blob.WriteID{Node: "n", Epoch: 1, N: 1}
 	b.Create(ctx, "k", strings.NewReader("v"), id)
@@ -102,92 +244,74 @@ func TestS3SamplesEveryCall(t *testing.T) {
 	b.Get(ctx, "k")
 	b.GetRange(ctx, "k", 0, 1)
 	b.Head(ctx, "k")
+	if len(l.lines()) != 1 {
+		t.Fatalf("five calls a minute off logged %q, want one warning", l.lines())
+	}
 	b.Delete(ctx, "k", "")
 	for range b.List(ctx, "", "") {
 	}
-	if n, errs := got.counts(); n < 7 || errs != 0 {
-		t.Fatalf("%d samples and %d failures from seven calls", n, errs)
+	if l.count(warnsOff) != 1 {
+		t.Fatalf("more calls warned again: %q", l.lines())
 	}
 }
 
-// A response without a usable time is reported as a failure, not dropped, and a
+// Responses without a usable time make the check blind, and the calls go on. A
 // request that got no response has nothing to report.
-func TestS3SampleFailures(t *testing.T) {
+func TestS3WithoutATime(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	for name, date := range map[string]string{"omitted": "", "malformed": "yesterday-ish"} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			b, got := sampledS3(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			b, l := loggedS3(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
 				wrote(r)
 				return withDate(s3Object(`"e"`, ""), date), nil
 			}))
-			if _, err := b.Head(ctx, "k"); err != nil {
-				t.Fatalf("a response without a usable Date failed the call: %v", err)
+			for range blob.ClockRun {
+				if _, err := b.Head(ctx, "k"); err != nil {
+					t.Fatalf("a response without a usable Date failed the call: %v", err)
+				}
 			}
-			if n, errs := got.counts(); n != 0 || errs != 1 {
-				t.Fatalf("%d samples and %d failures, want one failure", n, errs)
+			if l.count(warnsBlind) != 1 || len(l.lines()) != 1 {
+				t.Fatalf("%d responses without a time: %q", blob.ClockRun, l.lines())
 			}
 		})
 	}
 	t.Run("no response", func(t *testing.T) {
 		t.Parallel()
-		b, got := sampledS3(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
+		b, l := loggedS3(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
 			return nil, errors.New("connection refused")
 		}))
-		if _, err := b.Head(ctx, "k"); err == nil {
-			t.Fatal("a refused connection succeeded")
+		for range 3 * blob.ClockRun {
+			if _, err := b.Head(ctx, "k"); err == nil {
+				t.Fatal("a refused connection succeeded")
+			}
 		}
-		if n, errs := got.counts(); n != 0 || errs != 0 {
-			t.Fatalf("%d samples and %d failures from a request with no response", n, errs)
+		if got := l.lines(); len(got) != 0 {
+			t.Fatalf("requests with no response logged %q", got)
 		}
 	})
 }
 
-// Without a sink the backend takes no samples and the calls work as before.
-func TestS3NoSinkNoSamples(t *testing.T) {
-	t.Parallel()
-	b := fakeS3(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		wrote(r)
-		return s3Object(`"e"`, ""), nil
-	}))
-	if _, err := b.Head(context.Background(), "k"); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// The memory backend's store time is its own clock, and the window is the
-// process's.
-func TestMemorySamples(t *testing.T) {
+// The memory backend's store time is its own clock, truncated to the second.
+func TestMemoryChecksTheClock(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	store := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
-	var got sampled
-	m := blob.NewMemory(blob.WithClock(func() time.Time { return store }), blob.WithClockSink(got.sink))
-	before := time.Now()
+	var l logged
+	m := blob.NewMemory(blob.WithClock(func() time.Time { return time.Now().Add(time.Hour) }), blob.WithClockLogger(l.log()))
 	id := blob.WriteID{Node: "n", Epoch: 1, N: 1}
 	e, _ := m.Create(ctx, "k", strings.NewReader("v"), id)
 	m.Update(ctx, "k", strings.NewReader("w"), e, id)
 	m.Get(ctx, "k")
 	m.GetRange(ctx, "k", 0, 1)
-	m.Head(ctx, "k")
-	for range m.List(ctx, "", "") {
-	}
-	m.Delete(ctx, "k", "")
-	after := time.Now()
-	if n, errs := got.counts(); n != 7 || errs != 0 {
-		t.Fatalf("%d samples and %d failures from seven calls", n, errs)
-	}
-	for _, s := range got.samples {
-		if !s.Store.Equal(store) || s.Start.Before(before) || s.End.Before(s.Start) || s.End.After(after) {
-			t.Fatalf("sample %+v outside the calls [%v, %v]", s, before, after)
-		}
+	if len(l.lines()) != 0 {
+		t.Fatalf("four calls logged %q", l.lines())
 	}
 	// A failed call is sampled too: the store answered.
 	if _, err := m.Head(ctx, "gone"); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatal(err)
 	}
-	if n, _ := got.counts(); n != 8 {
-		t.Fatalf("%d samples after a failed call, want 8", n)
+	if l.count(warnsOff) != 1 || len(l.lines()) != 1 {
+		t.Fatalf("five calls an hour off logged %q", l.lines())
 	}
 }

@@ -34,8 +34,9 @@ const (
 
 // unavailable is a 503 the node answers with, and the Retry-After it gives.
 type unavailable struct {
-	msg   string
-	retry time.Duration
+	reason reason
+	msg    string
+	retry  time.Duration
 }
 
 func (e *unavailable) Error() string { return e.msg }
@@ -56,10 +57,10 @@ func (e *unavailable) Error() string { return e.msg }
 func (s *Server) forward(w http.ResponseWriter, r *http.Request, info *reqInfo) {
 	if info.forwarded {
 		w.Header().Set(hdrOwner, string(info.owner))
-		writeError(w, r, true, http.StatusMisdirectedRequest, fmt.Sprintf("%s is owned by %s", info.name, info.owner))
+		writeError(w, r, true, http.StatusMisdirectedRequest, reasonNotOwner, fmt.Sprintf("%s is owned by %s", info.name, info.owner))
 		return
 	}
-	address, err := s.m.addrs.address(r.Context(), info.owner)
+	address, err := s.m.addrs.Address(r.Context(), info.owner)
 	if err != nil {
 		s.fail(w, r, info.own, fmt.Errorf("forwarding to %s, the owner of %s: %w", info.owner, info.name, err))
 		return
@@ -80,7 +81,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, info *reqInfo) 
 	defer late.Stop()
 	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{Got1xxResponse: func(_ int, h textproto.MIMEHeader) error {
 		info.answer.CompareAndSwap(int32(answerAwaited), int32(answerHeard))
-		s.m.placer.answered(info.owner, http.Header(h))
+		s.m.placer.Answered(info.owner, http.Header(h))
 		return nil
 	}})
 	// The owner's 1xx are its own (it drops its app's), so none reaches the client.
@@ -88,17 +89,17 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, info *reqInfo) 
 	switch {
 	case info.unreachable:
 		s.m.Stats.Unanswered.Inc()
-		s.m.placer.unanswered(info.owner)
+		s.m.placer.Unanswered(info.owner)
 		if !s.m.isLive(info.owner) {
 			s.m.owners.Remove(info.name)
 		}
-		s.answer(w, r, info.own, &unavailable{fmt.Sprintf("%s, the owner of %s, does not answer", info.owner, info.name), time.Second})
+		s.answer(w, r, info.own, &unavailable{reasonOwnerUnreachable, fmt.Sprintf("%s, the owner of %s, does not answer", info.owner, info.name), time.Second})
 	case info.moved:
 		s.m.owners.Remove(info.name)
 		if info.movedTo != "" && info.movedTo != s.m.n.Name {
 			s.m.owners.Add(info.name, info.movedTo)
 		}
-		s.answer(w, r, info.own, &unavailable{fmt.Sprintf("%s is not owned by %s: try again", info.name, info.owner), 0})
+		s.answer(w, r, info.own, &unavailable{reasonMoved, fmt.Sprintf("%s is not owned by %s: try again", info.name, info.owner), 0})
 	}
 }
 
@@ -116,19 +117,18 @@ func (s *Server) forwardError(w http.ResponseWriter, r *http.Request, err error)
 		info.unreachable = true
 		return
 	}
-	s.proxyError(w, r, err)
+	s.upstreamError(w, r, err, reasonOwnerFailed, reasonOwnerUnreachable)
 }
 
 // forwardedResponse is the owner's answer to a forward. It passes through as it
 // is (the owner gated it), except for its Shardlite-Placement, which is taken
-// out, and a 421 from the owner's node. What a calling shard sends over an
+// out, and a 421 from the owner's node. Its Shardlite-Error goes through, so the
+// reason names the cause where it happened. What a calling shard sends over an
 // upgraded connection is gated here, on the caller.
 func (s *Server) forwardedResponse(resp *http.Response) error {
 	info, _ := resp.Request.Context().Value(ctxKey{}).(*reqInfo)
 	info.answer.Store(int32(answerHeard))
-	// The owner's placement is for this node alone: the client never sees it.
-	s.m.placer.answered(info.owner, resp.Header)
-	resp.Header.Del(hdrPlacement)
+	s.m.placer.Answered(info.owner, resp.Header) // and takes the placement out, which the client never sees
 	// Only a node sets Shardlite-Owner (an owner strips the app's), though it may
 	// be empty: the node that answered didn't find the owner.
 	if owner, ok := resp.Header[hdrOwner]; ok && resp.StatusCode == http.StatusMisdirectedRequest {

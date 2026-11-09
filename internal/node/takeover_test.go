@@ -18,6 +18,7 @@ import (
 	"github.com/luci1900/shardlite/internal/journal"
 	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/notify"
+	"github.com/luci1900/shardlite/internal/peers"
 	"github.com/luci1900/shardlite/internal/service"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
@@ -31,7 +32,8 @@ const takeoverTTL = time.Second
 type cnode struct {
 	*Node
 	tails *TailSet
-	scan  *leaseScan
+	scan  *peers.Scan
+	adopt *adopter
 }
 
 // startCluster starts a node on b. A live node renews its lease. A dying one
@@ -62,11 +64,15 @@ func startCluster(t *testing.T, b blob.Backend, name cluster.Node, live bool) *c
 // scanning serves a lease scan on c until the test ends.
 func (c *cnode) scanning(t *testing.T) *cnode {
 	t.Helper()
-	c.scan = &leaseScan{
-		reg: c.Registry, files: c.Files, store: c.Store, nodeErr: c.Err,
-		self:  func() lease.Incarnation { l := c.Keeper.Lease(); return l.Incarnation() },
-		clock: realClock{}, opts: LeaseScanOptions{Every: 50 * time.Millisecond, TTL: takeoverTTL},
-		log: slog.New(slog.DiscardHandler), scans: &notify.Counter{}, adopted: &notify.Counter{},
+	self := func() lease.Incarnation { l := c.Keeper.Lease(); return l.Incarnation() }
+	log := slog.New(slog.DiscardHandler)
+	c.adopt = &adopter{
+		reg: c.Registry, files: c.Files, store: c.Store, self: self, nodeErr: c.Err,
+		clock: realClock{}, log: log, adopted: &notify.Counter{},
+	}
+	c.scan = &peers.Scan{
+		Registry: c.Registry, Self: self, Clock: realClock{}, Options: peers.ScanOptions{Every: 50 * time.Millisecond, TTL: takeoverTTL},
+		Log: log, Scans: &notify.Counter{}, Adopt: c.adopt.adopt,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	var g errgroup.Group
@@ -158,7 +164,7 @@ func TestDeadNodeIsAdopted(t *testing.T) {
 	a := startCluster(t, b, "a", true).scanning(t)
 	third := startCluster(t, b, "third", true)
 	select {
-	case <-a.scan.adopted.Reached(1):
+	case <-a.adopt.adopted.Reached(1):
 	case <-time.After(30 * time.Second):
 		t.Fatal("the dead node wasn't adopted")
 	}
@@ -217,9 +223,9 @@ func TestDeadAdopterIsReplaced(t *testing.T) {
 
 	z := startCluster(t, b, "z", true).scanning(t)
 	select {
-	case <-z.scan.adopted.Reached(2):
+	case <-z.adopt.adopted.Reached(2):
 	case <-time.After(30 * time.Second):
-		t.Fatalf("adoptions: %d, want both x and y", z.scan.adopted.Load())
+		t.Fatalf("adoptions: %d, want both x and y", z.adopt.adopted.Load())
 	}
 	for _, node := range []cluster.Node{"x", "y"} {
 		if l := leaseOf(t, z, node); l.Adopted != l.Epoch || l.AdoptedBy != nil {
@@ -248,10 +254,10 @@ func TestTwoAdoptersAdoptOnce(t *testing.T) {
 		return leaseOf(t, a, "dead").Adopted == 1
 	})
 	// Both have listed again since: neither adopts a second time.
-	sa, sc := a.scan.scans.Load(), c.scan.scans.Load()
-	<-a.scan.scans.Reached(sa + 3)
-	<-c.scan.scans.Reached(sc + 3)
-	if n := a.scan.adopted.Load() + c.scan.adopted.Load(); n != 1 {
+	sa, sc := a.scan.Scans.Load(), c.scan.Scans.Load()
+	<-a.scan.Scans.Reached(sa + 3)
+	<-c.scan.Scans.Reached(sc + 3)
+	if n := a.adopt.adopted.Load() + c.adopt.adopted.Load(); n != 1 {
 		t.Fatalf("%d adoptions, want 1", n)
 	}
 }

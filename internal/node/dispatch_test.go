@@ -14,6 +14,7 @@ import (
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/dueindex"
+	"github.com/luci1900/shardlite/internal/harness"
 	"github.com/luci1900/shardlite/internal/reconcile"
 	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
@@ -62,7 +63,7 @@ func remind(t *testing.T, n *clusterNode, paths chan string, shard string, due i
 
 // dispatchCluster is a cluster on one fake clock whose leases never look old and
 // whose nodes wake inactive shards through the dispatcher.
-func dispatchCluster(t *testing.T, clk *fakeClock) *testCluster {
+func dispatchCluster(t *testing.T, clk *harness.FakeClock) *testCluster {
 	return newClusterWith(t, 2, func(o *ShardsetOptions) {
 		o.Clock = clk
 		o.Leases.TTL = 1000 * time.Hour
@@ -72,7 +73,7 @@ func dispatchCluster(t *testing.T, clk *fakeClock) *testCluster {
 // idleWithReminder puts a timer row due at due into shard on n and waits until the
 // shard is let go of there. Its manifest then names the reminder and the reminder
 // index has the entry for it.
-func idleWithReminder(t *testing.T, clk *fakeClock, n *clusterNode, paths chan string, shard string, due int64) {
+func idleWithReminder(t *testing.T, clk *harness.FakeClock, n *clusterNode, paths chan string, shard string, due int64) {
 	t.Helper()
 	remind(t, n, paths, shard, due)
 	m := n.m.Load()
@@ -122,7 +123,7 @@ func entriesOf(t *testing.T, n *clusterNode, name string) []shardfile.Reminder {
 // and woken, with no wake loop: the dispatch claims the released shard on the node
 // the placer picks, and that node's app answers the wake.
 func TestDispatchWakesAnIdleShard(t *testing.T) {
-	clk := newFakeClock()
+	clk := harness.NewFakeClock()
 	c := dispatchCluster(t, clk)
 	n0, n1 := c.nodes[0], c.nodes[1]
 	app := apptest.Start(t)
@@ -159,7 +160,7 @@ func TestDispatchWakesAnIdleShard(t *testing.T) {
 // A deactivation whose entry can't be created fails and the shard stays active, as
 // a failed entry keeps it active, and it deactivates once storage answers.
 func TestFailedEntryKeepsTheShardActive(t *testing.T) {
-	clk := newFakeClock()
+	clk := harness.NewFakeClock()
 	c := dispatchCluster(t, clk)
 	n0 := c.nodes[0]
 	app := apptest.Start(t)
@@ -191,7 +192,7 @@ func TestFailedEntryKeepsTheShardActive(t *testing.T) {
 // claimed once the lease scan counts the node dead, which
 // TestAdopterEntryWakesAKilledOwnersActiveShard covers.)
 func TestDispatchClaimsAShardNobodyOwns(t *testing.T) {
-	clk := newFakeClock()
+	clk := harness.NewFakeClock()
 	c := dispatchCluster(t, clk)
 	app := apptest.Start(t)
 	rungOn := map[*clusterNode]*atomic.Int32{}
@@ -204,13 +205,13 @@ func TestDispatchClaimsAShardNobodyOwns(t *testing.T) {
 	// cluster, and the shard goes idle on the other node.
 	advanceUntil(t, clk, 100*time.Millisecond, "both nodes to list the cluster", func() bool {
 		for _, n := range c.nodes {
-			if len(n.m.Load().liveNodes()) != len(c.nodes) {
+			if len(n.m.Load().leases.Nodes().Live()) != len(c.nodes) {
 				return false
 			}
 		}
 		return true
 	})
-	runner := reconcile.Runner(c.nodes[0].m.Load().liveNodes(), shardName(name).Lane())
+	runner := reconcile.Runner(c.nodes[0].m.Load().leases.Nodes().Live(), shardName(name).Lane())
 	var dispatcher, other *clusterNode
 	for _, n := range c.nodes {
 		if n.env.Name == runner {

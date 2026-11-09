@@ -5,6 +5,8 @@ go 1.26.0
 require (
 	github.com/coder/websocket v1.8.15
 	github.com/luci1900/shardlite v0.0.0
+	github.com/luci1900/shardlite/migrate v0.0.0
+	github.com/luci1900/shardlite/sdk/go v0.0.0
 	google.golang.org/grpc v1.84.0
 	google.golang.org/protobuf v1.36.11
 	modernc.org/sqlite v1.49.1
@@ -50,3 +52,7 @@ require (
 )
 
 replace github.com/luci1900/shardlite => ../
+
+replace github.com/luci1900/shardlite/sdk/go => ../sdk/go
+
+replace github.com/luci1900/shardlite/migrate => ../migrate

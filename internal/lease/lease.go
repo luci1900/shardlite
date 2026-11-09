@@ -142,9 +142,6 @@ func NewRegistry(b blob.Backend, node cluster.Node, opts RegistryOptions) *Regis
 	return &Registry{store: blob.NewStore(b, node, pos.Epoch(binary.BigEndian.Uint64(r[:])), opts.Blob), opts: opts}
 }
 
-// TTL is the lease TTL the registry grants (DefaultTTL if none was set).
-func (r *Registry) TTL() time.Duration { return r.opts.TTL }
-
 func encodeLease(l *Record) *bytes.Reader {
 	b, err := json.Marshal(l)
 	if err != nil {

@@ -1,0 +1,18 @@
+{
+  "name": "shardlite",
+  "version": "0.0.0",
+  "description": "The TypeScript SDK for apps served by shardlite",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "test": "node --test ./*.test.ts",
+    "lint": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=22.18"
+  }
+}

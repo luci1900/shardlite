@@ -19,6 +19,9 @@ import (
 // wake handler selects the due reminders, makes each call with Idempotency-Key
 // set to the key and deletes both rows once the call answered 2xx (leaving them
 // and answering 503 when a call fails, so the node wakes it again with backoff).
+// Its calls carry the context of the wake, so the receiver's node reads the
+// sender as the caller and the call is gated on the sender's commits (the call
+// is made on n0, which the sender lives on).
 // The receiver records (Shardlite-Caller, Idempotency-Key) in a table of its own
 // in the same transaction as its work, and skips work it has seen.
 //
@@ -46,7 +49,7 @@ func TestDurableSendBetweenNodes(t *testing.T) {
 		}
 		// The sender's wake handler.
 		wakes.Add(1)
-		self := q.Header.Get("Shardlite-Opened")
+		wake := q.Header.Get(hdrContext) // the wake's context, passed on to each call
 		out, err := app.Do("query", "q", path, `SELECT group_concat(r.key || '|' || s.target || '|' || s.path || '|' || s.body, ';') FROM _shardlite_reminders r JOIN sends s ON s.key = r.key WHERE r.due <= unixepoch()`)
 		if err != nil {
 			t.Error(err)
@@ -62,7 +65,7 @@ func TestDurableSendBetweenNodes(t *testing.T) {
 			key, target, cpath, body := f[0], f[1], f[2], f[3]
 			call, _ := http.NewRequest("POST", "http://"+n0.Control+cpath, strings.NewReader(body))
 			call.Header.Set("Shardlite-Target", target)
-			call.Header.Set("Shardlite-Caller", self)
+			call.Header.Set(hdrContext, wake)
 			call.Header.Set("Idempotency-Key", key)
 			resp, err := clusterClient.Do(call)
 			if err != nil {
@@ -188,7 +191,7 @@ func TestInboxHeaderIsOrdinaryBetweenNodes(t *testing.T) {
 		mu.Lock()
 		seen = nil
 		mu.Unlock()
-		hdr := map[string]string{"Shardlite-Target": "users/h", "Shardlite-Caller": "users/x", "Shardlite-Hops": "0", "Shardlite-Inbox": "true"}
+		hdr := map[string]string{"Shardlite-Target": "users/h", hdrContext: ctxOf("users/x", 0), "Shardlite-Inbox": "true"}
 		if tc.origin != "" {
 			hdr["Shardlite-Origin"] = tc.origin
 		}

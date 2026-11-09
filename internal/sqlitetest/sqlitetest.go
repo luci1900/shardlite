@@ -1,18 +1,13 @@
-// Package sqlitetest compares SQLite files in tests, and checks migrations.
+// Package sqlitetest compares SQLite files in tests.
 package sqlitetest
 
 import (
-	"context"
 	"database/sql"
 	"fmt"
-	"io/fs"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	_ "modernc.org/sqlite"
-
-	"github.com/luci1900/shardlite/internal/migrate"
 )
 
 // Dump returns every row of every table except SQLite's own, plus the
@@ -87,71 +82,4 @@ func TryDump(path string) (string, error) {
 		}
 	}
 	return sb.String(), nil
-}
-
-// Migrations checks a release's migrations (see package migrate): they pass
-// migrate.Check, and on a new file migrating up, down to nothing and up again
-// leaves the same tables and rows as the first time. Every table the files
-// create is STRICT: a value of the wrong type is refused instead of stored as
-// whatever the column's affinity makes of it.
-func Migrations(tb testing.TB, fsys fs.FS) {
-	tb.Helper()
-	if err := migrate.Check(fsys); err != nil {
-		tb.Fatal(err)
-	}
-	path := filepath.Join(tb.TempDir(), "migrations.db")
-	db, err := sql.Open("sqlite", "file:"+path)
-	if err != nil {
-		tb.Fatal(err)
-	}
-	defer db.Close()
-	db.SetMaxOpenConns(1)
-	to := func(v int) {
-		tb.Helper()
-		tx, err := db.Begin()
-		if err != nil {
-			tb.Fatal(err)
-		}
-		defer tx.Rollback()
-		if err := migrate.Migrate(context.Background(), tx, fsys, v); err != nil {
-			tb.Fatalf("to %d: %v", v, err)
-		}
-		if err := tx.Commit(); err != nil {
-			tb.Fatal(err)
-		}
-	}
-	to(migrate.Latest)
-	strict(tb, db)
-	first := Dump(tb, path)
-	to(0)
-	if empty := Dump(tb, path); empty != "" {
-		tb.Fatalf("down to 0 leaves:\n%s", empty)
-	}
-	to(migrate.Latest)
-	if again := Dump(tb, path); again != first {
-		tb.Fatalf("up again gives:\n%s\nthe first time:\n%s", again, first)
-	}
-}
-
-// strict fails the test for every table of the database that is not STRICT
-// (docs/guide.md, Schema migrations: a save format refuses what it cannot read
-// back). SQLite's own tables, whose names begin with sqlite_, are not ours to
-// demand it of.
-func strict(tb testing.TB, db *sql.DB) {
-	tb.Helper()
-	rows, err := db.Query(`SELECT name FROM pragma_table_list WHERE schema = 'main' AND type = 'table' AND "strict" = 0 AND name NOT LIKE 'sqlite_%'`)
-	if err != nil {
-		tb.Fatal(err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			tb.Fatal(err)
-		}
-		tb.Errorf("%s is not STRICT", name)
-	}
-	if err := rows.Err(); err != nil {
-		tb.Fatal(err)
-	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"github.com/luci1900/shardlite/internal/apptest"
+	"github.com/luci1900/shardlite/internal/harness"
 	"net/http"
 	"os"
 	"slices"
@@ -132,7 +133,7 @@ func TestShutdownWithAFailingHandlerLeavesAnEntryThatWakesTheShard(t *testing.T)
 // dispatched the shard.
 func TestCrashAfterTheWakeKeepsTheEntry(t *testing.T) {
 	t.Parallel()
-	clk := newFakeClock()
+	clk := harness.NewFakeClock()
 	opts := both(quick, withDispatch, withClock(clk))
 	r := newSRigWith(t, opts)
 	var up atomic.Bool
@@ -268,7 +269,7 @@ func TestFailedEntryFailsTheDelta(t *testing.T) {
 // next_reminder alone, so the dispatcher doesn't wake the shard for nothing.
 func TestDeactivationWithNoTailClearsTheNextReminder(t *testing.T) {
 	t.Parallel()
-	clk := newFakeClock()
+	clk := harness.NewFakeClock()
 	r := newSRigWith(t, both(quick, deltaAge(50*time.Millisecond), withClock(clk)))
 	rec := &recorder{keep: true, answer: func(int, *http.Request) int { return http.StatusServiceUnavailable }}
 	r.record(rec, "")

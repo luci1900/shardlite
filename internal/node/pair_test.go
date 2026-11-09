@@ -8,21 +8,22 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/apptest"
+	"github.com/luci1900/shardlite/internal/harness"
 )
 
 // pairRig is two nodes whose apps say which node they are. clk is the nodes' clock
 // (a fake one for the tests that move the idle timer).
 type pairRig struct {
 	*testCluster
-	clk *fakeClock
+	clk *harness.FakeClock
 	app *apptest.App // writes to the shards: one that holds nothing is deleted when it is let go of
 }
 
 // newPairRigOn is two nodes on the given fake clock, if there is one.
-func newPairRigOn(t *testing.T, clk *fakeClock) *pairRig { return newPairRigTuned(t, clk, nil) }
+func newPairRigOn(t *testing.T, clk *harness.FakeClock) *pairRig { return newPairRigTuned(t, clk, nil) }
 
 // newPairRigTuned is newPairRigOn with the nodes' options changed by tune, if it is set.
-func newPairRigTuned(t *testing.T, clk *fakeClock, tune func(*ShardsetOptions)) *pairRig {
+func newPairRigTuned(t *testing.T, clk *harness.FakeClock, tune func(*ShardsetOptions)) *pairRig {
 	r := &pairRig{clk: clk, app: apptest.Start(t)}
 	r.testCluster = newClusterWith(t, 2, func(o *ShardsetOptions) {
 		if tune != nil {

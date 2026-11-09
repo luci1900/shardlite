@@ -22,7 +22,7 @@ func intParam(r *http.Request, name string, def int) int {
 // bulk imports rows of random bytes in one transaction: ?rows=5000&bytes=1000.
 func (a *App) bulk(w http.ResponseWriter, r *http.Request, s *shardReq) {
 	rows, size := intParam(r, "rows", 1), intParam(r, "bytes", 1000)
-	tx, err := s.db.sql.BeginTx(r.Context(), nil)
+	tx, err := s.db.BeginTx(r.Context(), nil)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -47,7 +47,7 @@ func (a *App) bulk(w http.ResponseWriter, r *http.Request, s *shardReq) {
 
 // vacuum rewrites the whole database.
 func (a *App) vacuum(w http.ResponseWriter, r *http.Request, s *shardReq) {
-	if _, err := s.db.sql.ExecContext(r.Context(), `VACUUM`); err != nil {
+	if _, err := s.db.ExecContext(r.Context(), `VACUUM`); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -94,7 +94,7 @@ func (a *App) checkpoints(w http.ResponseWriter, r *http.Request, s *shardReq) {
 }
 
 // churn is an app that closes and opens its connection all the time, each time
-// with a write: ?n=300. It writes through connections of its own, not the pool's.
+// with a write: ?n=300. It writes through connections of its own, not the request's.
 func (a *App) churn(w http.ResponseWriter, r *http.Request, s *shardReq) {
 	n := intParam(r, "n", 300)
 	for i := range n {

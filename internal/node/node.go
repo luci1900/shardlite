@@ -37,10 +37,6 @@ type Config struct {
 	Lease  lease.RegistryOptions // lease TTL
 	Keeper lease.KeeperOptions   // renewal interval and safety margin (Info is the node's own)
 	Logger *slog.Logger
-	// Clock, if set, checks the node's clock against the store's. The backend
-	// must feed it (blob.S3Options.ClockSink). Start refuses a clock more than a
-	// lease TTL off, and the control API reports the offset.
-	Clock *lease.ClockWatch
 	// TempDir is where tails, deltas, snapshots and downloads are kept (in the
 	// data directory). It is made when it is first needed. The
 	// The shardset empties it of what a crash left.
@@ -100,26 +96,12 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 	}
 	reg := lease.NewRegistry(cfg.Backend, cfg.Name, cfg.Lease)
 	info := lease.NodeInfo{Name: cfg.Name, Address: cfg.Address}
-	// A clock too far off refuses the start before the lease is taken, by what the
-	// requests so far showed, and again once the lease's own response has.
-	checkClock := func() error {
-		if cfg.Clock == nil {
-			return nil
-		}
-		return cfg.Clock.CheckStart(reg.TTL())
-	}
-	if err := checkClock(); err != nil {
-		return nil, err
-	}
 	rec, err := reg.Acquire(ctx, info)
 	if err != nil {
 		return nil, fmt.Errorf("acquire lease: %w", err)
 	}
 	// The lease is left to run out, as after any failure past this point: it
 	// carries the previous life's range, which the next start adopts.
-	if err := checkClock(); err != nil {
-		return nil, err
-	}
 	store := blob.NewStore(cfg.Backend, cfg.Name, rec.Epoch, cfg.Blob)
 	n := &Node{
 		Config:   cfg,

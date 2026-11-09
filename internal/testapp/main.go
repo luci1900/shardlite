@@ -42,6 +42,17 @@ type app struct {
 	dbs   map[string]*sql.DB
 }
 
+// reservedTables is the reserved tables' DDL, the node's internal/node/reserved.sql:
+// the node runs it at every activation, so a captured shard's file always has
+// the tables, and the create command (which stands in for the node making the
+// file) makes them with the file.
+const reservedTables = `CREATE TABLE IF NOT EXISTS _shardlite_reminders (
+  key TEXT PRIMARY KEY,
+  due INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS _shardlite_reminders_due ON _shardlite_reminders (due);
+CREATE TABLE IF NOT EXISTS _shardlite_delete (marked INTEGER PRIMARY KEY CHECK (marked = 1)) STRICT;`
+
 func main() {
 	a := &app{paths: map[string]string{}, busy: map[string]string{}, dbs: map[string]*sql.DB{}}
 	sc := bufio.NewScanner(os.Stdin)
@@ -129,6 +140,17 @@ func (a *app) do(f []string) (string, error) {
 				return "", err
 			}
 			file.Close()
+			// The reserved tables, which the node's activation would make before
+			// the app gets the shard.
+			db, err := sql.Open("sqlite", "file:"+f[2]+"?mode=rw&_pragma=journal_mode(WAL)")
+			if err != nil {
+				return "", err
+			}
+			_, err = db.Exec(reservedTables)
+			db.Close()
+			if err != nil {
+				return "", err
+			}
 		}
 		return "", a.open(id, f[2], busy)
 	}

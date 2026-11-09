@@ -5,7 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"github.com/luci1900/shardlite/internal/apptest"
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/kind"
@@ -233,11 +234,11 @@ func (r *mrig) mustBeGone(target, path string) {
 	}
 }
 
-// markForDeletion makes the app create the delete marker in the shard it has open
-// as "a" (see r.write).
+// markForDeletion has the app mark the shard for deletion in the shard it has
+// open as "a" (see r.write): a row in the table the node created.
 func (r *mrig) markForDeletion() {
 	r.t.Helper()
-	r.app.Must(r.t, "exec", "a", "CREATE TABLE _shardlite_delete (x)")
+	r.app.Must(r.t, "exec", "a", `INSERT OR IGNORE INTO _shardlite_delete VALUES (1)`)
 }
 
 // A marked shard is captured and shipped like any other: it has a journal and its
@@ -296,6 +297,96 @@ func TestMarkedShardLeavesNothingAfterDeactivation(t *testing.T) {
 	}
 	if dump := r.liveDump(ref.Path()); strings.Contains(dump, "kv: ") {
 		t.Fatalf("the shard isn't empty:\n%s", dump)
+	}
+}
+
+// Deleting the marker's row unmarks the shard: it is kept at deactivation, with
+// its data, and marking it again deletes it.
+func TestMarkedShardIsUnmarkedWhenTheRowGoes(t *testing.T) {
+	t.Parallel()
+	r := newMRig(t)
+	ref := r.acquire("lobby/u1")
+	r.write(ref, "a")
+	r.markForDeletion()
+	r.app.Must(t, "exec", "a", `DELETE FROM _shardlite_delete`)
+	r.app.Must(t, "close", "a")
+	ref.Release()
+	apptest.Eventually(t, apptest.Timeout, "deactivation", func() bool { return r.released("lobby/u1") })
+	if _, err := r.rawManifest("lobby/u1"); err != nil {
+		t.Fatalf("an unmarked shard was deleted: %v", err)
+	}
+	if r.m.Stats.Deletes.Load() != 0 {
+		t.Fatalf("deletes %d, want none", r.m.Stats.Deletes.Load())
+	}
+
+	// The shard is as it was, and marking it again deletes it.
+	ref = r.acquire("lobby/u1")
+	path := ref.Path()
+	if got := strings.Count(r.liveDump(path), "kv: "); got != 2 {
+		t.Fatalf("%d rows, want the shard as it was", got)
+	}
+	r.app.Must(t, "open", "a", path)
+	r.markForDeletion()
+	r.app.Must(t, "close", "a")
+	ref.Release()
+	apptest.Eventually(t, apptest.Timeout, "deactivation", r.inactive("lobby/u1"))
+	r.mustBeGone("lobby/u1", path)
+}
+
+// The node creates _shardlite_delete, so an app still running the old DDL (or a
+// migration replaying it) fails instead of marking anything: the shard is kept.
+func TestCreatingTheDeleteTableFails(t *testing.T) {
+	t.Parallel()
+	r := newMRig(t)
+	ref := r.acquire("lobby/o1")
+	r.write(ref, "a")
+	if _, err := r.app.Do("exec", "a", "CREATE TABLE _shardlite_delete (x)"); err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("creating the marker's table: %v, want 'table already exists'", err)
+	}
+	r.app.Must(t, "close", "a")
+	ref.Release()
+	apptest.Eventually(t, apptest.Timeout, "deactivation", func() bool { return r.released("lobby/o1") })
+	if _, err := r.rawManifest("lobby/o1"); err != nil {
+		t.Fatalf("a shard whose marker table could not be created was deleted: %v", err)
+	}
+}
+
+// A shard whose _shardlite_delete the app dropped fails the marked check rather
+// than reading as unmarked: the deactivation fails loudly and the shard and its
+// data stay. The node tries the deactivation again after its hold off, and the
+// resumed activation makes the reserved table again, so the retry lets the
+// shard go as kept.
+func TestADroppedDeleteTableFailsTheMarkedCheck(t *testing.T) {
+	t.Parallel()
+	var logs bytes.Buffer
+	var lmu sync.Mutex
+	logger := slog.New(slog.NewTextHandler(writerFunc(func(p []byte) (int, error) { lmu.Lock(); defer lmu.Unlock(); return logs.Write(p) }), nil))
+	r := newMRigWith(t, func(o *ShardsetOptions) { o.Logger = logger })
+	ref := r.acquire("lobby/p1")
+	r.write(ref, "a")
+	r.app.Must(t, "exec", "a", `DROP TABLE _shardlite_delete`)
+	r.app.Must(t, "close", "a")
+	ref.Release()
+	readLogs := func() bool {
+		lmu.Lock()
+		defer lmu.Unlock()
+		return strings.Contains(logs.String(), "could not deactivate an idle shard") && strings.Contains(logs.String(), "no such table")
+	}
+	apptest.Eventually(t, apptest.Timeout, "the failed deactivation to be logged", readLogs)
+
+	// The retry makes the table again and the shard is let go of, kept as any
+	// written one.
+	apptest.Eventually(t, apptest.Timeout, "deactivation", func() bool { return r.released("lobby/p1") })
+	if _, err := r.rawManifest("lobby/p1"); err != nil {
+		t.Fatalf("a shard whose marked check failed once was deleted: %v", err)
+	}
+	if r.m.Stats.Deletes.Load() != 0 {
+		t.Fatalf("deletes %d, want none", r.m.Stats.Deletes.Load())
+	}
+	// dumpBlob restores from blob storage, which is where the data of a kept
+	// shard lives; liveDump would read the file without its WAL frames.
+	if g := strings.Count(r.dumpBlob("lobby/p1"), "kv: "); g != 2 {
+		t.Fatalf("%d rows in blob storage, want the shard as it was", g)
 	}
 }
 
@@ -358,8 +449,8 @@ func TestMarkedShardSurvivesACrash(t *testing.T) {
 				t.Fatalf("manifest %+v (%v), want the old shard", m, err)
 			}
 			dump := r.liveDump(ref.Path())
-			if got := strings.Count(dump, "kv: "); got != 2 || !strings.Contains(dump, "_shardlite_delete") {
-				t.Fatalf("%d rows after a crash, want the 2 of one write, and the marker:\n%s", got, dump)
+			if got := strings.Count(dump, "kv: "); got != 2 || !strings.Contains(dump, "_shardlite_delete: [1]") {
+				t.Fatalf("%d rows after a crash, want the 2 of one write, and the marker's row:\n%s", got, dump)
 			}
 			path := ref.Path()
 			ref.Release()

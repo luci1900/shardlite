@@ -302,6 +302,42 @@ func TestWALCursorFramesFromAnOffset(t *testing.T) {
 	}
 }
 
+// A wal-index that has gone back on the same WAL (the salts it names are the
+// cursor's own, but fewer frames than the cursor has read) is an error, not a
+// shorter read: the frames past it were read and captured, so anything fewer
+// would be a different database. This is the resumed release's proof against
+// a restarted WAL that kept its file size.
+func TestWALCursorRejectsAWalIndexBehindIt(t *testing.T) {
+	path, _ := openWAL(t, 0,
+		`CREATE TABLE t (x)`,
+		`INSERT INTO t VALUES (1)`,
+		`INSERT INTO t VALUES (2)`,
+	)
+	f := mustOpen(t, path+"-wal")
+	h, err := readWALHeader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := walAt(f, Info{Salt: h.salt, MxFrame: 2}, h.pageSize, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.readTo(f, 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := walAt(f, Info{Salt: h.salt, MxFrame: 1}, h.pageSize, &c); err == nil {
+		t.Fatal("a wal-index behind the cursor was accepted")
+	}
+	// At the frames already read it continues the cursor, checksum and all.
+	d, err := walAt(f, Info{Salt: h.salt, MxFrame: 2}, h.pageSize, &c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.frames != c.frames || d.ck != c.ck {
+		t.Fatalf("the cursor continued at frame %d (checksum %x), want frame %d (checksum %x)", d.frames, d.ck, c.frames, c.ck)
+	}
+}
+
 // SQLite writes the WAL's header and the wal-index's header in turn when it
 // restarts the WAL, so a read that straddles the restart sees the two name
 // different WALs. The pair is read again until it agrees, and the frames of the

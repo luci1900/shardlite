@@ -59,12 +59,7 @@ func peer(t *testing.T, h http.HandlerFunc) string {
 // would after the shard was there once.
 func (n *clusterNode) believe(target string, node cluster.Node, addr string) {
 	m := n.m.Load()
-	m.addrs.mu.Lock()
-	if m.addrs.leases == nil {
-		m.addrs.leases = map[cluster.Node]*lease.Record{}
-	}
-	m.addrs.leases[node] = &lease.Record{NodeInfo: lease.NodeInfo{Name: node, Address: addr}, Renewed: time.Now(), TTL: time.Hour}
-	m.addrs.mu.Unlock()
+	m.addrs.Remember(&lease.Record{NodeInfo: lease.NodeInfo{Name: node, Address: addr}, Renewed: time.Now(), TTL: time.Hour})
 	m.owners.Add(shardName(target), node)
 }
 
@@ -85,6 +80,7 @@ func moved(t *testing.T, resp *http.Response, body string) {
 	if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") != "0" {
 		t.Fatalf("%d (Retry-After %q) %q, want 503 with Retry-After: 0", resp.StatusCode, resp.Header.Get("Retry-After"), body)
 	}
+	wantReason(t, resp, reasonMoved)
 }
 
 // A shard that moved: the forward to its old owner gets 421 naming the new one,

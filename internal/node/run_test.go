@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -24,7 +25,9 @@ import (
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/blobtest"
+	"github.com/luci1900/shardlite/internal/harness"
 	"github.com/luci1900/shardlite/internal/lease"
+	"github.com/luci1900/shardlite/internal/notify"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
@@ -178,6 +181,62 @@ func TestRunLeavesNoGoroutines(t *testing.T) {
 	// No waiting: Run's return is the join.
 	if left := startedSince(before, nodeGoroutines()); len(left) > 0 {
 		t.Fatalf("%d node goroutines left after Run returned:\n%s", len(left), strings.Join(left, "\n\n"))
+	}
+}
+
+// SHARDLITE_BLOB=memory:// runs the node on the in-memory store, with a warning
+// that its storage is lost when it stops, and serves a shard.
+func TestRunOnMemoryBlob(t *testing.T) {
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		io.WriteString(w, runKinds)
+	}))
+	defer fake.Close()
+	vars := map[string]string{
+		"SHARDLITE_NODE": "run-memory", "SHARDLITE_BLOB": "memory://",
+		"SHARDLITE_DATA": filepath.Join(t.TempDir(), "data"),
+		"SHARDLITE_APP":  fake.URL, "SHARDLITE_LISTEN_PUBLIC": "127.0.0.1:0", "SHARDLITE_LISTEN_CONTROL": "127.0.0.1:0", "SHARDLITE_LISTEN_PEER": "127.0.0.1:0",
+		"SHARDLITE_FLUSH": "50ms",
+	}
+	env, err := ParseEnv(func(k string) string { return vars[k] })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var log runLog
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type addrs struct{ public, control string }
+	up := make(chan addrs, 1)
+	ran := make(chan error, 1)
+	go func() {
+		ran <- Run(ctx, env, slog.New(&log), func(public, control, peer string) { up <- addrs{public, control} })
+	}()
+	var a addrs
+	select {
+	case a = <-up:
+	case err := <-ran:
+		t.Fatalf("Run ended early: %v", err)
+	case <-time.After(20 * time.Second):
+		t.Fatal("the node did not come up")
+	}
+	apptest.Eventually(t, apptest.Timeout, "the app's declaration", func() bool {
+		resp, err := http.Get("http://" + a.public + readyPath)
+		if err != nil {
+			return false
+		}
+		resp.Body.Close()
+		return resp.StatusCode == 200
+	})
+	if !slices.ContainsFunc(log.warned.All(), func(m string) bool { return strings.Contains(m, "in memory") }) {
+		t.Fatalf("no warning that the storage is in memory: %q", log.warned.All())
+	}
+	cancel()
+	select {
+	case err := <-ran:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run did not return")
 	}
 }
 
@@ -453,6 +512,26 @@ type runRig struct {
 
 func startRun(t *testing.T, name string, vars map[string]string, opts ...RunOption) *runRig {
 	t.Helper()
+	r := startRunUnready(t, name, vars, opts...)
+	// The kinds come from the app's declaration now, not a file read at
+	// startup: the first requests wait for the poll to land.
+	apptest.Eventually(t, apptest.Timeout, "the app's declaration", func() bool { return r.ready() })
+	return r
+}
+
+// ready is whether the node answers its readiness route with 200.
+func (r *runRig) ready() bool {
+	resp, err := http.Get("http://" + r.public + readyPath)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode == 200
+}
+
+// startRunUnready starts Run and returns once it is serving, without waiting for the app to declare itself.
+func startRunUnready(t *testing.T, name string, vars map[string]string, opts ...RunOption) *runRig {
+	t.Helper()
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
 		if q.URL.Path == appReadyPath {
 			io.WriteString(w, runKinds)
@@ -499,16 +578,6 @@ func startRun(t *testing.T, name string, vars map[string]string, opts ...RunOpti
 	case <-time.After(20 * time.Second):
 		t.Fatal("the node did not come up")
 	}
-	// The kinds come from the app's declaration now, not a file read at
-	// startup: the first requests wait for the poll to land.
-	apptest.Eventually(t, apptest.Timeout, "the app's declaration", func() bool {
-		resp, err := http.Get("http://" + r.public + readyPath)
-		if err != nil {
-			return false
-		}
-		resp.Body.Close()
-		return resp.StatusCode == 200
-	})
 	return r
 }
 
@@ -839,26 +908,220 @@ func TestPeerListenerAnswersAsTheNode(t *testing.T) {
 	}
 }
 
+// addrsOf is an injected interface list.
+func addrsOf(addrs ...string) func() ([]netip.Addr, error) {
+	return func() ([]netip.Addr, error) {
+		out := make([]netip.Addr, len(addrs))
+		for i, a := range addrs {
+			out[i] = netip.MustParseAddr(a)
+		}
+		return out, nil
+	}
+}
+
+func listenOn(t *testing.T, addr string) net.Listener {
+	t.Helper()
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Skipf("can't listen on %s: %v", addr, err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	return ln
+}
+
 // Without SHARDLITE_ADVERTISE_PEER the node publishes the peer listener's address
-// unless it is a wildcard, which other nodes can't use.
-func TestPeerAddressRule(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+// when it names a host, and the setting wins over anything found. The interfaces
+// are not asked in either case.
+func TestPeerAddressSetOrBoundToAHost(t *testing.T) {
+	t.Parallel()
+	ln := listenOn(t, "127.0.0.1:0")
+	wild := listenOn(t, ":0")
+	never := func() ([]netip.Addr, error) { t.Error("the interfaces were listed"); return nil, nil }
+	if got, err := peerAddress("", ln, never); err != nil || got != ln.Addr().String() {
+		t.Fatalf("got %q, %v", got, err)
+	}
+	if got, err := peerAddress("h:1", ln, never); err != nil || got != "h:1" {
+		t.Fatalf("got %q, %v", got, err)
+	}
+	if got, err := peerAddress("h:1", wild, never); err != nil || got != "h:1" {
+		t.Fatalf("got %q, %v", got, err)
+	}
+}
+
+// On a wildcard address the one private IPv4 address is advertised with the peer
+// port. Public IPv4, IPv6, loopback and link-local addresses are left out, and
+// the shared address space (100.64/10) counts.
+func TestPeerAddressDetectsThePrivateIPv4(t *testing.T) {
+	t.Parallel()
+	wild := listenOn(t, ":0")
+	_, port, _ := net.SplitHostPort(wild.Addr().String())
+	for _, c := range []struct {
+		name  string
+		addrs []string
+		want  string
+	}{
+		{"private", []string{"10.1.2.3"}, "10.1.2.3:" + port},
+		{"others are left out", []string{"127.0.0.1", "::1", "169.254.1.1", "fe80::1", "2001:db8::7", "8.8.8.8", "10.1.2.3"}, "10.1.2.3:" + port},
+		{"shared address space", []string{"100.64.0.1", "127.0.0.1"}, "100.64.0.1:" + port},
+		{"mapped", []string{"::ffff:192.168.1.5"}, "192.168.1.5:" + port},
+	} {
+		if got, err := peerAddress("", wild, addrsOf(c.addrs...)); err != nil || got != c.want {
+			t.Errorf("%s: got %q, %v, want %q", c.name, got, err, c.want)
+		}
+	}
+}
+
+// With no private IPv4 address or several, the node refuses and says to set the
+// address, naming what it found.
+func TestPeerAddressRefusesNoneOrSeveral(t *testing.T) {
+	t.Parallel()
+	wild := listenOn(t, ":0")
+	_, err := peerAddress("", wild, addrsOf("127.0.0.1", "169.254.1.1", "fe80::1", "2001:db8::7", "8.8.8.8"))
+	if err == nil || !strings.Contains(err.Error(), "SHARDLITE_ADVERTISE_PEER") || !strings.Contains(err.Error(), "no private IPv4 address") {
+		t.Fatalf("no candidate was accepted: %v", err)
+	}
+	_, err = peerAddress("", wild, addrsOf("10.1.2.3", "172.17.0.1", "127.0.0.1", "8.8.8.8"))
+	if err == nil || !strings.Contains(err.Error(), "SHARDLITE_ADVERTISE_PEER") || !strings.Contains(err.Error(), "several private IPv4 addresses (10.1.2.3, 172.17.0.1)") {
+		t.Fatalf("several candidates were accepted or not named: %v", err)
+	}
+	failing := func() ([]netip.Addr, error) { return nil, errors.New("no interfaces") }
+	if _, err := peerAddress("", wild, failing); err == nil || !strings.Contains(err.Error(), "no interfaces") {
+		t.Fatalf("a failed listing was accepted: %v", err)
+	}
+}
+
+// A node whose app answered once and then went away stops by itself, as if told
+// to: it drains, lets go of its shards, releases its lease and returns ErrAppLost,
+// and another node claims the shards at once, without an adoption.
+func TestRunStopsWhenTheAppIsLost(t *testing.T) {
+	t.Parallel()
+	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		if q.URL.Path == appReadyPath {
+			io.WriteString(w, runKinds)
+		}
+	}))
+	t.Cleanup(app.Close)
+	clk := harness.NewFakeClock()
+	var m atomic.Pointer[Shardset]
+	r := startRun(t, "run-app-lost-test", map[string]string{"SHARDLITE_APP": app.URL}, withAppClock(clk), withShardset(func(_ *ShardsetOptions, c *Shardset) {
+		if c != nil {
+			m.Store(c)
+		}
+	}))
+	resp, err := http.Get("http://" + r.control + "/x?shardlite-target=users/lost1") // a call, which creates the shard
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
-	if got, err := peerAddress("", ln); err != nil || got != ln.Addr().String() {
-		t.Fatalf("got %q, %v", got, err)
+	resp.Body.Close()
+	files, _ := filepath.Glob(filepath.Join(r.env.Data, "users", "lost1.*.db"))
+	if len(files) != 1 {
+		t.Fatalf("the shard's files: %v", files)
 	}
-	if got, err := peerAddress("h:1", ln); err != nil || got != "h:1" {
-		t.Fatalf("got %q, %v", got, err)
+	sql := apptest.Start(t)
+	sql.Must(t, "open", "a", files[0])
+	sql.Must(t, "exec", "a", `CREATE TABLE t (x)`)
+	sql.Must(t, "close", "a") // the shard has something to keep, and the app lets go of the file
+
+	app.Close() // the app goes away
+	clk.Advance(time.Second)
+	apptest.Eventually(t, apptest.Timeout, "the node to find the app gone", func() bool { return !r.ready() })
+	select {
+	case err := <-r.ran:
+		t.Fatalf("Run returned %v before the app had been gone for appLostAfter", err)
+	default:
 	}
-	wild, err := net.Listen("tcp", ":0")
+	clk.Advance(appLostAfter)
+	if err := r.wait(); !errors.Is(err, ErrAppLost) {
+		t.Fatalf("Run returned %v, want ErrAppLost", err)
+	}
+	if !m.Load().draining.Load() {
+		t.Fatal("a lost app did not drain the node")
+	}
+	r.in(askedStopOrder...)
+	for _, w := range r.log.warned.All() {
+		if strings.Contains(w, "not deactivated") || strings.Contains(w, "releasing the lease") || strings.Contains(w, "still running") || strings.Contains(w, "a part of the node failed") {
+			t.Fatalf("Run logged %q", w)
+		}
+	}
+	if l := r.lease(); !l.Released {
+		t.Fatalf("the lease was kept: %+v", l)
+	}
+	body, _, err := blob.WithPrefix(r.mem, r.env.Prefix).Get(context.Background(), shardfile.ManifestKey(shardName("users/lost1")))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer wild.Close()
-	if _, err := peerAddress("", wild); err == nil || !strings.Contains(err.Error(), "SHARDLITE_ADVERTISE_PEER") {
-		t.Fatalf("a wildcard was accepted: %v", err)
+	defer body.Close()
+	var man shardfile.Manifest
+	if err := json.NewDecoder(body).Decode(&man); err != nil {
+		t.Fatal(err)
+	}
+	if man.Owner != "" {
+		t.Fatalf("the manifest still names %q", man.Owner)
+	}
+
+	// Another node on the same store claims the shard at once, with no
+	// adoption of a journal to wait for.
+	live := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		if q.URL.Path == appReadyPath {
+			io.WriteString(w, runKinds)
+		}
+	}))
+	t.Cleanup(live.Close)
+	b := startRun(t, "run-app-lost-other", map[string]string{"SHARDLITE_APP": live.URL}, WithBackend(r.hooked))
+	resp, err = http.Get("http://" + b.control + "/x?shardlite-target=users/lost1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("the other node answered %d for the shard", resp.StatusCode)
+	}
+	body2, _, err := blob.WithPrefix(r.mem, r.env.Prefix).Get(context.Background(), shardfile.ManifestKey(shardName("users/lost1")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer body2.Close()
+	if err := json.NewDecoder(body2).Decode(&man); err != nil {
+		t.Fatal(err)
+	}
+	if man.Owner != "run-app-lost-other" {
+		t.Fatalf("the shard's owner is %q, want the other node", man.Owner)
+	}
+}
+
+// A node started before its app has answered waits for it, not ready and owning
+// nothing, and stays up however long the app takes: it never calls an app lost
+// that it has not heard from.
+func TestRunWaitsForAnAppThatHasNotAnswered(t *testing.T) {
+	t.Parallel()
+	var polls notify.Counter
+	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		conn, _, err := w.(http.Hijacker).Hijack() // no answer at all
+		if err == nil {
+			conn.Close()
+		}
+		polls.Inc()
+	}))
+	t.Cleanup(app.Close)
+	clk := harness.NewFakeClock()
+	r := startRunUnready(t, "run-no-app-test", map[string]string{"SHARDLITE_APP": app.URL}, withAppClock(clk))
+	waited := func(n uint64) {
+		t.Helper()
+		select {
+		case <-polls.Reached(n):
+		case <-time.After(apptest.Timeout):
+			t.Fatalf("the app was polled %d times, want %d", polls.Load(), n)
+		}
+	}
+	waited(1)
+	for i := uint64(2); i <= 4; i++ {
+		clk.Advance(appLostAfter) // a poll that finds no app, a whole appLostAfter after the last
+		waited(i)
+	}
+	apptest.Eventually(t, apptest.Timeout, "the node to be up and not ready", func() bool { return !r.ready() })
+	select {
+	case err := <-r.ran:
+		t.Fatalf("Run returned %v with no app to wait for", err)
+	default:
 	}
 }

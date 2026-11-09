@@ -89,11 +89,11 @@ func (rm *reminders) call(ctx context.Context, a *actor) (ok bool, err error) {
 	return err == nil, err
 }
 
-// ensureTables creates the reserved table and its index through capture's
-// connection, in one transaction. A shard that has
-// everything commits nothing; otherwise the commit is captured at once, so the
-// shard's final sync has nothing new to find (a shard the app never wrote to is
-// still deleted as never written).
+// ensureTables creates the reserved tables and the reminders index through
+// capture's connection, in one transaction. A shard that has everything commits
+// nothing; otherwise the commit is captured at once, so the shard's final sync
+// has nothing new to find (a shard the app never wrote to is still deleted as
+// never written).
 func ensureTables(ctx context.Context, sh *capture.Shard) error {
 	before, herr := sh.Header()
 	if err := sh.Use(ctx, func(db *sql.DB) error {

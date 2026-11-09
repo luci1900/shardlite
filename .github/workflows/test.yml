@@ -28,16 +28,30 @@ jobs:
           cache-dependency-path: |
             go.sum
             e2e/go.sum
+            migrate/go.sum
+            sdk/go/go.sum
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: sdk/ts/package-lock.json
+      - name: Install the TypeScript SDK's dependencies
+        run: npm ci
+        working-directory: sdk/ts
       - name: Build
         run: |
           go build ./...
           CGO_ENABLED=0 go build ./...
           (cd e2e && go build ./...)
+          (cd migrate && go build ./...)
+          (cd sdk/go && go build ./...)
       - name: Vet
         run: |
           go vet ./...
           go vet -tags fault ./...
           (cd e2e && go vet -tags fault ./...)
+          (cd migrate && go vet ./...)
+          (cd sdk/go && go vet ./...)
       - name: gofmt
         run: |
           out=$(gofmt -l .)
@@ -77,6 +91,8 @@ jobs:
           cache-dependency-path: |
             go.sum
             e2e/go.sum
+            migrate/go.sum
+            sdk/go/go.sum
       - name: Start RustFS
         run: |
           docker compose -f docker/compose.s3.yaml up -d

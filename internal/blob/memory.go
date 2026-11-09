@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"iter"
+	"log/slog"
 	"slices"
 	"strings"
 	"sync"
@@ -32,7 +33,7 @@ type Memory struct {
 	mu      sync.Mutex
 	objects map[string]memObject
 	now     func() time.Time
-	sink    ClockSink
+	clock   *clockCheck
 }
 
 type memObject struct {
@@ -51,24 +52,25 @@ func WithClock(now func() time.Time) MemoryOption {
 	return func(m *Memory) { m.now = now }
 }
 
-// WithClockSink gives the backend a sink to sample, on every call, the clock
-// that stamps LastModified (WithClock) as the store's time, in whole seconds as
-// a real store sends it, against the process's own clock, so a test can skew the
-// store's clock from the node's.
-func WithClockSink(sink ClockSink) MemoryOption {
-	return func(m *Memory) { m.sink = sink }
+// WithClockLogger makes the backend check, on every call, the clock that stamps
+// LastModified (WithClock) as the store's time, in whole seconds as a real store
+// sends it, against the process's own clock, and warn on log as the S3 backend
+// does. A test can then skew the store's clock from the node's. Without it the
+// backend checks nothing.
+func WithClockLogger(log *slog.Logger) MemoryOption {
+	return func(m *Memory) { m.clock = newClockCheck(log) }
 }
 
-// sample reports the store's clock to the sink, for a call that began at start.
+// sample reports the store's clock to the check, for a call that began at start.
 // Callers defer it first, so it runs after the call has let go of the lock.
 func (m *Memory) sample(start time.Time) {
-	if m.sink == nil {
+	if m.clock == nil {
 		return
 	}
 	m.mu.Lock()
 	store := m.now()
 	m.mu.Unlock()
-	m.sink(ClockSample{Store: store.Truncate(time.Second), Start: start, End: time.Now()}, nil)
+	m.clock.observe(ClockSample{Store: store.Truncate(time.Second), Start: start, End: time.Now()}, nil)
 }
 
 // NewMemory returns an empty in-memory backend.

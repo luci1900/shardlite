@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -17,7 +18,11 @@ import (
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	if err := run(log); err != nil {
-		log.Error("shardlite failed", "err", err)
+		// A lost app was logged when the declaration poll found it, with how long
+		// the app was gone.
+		if !errors.Is(err, node.ErrAppLost) {
+			log.Error("shardlite failed", "err", err)
+		}
 		os.Exit(1)
 	}
 }

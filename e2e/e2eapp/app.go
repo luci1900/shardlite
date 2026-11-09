@@ -1,17 +1,19 @@
 // Package e2eapp is a stand-in for a real application, used by the end-to-end
 // tests and the benchmark. It serves two kinds of shards, users (sync off) and
-// wallet (sync on), over plain HTTP, server-sent events, WebSocket (github.com/coder/websocket) and
-// gRPC (google.golang.org/grpc),
-// with a shardless login and a handler that calls another shard through the
-// node's control API. It follows the app contract in docs/guide.md: a route
-// that belongs to a shard works out which shard a request is for from the
-// request itself (the path, or x-shard metadata for gRPC) and uses the file the
-// node opened (Shardlite-File) only if that is the shard the node opened
-// (Shardlite-Opened). Otherwise it refuses the request, since the client's hint
-// was missing or wrong and the client fixes it. Routes that only take calls, and
-// the reminder wake, take their identity from Shardlite-Opened. The app uses WAL
-// mode with default locking, migrates lazily on the first write and closes
-// shards that have been idle for a while.
+// wallet (sync on), over plain HTTP, server-sent events, WebSocket
+// (github.com/coder/websocket) and gRPC (google.golang.org/grpc), with a
+// shardless login and a handler that calls another shard through the node's
+// control API.
+//
+// It follows the app contract in docs/guide.md and is built on the Go SDK
+// (sdk/go). A route that belongs to a shard works out which shard a request is
+// for from the request itself (the path, or x-shard metadata for gRPC) and asks
+// Expect for it, which refuses the request unless that is the shard the node
+// opened. Routes that only take calls, and the reminder wake, use ExpectCall.
+// The shard's database is opened for the length of each request (WAL mode with
+// default locking) and the app migrates lazily on the first write. It writes
+// its declaration by hand from a file instead of using the SDK's Ready, since
+// its scenarios rewrite the declaration while it runs.
 package e2eapp
 
 import (
@@ -36,13 +38,13 @@ import (
 	"google.golang.org/grpc"
 	_ "modernc.org/sqlite"
 
-	"github.com/luci1900/shardlite/internal/migrate"
+	"github.com/luci1900/shardlite/migrate"
+	shardlite "github.com/luci1900/shardlite/sdk/go"
 )
 
 // Options configure an App.
 type Options struct {
-	Control   string        // the node's control API, host:port (127.0.0.1:2282 if empty)
-	IdleClose time.Duration // close a shard's database after this long unused (200 ms if zero, so a connection is closed within the shortest idle timeout the app declares, arena's 300 ms, as the guide asks)
+	Control string // the node's control API, host:port (127.0.0.1:2282 if empty)
 	// Declare names a file holding the app's declaration (docs/guide.md, Shard
 	// kinds), read again on every request to the ready route, so a
 	// rewrite stands in for a new deploy. Empty serves DefaultDeclaration.
@@ -62,30 +64,33 @@ const DefaultDeclaration = `{"version": "1", "kinds": {
 
 // App is the application.
 type App struct {
-	opts  Options
-	pool  *pool
-	http  *http.Client
-	grpc  *grpc.Server
-	debug Debug
+	opts    Options
+	node    *shardlite.Node // the SDK's handle on the node
+	grpc    *grpc.Server
+	debug   Debug
+	serving atomic.Int64 // requests being served on a shard, each of which may hold its shard's database
 
 	ccMu sync.Mutex
 	cc   *grpc.ClientConn // to the control API
 }
 
 // New returns an App. Close stops it.
-func New(opts Options) *App {
+func New(opts Options) (*App, error) {
 	if opts.Control == "" {
-		opts.Control = "127.0.0.1:2282"
+		opts.Control = shardlite.DefaultAddr
 	}
-	if opts.IdleClose <= 0 {
-		opts.IdleClose = 200 * time.Millisecond
+	hc := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{MaxIdleConnsPerHost: 64}}
+	// No Kinds: the declaration is the file the ready route serves.
+	node, err := shardlite.New(shardlite.Config{Open: openSQLite, Addr: opts.Control, HTTP: hc})
+	if err != nil {
+		return nil, err
 	}
-	a := &App{opts: opts, pool: newPool(opts.IdleClose), http: &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{MaxIdleConnsPerHost: 64}}}
+	a := &App{opts: opts, node: node}
 	a.grpc = a.newGRPC()
-	return a
+	return a, nil
 }
 
-// Close closes every database.
+// Close stops the gRPC server and closes its connection to the node.
 func (a *App) Close() {
 	a.grpc.Stop()
 	a.ccMu.Lock()
@@ -93,14 +98,18 @@ func (a *App) Close() {
 		a.cc.Close()
 	}
 	a.ccMu.Unlock()
-	a.pool.close()
+}
+
+// openSQLite is the app's Opener: its driver and its options. Writers start with BEGIN IMMEDIATE, so a read-then-write transaction can't fail on upgrade.
+func openSQLite(uri string) (*sql.DB, error) {
+	return sql.Open("sqlite", uri+"&_pragma=synchronous(NORMAL)&_txlock=immediate")
 }
 
 // Handler returns the app's HTTP handler. It serves HTTP/1.1 and, for gRPC,
 // HTTP/2 over cleartext (the server must have UnencryptedHTTP2 enabled).
 func (a *App) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /_shardlite/ready", a.ready)
+	mux.HandleFunc("GET "+shardlite.ReadyPath, a.ready)
 	mux.HandleFunc("POST /login", a.login)
 	// Routes that belong to a shard have its name in the path, and clients can
 	// reach them.
@@ -120,33 +129,43 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /{kind}/{id}/churn", a.shard(pathShard, a.churn))
 	// Routes that only take calls, and the reminder wake, take the shard from
 	// what the node opened.
-	mux.HandleFunc("POST /credit", a.internal(a.credit))
-	mux.HandleFunc("POST /receive", a.internal(a.receive))
-	mux.HandleFunc("POST /_shardlite/reminders", a.internal(a.reminders))
+	mux.HandleFunc("POST /credit", a.call(a.credit))
+	mux.HandleFunc("POST /receive", a.call(a.receive))
+	mux.HandleFunc("POST "+shardlite.RemindersPath, a.call(a.reminders))
 	mux.HandleFunc("GET /debug", a.serveDebug)
 	// gRPC shares the listener: HTTP/2 requests with a gRPC content type go to
 	// the gRPC server (which is an http.Handler), the rest to the mux.
-	rpc := a.shard(grpcShard, a.serveGRPC)
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	rpc := a.shard(a.grpcShard, a.serveGRPC)
+	app := a.node.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if isGRPC(r) {
 			rpc.ServeHTTP(w, r)
 			return
 		}
 		mux.ServeHTTP(w, r)
+	}))
+	// Outside the middleware, so a request counts as served only once its database is closed.
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := a.node.Request(r).Opened(); ok {
+			a.serving.Add(1)
+			defer a.serving.Add(-1)
+		}
+		app.ServeHTTP(w, r)
 	})
 }
 
 func (a *App) serveDebug(w http.ResponseWriter, r *http.Request) {
 	a.debug.mu.Lock()
 	defer a.debug.mu.Unlock()
-	a.debug.OpenDBs = int(a.pool.open.Load())
+	a.debug.Serving = int(a.serving.Load())
 	writeJSON(w, &a.debug)
 }
 
-// ready answers the app's declaration: the node's poll is both the health
-// check and how the app's kinds reach it. The route is under /_shardlite/,
-// which the node refuses to client requests, so the declaration (which lists
-// every kind, including ones clients may not name) only reaches the node.
+// ready answers the app's declaration: the node's poll is both the health check
+// and how the app's kinds reach it. The route is under /_shardlite/, which the
+// node refuses to client requests, so the declaration (which lists every kind,
+// including ones clients may not name) only reaches the node. This app reads
+// the declaration from a file on every request, to stand in for a new deploy,
+// and is not ready while it can't. It writes the JSON by hand.
 func (a *App) ready(w http.ResponseWriter, r *http.Request) {
 	data := []byte(DefaultDeclaration)
 	if a.opts.Declare != "" {
@@ -161,79 +180,101 @@ func (a *App) ready(w http.ResponseWriter, r *http.Request) {
 	w.Write(data)
 }
 
-// shardReq is a request for a shard, with the shard's database open.
+// shardReq is a request for a shard, with the shard's database open for as long
+// as the request lasts.
 type shardReq struct {
-	name string // kind/id
-	file string // Shardlite-File
-	db   *handle
+	name   string // kind/id
+	file   string // Shardlite-File, for routes that open their own connections
+	db     *sql.DB
+	opened *shardlite.Opened
 }
 
 type shardHandler func(w http.ResponseWriter, r *http.Request, s *shardReq)
 
-// shard wraps a handler for a route that belongs to a shard and that clients can
-// reach. of works out which shard the request is for from the request itself.
-// If that is the shard the node opened, h gets its open file. Otherwise (the
-// client's Shardlite-Target was missing or wrong) the request is refused: the
-// app never calls a shard with an id the client supplied, so a wrong hint is the
-// client's to fix.
+// shard wraps a handler for a route that belongs to a shard and that clients
+// can reach. of works out which shard the request is for. If that is the shard
+// the node opened, h gets its database. Otherwise Expect refuses the request:
+// the client's Shardlite-Target was missing or wrong, and the app never calls a
+// shard with an id the client supplied, so it is the client's to fix.
 //
 // This app has no authentication. One that did would authenticate before this
-// decision: Shardlite-Caller is never a reason to skip it on a route clients can
-// reach.
-func (a *App) shard(of func(*http.Request) string, h shardHandler) http.HandlerFunc {
+// decision: Shardlite-Caller is never a reason to skip it on a route clients
+// can reach.
+func (a *App) shard(of func(*http.Request) (shardlite.ShardName, error), h shardHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		name := of(r)
-		if name == "" {
-			refuse(w, r, http.StatusBadRequest, "the request does not say which shard it is for")
+		name, err := of(r)
+		if err != nil {
+			refuse(w, r, http.StatusBadRequest, "the request does not say which shard it is for: "+err.Error())
 			return
 		}
-		if opened := r.Header.Get("Shardlite-Opened"); name != opened {
-			refuse(w, r, http.StatusBadRequest, fmt.Sprintf("the request is for %s but the node opened %q: send Shardlite-Target naming the shard", name, opened))
+		opened, err := a.node.Expect(r, name)
+		if err != nil {
+			refuseExpect(w, r, err)
 			return
 		}
-		a.serveOpened(w, r, h)
+		a.serveOpened(w, r, opened, h)
 	}
 }
 
-// internal wraps a handler for a route that only takes calls: it needs
-// Shardlite-Caller, and the shard is the one the node opened, because app code
-// chose the target and the node strips Shardlite-* headers from clients. The
-// reminder wake is the same, with the node as its caller.
-func (a *App) internal(h shardHandler) http.HandlerFunc {
+// call wraps a handler for a route that only takes calls. ExpectCall wants a
+// caller (the node sets Shardlite-Caller and strips Shardlite-* headers from
+// clients) and the shard is the one the node opened. The reminder wake is the
+// same, with the node as its caller.
+func (a *App) call(h shardHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Shardlite-Caller") == "" {
-			refuse(w, r, http.StatusForbidden, "internal")
+		opened, err := a.node.ExpectCall(r)
+		if err != nil {
+			refuseExpect(w, r, err)
 			return
 		}
-		a.serveOpened(w, r, h)
+		a.serveOpened(w, r, opened, h)
 	}
 }
 
-// serveOpened runs h on the shard the node opened. A request without the node's
-// headers did not come through the node.
-func (a *App) serveOpened(w http.ResponseWriter, r *http.Request, h shardHandler) {
-	name, file := r.Header.Get("Shardlite-Opened"), r.Header.Get("Shardlite-File")
-	if name == "" || file == "" {
-		refuse(w, r, http.StatusBadRequest, "this endpoint is for a shard: send it through the node, which sets Shardlite-Opened")
-		return
-	}
+// refuseExpect answers what Expect or ExpectCall refused r with, in the
+// protocol r speaks (see refuse).
+func refuseExpect(w http.ResponseWriter, r *http.Request, err error) {
+	var ref *shardlite.Refusal
+	errors.As(err, &ref)
+	refuse(w, r, ref.Status, ref.Message)
+}
+
+// serveOpened runs h on the shard the node opened, with its database open until
+// the request ends.
+func (a *App) serveOpened(w http.ResponseWriter, r *http.Request, opened *shardlite.Opened, h shardHandler) {
+	name := opened.Name().String()
 	a.debug.mu.Lock()
 	if a.debug.Served == nil {
 		a.debug.Served = map[string]int{}
 	}
 	a.debug.Served[name]++
 	a.debug.mu.Unlock()
-	db, err := a.pool.get(file)
+	db, err := opened.DB()
 	if err != nil {
 		refuse(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
-	defer db.release()
-	h(w, r, &shardReq{name: name, file: file, db: db})
+	h(w, r, &shardReq{name: name, file: r.Header.Get("Shardlite-File"), db: db, opened: opened})
 }
 
 // pathShard is the shard of a route whose path is /{kind}/{id}/...
-func pathShard(r *http.Request) string { return r.PathValue("kind") + "/" + r.PathValue("id") }
+func pathShard(r *http.Request) (shardlite.ShardName, error) {
+	return shardlite.ParseShard(r.PathValue("kind") + "/" + r.PathValue("id"))
+}
+
+// callerName is the caller as the app records it: the shard's name, "app" or ""
+// for a client.
+func callerName(c shardlite.Caller) string {
+	switch c := c.(type) {
+	case *shardlite.CallerClient:
+		return ""
+	case *shardlite.CallerApp:
+		return "app"
+	case *shardlite.CallerShard:
+		return c.Name.String()
+	}
+	return ""
+}
 
 // Schema. Migrations happen in create and on the first write, not on open: a
 // request that only reads a shard that was never written leaves nothing behind.
@@ -254,7 +295,7 @@ func (s *shardReq) insert(ctx context.Context, token string) (id, count int64, e
 
 // insertWith is insert with more work in the same transaction.
 func (s *shardReq) insertWith(ctx context.Context, token string, more func(tx *sql.Tx) error) (id, count int64, err error) {
-	tx, err := s.db.sql.BeginTx(ctx, nil) // BEGIN IMMEDIATE (the DSN says so): a read-then-write transaction can't fail on upgrade
+	tx, err := s.db.BeginTx(ctx, nil) // BEGIN IMMEDIATE (the DSN says so): a read-then-write transaction can't fail on upgrade
 	if err != nil {
 		return 0, 0, err
 	}
@@ -291,7 +332,7 @@ func (s *shardReq) migrate(ctx context.Context, tx *sql.Tx) error {
 // kept. Clients can only reach shards that exist, so the app creates one by
 // calling create before sending a client to it (docs/guide.md, Creating shards).
 func (a *App) create(w http.ResponseWriter, r *http.Request, s *shardReq) {
-	tx, err := s.db.sql.BeginTx(r.Context(), nil)
+	tx, err := s.db.BeginTx(r.Context(), nil)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -311,10 +352,10 @@ func (a *App) create(w http.ResponseWriter, r *http.Request, s *shardReq) {
 // tokensOf lists the tokens in a shard (none if it was never written).
 func (s *shardReq) tokensOf(ctx context.Context) ([]string, error) {
 	var version int
-	if err := s.db.sql.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil || version == 0 {
+	if err := s.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil || version == 0 {
 		return nil, err
 	}
-	rs, err := s.db.sql.QueryContext(ctx, `SELECT token FROM rows ORDER BY id`)
+	rs, err := s.db.QueryContext(ctx, `SELECT token FROM rows ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -364,7 +405,7 @@ func (a *App) tokens(w http.ResponseWriter, r *http.Request, s *shardReq) {
 }
 
 func (a *App) me(w http.ResponseWriter, r *http.Request, s *shardReq) {
-	writeJSON(w, map[string]any{"shard": s.name, "caller": r.Header.Get("Shardlite-Caller"), "hops": r.Header.Get("Shardlite-Hops")})
+	writeJSON(w, map[string]any{"shard": s.name, "caller": callerName(s.opened.Caller()), "context": r.Header.Get(shardlite.HeaderContext)})
 }
 
 // events streams n server-sent events, each after a commit: ?n=3&prefix=x.
@@ -392,11 +433,13 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	shard := "users/" + name
+	target, err := shardlite.ParseShard(shard)
+	if err != nil {
+		http.Error(w, "bad user name: "+err.Error(), http.StatusBadRequest)
+		return
+	}
 	// The client can only reach a shard that exists, so create it first.
-	q, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, "http://"+a.opts.Control+"/"+shard+"/create", nil)
-	q.Header.Set("Shardlite-Target", shard)
-	q.Header.Set("Shardlite-Caller", "app")
-	resp, err := a.http.Do(q)
+	resp, err := a.node.Request(r).Call(target, http.MethodPost, "/"+shard+"/create", nil)
 	if err != nil {
 		http.Error(w, "creating the user's shard: "+err.Error(), http.StatusBadGateway)
 		return
@@ -411,7 +454,7 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 
 // transfer debits this shard, then credits another one by calling it through
 // the node's control API: ?to=wallet/b&token=t. The debit is committed before the
-// call, and the call carries this shard as its caller, so the node holds it until
+// call, and the call is made from this request, so it carries the request's context (which names this shard as its caller) and the node holds it until
 // the debit is durable if this shard's kind has sync on.
 func (a *App) transfer(w http.ResponseWriter, r *http.Request, s *shardReq) {
 	to, token := r.URL.Query().Get("to"), r.URL.Query().Get("token")
@@ -419,14 +462,16 @@ func (a *App) transfer(w http.ResponseWriter, r *http.Request, s *shardReq) {
 		http.Error(w, "to and token are required", http.StatusBadRequest)
 		return
 	}
+	target, err := shardlite.ParseShard(to)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	if _, _, err := s.insert(r.Context(), "debit:"+token); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	q, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, "http://"+a.opts.Control+"/credit", strings.NewReader(token))
-	q.Header.Set("Shardlite-Target", to)
-	q.Header.Set("Shardlite-Caller", s.name) // as the app received it
-	resp, err := a.http.Do(q)
+	resp, err := s.opened.Call(target, http.MethodPost, "/credit", strings.NewReader(token))
 	if err != nil {
 		http.Error(w, "credit failed: "+err.Error(), http.StatusBadGateway)
 		return
@@ -461,13 +506,16 @@ func (a *App) notify(w http.ResponseWriter, r *http.Request, s *shardReq) {
 		http.Error(w, "to and token are required", http.StatusBadRequest)
 		return
 	}
+	if _, err := shardlite.ParseShard(to); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	key := "send:" + token
 	_, _, err := s.insertWith(r.Context(), "sent:"+token, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(r.Context(), `INSERT INTO sends (key, target, path, body) VALUES (?, ?, '/receive', ?)`, key, to, []byte(token)); err != nil {
 			return err
 		}
-		_, err := tx.ExecContext(r.Context(), `INSERT INTO _shardlite_reminders (key, due) VALUES (?, unixepoch())`, key)
-		return err
+		return shardlite.SetReminder(r.Context(), tx, key, time.Now())
 	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -481,7 +529,7 @@ var errSeen = errors.New("seen before")
 // receive is internal: it records a send from another shard once per sender and
 // key (the sender can call twice), in the same transaction as the work.
 func (a *App) receive(w http.ResponseWriter, r *http.Request, s *shardReq) {
-	caller, key := r.Header.Get("Shardlite-Caller"), r.Header.Get("Idempotency-Key")
+	caller, key := callerName(s.opened.Caller()), r.Header.Get("Idempotency-Key")
 	if key == "" {
 		http.Error(w, "an Idempotency-Key is required", http.StatusBadRequest)
 		return
@@ -516,8 +564,7 @@ func (a *App) remind(w http.ResponseWriter, r *http.Request, s *shardReq) {
 		return
 	}
 	_, _, err = s.insertWith(r.Context(), "set:"+key, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(r.Context(), `INSERT INTO _shardlite_reminders (key, due) VALUES (?, unixepoch() + ?) ON CONFLICT (key) DO UPDATE SET due = excluded.due`, "timer:"+key, secs)
-		return err
+		return shardlite.SetReminder(r.Context(), tx, "timer:"+key, time.Now().Add(time.Duration(secs)*time.Second))
 	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -532,11 +579,12 @@ func (a *App) remind(w http.ResponseWriter, r *http.Request, s *shardReq) {
 // rows are deleted once the call answered 2xx. It answers 503 if a send failed,
 // so the node wakes it again with backoff.
 func (a *App) reminders(w http.ResponseWriter, r *http.Request, s *shardReq) {
-	if r.Header.Get("Shardlite-Caller") != s.name { // from the node, about this shard
+	// The wake comes from the node and names this shard as its caller.
+	if c, ok := s.opened.Caller().(*shardlite.CallerShard); !ok || c.Name != s.opened.Name() {
 		http.Error(w, "internal", http.StatusForbidden)
 		return
 	}
-	keys, err := s.dueReminders(r.Context())
+	keys, err := shardlite.DueReminders(r.Context(), s.db)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -545,12 +593,11 @@ func (a *App) reminders(w http.ResponseWriter, r *http.Request, s *shardReq) {
 	for _, key := range keys {
 		if name, ok := strings.CutPrefix(key, "timer:"); ok {
 			_, _, err = s.insertWith(r.Context(), "fired:"+name, func(tx *sql.Tx) error {
-				_, err := tx.ExecContext(r.Context(), `DELETE FROM _shardlite_reminders WHERE key = ?`, key)
-				return err
+				return shardlite.CancelReminder(r.Context(), tx, key)
 			})
 		} else {
 			var sent bool
-			if sent, err = a.send(r.Context(), s, key); err == nil && !sent {
+			if sent, err = a.send(r, s, key); err == nil && !sent {
 				failed = true
 			}
 		}
@@ -568,23 +615,22 @@ func (a *App) reminders(w http.ResponseWriter, r *http.Request, s *shardReq) {
 
 // send makes the call recorded under key and, if it answered 2xx, deletes the
 // row and its reminder in one transaction. It reports whether the call
-// succeeded. A reminder with no row is deleted.
-func (a *App) send(ctx context.Context, s *shardReq, key string) (sent bool, err error) {
+// succeeded. A reminder with no row is deleted. The call is made on the
+// wake's shard, so it carries the wake's context.
+func (a *App) send(wake *http.Request, s *shardReq, key string) (sent bool, err error) {
+	ctx := wake.Context()
 	var target, path string
 	var body []byte
-	err = s.db.sql.QueryRowContext(ctx, `SELECT target, path, body FROM sends WHERE key = ?`, key).Scan(&target, &path, &body)
+	err = s.db.QueryRowContext(ctx, `SELECT target, path, body FROM sends WHERE key = ?`, key).Scan(&target, &path, &body)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, err
 	}
 	if err == nil {
-		q, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+a.opts.Control+path, bytes.NewReader(body))
+		to, err := shardlite.ParseShard(target)
 		if err != nil {
 			return false, err
 		}
-		q.Header.Set("Shardlite-Target", target)
-		q.Header.Set("Shardlite-Caller", s.name)
-		q.Header.Set("Idempotency-Key", key)
-		resp, err := a.http.Do(q)
+		resp, err := s.opened.Call(to, http.MethodPost, path, bytes.NewReader(body), shardlite.Header("Idempotency-Key", key))
 		if err != nil {
 			return false, nil // try again at the next wake
 		}
@@ -594,7 +640,7 @@ func (a *App) send(ctx context.Context, s *shardReq, key string) (sent bool, err
 			return false, nil
 		}
 	}
-	tx, err := s.db.sql.BeginTx(ctx, nil)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
@@ -602,132 +648,8 @@ func (a *App) send(ctx context.Context, s *shardReq, key string) (sent bool, err
 	if _, err := tx.ExecContext(ctx, `DELETE FROM sends WHERE key = ?`, key); err != nil {
 		return false, err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM _shardlite_reminders WHERE key = ?`, key); err != nil {
+	if err := shardlite.CancelReminder(ctx, tx, key); err != nil {
 		return false, err
 	}
 	return true, tx.Commit()
-}
-
-// dueReminders lists the keys of the reminders that are due.
-func (s *shardReq) dueReminders(ctx context.Context) ([]string, error) {
-	rs, err := s.db.sql.QueryContext(ctx, `SELECT key FROM _shardlite_reminders WHERE due <= unixepoch() ORDER BY due, key`)
-	if err != nil {
-		return nil, err
-	}
-	defer rs.Close()
-	var keys []string
-	for rs.Next() {
-		var k string
-		if err := rs.Scan(&k); err != nil {
-			return nil, err
-		}
-		keys = append(keys, k)
-	}
-	return keys, rs.Err()
-}
-
-// pool keeps each shard's database open between requests and closes it when it
-// has been idle for a while, well within the node's idle timeout (the node
-// can't let go of a shard the app has open).
-type pool struct {
-	idle time.Duration
-	mu   sync.Mutex
-	dbs  map[string]*handle
-	stop chan struct{}
-	wg   sync.WaitGroup
-	open atomic.Int64 // databases opened and not yet closed
-}
-
-type handle struct {
-	p     *pool
-	path  string
-	sql   *sql.DB
-	refs  int
-	last  time.Time
-	ready chan struct{}
-	err   error
-}
-
-func newPool(idle time.Duration) *pool {
-	p := &pool{idle: idle, dbs: map[string]*handle{}, stop: make(chan struct{})}
-	p.wg.Add(1)
-	go p.janitor()
-	return p
-}
-
-func (p *pool) get(path string) (*handle, error) {
-	p.mu.Lock()
-	h := p.dbs[path]
-	if h == nil {
-		h = &handle{p: p, path: path, ready: make(chan struct{})}
-		p.dbs[path] = h
-		h.refs++
-		p.mu.Unlock()
-		// WAL mode, the default locking mode, and write transactions that start with BEGIN IMMEDIATE.
-		h.sql, h.err = sql.Open("sqlite", "file:"+path+"?mode=rw&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_txlock=immediate")
-		if h.err == nil {
-			p.open.Add(1)
-			h.sql.SetMaxOpenConns(8)
-			h.err = h.sql.Ping()
-		}
-		close(h.ready)
-	} else {
-		h.refs++
-		p.mu.Unlock()
-		<-h.ready
-	}
-	if h.err != nil {
-		h.release()
-		return nil, h.err
-	}
-	return h, nil
-}
-
-func (h *handle) release() {
-	h.p.mu.Lock()
-	h.refs--
-	h.last = time.Now()
-	h.p.mu.Unlock()
-}
-
-func (p *pool) janitor() {
-	defer p.wg.Done()
-	t := time.NewTicker(p.idle / 5)
-	defer t.Stop()
-	for {
-		select {
-		case <-p.stop:
-			return
-		case <-t.C:
-		}
-		var closing []*handle
-		p.mu.Lock()
-		for path, h := range p.dbs {
-			if h.refs == 0 && time.Since(h.last) > p.idle {
-				delete(p.dbs, path)
-				closing = append(closing, h)
-			}
-		}
-		p.mu.Unlock()
-		for _, h := range closing {
-			if h.sql != nil {
-				h.sql.Close()
-				p.open.Add(-1)
-			}
-		}
-	}
-}
-
-func (p *pool) close() {
-	close(p.stop)
-	p.wg.Wait()
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for _, h := range p.dbs {
-		if h.sql != nil {
-			h.sql.Close()
-			p.open.Add(-1)
-		}
-	}
-	p.dbs = map[string]*handle{}
 }

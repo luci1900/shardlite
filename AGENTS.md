@@ -6,7 +6,8 @@ Shardlite serves SQLite databases as actors, with blob storage as the system of 
 
 - [docs/overview.md](docs/overview.md) for the concepts and goals
 - [docs/internals.md](docs/internals.md) for how the node works, including its goroutine ownership and shutdown rules (read the Concurrency section before touching any goroutine)
-- [docs/guide.md](docs/guide.md) for app-facing behaviour, headers, endpoints and settings
+- [docs/guide.md](docs/guide.md) for app-facing behaviour, headers and endpoints
+- [docs/deployment.md](docs/deployment.md) for how to run the node on each platform: hosts, storage, the load balancer and the settings
 - [docs/roadmap.md](docs/roadmap.md) for what is left to build
 
 The docs are the source of truth for the design. If code and docs disagree, say so rather than quietly picking one. Update the docs in the same change when behaviour changes.
@@ -50,6 +51,8 @@ Always use simulation for non-trivial Quint models (`quint run`): verification (
 
 ## Writing
 
-For docs and comments: plain language, no hard wraps, no Oxford comma, few em dashes or semicolons, parentheses for asides.
+For docs and comments: plain language, no Oxford comma, few em dashes or semicolons, parentheses for asides. Docs have no hard wraps. Comments may wrap.
+
+Give each fact one home: a doc states its own audience's concern and links to the doc that owns the mechanism, rather than telling it again. A bullet past about 100 words is a subsection.
 
 Never name a stage in docs or comments. Stages live in `plans/`, which is deleted once the stage is done, so a reference to one dangles. Name the thing itself (the lease scan, the journal's writer, the due index) or point at the code or doc that carries the fact.

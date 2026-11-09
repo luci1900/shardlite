@@ -15,6 +15,6 @@ type Node string
 var nodeName = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
 
 // ValidNode reports whether s is a node's name: 1 to 128 ASCII letters, digits,
-// '.', '-' and '_'. The name goes into object keys as it is (docs/guide.md, the
-// reference), so nothing else may be in it.
+// '.', '-' and '_'. The name goes into object keys as it is (docs/deployment.md,
+// Environment variables), so nothing else may be in it.
 func ValidNode(s string) bool { return nodeName.MatchString(s) }

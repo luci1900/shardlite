@@ -27,6 +27,7 @@ import (
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/capture"
+	"github.com/luci1900/shardlite/internal/harness"
 	"github.com/luci1900/shardlite/internal/journal"
 	"github.com/luci1900/shardlite/internal/kind"
 	"github.com/luci1900/shardlite/internal/lease"
@@ -54,9 +55,8 @@ type mrig struct {
 	data        string
 	kinds       *Kinds
 	app         *apptest.App
-	clock       *lease.ClockWatch // the node's clock check, nil for none
-	logger      *slog.Logger      // the node's logger, the default if nil
-	keeperEvery time.Duration     // the keeper's renewal interval, 100 ms if zero
+	logger      *slog.Logger  // the node's logger, the default if nil
+	keeperEvery time.Duration // the keeper's renewal interval, 100 ms if zero
 	n           *Node
 	m           *Shardset
 	stopM       func() error // stops the shards' Serve and returns what it returned
@@ -125,7 +125,6 @@ func (r *mrig) tryStartNode() (*Node, error) {
 		Lease: lease.RegistryOptions{TTL: time.Hour, Blob: blob.Options{Backoff: time.Millisecond}},
 		Keeper: lease.KeeperOptions{Interval: cmp.Or(r.keeperEvery, 100*time.Millisecond), Margin: time.Minute,
 			Now: func() time.Time { return time.Now().Add(time.Duration(r.leaseAhead.Load())) }},
-		Clock:  r.clock,
 		Logger: r.logger,
 	})
 }
@@ -323,7 +322,7 @@ func (r *mrig) afterCycle() {
 
 // advanceUntil moves the clock by step each time it looks, until cond holds:
 // the way to wait for something that only time brings (an idle shard going).
-func advanceUntil(t *testing.T, clk *fakeClock, step time.Duration, what string, cond func() bool) {
+func advanceUntil(t *testing.T, clk *harness.FakeClock, step time.Duration, what string, cond func() bool) {
 	t.Helper()
 	apptest.Eventually(t, apptest.Timeout, what, func() bool {
 		clk.Advance(step)
@@ -583,7 +582,7 @@ func TestOneActivationForConcurrentRequests(t *testing.T) {
 // no journal, and nothing of the shard is left on the node.
 func TestDeactivationReleasesInOneUpdateAndDeletesTheFiles(t *testing.T) {
 	t.Parallel()
-	clk := newFakeClock()
+	clk := harness.NewFakeClock()
 	r := newMRigWith(t, withClock(clk))
 	ctx := context.Background()
 	const target = "users/4"
@@ -814,7 +813,7 @@ func TestCrashLeavesActiveFilesToBeDiscarded(t *testing.T) {
 
 func TestIdleTimeoutAndOpenConnections(t *testing.T) {
 	t.Parallel()
-	clk := newFakeClock()
+	clk := harness.NewFakeClock()
 	r := newMRigWith(t, withClock(clk))
 	ref := r.acquire("users/8")
 	r.write(ref, "a")
@@ -1041,7 +1040,7 @@ func TestBackgroundSnapshotsAreNotRebasedByAge(t *testing.T) {
 	t.Parallel()
 	r := newMRig(t)
 	r.crash()
-	clock := newFakeClock()
+	clock := harness.NewFakeClock()
 	r.startShardset(func(o *ShardsetOptions) {
 		o.Lifecycle.DeltaAge = 20 * time.Millisecond
 		o.Lifecycle.MaxFiles = 100

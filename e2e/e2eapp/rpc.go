@@ -18,6 +18,8 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/wrapperspb"
+
+	shardlite "github.com/luci1900/shardlite/sdk/go"
 )
 
 // The gRPC service e2e.Shards. It is registered by hand (a grpc.ServiceDesc)
@@ -31,7 +33,7 @@ import (
 //	Fail     unary: "code message"; ends with that status and a trailer
 //	Hold     unary: waits until the call is cancelled (or "ms" passes) and records what it saw
 //	Transfer unary: "to token"; debits this shard, then calls Add on another shard through the control API
-//	Who      unary: reports the opened shard, caller and hops the app was called with
+//	Who      unary: reports the opened shard, caller and context the app was called with
 //
 // gRPC has no path to put an id in, so a call says which shard it is for in
 // x-shard metadata, which is this app's own key and sits beside the
@@ -65,7 +67,7 @@ type Debug struct {
 	LastHold    HoldRecord     `json:"last_hold"`
 	WSEnded     int            `json:"ws_ended"`
 	WSClose     []WSCloseRec   `json:"ws_closes"` // how each connection ended, in order
-	OpenDBs     int            `json:"open_dbs"`  // shard databases the app has open right now
+	Serving     int            `json:"serving"`   // requests the app is serving on a shard right now (a request's database is closed before it stops counting)
 	Served      map[string]int `json:"served"`    // how many requests the app has served on each shard, by the shard the node opened
 }
 
@@ -79,13 +81,18 @@ type WSCloseRec struct {
 type shardKey struct{}
 
 // grpcShard is the shard a gRPC call is for. Fail, Hold and Who touch no shard
-// data and answer for whichever shard the node opened.
-func grpcShard(r *http.Request) string {
+// data and answer for whichever shard the node opened, so for those the name of
+// the opened shard is the shard they are for.
+func (a *App) grpcShard(r *http.Request) (shardlite.ShardName, error) {
 	switch r.URL.Path {
 	case "/e2e.Shards/Fail", "/e2e.Shards/Hold", "/e2e.Shards/Who":
-		return r.Header.Get("Shardlite-Opened")
+		name, ok := a.node.Request(r).Opened()
+		if !ok {
+			return shardlite.ShardName{}, errors.New("the node opened no shard")
+		}
+		return name, nil
 	}
-	return r.Header.Get("X-Shard")
+	return shardlite.ParseShard(r.Header.Get("X-Shard"))
 }
 
 // serveGRPC runs the gRPC server on a call for the shard the node opened. The
@@ -219,11 +226,11 @@ func (a *App) rpcTransfer(ctx context.Context, s *shardReq, in string) (string, 
 	if _, _, err := s.insert(ctx, "debit:"+tok); err != nil {
 		return "", status.Error(codes.Internal, err.Error())
 	}
+	// The SDK has no gRPC, so the app passes the context it was given on as
+	// metadata itself, unchanged, beside the target.
 	md, _ := metadata.FromIncomingContext(ctx)
-	out := metadata.Pairs("shardlite-target", to, "x-shard", to, "shardlite-caller", s.name)
-	if v := md.Get("shardlite-hops"); len(v) > 0 {
-		out.Set("shardlite-hops", v[0])
-	}
+	out := metadata.Pairs(shardlite.HeaderTarget, to, "x-shard", to)
+	out.Append(shardlite.HeaderContext, md.Get(shardlite.HeaderContext)...)
 	cc, err := a.controlConn()
 	if err != nil {
 		return "", status.Error(codes.Unavailable, err.Error())
@@ -244,7 +251,7 @@ func (a *App) rpcWho(ctx context.Context, _ *shardReq, _ string) (string, error)
 		}
 		return ""
 	}
-	return fmt.Sprintf("opened=%s caller=%s hops=%s", get("shardlite-opened"), get("shardlite-caller"), get("shardlite-hops")), nil
+	return fmt.Sprintf("opened=%s caller=%s context=%s", get("shardlite-opened"), get("shardlite-caller"), get("shardlite-context")), nil
 }
 
 func (a *App) controlConn() (*grpc.ClientConn, error) {

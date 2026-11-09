@@ -6,7 +6,7 @@ A test that sits idle for 30 seconds is too slow for the fast suite anyway. An a
 
 ## The fast suite
 
-Every test in the main module's `internal/...` on the in-memory blob store only (no S3 emulator, containers, `fault` build tag or `SHARDLITE_MEASURE`):
+Every test in the main module's `internal/...` on the in-memory blob store only (no S3 emulator, containers, `fault` build tag or `SHARDLITE_MEASURE`), then every test in the migrate module (`migrate`, with the same flags), then every test in the Go SDK's module (`sdk/go`, with the same flags) and the TypeScript SDK's (`sdk/ts`, `npm test`), which both run only when `ARGS` does not name a package, and start a real node in some tests, so the suite builds the `shardlite` binary once into a temporary directory and sets `SHARDLITE_BIN` to it for them:
 
 ```
 make test                              # without -race
@@ -41,11 +41,11 @@ docker compose -f docker/compose.s3.yaml down
 
 To run the suite on Linux from a Mac, build the image from `docker/Dockerfile` and run `make test-long` in it with RustFS reachable from the container (for instance `--add-host=host.docker.internal:host-gateway -e SHARDLITE_TEST_S3_ENDPOINT=http://host.docker.internal:19000`, with the compose file's port published on the host). Mount a named volume for `/tmp` if the tests are to avoid the container's overlay filesystem.
 
-Setting `TESTWATCH_OUT` to a directory makes the suites copy their `go test -json` output and report there: `out.json` and `report.txt` (fast suite), and one pair per long-suite run named `main`, `main-race`, `e2e` and `linux`. CI points each job at a directory and uploads it on failure, with the stack dumps of stopped binaries inside the outputs.
+Setting `TESTWATCH_OUT` to a directory makes the suites copy their `go test -json` output and report there: `out.json` and `report.txt` (fast suite, with `migrate.json` and `migrate.report.txt` for the migrate module, `sdk.json` and `sdk.report.txt` for the Go SDK's module and `ts.report.txt` for the TypeScript SDK's), and one pair per long-suite run named `main`, `main-race`, `e2e` and `linux`. CI points each job at a directory and uploads it on failure, with the stack dumps of stopped binaries inside the outputs.
 
 ## In CI
 
-`.github/workflows/test.yml` runs on Linux (`ubuntu-latest`). It runs only when started by hand (Actions, test, Run workflow). The `fast` job always runs: build (also with `CGO_ENABLED=0`), `go vet` (main module, `-tags fault` and `e2e`), `gofmt -l`, then `make test` and `make test ARGS=-race`. The `long` job runs only if the `long` input is ticked: it starts RustFS from the compose file, waits until it answers and runs `make test-long`.
+`.github/workflows/test.yml` runs on Linux (`ubuntu-latest`). It runs only when started by hand (Actions, test, Run workflow). The `fast` job always runs: build (also with `CGO_ENABLED=0`), `go vet` (main module, `-tags fault` and `e2e`), `gofmt -l`, then `make test` and `make test ARGS=-race`. The job installs Node 24 and runs `npm ci` in `sdk/ts` ahead of the suites, so `make test` always has the TypeScript SDK's dev dependencies in place (the Makefile's `lint` target installs them when missing, and the tests need no install at all). The `long` job runs only if the `long` input is ticked: it starts RustFS from the compose file, waits until it answers and runs `make test-long`.
 
 ## By hand
 
