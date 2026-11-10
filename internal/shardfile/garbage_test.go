@@ -16,7 +16,6 @@ import (
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/capture"
-	"github.com/luci1900/shardlite/internal/dueindex"
 	"github.com/luci1900/shardlite/internal/harness"
 	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/notify"
@@ -90,7 +89,7 @@ func (r *garbageRig) changeManifest(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return other.SetReminder(ctx, dueindex.MinuteAt(time.Now().Add(time.Hour)), false)
+	return other.SetReminder(ctx, shardfile.MinuteAt(time.Now().Add(time.Hour)), false)
 }
 
 func (r *garbageRig) hook() blobtest.Hook {

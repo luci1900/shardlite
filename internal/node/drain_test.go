@@ -14,10 +14,10 @@ import (
 
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blobtest"
+	"github.com/luci1900/shardlite/internal/dispatch"
 	"github.com/luci1900/shardlite/internal/kill"
 	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/peers"
-	"github.com/luci1900/shardlite/internal/reconcile"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
@@ -190,7 +190,7 @@ func TestDrainTurnsForwardsAndActivationsAway(t *testing.T) {
 	if got := fwd.final.Get(hdrError); got != string(reasonNotOwner) {
 		t.Errorf("a forward got reason %q, want %q", got, reasonNotOwner)
 	}
-	dis := n0.peerDo("POST", reconcile.Activate, map[string]string{"Shardlite-Origin": originNode, "Shardlite-Target": dispatched, hdrIfExists: "true"}, "")
+	dis := n0.peerDo("POST", dispatch.Activate, map[string]string{"Shardlite-Origin": originNode, "Shardlite-Target": dispatched, hdrIfExists: "true"}, "")
 	if dis.status != 421 || dis.final.Get(hdrOwner) != "n1" {
 		t.Errorf("an activation got %d naming %q, want 421 naming n1", dis.status, dis.final.Get(hdrOwner))
 	}

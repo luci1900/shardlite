@@ -19,9 +19,9 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/dispatch"
 	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/peers"
-	"github.com/luci1900/shardlite/internal/reconcile"
 	"github.com/luci1900/shardlite/internal/service"
 )
 
@@ -217,7 +217,7 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 		Flush:     FlushOptions{Interval: env.Flush, Min: env.FlushMin},
 		Lifecycle: LifecycleOptions{DeltaAge: env.DeltaAge, DeltaSize: env.DeltaSize, At: ro.faults.At, MaxFiles: ro.faults.MaxFiles},
 		Leases:    peers.ScanOptions{TTL: env.LeaseTTL},
-		Dispatch:  &reconcile.Options{},
+		Dispatch:  &dispatch.Options{},
 	}
 	if ro.shardset != nil {
 		ro.shardset(&so, nil)

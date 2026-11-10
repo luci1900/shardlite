@@ -21,7 +21,6 @@ import (
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/blobtest"
-	"github.com/luci1900/shardlite/internal/dueindex"
 	"github.com/luci1900/shardlite/internal/harness"
 	"github.com/luci1900/shardlite/internal/journal"
 	"github.com/luci1900/shardlite/internal/shardfile"
@@ -1097,8 +1096,8 @@ func TestEntryFailingBeforeAReleaseKeepsTheLoop(t *testing.T) {
 	}
 	failing.Store(false)
 	apptest.Eventually(t, apptest.Timeout, "the next idle look to let go of the shard", func() bool { return r.released("users/hr1") })
-	if m, err := r.manifest("users/hr1"); err != nil || m.NextReminder != dueindex.MinuteOf(due) {
-		t.Fatalf("manifest %+v (%v), want next_reminder %d", m, err, dueindex.MinuteOf(due))
+	if m, err := r.manifest("users/hr1"); err != nil || m.NextReminder != shardfile.MinuteOf(due) {
+		t.Fatalf("manifest %+v (%v), want next_reminder %d", m, err, shardfile.MinuteOf(due))
 	}
 }
 

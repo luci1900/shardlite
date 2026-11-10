@@ -12,7 +12,7 @@ import (
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/cluster"
-	"github.com/luci1900/shardlite/internal/reconcile"
+	"github.com/luci1900/shardlite/internal/dispatch"
 	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
@@ -75,7 +75,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, o origin) {
 		name = n
 	}
 	info := &reqInfo{name: name, public: o.kind == fromClient, own: o.internal(), node: o.kind == fromNode, forwarded: o.forwarded}
-	activate := info.node && r.URL.Path == reconcile.Activate
+	activate := info.node && r.URL.Path == dispatch.Activate
 	// The proxy can leave goroutines behind that are still reading through a gate
 	// when the handler returns: the second copier of an upgraded connection, or
 	// the transport writing a request body. Their gates end with the request's

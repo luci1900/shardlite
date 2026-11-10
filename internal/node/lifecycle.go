@@ -11,7 +11,6 @@ import (
 	"github.com/superfly/ltx"
 
 	"github.com/luci1900/shardlite/internal/capture"
-	"github.com/luci1900/shardlite/internal/dueindex"
 	"github.com/luci1900/shardlite/internal/kill"
 	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/shardfile"
@@ -246,7 +245,7 @@ func (a *actor) deactivate(ctx context.Context, ifHeld capture.IfHeld) (bool, er
 	// The reminder to record with the delta: the exact time when the release's
 	// read saw the final state, and now otherwise, since the shard's state at
 	// the end is then unknown and now is never late.
-	var reminder func(end pos.Position) dueindex.Minute
+	var reminder func(end pos.Position) shardfile.Minute
 	switch r := final.(type) {
 	case *capture.Deleted:
 		// The shard leaves nothing behind, and no final delta: the tail goes with the
@@ -263,12 +262,12 @@ func (a *actor) deactivate(ctx context.Context, ifHeld capture.IfHeld) (bool, er
 		a.gone = true
 		return true, nil
 	case *capture.Kept:
-		reminder = func(end pos.Position) dueindex.Minute { return a.recordedFor(next, r.At, end) }
+		reminder = func(end pos.Position) shardfile.Minute { return a.recordedFor(next, r.At, end) }
 	case *capture.Uncertain:
 		// The read did not see the final state, so the shard's state at the end
 		// is unknown and the reminder is now, never late. A shard with nothing
 		// in it has no reminder to be late for, and none is recorded.
-		reminder = func(end pos.Position) dueindex.Minute {
+		reminder = func(end pos.Position) shardfile.Minute {
 			if end == 0 {
 				return 0
 			}
@@ -325,12 +324,12 @@ func (a *actor) warnOpen(open bool) {
 // stored manifest first). It runs on the loop's context and not the caller's,
 // since a caller giving up must not leave the outcome unlearned, and only the loop's ending
 // (the node stopping) ends the asking.
-func (a *actor) finish(sh *capture.Shard, reminder func(end pos.Position) dueindex.Minute) error {
+func (a *actor) finish(sh *capture.Shard, reminder func(end pos.Position) shardfile.Minute) error {
 	ctx := a.ctx
 	wait := 100 * time.Millisecond
 	for {
 		recorded := false
-		record := func(_ context.Context, end pos.Position) (dueindex.Minute, error) {
+		record := func(_ context.Context, end pos.Position) (shardfile.Minute, error) {
 			recorded = true
 			return reminder(end), nil
 		}

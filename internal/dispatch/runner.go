@@ -1,10 +1,4 @@
-// Package reconcile is what the node's reconcilers share (docs/internals.md,
-// Reconcilers): the ranking that says which node runs a lane, the names of the
-// node's own requests that a reconciler sends through the node, and the loop that
-// runs the reconcilers over their due indexes (loop.go). Each reconciler's handler
-// is a package of its own below this one. Those packages never import the node or
-// each other.
-package reconcile
+package dispatch
 
 import (
 	"hash/fnv"
@@ -27,8 +21,8 @@ const IfExists = "Shardlite-If-Exists"
 // 200 if the request activated it or 204 if it was active already.
 const Activate = "/_shardlite/activate"
 
-// Clock is the time a reconciler runs on: the node's clock, so that tests with a
-// fake one drive its loop.
+// Clock is the time the dispatcher runs on: the node's clock, so that tests with a
+// fake one drive its passes.
 type Clock interface {
 	Now() time.Time
 	// NewTimer sends the time on the channel once, d from now. The function stops it.

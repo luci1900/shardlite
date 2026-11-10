@@ -17,9 +17,9 @@ import (
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/cluster"
+	"github.com/luci1900/shardlite/internal/dispatch"
 	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/peers"
-	"github.com/luci1900/shardlite/internal/reconcile"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
@@ -81,8 +81,8 @@ func TestPeerListenerAnswersSayAvoidWhileDraining(t *testing.T) {
 		status       int
 	}{
 		"a forward":                 {"GET", "/x", forward, 200},
-		"an activation":             {"POST", reconcile.Activate, map[string]string{"Shardlite-Origin": originNode, "Shardlite-Target": "users/a"}, 204},
-		"a client's activation":     {"POST", reconcile.Activate, map[string]string{"Shardlite-Origin": originClient, "Shardlite-Target": "users/a"}, 404},
+		"an activation":             {"POST", dispatch.Activate, map[string]string{"Shardlite-Origin": originNode, "Shardlite-Target": "users/a"}, 204},
+		"a client's activation":     {"POST", dispatch.Activate, map[string]string{"Shardlite-Origin": originClient, "Shardlite-Target": "users/a"}, 404},
 		"a missing origin":          {"GET", "/x", map[string]string{"Shardlite-Target": "users/a"}, 404},
 		"a shard that is not there": {"GET", "/x", map[string]string{"Shardlite-Origin": originClient, "Shardlite-Target": "users/nope"}, 404},
 		"a path of the nodes":       {"GET", apiPrefix + "x", map[string]string{"Shardlite-Origin": originClient, "Shardlite-Target": "users/a"}, 404},

@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blobtest"
-	"github.com/luci1900/shardlite/internal/dueindex"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
@@ -83,7 +82,7 @@ func TestLostClaimWithNoOwnerYetAsksTheClientToRetry(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			return h.SetReminder(ctx, dueindex.MinuteAt(time.Now().Add(time.Hour)), false)
+			return h.SetReminder(ctx, shardfile.MinuteAt(time.Now().Add(time.Hour)), false)
 		}
 		return nil
 	})

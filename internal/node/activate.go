@@ -4,7 +4,7 @@ import (
 	"net/http"
 )
 
-// serveActivate answers a request of the node's own for reconcile.Activate once
+// serveActivate answers a request of the node's own for dispatch.Activate once
 // route holds the shard here, and says nothing else: no listener lets the app
 // send a path under /_shardlite/, and a peer takes one only from a forward of a
 // node's request. The request routes as any call does, so it follows the owner

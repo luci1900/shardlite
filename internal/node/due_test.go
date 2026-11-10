@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/dueindex"
 	"github.com/luci1900/shardlite/internal/harness"
+	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
 func withClock(c Clock) func(*ShardsetOptions) {
@@ -298,8 +298,8 @@ func TestReminderAnHourAwayWakesTheShard(t *testing.T) {
 			case "after deactivation":
 				r.closeInApp("users/wh1")
 				advanceUntil(t, clk, 100*time.Millisecond, "deactivation (a reminder an hour away does not hold the shard)", func() bool { return r.released("users/wh1") })
-				if got := r.nextReminder("users/wh1"); got != dueindex.MinuteOf(due) {
-					t.Fatalf("next_reminder %d, want minute %d", got, dueindex.MinuteOf(due))
+				if got := r.nextReminder("users/wh1"); got != shardfile.MinuteOf(due) {
+					t.Fatalf("next_reminder %d, want minute %d", got, shardfile.MinuteOf(due))
 				}
 				clk.Advance(3601 * time.Second)
 			case "after a crash":
@@ -316,8 +316,8 @@ func TestReminderAnHourAwayWakesTheShard(t *testing.T) {
 				r.restart(opts)
 			case "new machine":
 				r.shutdown("users/wh1")
-				if got := r.nextReminder("users/wh1"); got != dueindex.MinuteOf(due) {
-					t.Fatalf("next_reminder %d, want minute %d", got, dueindex.MinuteOf(due))
+				if got := r.nextReminder("users/wh1"); got != shardfile.MinuteOf(due) {
+					t.Fatalf("next_reminder %d, want minute %d", got, shardfile.MinuteOf(due))
 				}
 				if err := removeAll(r.data); err != nil {
 					t.Fatal(err)

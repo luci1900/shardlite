@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -12,7 +13,6 @@ import (
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/blobtest"
-	"github.com/luci1900/shardlite/internal/dueindex"
 	"github.com/luci1900/shardlite/internal/harness"
 	"github.com/luci1900/shardlite/internal/pos"
 	shardpkg "github.com/luci1900/shardlite/internal/shard"
@@ -51,11 +51,11 @@ func (l *opLog) take() []string {
 
 // reminderAt is a hook that records the reminder at the minute of unix seconds.
 func reminderAt(unix int64) shardfile.Hooks {
-	return shardfile.Hooks{BeforeUpdate: func(context.Context, pos.Position) (dueindex.Minute, error) {
+	return shardfile.Hooks{BeforeUpdate: func(context.Context, pos.Position) (shardfile.Minute, error) {
 		if unix == 0 {
 			return 0, nil
 		}
-		return dueindex.MinuteOf(unix), nil
+		return shardfile.MinuteOf(unix), nil
 	}}
 }
 
@@ -63,17 +63,11 @@ func dueEntries(t *testing.T, e *harness.Env, now time.Time) []shardfile.Reminde
 	t.Helper()
 	var out []shardfile.Reminder
 	for i := range shardpkg.Lanes {
-		got, err := shardfile.ReminderIndex(e.Store).Due(context.Background(), shardpkg.Lane(i), now, 1000)
+		got, err := shardfile.NewReminderIndex(e.Store).Due(context.Background(), shardpkg.Lane(i), now, 1000)
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, d := range got {
-			r, err := shardfile.ParseReminder(d)
-			if err != nil {
-				t.Fatal(err)
-			}
-			out = append(out, r)
-		}
+		out = append(out, got...)
 	}
 	return out
 }
@@ -102,10 +96,10 @@ func TestNextReminderHasItsEntryFirst(t *testing.T) {
 		t.Fatalf("operations %v, want the entry and then the manifest", got)
 	}
 	m, _, err := e.Files.GetManifest(ctx, shardName(shard))
-	if err != nil || m.NextReminder != dueindex.MinuteOf(due) {
-		t.Fatalf("manifest %+v (%v), want next_reminder %d", m, err, dueindex.MinuteOf(due))
+	if err != nil || m.NextReminder != shardfile.MinuteOf(due) {
+		t.Fatalf("manifest %+v (%v), want next_reminder %d", m, err, shardfile.MinuteOf(due))
 	}
-	want := shardfile.Reminder{Minute: dueindex.MinuteOf(due), Shard: shardName(shard), Base: base}
+	want := shardfile.Reminder{Minute: shardfile.MinuteOf(due), Shard: shardName(shard), Base: base}
 	if got := dueEntries(t, e, time.Unix(due, 0)); len(got) != 1 || got[0] != want {
 		t.Fatalf("entries %+v, want %+v", got, want)
 	}
@@ -199,10 +193,10 @@ func TestAdoptionRecordsAnEntryDueNow(t *testing.T) {
 		t.Fatalf("operations %v, want the entry and then the manifest", got)
 	}
 	m, _, err := e.Files.GetManifest(ctx, shardName(shard))
-	if err != nil || m.NextReminder != dueindex.MinuteAt(now) {
-		t.Fatalf("manifest %+v (%v), want next_reminder %d", m, err, dueindex.MinuteAt(now))
+	if err != nil || m.NextReminder != shardfile.MinuteAt(now) {
+		t.Fatalf("manifest %+v (%v), want next_reminder %d", m, err, shardfile.MinuteAt(now))
 	}
-	want := shardfile.Reminder{Minute: dueindex.MinuteOf(now.Unix()), Shard: shardName(shard), Base: base}
+	want := shardfile.Reminder{Minute: shardfile.MinuteOf(now.Unix()), Shard: shardName(shard), Base: base}
 	if got := dueEntries(t, e, now); len(got) != 1 || got[0] != want {
 		t.Fatalf("entries %+v, want %+v", got, want)
 	}
@@ -275,39 +269,53 @@ func TestReleaseThenClaimGivesANewVersion(t *testing.T) {
 func at(h, m int) time.Time { return time.Date(2026, 10, 19, h, m, 0, 0, time.UTC) }
 
 // minuteAt is the minute of 14:05, say, on the test day.
-func minuteAt(h, m int) dueindex.Minute { return dueindex.MinuteAt(at(h, m)) }
+func minuteAt(h, m int) shardfile.Minute { return shardfile.MinuteAt(at(h, m)) }
 
-// reminderKey is the object key of a reminder.
-func reminderKey(r shardfile.Reminder) string {
-	return dueindex.Key(shardfile.ReminderPrefix, r.Entry())
-}
-
-// parseReminderKey is reminderKey's inverse.
-func parseReminderKey(key string) (shardfile.Reminder, error) {
-	d, err := dueindex.Parse(shardfile.ReminderPrefix, key)
-	if err != nil {
-		return shardfile.Reminder{}, err
+func TestMinutes(t *testing.T) {
+	t.Parallel()
+	if got := shardfile.MinuteOf(119); got != 1 {
+		t.Errorf("MinuteOf(119) = %d, want 1", got)
 	}
-	return shardfile.ParseReminder(d)
+	if got, want := shardfile.MinuteAt(at(14, 5).Add(59*time.Second)), shardfile.MinuteOf(at(14, 5).Unix()); got != want {
+		t.Errorf("MinuteAt = %d, want %d", got, want)
+	}
 }
 
 func TestReminderKeyRoundTrip(t *testing.T) {
 	t.Parallel()
-	r := shardfile.Reminder{Minute: minuteAt(14, 5), Shard: shardpkg.MustParse("users/42"), Base: shardfile.BaseOf("etag"), N: 3}
-	got, err := parseReminderKey(reminderKey(r))
-	if err != nil || got != r {
-		t.Fatalf("%q parses to %+v (%v), want %+v", reminderKey(r), got, err, r)
+	for _, r := range []shardfile.Reminder{
+		{Minute: minuteAt(14, 5), Shard: shardpkg.MustParse("users/42"), Base: shardfile.BaseOf("etag"), N: 3},
+		{Minute: minuteAt(0, 0), Shard: shardpkg.MustParse("a/b"), Base: "x", N: 0},
+		{Minute: minuteAt(23, 59), Shard: shardpkg.MustParse("users/7"), Base: "y", N: 12},
+	} {
+		got, err := shardfile.ParseKey(r.Key())
+		if err != nil || got != r {
+			t.Errorf("%q parses to %+v (%v), want %+v", r.Key(), got, err, r)
+		}
 	}
+	r := shardfile.Reminder{Minute: minuteAt(14, 5), Shard: shardpkg.MustParse("users/42"), Base: "b", N: 3}
+	lane := r.Shard.Lane().String()
 	p := shardfile.ReminderPrefix
 	for _, bad := range []string{
 		"", p, shardfile.ManifestKey(shardpkg.MustParse("users/42")),
-		p + "x/2026-10-19T14:05Z/users/42/a.0",
+		"index/other/" + lane + "/2026-10-19T14:05Z/users/42/b.3",
+		p + lane + "/2026-10-19T14:05Z",                                // no shard
+		p + lane + "/2026-10-19T14:05Z/users/42",                       // no base
+		p + lane + "/2026-10-19T14:05Z/users/42/b",                     // no move count
+		p + lane + "/2026-10-19T14:05Z/users/42/b.x",                   // move count not a number
+		p + lane + "/2026-10-19T14:05Z/users/42/b.-1",                  // negative move count
+		p + lane + "/2026-10-19T14:05Z/Users/42/b.3",                   // not a shard name
+		p + lane + "/2026-10-19T14:05Z/users/42/b.3/c",                 // more after the base
+		p + "x/2026-10-19T14:05Z/users/42/b.3",                         // lane not a digit
+		"index/reminders/0" + lane + "/2026-10-19T14:05Z/users/42/b.3", // lane not as written
+		p + lane + "/2026-10-19T14:5Z/users/42/b.3",                    // minute not as written
+		p + lane + "/2026-10-19T14:05:30Z/users/42/b.3",                // minute with seconds
 		// The old layout, with the minute first.
-		p + "2026-10-19T14:05Z/" + r.Shard.Lane().String() + "/users/42/a.0",
+		p + "2026-10-19T14:05Z/" + lane + "/users/42/b.3",
 		// Not the shard's lane.
-		p + ((r.Shard.Lane() + 1) % shardpkg.Lanes).String() + "/2026-10-19T14:05Z/users/42/a.0",
+		p + ((r.Shard.Lane() + 1) % shardpkg.Lanes).String() + "/2026-10-19T14:05Z/users/42/b.3",
 	} {
-		if _, err := parseReminderKey(bad); err == nil {
+		if _, err := shardfile.ParseKey(bad); err == nil {
 			t.Errorf("%q parsed", bad)
 		}
 	}
@@ -329,38 +337,12 @@ func TestKeysAreFixed(t *testing.T) {
 		{shardfile.Reminder{Minute: minuteAt(14, 5), Shard: name, Base: "b", N: 2}, "index/reminders/6/2026-10-19T14:05Z/users/42/b.2"},
 		{shardfile.Reminder{Minute: minuteAt(15, 0), Shard: name, Base: shardfile.BaseOf("etag"), N: 0}, "index/reminders/6/2026-10-19T15:00Z/users/42/fcaec3a55087.0"},
 	} {
-		if got := reminderKey(c.e); got != c.want {
+		if got := c.e.Key(); got != c.want {
 			t.Errorf("key %q, want %q", got, c.want)
 		}
 	}
 	if got := shardfile.BaseOf("etag"); got != "fcaec3a55087" {
 		t.Errorf("BaseOf(etag) = %q, want fcaec3a55087", got)
-	}
-}
-
-// The subject is kind/id/base.n, and the lane is the shard's.
-func TestReminderSubjectRoundTrip(t *testing.T) {
-	t.Parallel()
-	r := shardfile.Reminder{Minute: minuteAt(14, 5), Shard: shardpkg.MustParse("users/42"), Base: shardfile.BaseOf("etag"), N: 3}
-	d := r.Entry()
-	if want := "users/42/" + shardfile.BaseOf("etag") + ".3"; d.Subject != want || d.Lane != r.Shard.Lane() || d.Minute != r.Minute {
-		t.Fatalf("due entry %+v, want subject %q in the shard's lane", d, want)
-	}
-	got, err := shardfile.ParseReminder(d)
-	if err != nil || got != r {
-		t.Fatalf("%+v parses to %+v (%v), want %+v", d, got, err, r)
-	}
-	for _, subject := range []string{"", "a", "users/42", "users/42/b", "users/42/b.x", "users/42/b.-1", "Users/42/b.0", "users/42/b.0/c"} {
-		bad := d
-		bad.Subject = subject
-		if _, err := shardfile.ParseReminder(bad); err == nil {
-			t.Errorf("subject %q parsed", subject)
-		}
-	}
-	other := d
-	other.Lane = (d.Lane + 1) % shardpkg.Lanes
-	if _, err := shardfile.ParseReminder(other); err == nil {
-		t.Error("an entry under another shard's lane parsed")
 	}
 }
 
@@ -380,27 +362,165 @@ func shardsIn(t *testing.T, b shardpkg.Lane, n int) []shardpkg.Name {
 	return out
 }
 
-// The reminder index lists its lane's reminders earliest first and leaves what isn't
-// a reminder alone, without it counting against the page.
-func TestReminderIndexListsOnlyReminders(t *testing.T) {
-	t.Parallel()
+func newIndex(t *testing.T) (shardfile.ReminderIndex, *blob.Store) {
+	t.Helper()
 	store := blob.NewStore(blob.NewMemory(), "n1", 1, blob.Options{Backoff: time.Millisecond})
-	x := shardfile.ReminderIndex(store)
+	return shardfile.NewReminderIndex(store), store
+}
+
+// remindersIn makes reminders of the lane: the shard is the i'th of its lane.
+func reminderIn(t *testing.T, lane shardpkg.Lane, i int, m shardfile.Minute) shardfile.Reminder {
+	t.Helper()
+	return shardfile.Reminder{Minute: m, Shard: shardsIn(t, lane, i+1)[i], Base: "b"}
+}
+
+// dueAll lists the due reminders of every lane.
+func dueAll(t *testing.T, x shardfile.ReminderIndex, now time.Time) []shardfile.Reminder {
+	t.Helper()
+	var out []shardfile.Reminder
+	for i := range shardpkg.Lanes {
+		got, err := x.Due(context.Background(), shardpkg.Lane(i), now, 1000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, got...)
+	}
+	return out
+}
+
+// The reminder index lists a lane's reminders earliest first, up to now and a page,
+// leaves what isn't a reminder alone without it counting against the page, and
+// keeps lanes apart.
+func TestDueListsALaneInTimeOrderUpToNow(t *testing.T) {
+	t.Parallel()
+	x, store := newIndex(t)
 	ctx := context.Background()
-	names := shardsIn(t, 3, 2)
-	late := shardfile.Reminder{Minute: minuteAt(14, 7), Shard: names[0], Base: "b"}
-	early := shardfile.Reminder{Minute: minuteAt(14, 5), Shard: names[1], Base: "b"}
-	for _, r := range []shardfile.Reminder{late, early} {
-		if err := x.Create(ctx, r.Entry()); err != nil {
+	a, b, c, d := reminderIn(t, 3, 0, minuteAt(14, 7)), reminderIn(t, 3, 1, minuteAt(14, 5)), reminderIn(t, 3, 2, minuteAt(14, 6)), reminderIn(t, 3, 3, minuteAt(14, 9))
+	e := reminderIn(t, 4, 0, minuteAt(14, 5))
+	for _, r := range []shardfile.Reminder{a, b, c, d, e} {
+		for range 2 { // the second is a retry of the same write
+			if err := x.Create(ctx, r); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// Objects under the prefix that aren't reminders are skipped, early or late.
+	for _, junk := range []string{"3/not-a-minute/c", "3/2026-10-19T14:00Z/junk", "3/2026-10-19T14:06Z/users/zz/b"} {
+		if _, err := store.Create(ctx, shardfile.ReminderPrefix+junk, bytes.NewReader(nil)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := store.Create(ctx, shardfile.ReminderPrefix+"3/2026-10-19T14:00Z/junk", bytes.NewReader(nil)); err != nil {
+	got, err := x.Due(ctx, 3, at(14, 7).Add(30*time.Second), 10)
+	if want := []shardfile.Reminder{b, c, a}; err != nil || !slices.Equal(got, want) {
+		t.Fatalf("due %+v (%v), want the lane's %+v in time order", got, err, want)
+	}
+	if got, _ := x.Due(ctx, 3, at(14, 9), 2); !slices.Equal(got, []shardfile.Reminder{b, c}) {
+		t.Fatalf("a page of 2 held %+v, want the two earliest", got)
+	}
+	if got, _ := x.Due(ctx, 4, at(14, 9), 10); !slices.Equal(got, []shardfile.Reminder{e}) {
+		t.Fatalf("the other lane lists %+v, want just its own", got)
+	}
+	if got, _ := x.Due(ctx, 5, at(14, 9), 10); len(got) != 0 {
+		t.Fatalf("an empty lane lists %+v", got)
+	}
+}
+
+// Every lane lists on its own.
+func TestLanesAreSeparate(t *testing.T) {
+	t.Parallel()
+	x, _ := newIndex(t)
+	ctx := context.Background()
+	var all []shardfile.Reminder
+	for i := range shardpkg.Lanes {
+		r := reminderIn(t, shardpkg.Lane(i), 0, minuteAt(14, 5))
+		all = append(all, r)
+		if err := x.Create(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, want := range all {
+		got, err := x.Due(ctx, shardpkg.Lane(i), at(15, 0), 10)
+		if err != nil || !slices.Equal(got, []shardfile.Reminder{want}) {
+			t.Fatalf("lane %d lists %+v (%v), want %+v", i, got, err, want)
+		}
+	}
+}
+
+// A move creates the next entry before it deletes the old one, so a crash between
+// them leaves a duplicate and never a gap.
+func TestMoveCreatesTheNextThenDeletesTheOld(t *testing.T) {
+	t.Parallel()
+	hooked := blobtest.WithHook(blob.NewMemory())
+	store := blob.NewStore(hooked, "n1", 1, blob.Options{Backoff: time.Millisecond})
+	x := shardfile.NewReminderIndex(store)
+	ctx := context.Background()
+	r := reminderIn(t, 5, 0, minuteAt(14, 5))
+	next := r
+	next.Minute, next.N = minuteAt(14, 6), 1
+	if err := x.Create(ctx, r); err != nil {
 		t.Fatal(err)
 	}
-	got, err := x.Due(ctx, 3, at(15, 0), 2)
-	if err != nil || len(got) != 2 || got[0] != early.Entry() || got[1] != late.Entry() {
-		t.Fatalf("due %+v (%v), want %+v then %+v", got, err, early.Entry(), late.Entry())
+	var mu sync.Mutex
+	var ops []string
+	hooked.SetHook(func(_ context.Context, op blobtest.Op, key string, after bool) error {
+		if after {
+			return nil
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if op == blobtest.OpCreate {
+			ops = append(ops, "create "+key)
+		}
+		if op == blobtest.OpDelete {
+			ops = append(ops, "delete "+key)
+		}
+		return nil
+	})
+	if err := x.Move(ctx, r, next); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"create " + next.Key(), "delete " + r.Key()}; !slices.Equal(ops, want) {
+		t.Fatalf("operations %v, want %v", ops, want)
+	}
+	hooked.SetHook(nil)
+	if got := dueAll(t, x, at(15, 0)); !slices.Equal(got, []shardfile.Reminder{next}) {
+		t.Fatalf("entries %+v, want just %+v", got, next)
+	}
+	if err := x.Delete(ctx, next); err != nil {
+		t.Fatal(err)
+	}
+	if err := x.Delete(ctx, next); err != nil { // already gone
+		t.Fatal(err)
+	}
+	if got := dueAll(t, x, at(15, 0)); len(got) != 0 {
+		t.Fatalf("entries %+v after the delete", got)
+	}
+}
+
+// A move to the entry's own key would delete the entry it made, so it is refused
+// and leaves the entry where it was.
+func TestMoveOntoItselfIsRefused(t *testing.T) {
+	t.Parallel()
+	x, _ := newIndex(t)
+	ctx := context.Background()
+	r := reminderIn(t, 5, 0, minuteAt(14, 5))
+	if err := x.Create(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if err := x.Move(ctx, r, r); err == nil {
+		t.Fatal("a move onto the same key succeeded")
+	}
+	if got := dueAll(t, x, at(15, 0)); !slices.Equal(got, []shardfile.Reminder{r}) {
+		t.Fatalf("entries %+v, want just %+v", got, r)
+	}
+	// A new move count in the same minute is a move.
+	next := r
+	next.N++
+	if err := x.Move(ctx, r, next); err != nil {
+		t.Fatal(err)
+	}
+	if got := dueAll(t, x, at(15, 0)); !slices.Equal(got, []shardfile.Reminder{next}) {
+		t.Fatalf("entries %+v, want just %+v", got, next)
 	}
 }
 
@@ -408,7 +528,7 @@ func TestBacks(t *testing.T) {
 	t.Parallel()
 	r := shardfile.Reminder{Minute: minuteAt(14, 5)}
 	for _, c := range []struct {
-		next dueindex.Minute
+		next shardfile.Minute
 		want bool
 	}{
 		{0, false},
@@ -431,7 +551,7 @@ func TestPrunable(t *testing.T) {
 	for _, c := range []struct {
 		name    string
 		exists  bool
-		next    dueindex.Minute
+		next    shardfile.Minute
 		version blob.ETag
 		want    bool
 	}{

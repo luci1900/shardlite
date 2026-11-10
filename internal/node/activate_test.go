@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/reconcile"
+	"github.com/luci1900/shardlite/internal/dispatch"
 )
 
 // A node's request for the activate path makes an existing shard active where it
@@ -18,19 +18,19 @@ func TestActivateMakesAnExistingShardActive(t *testing.T) {
 	n0.unowned(target)
 	hdr := map[string]string{"Shardlite-Origin": originNode, "Shardlite-Target": target, hdrIfExists: "true"}
 
-	if got := n0.peerDo("POST", reconcile.Activate, hdr, ""); got.status != 200 {
+	if got := n0.peerDo("POST", dispatch.Activate, hdr, ""); got.status != 200 {
 		t.Fatalf("activating got %d, want 200", got.status)
 	}
 	if !n0.m.Load().IsActive(shardName(target)) {
 		t.Fatal("the shard is not active after its activation")
 	}
-	if got := n0.peerDo("POST", reconcile.Activate, hdr, ""); got.status != 204 {
+	if got := n0.peerDo("POST", dispatch.Activate, hdr, ""); got.status != 204 {
 		t.Fatalf("activating an active shard got %d, want 204", got.status)
 	}
 
 	const missing = "users/nope"
 	hdr["Shardlite-Target"] = missing
-	if got := n0.peerDo("POST", reconcile.Activate, hdr, ""); got.status != 404 {
+	if got := n0.peerDo("POST", dispatch.Activate, hdr, ""); got.status != 404 {
 		t.Fatalf("activating a shard with no manifest got %d, want 404", got.status)
 	}
 	if n0.m.Load().IsActive(shardName(missing)) {
@@ -49,7 +49,7 @@ func TestActivateIsNotTheApps(t *testing.T) {
 	n0.create("users/a")
 	hdr := map[string]string{"Shardlite-Target": "users/a", hdrIfExists: "true"}
 	for name, addr := range map[string]string{"the control API": n0.Control, "the public listener": n0.Public} {
-		resp, body := send(t, "POST", "http://"+addr+reconcile.Activate, hdr, "")
+		resp, body := send(t, "POST", "http://"+addr+dispatch.Activate, hdr, "")
 		if resp.StatusCode != 404 {
 			t.Errorf("%s answered %d %q, want 404", name, resp.StatusCode, body)
 		}

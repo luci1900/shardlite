@@ -17,14 +17,13 @@ import (
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/cluster"
+	"github.com/luci1900/shardlite/internal/dispatch"
 	"github.com/luci1900/shardlite/internal/kill"
 	"github.com/luci1900/shardlite/internal/kind"
 	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/notify"
 	"github.com/luci1900/shardlite/internal/peers"
 	"github.com/luci1900/shardlite/internal/pos"
-	"github.com/luci1900/shardlite/internal/reconcile"
-	"github.com/luci1900/shardlite/internal/reconcile/dispatch"
 	"github.com/luci1900/shardlite/internal/service"
 	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
@@ -55,10 +54,9 @@ type ShardsetOptions struct {
 	Reminders ReminderOptions // docs/guide.md, Reminders
 	Leases    peers.ScanOptions
 
-	// Dispatch, if set, runs the dispatcher, the reminder index's reconciler, which
-	// wakes the shards whose reminders are due while they are inactive
-	// (docs/internals.md, Reconcilers).
-	Dispatch *reconcile.Options
+	// Dispatch, if set, runs the dispatcher, which wakes the shards whose
+	// reminders are due while they are inactive (docs/internals.md, The dispatcher).
+	Dispatch *dispatch.Options
 
 	// OwnerCache is how many shards' owners the node remembers, 100,000 if zero
 	// (docs/internals.md, Routing and forwarding).
@@ -114,7 +112,7 @@ type Stats struct {
 
 // Shardset owns the node's shards, which are the active ones (docs/internals.md,
 // Concurrency). Its parts are the table of shards and their actors, the flush loop,
-// the lease scan, the watchdog and the reconcilers,
+// the lease scan, the watchdog and the dispatcher,
 // which Serve runs. The reminders' limits are its too. Each part gets what it
 // depends on passed in, and Shardset orders its own stop (Serve).
 type Shardset struct {
@@ -123,15 +121,13 @@ type Shardset struct {
 	log   *slog.Logger
 	Stats Stats
 
-	tab         *table
-	flush       *Flusher
-	rem         *reminders
-	leases      *peers.Scan
-	watch       *watchdog
-	reconcilers *reconcile.Loop       // nil unless Dispatch is set
-	dispatching *reconcile.Reconciler // the reminder index's, nil unless Dispatch is set
-	dispatcher  *dispatch.Dispatcher  // its handler, nil unless Dispatch is set
-	deps        *actorDeps            // what every shard is given
+	tab        *table
+	flush      *Flusher
+	rem        *reminders
+	leases     *peers.Scan
+	watch      *watchdog
+	dispatcher *dispatch.Dispatcher // nil unless Dispatch is set
+	deps       *actorDeps           // what every shard is given
 
 	// owners maps a shard's name to the node that owned it when this node last
 	// found out. It is a hint: a wrong entry costs a misdirected request, never
@@ -210,14 +206,8 @@ func NewShardset(n *Node, opts ShardsetOptions, newRouting func(*Shardset) routi
 		Registry: n.Registry, Self: self, Clock: clk, Options: opts.Leases, Log: log,
 		Scans: &st.LeaseScans, Adopt: ad.adopt, Died: m.died,
 	}
-	var rs []*reconcile.Reconciler
 	if opts.Dispatch != nil {
-		m.dispatcher = dispatch.New(dispatch.Deps{Store: n.Store, Clock: clk, Log: log, Call: rt.call})
-		m.dispatching = &reconcile.Reconciler{Name: "dispatcher", Index: shardfile.ReminderIndex(n.Store), Handler: m.dispatcher, Options: *opts.Dispatch}
-		rs = append(rs, m.dispatching)
-	}
-	if len(rs) > 0 {
-		m.reconcilers = reconcile.New(reconcile.Deps{Clock: clk, Log: log, Mine: m.lanes, Check: n.Keeper.Check}, rs...)
+		m.dispatcher = dispatch.New(dispatch.Deps{Store: n.Store, Clock: clk, Log: log, Call: rt.call, Mine: m.lanes, Check: n.Keeper.Check}, *opts.Dispatch)
 	}
 	m.placer = &peers.Placer{
 		Self: n.Name, Draining: &m.draining, Listing: m.leases.Nodes, Clock: clk, TTL: opts.Leases.TTL, Log: log,
@@ -273,8 +263,8 @@ func (m *Shardset) Serve(ctx context.Context) error {
 	for _, s := range []service.Service{m.leases, m.watch} {
 		loops.Add(s)
 	}
-	if m.reconcilers != nil {
-		loops.Add(m.reconcilers)
+	if m.dispatcher != nil {
+		loops.Add(m.dispatcher)
 	}
 	<-ctx.Done()
 
@@ -643,9 +633,9 @@ func (m *Shardset) isLive(node cluster.Node) bool {
 	return slices.Contains(m.leases.Nodes().Live(), node)
 }
 
-// lanes is the lanes this node runs the reconcilers for: the ones it ranks first for among the nodes of the lease scan's last listing (reconcile.Mine), and whether there has been a listing yet.
+// lanes is the lanes this node runs the dispatcher for: the ones it ranks first for among the nodes of the lease scan's last listing (dispatch.Mine), and whether there has been a listing yet.
 func (m *Shardset) lanes() (lanes []shard.Lane, listed bool) {
-	return reconcile.Mine(m.n.Name, m.leases.Nodes().Live()), m.leases.Nodes() != nil
+	return dispatch.Mine(m.n.Name, m.leases.Nodes().Live()), m.leases.Nodes() != nil
 }
 
 // Flusher is the flush loop, for the gates.

@@ -12,7 +12,6 @@ import (
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/cluster"
-	"github.com/luci1900/shardlite/internal/dueindex"
 	"github.com/luci1900/shardlite/internal/journal"
 	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/shard"
@@ -206,8 +205,8 @@ func (f *Files) adoptShard(ctx context.Context, node cluster.Node, n shard.Name,
 		// creates an entry again. The delta records a reminder due now, since the
 		// shard may hold reminders that were never delivered and the adopter can't
 		// read them.
-		now := dueindex.MinuteAt(f.now())
-		hooks := Hooks{BeforeUpdate: func(context.Context, pos.Position) (dueindex.Minute, error) { return now, nil }}
+		now := MinuteAt(f.now())
+		hooks := Hooks{BeforeUpdate: func(context.Context, pos.Position) (Minute, error) { return now, nil }}
 		err = h.putTail(ctx, tail.Files, hooks, func(n *Manifest) { n.Journal = "" })
 		tail.Close()
 		if errors.Is(err, blob.ErrConflict) {

@@ -10,7 +10,6 @@ import (
 
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blobtest"
-	"github.com/luci1900/shardlite/internal/dueindex"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
@@ -82,8 +81,8 @@ func TestDeactivationRecordsTheReminderOfAReleasedShard(t *testing.T) {
 	r.closeInApp(target)
 	apptest.Eventually(t, apptest.Timeout, "the idle deactivation", func() bool { return r.released(target) })
 	man, err := r.manifest(target)
-	if err != nil || man.Owner != "" || man.Journal != "" || man.NextReminder != dueindex.MinuteAt(due) {
-		t.Fatalf("the manifest after the release: %+v %v, want it released with the reminder's minute %d", man, err, dueindex.MinuteAt(due))
+	if err != nil || man.Owner != "" || man.Journal != "" || man.NextReminder != shardfile.MinuteAt(due) {
+		t.Fatalf("the manifest after the release: %+v %v, want it released with the reminder's minute %d", man, err, shardfile.MinuteAt(due))
 	}
 	if n := r.entryCount(target); n != 1 {
 		t.Fatalf("%d reminder index entries for the released shard, want the one that backs its manifest", n)

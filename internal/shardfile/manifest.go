@@ -15,7 +15,6 @@ import (
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/cluster"
-	"github.com/luci1900/shardlite/internal/dueindex"
 	"github.com/luci1900/shardlite/internal/journal"
 	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/notify"
@@ -36,7 +35,7 @@ type Manifest struct {
 	// there is none (docs/internals.md, Manifest). The owner's deltas, rebases and
 	// deactivations set it, with its entry in the reminder index created before the
 	// write. Claims and releases keep it.
-	NextReminder dueindex.Minute `json:"next_reminder,omitempty"`
+	NextReminder Minute `json:"next_reminder,omitempty"`
 	// Rev counts the manifest's writes, so no two versions have the same bytes and
 	// ETag. The reminder index's pruning rule relies on a changed version staying changed.
 	Rev uint64 `json:"rev,omitempty"`
@@ -328,10 +327,10 @@ func (f *Files) Create(ctx context.Context, n shard.Name) (h *Handle, created bo
 // version the write CASes against, and a failure fails the write. A reminder in
 // the minute the manifest already has (Unix minutes) needs no new entry: the entry that backs
 // the old one backs it too, since an entry is never deleted while it is backed.
-func (h *Handle) setReminder(ctx context.Context, next *Manifest, reminder dueindex.Minute) error {
+func (h *Handle) setReminder(ctx context.Context, next *Manifest, reminder Minute) error {
 	if reminder > 0 && reminder != h.Manifest.NextReminder {
 		e := Reminder{Minute: reminder, Shard: h.Name, Base: BaseOf(h.ETag)}
-		if err := ReminderIndex(h.F.Blob).Create(ctx, e.Entry()); err != nil {
+		if err := NewReminderIndex(h.F.Blob).Create(ctx, e); err != nil {
 			return err
 		}
 	}
@@ -346,7 +345,7 @@ func (h *Handle) setReminder(ctx context.Context, next *Manifest, reminder duein
 // the shard has nothing due at, and the dispatcher waking it for nothing. It
 // writes nothing if the manifest has that already. With release the same update gives the shard up
 // (see Hooks.Release), and nothing is written only if a write of that kind landed already.
-func (h *Handle) SetReminder(ctx context.Context, reminder dueindex.Minute, release bool) error {
+func (h *Handle) SetReminder(ctx context.Context, reminder Minute, release bool) error {
 	if err := h.settle(ctx); err != nil {
 		return err
 	}

@@ -14,7 +14,6 @@ import (
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/capture"
-	"github.com/luci1900/shardlite/internal/dueindex"
 	"github.com/luci1900/shardlite/internal/kill"
 	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/tempfile"
@@ -48,7 +47,7 @@ type Hooks struct {
 	// none), which the update records with its entry in the reminder index
 	// (docs/internals.md, Reminder index). Without the hook the manifest keeps its
 	// own.
-	BeforeUpdate func(ctx context.Context, end pos.Position) (nextReminder dueindex.Minute, err error)
+	BeforeUpdate func(ctx context.Context, end pos.Position) (nextReminder Minute, err error)
 	// Release makes the delta's manifest update also give the shard up (no owner and no
 	// journal, as SetReminder does with release), so that a deactivation is one write. Everything the
 	// tail holds is in the delta, so nothing is left in any journal. The update is

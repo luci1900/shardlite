@@ -15,8 +15,7 @@ import (
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/blobtest"
-	"github.com/luci1900/shardlite/internal/dueindex"
-	"github.com/luci1900/shardlite/internal/reconcile"
+	"github.com/luci1900/shardlite/internal/dispatch"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
@@ -43,11 +42,11 @@ func TestNeverWrittenWithAnAutoincrementSequence(t *testing.T) {
 
 // withDispatch runs _dispatch, which wakes the inactive shards whose entries are
 // due, with a pass every second when none is.
-func withDispatch(o *ShardsetOptions) { o.Dispatch = &reconcile.Options{Every: time.Second} }
+func withDispatch(o *ShardsetOptions) { o.Dispatch = &dispatch.Options{Every: time.Second} }
 
 // nextReminder is the minute the manifest of target says it next needs waking, 0
 // for none.
-func (r *mrig) nextReminder(target string) dueindex.Minute {
+func (r *mrig) nextReminder(target string) shardfile.Minute {
 	r.t.Helper()
 	m, err := r.manifest(target)
 	if err != nil {
@@ -319,7 +318,7 @@ func TestDeltaAheadOfAnUncapturedCommitRecordsNow(t *testing.T) {
 	if len(m.Files) == 0 {
 		t.Fatal("no delta")
 	}
-	if got := m.NextReminder; got == dueindex.MinuteOf(later) || got < dueindex.MinuteOf(before) || got > dueindex.MinuteOf(time.Now().Unix()) {
-		t.Fatalf("next_reminder is minute %d, want now (the reminder was due at minute %d)", got, dueindex.MinuteOf(later))
+	if got := m.NextReminder; got == shardfile.MinuteOf(later) || got < shardfile.MinuteOf(before) || got > shardfile.MinuteOf(time.Now().Unix()) {
+		t.Fatalf("next_reminder is minute %d, want now (the reminder was due at minute %d)", got, shardfile.MinuteOf(later))
 	}
 }

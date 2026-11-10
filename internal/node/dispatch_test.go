@@ -13,9 +13,8 @@ import (
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/blobtest"
-	"github.com/luci1900/shardlite/internal/dueindex"
+	"github.com/luci1900/shardlite/internal/dispatch"
 	"github.com/luci1900/shardlite/internal/harness"
-	"github.com/luci1900/shardlite/internal/reconcile"
 	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
@@ -82,8 +81,8 @@ func idleWithReminder(t *testing.T, clk *harness.FakeClock, n *clusterNode, path
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mf.NextReminder != dueindex.MinuteOf(due) {
-		t.Fatalf("%s's manifest has next_reminder %d, want %d", shard, mf.NextReminder, dueindex.MinuteOf(due))
+	if mf.NextReminder != shardfile.MinuteOf(due) {
+		t.Fatalf("%s's manifest has next_reminder %d, want %d", shard, mf.NextReminder, shardfile.MinuteOf(due))
 	}
 }
 
@@ -92,17 +91,11 @@ func allEntries(t *testing.T, store *blob.Store) []shardfile.Reminder {
 	t.Helper()
 	var out []shardfile.Reminder
 	for i := range shard.Lanes {
-		got, err := shardfile.ReminderIndex(store).Due(context.Background(), shard.Lane(i), time.Now().AddDate(10, 0, 0), 100000)
+		got, err := shardfile.NewReminderIndex(store).Due(context.Background(), shard.Lane(i), time.Now().AddDate(10, 0, 0), 100000)
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, d := range got {
-			r, err := shardfile.ParseReminder(d)
-			if err != nil {
-				t.Fatal(err)
-			}
-			out = append(out, r)
-		}
+		out = append(out, got...)
 	}
 	return out
 }
@@ -132,7 +125,7 @@ func TestDispatchWakesAnIdleShard(t *testing.T) {
 	rung := func() int32 { return rung0.Load() + rung1.Load() }
 	due := clk.Now().Unix() + 3600
 	idleWithReminder(t, clk, n0, paths, "brief/d", due)
-	if got := entriesOf(t, n0, "brief/d"); len(got) != 1 || got[0].Minute != dueindex.MinuteOf(due) {
+	if got := entriesOf(t, n0, "brief/d"); len(got) != 1 || got[0].Minute != shardfile.MinuteOf(due) {
 		t.Fatalf("entries %+v, want one for the minute of %d", got, due)
 	}
 
@@ -211,7 +204,7 @@ func TestDispatchClaimsAShardNobodyOwns(t *testing.T) {
 		}
 		return true
 	})
-	runner := reconcile.Runner(c.nodes[0].m.Load().leases.Nodes().Live(), shardName(name).Lane())
+	runner := dispatch.Runner(c.nodes[0].m.Load().leases.Nodes().Live(), shardName(name).Lane())
 	var dispatcher, other *clusterNode
 	for _, n := range c.nodes {
 		if n.env.Name == runner {
@@ -224,7 +217,7 @@ func TestDispatchClaimsAShardNobodyOwns(t *testing.T) {
 	// one is made to pick the other node.
 	dispatcher.placeOn(other.env.Name)
 	for _, n := range c.nodes {
-		waitCounter(t, "the dispatcher to have run on "+string(n.env.Name), &n.m.Load().dispatching.Passes, 1)
+		waitCounter(t, "the dispatcher to have run on "+string(n.env.Name), &n.m.Load().dispatcher.Passes, 1)
 	}
 	due := clk.Now().Unix() + 3600
 	idleWithReminder(t, clk, other, pathsOn[other], name, due)
@@ -247,7 +240,7 @@ func TestDispatchClaimsAShardNobodyOwns(t *testing.T) {
 func TestAdopterEntryWakesAKilledOwnersActiveShard(t *testing.T) {
 	c := newClusterEnv(t, 2, map[string]string{"SHARDLITE_LEASE_TTL": "1s"}, func(o *ShardsetOptions) {
 		o.Leases.Every = 50 * time.Millisecond
-		o.Dispatch = &reconcile.Options{Every: time.Second}
+		o.Dispatch = &dispatch.Options{Every: time.Second}
 	})
 	n0, n1 := c.nodes[0], c.nodes[1]
 	app := apptest.Start(t)

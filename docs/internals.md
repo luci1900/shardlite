@@ -11,7 +11,6 @@ How the node works: its architecture and the rules that keep it correct. It desc
 | **Snapshot** | A shard as of one commit, as immutable LTX files: a base and deltas. An inactive shard lives only in its snapshot. |
 | **Manifest** | A shard's state in storage: owner and epoch, files, the journal holding later commits, when it next needs waking. |
 | **Reminder index** | Empty objects saying a shard may need waking at a minute. The dispatcher reads them. |
-| **Reconciler** | A due index (the reminder index) and the handler for its entries, run by one loop on every node. |
 | **Lane** | One of 16 hash classes of shard names. A shard's index entries, LTX files and manifest (`state/shards/{lane}/{kind}/{id}`) have keys that start with its lane, and each lane's index entries are handled by the node that ranks first for it. |
 
 The other terms are in the [overview](overview.md#concepts).
@@ -140,13 +139,13 @@ The same split as a database's WAL and data files: the journal is the shared WAL
 |---|---|---|---|
 | **Data** | journal segments, LTX files | create once, delete by garbage collection | never modified |
 | **State** | leases, manifests | compare-and-swap by the owner | the truth, naming the data it points at |
-| **Index** | due index entries (the reminder index) | created by anyone before the write they are for, moved and deleted by the index's [reconciler](#reconcilers) | deleted only by the index's own rule, once the truth they point at no longer needs them |
+| **Index** | the reminder index's entries | created by anyone before the write they are for, moved and deleted by the [dispatcher](#the-dispatcher) | deleted only by the index's own rule, once the truth they point at no longer needs them |
 
-Journal segments go to blob storage, which is the only copy: a restore, an adoption and a restart all read it, and the fence is created there. Listings stay per prefix (leases, a node's journal, a lane's entries of one index, one generation of a shard's LTX files), so none grows with the rest. Index entries, LTX files and manifests all have keys that start with the shard's lane (`shard.Name.Lane`, a hash of the name), so the store's writes and a launch spike of claims spread over 16 key ranges from the start.
+Journal segments go to blob storage, which is the only copy: a restore, an adoption and a restart all read it, and the fence is created there. Listings stay per prefix (leases, a node's journal, a lane's reminder entries, one generation of a shard's LTX files), so none grows with the rest. Index entries, LTX files and manifests all have keys that start with the shard's lane (`shard.Name.Lane`, a hash of the name), so the store's writes and a launch spike of claims spread over 16 key ranges from the start.
 
 ### Reminder index
 
-An inactive shard's reminder needs someone to wake it. `next_reminder` in the manifest says when, and the index says which manifests to look at when: an entry is an empty object anyone can create, needing no owner and no clock, read only by the dispatcher. A minute is enough, since a shard's own loop fires at the second once it is active. Its subject (`internal/shardfile/reminder.go`) names the shard and the manifest version the entry backs.
+An inactive shard's reminder needs someone to wake it. `next_reminder` in the manifest says when, and the index says which manifests to look at when: an entry is an empty object anyone can create, needing no owner and no clock, read only by the [dispatcher](#the-dispatcher). A minute is enough, since a shard's own loop fires at the second once it is active. Its key, `index/reminders/{lane}/{minute}/{kind}/{id}/{base}.{n}`, names the shard, the manifest version the entry backs and how many times the dispatcher has moved it. The keys, the listing and the moves are in `internal/shardfile/reminder.go`, beside the rule.
 
 - **Index first.** Before a manifest write that sets `next_reminder` to a new minute, the writer creates the entry for that minute and its base, a failed create failing the write.
 - **Each write has its own entry,** so the dispatcher can't prune one on the terms of a write that isn't the one relying on it.
@@ -155,31 +154,19 @@ An inactive shard's reminder needs someone to wake it. `next_reminder` in the ma
 
 `specs/dispatch.qnt` checks that a shard with a reminder in its durable state always has a backed entry or a tail an adoption will still write a delta for.
 
-## Reconcilers
+## The dispatcher
 
-Some of the node's work is the cluster's: waking the inactive shards whose reminders are due. It is a **reconciler**, a due index and a handler for its entries, the shape of a Kubernetes controller (a work queue of keys and a handler that reads the truth and converges). One loop on every node runs it, as one of the shardset's services. **A reconciler may be late, never wrong.**
+Some of the node's work is the cluster's: waking the inactive shards whose reminders are due. The **dispatcher** (`internal/dispatch`) does it, one of the shardset's services on every node, in the shape of a Kubernetes controller (a work queue of keys and a handler that reads the truth and converges). **The dispatcher may be late, never wrong.**
 
-### The due index and the handler
+Its work queue is the [reminder index](#reminder-index): empty objects keyed by lane and minute, created by anyone, moved to a later minute and deleted, and listed per lane up to a minute, earliest first. An entry is a key, never a payload: the dispatcher reads the truth (the manifest, its own lease), so an entry handled twice or late is harmless. Handled entries leave the head of the listing, so the dispatcher keeps no cursor or any state of its own, and a cold start and catching up after an outage are the same case.
 
-Entries (`internal/dueindex`) are empty objects keyed `{prefix}{lane}/{minute}/{subject}`, created by anyone, moved to a later minute and deleted, and listed per lane up to a minute, earliest first. An entry is a key, never a payload: the handler reads the truth (a manifest, a lease), so an entry handled twice or late is harmless. Handled entries leave the head of the listing, so no reconciler keeps a cursor or any state of its own, and a cold start and catching up after an outage are the same case.
+It passes at the start of every minute, when a minute's entries fall due, again after a second when a pass found entries, and after a doubling wait up to a minute when a pass failed. A pass lists the due entries of the node's lanes and handles them within its concurrency, rate and budget (`dispatch.Options`). It checks the node's lease before each send, delete or move, and writes nothing while the check fails.
 
-The handler gets one due entry and the node's lease check, does its work (checking the lease before each delete or send of its own) and answers what becomes of the entry: done (the loop deletes it), move (to a later minute) or leave (it stays due).
+The work is split by [lane](#terms). For each lane every node ranks the live nodes of the lease scan's last listing by a rendezvous hash of the node's name and the lane (`dispatch.Runner`), and the first runs that lane. While nodes disagree a lane has two runners or none for a few seconds, and a node joining or leaving moves only the lanes it ranks first for. Before its first listing a node runs nothing.
 
-### The loop and the lanes
+The dispatcher is idempotent and convergent: every write it makes is conditional or harmless to repeat, so two runners at once only cost work and none for a while only makes it late. Work that needs doing is recorded by an entry before the write that makes it. Work that needed an effect outside storage to happen once would need an ownership record of its own, and none does.
 
-The loop (`internal/reconcile`) passes at each reconciler's own interval, again after a second when a pass found entries, and after a doubling wait up to a minute when a pass failed. A pass lists the node's lanes' due entries, hands them to the handler within the reconciler's concurrency, rate and budget, and applies each answer, writing nothing while the lease check fails.
-
-The work is split by [lane](#terms). For each lane every node ranks the live nodes of the lease scan's last listing by a rendezvous hash of the node's name and the lane (`reconcile.Runner`), and the first runs that lane for every reconciler. While nodes disagree a lane has two runners or none for a few seconds, and a node joining or leaving moves only the lanes it ranks first for. Before its first listing a node runs nothing.
-
-A reconciler is idempotent and convergent: every write it makes is conditional or harmless to repeat, so two runners at once only cost work and none for a while only makes it late. Work that needs doing is recorded by an entry before the write that makes it. One that needed an effect outside storage to happen once would need an ownership record of its own, and none does.
-
-| Reconciler | Index | Passes | What it does |
-|---|---|---|---|
-| the dispatcher (`internal/reconcile/dispatch`) | the [reminder index](#reminder-index) | every minute | wakes the shards whose reminders are due while they are inactive |
-
-### The dispatcher
-
-For each due entry the dispatcher reads the manifest and prunes the entry by the rule above (done), or sends the backed shard a **dispatch**: `POST /_shardlite/activate` as the node's own request, with `Shardlite-Target` the shard and `Shardlite-If-Exists: true`. The node answers that path itself once the shard is held where the request lands, and the app never sees it. The request routes as any does and never creates the shard, and the shard's own loop then wakes the app for its due reminders. A dispatched entry moves forward whatever the answer (16 minutes for a shard that was active, otherwise by a step doubling from a minute), and a failed manifest read leaves it. A kind starting with `_` is reserved for the node (none is declared today).
+For each due entry it reads the manifest and deletes the entry by the [pruning rule](#reminder-index), or sends the backed shard a **dispatch**: `POST /_shardlite/activate` as the node's own request, with `Shardlite-Target` the shard and `Shardlite-If-Exists: true`. The node answers that path itself once the shard is held where the request lands, and the app never sees it. The request routes as any does and never creates the shard, and the shard's own loop then wakes the app for its due reminders. A dispatched entry moves forward whatever the answer (16 minutes for a shard that was active, otherwise by a step doubling from a minute), and a failed manifest read leaves it for the next pass. A kind starting with `_` is reserved for the node (none is declared today).
 
 ## Lifecycle
 
@@ -296,8 +283,8 @@ Only capture's traces are replayed against the code: `internal/capture/replay_te
 | `internal/blob`, `internal/blobtest` | object storage with write ids, the startup check and the clock warning, and the in-memory store (`SHARDLITE_BLOB=memory://`) |
 | `internal/journal` | a node's journal: its segment store, writer and fencing |
 | `internal/capture` | reading a shard's WAL and the [read rule](#the-read-rule) |
-| `internal/shardfile` | the manifest, deltas, snapshots, restores and adoption, and the reminder index's keys and rules |
-| `internal/dueindex`, `internal/reconcile` | the due index and the [reconcilers](#reconcilers) |
+| `internal/shardfile` | the manifest, deltas, snapshots, restores and adoption, and the [reminder index](#reminder-index) |
+| `internal/dispatch` | the [dispatcher](#the-dispatcher) and the ranking of lanes |
 | `internal/peers` | the lease scan, the peers' addresses, placement and the peer headers |
 | `internal/node` | `Run` and everything it stages: shardset, actor, flusher, gates, routing, reminders, servers, adoption, local files |
 | `internal/kill`, `internal/audit`, `internal/harness` | the fault rig's kill points, the store walk and shared test pieces |
