@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/superfly/ltx"
+	"golang.org/x/sync/errgroup"
 	"modernc.org/sqlite"
 
 	"github.com/luci1900/shardlite/internal/kill"
@@ -1065,7 +1066,7 @@ func (s *Shard) Snapshot(ctx context.Context) (position pos.Position, r io.ReadC
 		}
 		s.snaps++
 		pr, pw := io.Pipe()
-		sr := &snapshotReader{PipeReader: pr, done: make(chan struct{}), s: s}
+		sr := &snapshotReader{PipeReader: pr, s: s}
 		hdr := ltx.Header{
 			Version:   ltx.Version,
 			PageSize:  uint32(s.pageSize),
@@ -1082,8 +1083,7 @@ func (s *Shard) Snapshot(ctx context.Context) (position pos.Position, r io.ReadC
 			s.cks.sum ^= skewMask
 		}
 		want, cks := s.cks.Checksum(), s.cks
-		go func() {
-			defer close(sr.done)
+		sr.eg.Go(func() error {
 			bw := bufio.NewWriterSize(pw, 1<<20)
 			// The pending is the goroutine's own: the pages are read without the
 			// shard's lock, and a sync may be computing CRCs at the same time.
@@ -1095,8 +1095,9 @@ func (s *Shard) Snapshot(ctx context.Context) (position pos.Position, r io.ReadC
 			if err == nil && post != want {
 				s.mismatch(want, post, p, Pages(hdr.Commit))
 			}
-			pw.CloseWithError(err)
-		}()
+			pw.CloseWithError(err) // the reader gets the error, so the goroutine has none
+			return nil
+		})
 		r = sr
 		return nil
 	})
@@ -1129,7 +1130,7 @@ func (eofReader) Read([]byte) (int, error) { return 0, io.EOF }
 // snapshot and lets the WAL be restarted again.
 type snapshotReader struct {
 	*io.PipeReader
-	done chan struct{}
+	eg   errgroup.Group // the goroutine writing the file
 	s    *Shard
 	once sync.Once
 }
@@ -1137,7 +1138,7 @@ type snapshotReader struct {
 func (r *snapshotReader) Close() error {
 	r.once.Do(func() {
 		r.PipeReader.CloseWithError(io.ErrClosedPipe)
-		<-r.done
+		r.eg.Wait()
 		r.s.call(func() { r.s.snaps-- })
 	})
 	return nil
