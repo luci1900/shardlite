@@ -27,11 +27,13 @@ import (
 //
 //	SHARDLITE_FAULT_KILL_AT       a kill point (internal/kill): the process dies with SIGKILL when it reaches it
 //	SHARDLITE_FAULT_KILL_WHEN     a path: the kill point is armed only once a file exists there, so a test arms it after the node is up and settled
-//	SHARDLITE_FAULT_STORAGE       mode:permille:delay[:target], for the creates of the journal's segments (target
-//	                              "segments", the default) or of the orphan index's entries (target "orphans"): mode
-//	                              "fail" (an error before the write), "lost" (the write happens and the caller sees
-//	                              an error) or "none", the permille how many in a thousand fail, and the delay (a Go
-//	                              duration) the longest random wait before each write
+//	SHARDLITE_FAULT_STORAGE       mode:permille:delay[:target], for the creates of the journal's
+//	                              segments (target "segments", the default), the creates of LTX
+//	                              files ("files") or the deletes of LTX files ("file-deletes"):
+//	                              mode "fail" (an error before the call), "lost" (the call happens
+//	                              and the caller sees an error) or "none", the permille how many in
+//	                              a thousand fail, and the delay (a Go duration) the longest random
+//	                              wait before each call
 //	SHARDLITE_FAULT_TEMP          op:permille: "create", "append" or "dup" on the node's temporary files fails at that rate
 //	SHARDLITE_FAULT_PEER_HEADER   mode:permille: for that many in a thousand of the values of the peer
 //	                              headers the node sends (Shardlite-Node on its forwards and, while it drains,
@@ -126,15 +128,17 @@ func storageFault(v string, at func(kill.Point)) (blobtest.Hook, error) {
 	if len(f) != 3 && len(f) != 4 {
 		return nil, bad("three fields and an optional target")
 	}
-	// What the fault is for: the creates under this prefix.
-	prefix := journal.Root
+	// What the fault is for: the calls of this op under this prefix.
+	op, prefix := blobtest.OpCreate, journal.Root
 	if len(f) == 4 {
 		switch f[3] {
 		case "segments":
-		case "orphans":
-			prefix = shardfile.OrphanPrefix
+		case "files":
+			prefix = shardfile.FilesPrefix
+		case "file-deletes":
+			op, prefix = blobtest.OpDelete, shardfile.FilesPrefix
 		default:
-			return nil, bad("target is segments or orphans")
+			return nil, bad("target is segments, files or file-deletes")
 		}
 	}
 	mode := f[0]
@@ -151,12 +155,11 @@ func storageFault(v string, at func(kill.Point)) (blobtest.Hook, error) {
 	if err != nil || delay < 0 {
 		return nil, bad("delay is a duration")
 	}
-	return func(ctx context.Context, op blobtest.Op, key string, after bool) error {
-		if op != blobtest.OpCreate {
-			return nil
+	return func(ctx context.Context, got blobtest.Op, key string, after bool) error {
+		if got == blobtest.OpCreate {
+			segmentPoint(at, got, key, after)
 		}
-		segmentPoint(at, op, key, after)
-		if !strings.HasPrefix(key, prefix) {
+		if got != op || !strings.HasPrefix(key, prefix) {
 			return nil
 		}
 		if !after && delay > 0 {

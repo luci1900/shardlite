@@ -160,9 +160,6 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 		Logger:  log,
 		TempDir: tempDir,
 		Faults:  ro.faults,
-		// Orphans are left alone for as long as the journal keeps its segments: past that a
-		// delta whose manifest update still fails has lost its tail anyway.
-		OrphanAge: expireAge,
 	})
 	if err != nil {
 		peer.Close()
@@ -221,7 +218,6 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 		Lifecycle: LifecycleOptions{DeltaAge: env.DeltaAge, DeltaSize: env.DeltaSize, At: ro.faults.At, MaxFiles: ro.faults.MaxFiles},
 		Leases:    peers.ScanOptions{TTL: env.LeaseTTL},
 		Dispatch:  &reconcile.Options{},
-		Collect:   &reconcile.Options{},
 	}
 	if ro.shardset != nil {
 		ro.shardset(&so, nil)

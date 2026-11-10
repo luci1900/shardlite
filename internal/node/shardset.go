@@ -24,7 +24,6 @@ import (
 	"github.com/luci1900/shardlite/internal/peers"
 	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/reconcile"
-	"github.com/luci1900/shardlite/internal/reconcile/collect"
 	"github.com/luci1900/shardlite/internal/reconcile/dispatch"
 	"github.com/luci1900/shardlite/internal/service"
 	"github.com/luci1900/shardlite/internal/shard"
@@ -60,11 +59,6 @@ type ShardsetOptions struct {
 	// wakes the shards whose reminders are due while they are inactive
 	// (docs/internals.md, Reconcilers).
 	Dispatch *reconcile.Options
-
-	// Collect, if set, runs the collector, the orphan index's reconciler, which
-	// deletes the LTX files no manifest lists once they are past the age rule
-	// (docs/internals.md, Reconcilers). Its Every is collect.Every if zero.
-	Collect *reconcile.Options
 
 	// OwnerCache is how many shards' owners the node remembers, 100,000 if zero
 	// (docs/internals.md, Routing and forwarding).
@@ -109,12 +103,13 @@ type Stats struct {
 	Unanswered     notify.Counter // forwards that failed before the owner's node answered (no connection, or no 102 within the answer timeout)
 	Waits          notify.Counter // requests that found their shard being activated or let go of, and waited for it
 
-	ReminderWakes        atomic.Int64 // wakes of apps for reminders, however they ended
-	ReminderWakeFailures atomic.Int64 // wakes that failed and will be repeated after a backoff
-	ChecksumMismatches   atomic.Int64 // snapshots whose checksum was not the capture's: the capture went wrong somewhere
-	Placements           atomic.Int64 // claims this node sent to another node, picked at random
-	LetGoHeld            atomic.Int64 // shards a stop let go of though the app had their file open (the idle path never does)
-	HeldPastIdle         atomic.Int64 // holds of a shard's file by the app that outlasted an idle timeout and were warned of, once per hold (the shard stays active until the app closes it)
+	ReminderWakes        atomic.Int64   // wakes of apps for reminders, however they ended
+	ReminderWakeFailures atomic.Int64   // wakes that failed and will be repeated after a backoff
+	ChecksumMismatches   atomic.Int64   // snapshots whose checksum was not the capture's: the capture went wrong somewhere
+	Placements           atomic.Int64   // claims this node sent to another node, picked at random
+	LetGoHeld            atomic.Int64   // shards a stop let go of though the app had their file open (the idle path never does)
+	HeldPastIdle         atomic.Int64   // holds of a shard's file by the app that outlasted an idle timeout and were warned of, once per hold (the shard stays active until the app closes it)
+	LeakedFiles          notify.Counter // LTX files the node knew no manifest lists and could not delete (a failed best-effort delete, a delete in a rebase's sweep or of a deleted shard's files), and each failed read that stopped such a delete (docs/internals.md, Garbage)
 }
 
 // Shardset owns the node's shards, which are the active ones (docs/internals.md,
@@ -133,11 +128,9 @@ type Shardset struct {
 	rem         *reminders
 	leases      *peers.Scan
 	watch       *watchdog
-	reconcilers *reconcile.Loop       // nil unless Dispatch or Collect is set
+	reconcilers *reconcile.Loop       // nil unless Dispatch is set
 	dispatching *reconcile.Reconciler // the reminder index's, nil unless Dispatch is set
 	dispatcher  *dispatch.Dispatcher  // its handler, nil unless Dispatch is set
-	collecting  *reconcile.Reconciler // the orphan index's, nil unless Collect is set
-	collector   *collect.Collector    // its handler, nil unless Collect is set
 	deps        *actorDeps            // what every shard is given
 
 	// owners maps a shard's name to the node that owned it when this node last
@@ -206,6 +199,7 @@ func NewShardset(n *Node, opts ShardsetOptions, newRouting func(*Shardset) routi
 	m := &Shardset{n: n, opts: opts, log: opts.Logger, tab: newTable(opts.Logger)}
 	n.Files.Now = opts.Clock.Now
 	log, clk, st := opts.Logger, opts.Clock, &m.Stats
+	n.Files.Log, n.Files.Leaked = log, &st.LeakedFiles
 	m.owners, _ = lru.New[shard.Name, cluster.Node](opts.OwnerCache) // only a size below 1 fails
 	rt := newRouting(m)
 	m.rem = newReminders(opts.Reminders, clk, log, st, rt.wake)
@@ -221,15 +215,6 @@ func NewShardset(n *Node, opts ShardsetOptions, newRouting func(*Shardset) routi
 		m.dispatcher = dispatch.New(dispatch.Deps{Store: n.Store, Clock: clk, Log: log, Call: rt.call})
 		m.dispatching = &reconcile.Reconciler{Name: "dispatcher", Index: shardfile.ReminderIndex(n.Store), Handler: m.dispatcher, Options: *opts.Dispatch}
 		rs = append(rs, m.dispatching)
-	}
-	if opts.Collect != nil {
-		co := *opts.Collect
-		if co.Every <= 0 {
-			co.Every = collect.Every
-		}
-		m.collector = collect.New(collect.Deps{Store: n.Store, Clock: clk, Log: log, Age: n.Files.AgeRule()})
-		m.collecting = &reconcile.Reconciler{Name: "collector", Index: shardfile.OrphanIndex(n.Store), Handler: m.collector, Options: co}
-		rs = append(rs, m.collecting)
 	}
 	if len(rs) > 0 {
 		m.reconcilers = reconcile.New(reconcile.Deps{Clock: clk, Log: log, Mine: m.lanes, Check: n.Keeper.Check}, rs...)

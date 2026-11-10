@@ -257,13 +257,19 @@ func merge(w io.Writer, files []capture.TailFile, rg Range) error {
 // has adopted the file, so blob.Store can tell the earlier attempt's object
 // from somebody else's without comparing bytes.
 //
-// The generation's entry in the orphan index comes first, so a file that never
-// reaches a manifest is found. A failed entry fails the write with nothing uploaded.
+// The one "exists" that is neither is a file this process itself left at the
+// key: the name carries its epoch, and one process writes a shard from one
+// handle at a time, so it is an earlier handle's upload whose manifest update
+// never listed it. The node keeps to one handle: one actor per shard, whose
+// entry leaves the table only once its loop has ended (table.start and
+// actor.Serve in internal/node), an adoption of a dead node's journal that
+// writes only while the manifest names that journal, which a claim waits out
+// (CheckClaimable), and the adoption of its own journal before the shardset
+// starts (Node.adoptOwn). Nothing can list the file now, since a manifest only
+// ever adds files its own writer has just uploaded, so the file is garbage: it
+// is deleted and ours put in its place, which a delete that fails leaves to
+// the next write of the range as a leak (Files.leak).
 func (h *Handle) putFile(ctx context.Context, f File, body blob.Body, hooks Hooks) error {
-	if err := h.orphanEntry(ctx, h.Manifest.Generation); err != nil {
-		return err
-	}
-	hooks.at(kill.OrphanEntryBeforeFile)
 	key := FileKey(h.Name, h.Manifest.Generation, f)
 	id, ok := h.writes[key]
 	if !ok {
@@ -274,6 +280,14 @@ func (h *Handle) putFile(ctx context.Context, f File, body blob.Body, hooks Hook
 		h.writes[key] = id
 	}
 	_, err := h.F.Blob.CreateWithID(ctx, key, body, id)
+	if !errors.Is(err, blob.ErrExists) {
+		return err
+	}
+	if derr := h.F.Blob.Delete(ctx, key, ""); derr != nil && !errors.Is(derr, blob.ErrNotFound) {
+		h.F.leak(h.Name, key, derr)
+		return err
+	}
+	_, err = h.F.Blob.CreateWithID(ctx, key, body, id)
 	return err
 }
 
@@ -346,6 +360,13 @@ func (h *Handle) putTail(ctx context.Context, tail []capture.TailFile, hooks Hoo
 		}
 	}
 	if err := h.update(ctx, "delta", next); err != nil {
+		// A conflict is the one outcome that means the file can never be
+		// listed: the manifest changed under the handle. An unknown outcome
+		// may have listed it, ErrMovedOn means it did, and any other failure
+		// is retried with the same name and write id.
+		if errors.Is(err, blob.ErrConflict) {
+			h.deleteUnlisted(ctx, file)
+		}
 		return err
 	}
 	delete(h.writes, FileKey(h.Name, h.Manifest.Generation, file))
@@ -422,10 +443,11 @@ func (h *Handle) rebase(ctx context.Context, sh *capture.Shard, hooks Hooks) (Sn
 // The snapshot covers the shard's positions up to the one capture says it is
 // at (see capture.Shard.Snapshot), so the base is 1-{position}, and the commits
 // after it are the tail, still in the node's logs and journal. The manifest
-// is pointed at the base alone by compare-and-swap before the old files are
-// deleted, as a crash in between leaves the old files in use and the new base
-// unreferenced. It reports whether it wrote a base: there is nothing to do for a
-// shard that has no commits, or whose only file already covers everything.
+// is pointed at the base alone by compare-and-swap before the generation's
+// garbage is deleted (sweep), as a crash in between leaves the old files in
+// use and the new base unreferenced. It reports whether it wrote a base: there
+// is nothing to do for a shard that has no commits, or whose only file
+// already covers everything.
 func (h *Handle) Rebase(ctx context.Context, sh *capture.Shard, hooks Hooks) (bool, error) {
 	if err := h.settle(ctx); err != nil {
 		return false, err
@@ -464,10 +486,11 @@ func (h *Handle) Rebase(ctx context.Context, sh *capture.Shard, hooks Hooks) (bo
 			return false, err
 		}
 	}
-	// The files the base supersedes: h.update swaps h.Manifest to the base
-	// alone, so the old list is taken here, before the swap.
-	superseded := h.Manifest.Files
 	if err := h.update(ctx, "rebase", next); err != nil {
+		// A conflict means the base can never be listed (see putTail).
+		if errors.Is(err, blob.ErrConflict) {
+			h.deleteUnlisted(ctx, base)
+		}
 		return false, err
 	}
 	delete(h.writes, FileKey(h.Name, h.Manifest.Generation, base))
@@ -478,22 +501,13 @@ func (h *Handle) Rebase(ctx context.Context, sh *capture.Shard, hooks Hooks) (bo
 			return true, err
 		}
 	}
-	// Superseded files are garbage now. A failure here only leaves garbage behind,
-	// and a delete that finds nothing is done. The rebase makes no orphan entry of
-	// its own: the base's upload made one before the swap, due an age later, and by
-	// then the manifest lists the base alone, so that entry finds what a failure here
-	// leaves.
-	var firstErr error
-	for _, f := range superseded {
-		if f == base {
-			continue
-		}
-		err := h.F.Blob.Delete(ctx, FileKey(h.Name, h.Manifest.Generation, f), "")
-		if err != nil && !errors.Is(err, blob.ErrNotFound) && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return true, firstErr
+	// The generation's garbage goes now that the manifest lists the base
+	// alone: every file an earlier crash, lost race or zombie left in it, not
+	// just what this rebase supersedes. A failure costs storage until the next
+	// rebase and is reported as a leak (sweep), never as the rebase's, which
+	// has done its work.
+	h.sweep(ctx)
+	return true, nil
 }
 
 // snapshotTo writes a snapshot of the shard to w as an LTX file covering

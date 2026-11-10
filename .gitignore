@@ -7,3 +7,4 @@ _apalache-out/
 .DS_Store
 sdk/ts/node_modules/
 node_modules/
+/shardlite

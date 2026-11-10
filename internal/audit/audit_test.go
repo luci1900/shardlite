@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/dueindex"
 	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
@@ -16,7 +15,7 @@ const age = time.Hour
 
 var written = time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
 
-// stand is a time past the age rule for everything the tests write.
+// stand is a time past the walk's age for everything the tests write.
 var stand = written.Add(2 * age)
 
 type store struct {
@@ -57,21 +56,6 @@ func (s store) manifest(name, gen string, files ...string) {
 	}
 }
 
-// entry creates the orphan index's entry for the shard's generation.
-func (s store) entry(name, gen string) {
-	s.t.Helper()
-	o := shardfile.Orphan{Minute: dueindex.MinuteAt(written.Add(age)), Shard: shard.MustParse(name), Generation: shard.Gen(gen)}
-	if err := shardfile.OrphanIndex(s.Store).Create(context.Background(), o.Entry()); err != nil {
-		s.t.Fatal(err)
-	}
-}
-
-func (s store) exists(key string) bool {
-	s.t.Helper()
-	_, _, err := s.Get(context.Background(), key)
-	return err == nil
-}
-
 // The walk reports the files past the age that no manifest lists (of a shard whose
 // manifest names another generation or is gone as well) and nothing else: not a
 // listed file, a young one, a file that isn't LTX.
@@ -95,7 +79,7 @@ func TestUnlistedFindsOldFilesNoManifestLists(t *testing.T) {
 		t.Fatalf("the walk found\n%v\nwant\n%v", got, want)
 	}
 
-	// Nothing is old yet when the audit stands at the write.
+	// Nothing is old yet when the walk stands at the write.
 	if got, err := Unlisted(context.Background(), s.Store, age, written); err != nil || len(got) != 0 {
 		t.Fatalf("at the time of the write the walk found %v, %v", got, err)
 	}
@@ -114,44 +98,5 @@ func TestUnlistedRefusesAKeyThatIsNoShardsFile(t *testing.T) {
 	s.put(shardfile.LanePrefix(other) + "users/a/g1/1-5.1.ltx")
 	if _, err := Unlisted(context.Background(), s.Store, age, stand); err == nil {
 		t.Fatal("a file in another shard's lane passed")
-	}
-}
-
-// An unlisted old file that an entry leads to is collected, and the audit passes.
-func TestRunPassesWhenEveryOrphanHasAnEntry(t *testing.T) {
-	s := newStore(t)
-	listed := key("users/a", "g1", "1-5.1")
-	s.put(listed)
-	s.put(key("users/a", "g1", "6-8.1"))
-	s.put(key("users/b", "g1", "1-2.1")) // a deleted shard's
-	s.manifest("users/a", "g1", "1-5.1")
-	s.entry("users/a", "g1")
-	s.entry("users/b", "g1")
-
-	if err := Run(context.Background(), s.Store, age, stand); err != nil {
-		t.Fatal(err)
-	}
-	if !s.exists(listed) {
-		t.Fatal("the audit deleted a listed file")
-	}
-	if left, _ := Unlisted(context.Background(), s.Store, age, stand); len(left) != 0 {
-		t.Fatalf("left %v", left)
-	}
-}
-
-// An unlisted old file in a generation with no entry is one the collector never
-// looks at: the audit fails and names it.
-func TestRunFailsOnAnOldFileNoEntryLeadsTo(t *testing.T) {
-	s := newStore(t)
-	s.put(key("users/a", "g1", "1-5.1"))
-	orphan := key("users/a", "g1", "6-8.1")
-	s.put(orphan)
-	s.manifest("users/a", "g1", "1-5.1")
-	// An entry for another generation of the shard doesn't cover this one.
-	s.entry("users/a", "g0")
-
-	err := Run(context.Background(), s.Store, age, stand)
-	if err == nil || !strings.Contains(err.Error(), orphan) {
-		t.Fatalf("the audit answered %v, want a failure naming %s", err, orphan)
 	}
 }

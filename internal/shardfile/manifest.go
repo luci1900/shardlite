@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,8 +17,8 @@ import (
 	"github.com/luci1900/shardlite/internal/cluster"
 	"github.com/luci1900/shardlite/internal/dueindex"
 	"github.com/luci1900/shardlite/internal/journal"
-	"github.com/luci1900/shardlite/internal/kill"
 	"github.com/luci1900/shardlite/internal/lease"
+	"github.com/luci1900/shardlite/internal/notify"
 	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/tempfile"
@@ -206,12 +207,15 @@ type Files struct {
 	// files of a restore, the commits of a restored tail). It is in the data
 	// directory, and required.
 	Temp *tempfile.Dir
-	// Now is the time adoption records its reminders at and the orphan index's
-	// entries are made at, time.Now if nil.
+	// Now is the time adoption records its reminders at, time.Now if nil.
 	Now func() time.Time
-	// OrphanAge is the age rule (AgeRule): how old an LTX file that no manifest lists
-	// must be before the collector deletes it. DefaultAgeRule if zero.
-	OrphanAge time.Duration
+	// Log is where a failed delete of an LTX file the node knows is garbage is
+	// logged (see garbage.go). The default logger if nil.
+	Log *slog.Logger
+	// Leaked counts the LTX files the node knew no manifest lists and could not
+	// delete (see garbage.go): the node's Stats.LeakedFiles, nil where nobody
+	// counts.
+	Leaked *notify.Counter
 
 	journals   map[cluster.Node]*journal.Store // one store per journal this node has touched
 	journalsMu sync.Mutex
@@ -481,10 +485,9 @@ func (h *Handle) Claim(ctx context.Context) error {
 // activation that starts it empty. Its positions start again at 1, and an
 // earlier activation that failed after its first sync may have left commits at
 // those positions in the journal: in a new generation they are never read.
-//
-// It makes no orphan entry: the manifest it moves off lists no commits, so any
-// files of the old generation are uploads that never reached it, and each one's
-// upload made its own entry first.
+// Anything the old generation holds that no manifest lists is garbage, which
+// the old shard's next rebase would never sweep (it names the new generation)
+// and a separate cleanup finds (docs/internals.md, Garbage).
 func (h *Handle) StartOver(ctx context.Context) error {
 	next := h.Manifest.clone()
 	next.Generation = NewGeneration()
@@ -535,19 +538,15 @@ func giveUp(m *Manifest) { m.Owner, m.NodeEpoch, m.Journal = "", 0, "" }
 // deleted by conditional delete at the handle's version (a conflict, if somebody
 // changed it, leaves everything as it is), then the LTX files of its generation.
 // A crash in between leaves files nobody refers to. The next request creates a
-// new shard with a new generation, so it never reads the old one's data. Any
-// tail left in the node journal is never read again (its generation no longer
-// matches any manifest). That leftover is what the generation's entry in the orphan
-// index is for, created before the manifest is deleted.
-func (h *Handle) DeleteShard(ctx context.Context, hooks Hooks) error {
+// new shard with a new generation, so it never reads the old one's data, and the
+// old files wait for a separate cleanup (docs/internals.md, Garbage). A file
+// delete that fails is a leak (Files.leak) and fails the call: every file is
+// tried, so one bad delete leaves as little behind as it can.
+func (h *Handle) DeleteShard(ctx context.Context) error {
 	f := h.F
 	if err := h.settle(ctx); err != nil {
 		return err
 	}
-	if err := h.orphanEntry(ctx, h.Manifest.Generation); err != nil {
-		return err
-	}
-	hooks.at(kill.OrphanEntryBeforeDeleteShard)
 	if err := f.manifests().Delete(ctx, h.Name, h.ETag); err != nil && !errors.Is(err, blob.ErrNotFound) {
 		return err
 	}
@@ -559,10 +558,14 @@ func (h *Handle) DeleteShard(ctx context.Context, hooks Hooks) error {
 		}
 		keys = append(keys, info.Key)
 	}
+	var firstErr error
 	for _, k := range keys {
 		if err := f.Blob.Delete(ctx, k, ""); err != nil && !errors.Is(err, blob.ErrNotFound) {
-			return err
+			f.leak(h.Name, k, err)
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
-	return nil
+	return firstErr
 }

@@ -254,7 +254,7 @@ func (a *actor) deactivate(ctx context.Context, ifHeld capture.IfHeld) (bool, er
 		// capture resumes and the shard stays active.
 		defer sh.Discard() // the shard is deleted, or resumed with the tail handed on
 		resume := func() error { return a.resume(ctx, sh) }
-		if err := a.deleteReleased(ctx, shardfile.Hooks{At: d.opts.At}, resume); err != nil {
+		if err := a.deleteReleased(ctx, resume); err != nil {
 			return false, err
 		}
 		a.warnOpen(open)

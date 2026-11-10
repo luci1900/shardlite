@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -150,7 +151,7 @@ func TestCrashBetweenFileAndManifest(t *testing.T) {
 	if err := h.WriteDelta(ctx, sh, shardfile.Hooks{AfterFileWrite: func() error { return crash }}); !errors.Is(err, crash) {
 		t.Fatalf("got %v", err)
 	}
-	// The orphan file exists, but the stored manifest is unchanged and valid.
+	// The unlisted file exists, but the stored manifest is unchanged and valid.
 	m, _, err := e.Files.GetManifest(ctx, shardName(shard))
 	if err != nil || len(m.Files) != 1 || m.Files[0] != before {
 		t.Fatalf("manifest %+v err=%v", m, err)
@@ -163,9 +164,9 @@ func TestCrashBetweenFileAndManifest(t *testing.T) {
 		keys++
 	}
 	if keys != 2 {
-		t.Fatalf("%d files, want the base and one orphan", keys)
+		t.Fatalf("%d files, want the base and one unlisted file", keys)
 	}
-	// Restore ignores the orphan and still reaches the latest state through the journal.
+	// Restore ignores the unlisted file and still reaches the latest state through the journal.
 	if want, got := apptest.Dump(t, e.Path(shard)), restoreDump(t, e, "r"); want != got {
 		t.Fatal("restore after crash differs")
 	}
@@ -328,16 +329,30 @@ func TestLostResponses(t *testing.T) {
 		sh.Close(ctx)
 	})
 
-	t.Run("a different object under the name is a conflict", func(t *testing.T) {
+	t.Run("a leftover file of this node under the name is deleted and replaced", func(t *testing.T) {
 		e := harness.New(t)
 		app := e.StartApp(shard)
 		h, sh := e.NewShard(shard)
 		write(t, e, app, func() error { return sh.Sync(ctx) }, 0)
 		tail := tailOf(t, sh).Files
 		key := shardfile.FileKey(shardName(shard), h.Manifest.Generation, shardfile.File{Range: shardfile.Range{Min: tail[0].Position, Max: tail[len(tail)-1].Last()}, Epoch: h.F.Blob.Epoch()})
-		e.Store.Create(ctx, key, strings.NewReader("someone else's bytes"))
-		if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); !errors.Is(err, blob.ErrExists) {
-			t.Fatalf("got %v, want blob.ErrExists", err)
+		// The name carries this node's epoch, so only its own incarnation can
+		// have left a file there: an earlier handle's upload whose manifest
+		// update never listed it. Nothing can list it now, so the write takes
+		// the name back rather than fail on it.
+		e.Store.Create(ctx, key, strings.NewReader("an earlier failed write's bytes"))
+		if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); err != nil {
+			t.Fatalf("got %v, want the leftover replaced", err)
+		}
+		e.Blob.SetHook(nil)
+		rc, _, err := e.Store.Get(ctx, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil || string(b) == "an earlier failed write's bytes" {
+			t.Fatalf("the leftover bytes are still there (%v)", err)
 		}
 		sh.Close(ctx)
 	})

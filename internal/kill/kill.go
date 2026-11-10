@@ -17,12 +17,6 @@ const (
 	DeltaBeforeManifest  Point = "delta-before-manifest"
 	RebaseBeforeManifest Point = "rebase-before-manifest"
 	RebaseAfterSwap      Point = "rebase-after-swap"
-	// The orphan index's entry comes before every write that can leave files no
-	// manifest lists (docs/internals.md, Orphan index). These two are right after an
-	// entry is created and before the write it is for: a file's upload (a delta,
-	// a rebase's base or an adoption's delta) and the manifest's deletion.
-	OrphanEntryBeforeFile        Point = "orphan-entry-before-file"
-	OrphanEntryBeforeDeleteShard Point = "orphan-entry-before-delete-shard"
 	// SnapshotPage is before each page a snapshot reads, in the goroutine that
 	// reads them. A test holds the reads there to put the app's work between two
 	// of them.
@@ -39,8 +33,7 @@ const (
 func ByName(name string) (Point, bool) {
 	switch Point(name) {
 	case Restored, Folded, ReadHeld, FirstSyncDone, SegmentBefore, SegmentAfter,
-		RestoreBeforeRename, DeltaBeforeManifest, RebaseBeforeManifest, RebaseAfterSwap, SnapshotPage, StopLetGo,
-		OrphanEntryBeforeFile, OrphanEntryBeforeDeleteShard:
+		RestoreBeforeRename, DeltaBeforeManifest, RebaseBeforeManifest, RebaseAfterSwap, SnapshotPage, StopLetGo:
 		return Point(name), true
 	}
 	return "", false

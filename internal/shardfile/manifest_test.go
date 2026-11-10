@@ -186,7 +186,7 @@ func TestDeleteShard(t *testing.T) {
 	}
 	stale := *other
 	stale.ETag = "stale"
-	if err := stale.DeleteShard(ctx, shardfile.Hooks{}); !errors.Is(err, blob.ErrConflict) {
+	if err := stale.DeleteShard(ctx); !errors.Is(err, blob.ErrConflict) {
 		t.Fatalf("delete with a stale version: %v", err)
 	}
 	if _, _, err := e.Files.GetManifest(ctx, shardName("users/e1")); err != nil {
@@ -196,7 +196,7 @@ func TestDeleteShard(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := current.DeleteShard(ctx, shardfile.Hooks{}); err != nil {
+	if err := current.DeleteShard(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := e.Files.GetManifest(ctx, shardName("users/e1")); !errors.Is(err, blob.ErrNotFound) {

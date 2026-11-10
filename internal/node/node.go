@@ -41,9 +41,6 @@ type Config struct {
 	// data directory). It is made when it is first needed. The
 	// The shardset empties it of what a crash left.
 	TempDir string
-	// OrphanAge is the age rule (shardfile.Files.AgeRule), the one value the writer's
-	// orphan entries and the collector share. shardfile.DefaultAgeRule if zero.
-	OrphanAge time.Duration
 	// Faults is nil in production (see Faults).
 	Faults Faults
 }
@@ -108,7 +105,7 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		Registry: reg,
 		Store:    store,
 		Files: &shardfile.Files{Blob: store, Backend: cfg.Backend, Node: cfg.Name, Leases: reg,
-			JournalOptions: journal.Options(cfg.Blob), Temp: tempfile.NewDir(cfg.TempDir), OrphanAge: cfg.OrphanAge},
+			JournalOptions: journal.Options(cfg.Blob), Temp: tempfile.NewDir(cfg.TempDir), Log: cfg.Logger},
 	}
 	if cfg.Faults.Temp != nil {
 		n.Files.Temp.SetHook(cfg.Faults.Temp)

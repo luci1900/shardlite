@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/luci1900/shardlite/internal/apptest"
 )
 
 var longClient = &http.Client{Timeout: 2 * time.Minute}
@@ -105,6 +107,11 @@ func (r *faultRig) faults(label string) {
 	if !strings.Contains(r.s.node.out.String(), "fault: injected") {
 		r.t.Fatalf("%s: the node logged no injected fault, so none was tested:\n%s", label, r.s.node.out.String())
 	}
+	if r.reportedLeaks {
+		apptest.Eventually(r.t, apptest.Timeout, "the node to report a failed delete", func() bool {
+			return strings.Contains(r.s.node.out.String(), "could not delete an LTX file")
+		})
+	}
 	r.verify("with " + label)
 	// A node without the fault goes on from what the faulty one left.
 	r.base = append([]string(nil), faultEnv...)
@@ -137,14 +144,31 @@ func TestFaultStorage(t *testing.T) {
 	}
 }
 
-// Failing orphan entries: the entry made before every file's upload fails, so deltas
-// and rebases fail and are retried by the node's own loop, and nothing acknowledged is lost.
-func TestFaultOrphanEntries(t *testing.T) {
+// Failing LTX file uploads: a delta or a rebase's base that fails or whose response is
+// lost is retried by the node's own loop, and nothing acknowledged is lost. A file
+// whose manifest update then loses leaks, which the rig's walk bounds by the kills.
+func TestFaultFiles(t *testing.T) {
 	t.Parallel()
 	for _, mode := range []string{"fail", "lost"} {
 		t.Run(mode, func(t *testing.T) {
 			t.Parallel()
-			newFaultRig(t, "SHARDLITE_FAULT_STORAGE="+mode+":300:30ms:orphans").faults(mode + " orphan entries") // 30% of the creates
+			newFaultRig(t, "SHARDLITE_FAULT_STORAGE="+mode+":300:30ms:files").faults(mode + " file uploads") // 30% of the creates
+		})
+	}
+}
+
+// Failing LTX file deletes: every delete of a superseded file fails, or lands and
+// loses its response, and nothing acknowledged is lost. A failed delete reports the
+// file it leaves, which the rig wants in the node's log. A lost one is retried, finds
+// the file gone and counts as done, so it leaves nothing.
+func TestFaultFileDeletes(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{"fail", "lost"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			r := newFaultRig(t, "SHARDLITE_FAULT_STORAGE="+mode+":1000:0s:file-deletes") // every delete
+			r.reportedLeaks = mode == "fail"
+			r.faults(mode + " file deletes")
 		})
 	}
 }

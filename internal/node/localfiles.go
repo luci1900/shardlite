@@ -12,7 +12,6 @@ import (
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/shard"
-	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
 // cleanDataDir is what a start does to the data directory, after the node has
@@ -92,9 +91,9 @@ func pathFor(data string, name shard.Name, generation shard.Gen) string {
 // A crash after the manifest is deleted leaves LTX files that nothing refers to
 // in blob storage, and the local files, which the next start deletes. A crash before it leaves the shard
 // as it was.
-func (a *actor) deleteReleased(ctx context.Context, hooks shardfile.Hooks, resume func() error) error {
+func (a *actor) deleteReleased(ctx context.Context, resume func() error) error {
 	d := a.d
-	if err := a.h.DeleteShard(ctx, hooks); err != nil {
+	if err := a.h.DeleteShard(ctx); err != nil {
 		// If the manifest is gone the shard is deleted, whatever else failed.
 		if _, _, gerr := d.files.GetManifest(ctx, a.Name); !errors.Is(gerr, blob.ErrNotFound) {
 			if rerr := resume(); rerr != nil {

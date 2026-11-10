@@ -1,76 +1,29 @@
-// Package audit is the check the fault tests run on a store after a scenario: every
-// LTX file past the age rule is either listed by its shard's manifest or was
-// collected. It is the full walk the collector replaced, kept to catch a path that
-// writes LTX files without first creating an orphan index entry for them (the
-// collector only ever looks where an entry points). Nothing in the node uses it.
+// Package audit lists the LTX files in a store that no manifest lists. The walk
+// is the one piece the fault tests and a future operator command share: the
+// fault rig runs it after a scenario, and an operator's cleanup (on the
+// roadmap) would delete what it names, past the journal's expiry. Nothing in
+// the node uses it.
 package audit
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"log/slog"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/dueindex"
-	"github.com/luci1900/shardlite/internal/reconcile"
-	"github.com/luci1900/shardlite/internal/reconcile/collect"
 	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
 
-// Run is the audit. It stands at now, a time past the age rule for every file in the
-// store, and the node that wrote them must be stopped: a file on its way to the
-// manifest would look like an orphan. It runs the collector over every entry of the
-// orphan index, due or not, and then walks the store and fails on any LTX file older
-// than age that its shard's manifest doesn't list: a file no entry led the collector to.
-func Run(ctx context.Context, store *blob.Store, age time.Duration, now time.Time) error {
-	if err := collectAll(ctx, store, age, now); err != nil {
-		return err
-	}
-	left, err := Unlisted(ctx, store, age, now)
-	if err != nil {
-		return err
-	}
-	if len(left) > 0 {
-		return fmt.Errorf("%d LTX files older than the age rule are listed by no manifest and no orphan entry led the collector to them (a write path that makes no entry first):\n%s", len(left), strings.Join(left, "\n"))
-	}
-	return nil
-}
-
-// collectAll hands every entry of the orphan index to the collector as it would be
-// at now, and fails unless each is done.
-func collectAll(ctx context.Context, store *blob.Store, age time.Duration, now time.Time) error {
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	c := collect.New(collect.Deps{Store: store, Clock: at(now), Log: log, Age: age})
-	index := shardfile.OrphanIndex(store)
-	for lane := range shard.Lanes {
-		entries, err := index.Due(ctx, shard.Lane(lane), now, 1<<30)
-		if err != nil {
-			return err
-		}
-		for _, e := range entries {
-			if a := c.Handle(ctx, e, func() error { return nil }); !isDone(a) {
-				return fmt.Errorf("the collector answered %#v for the entry %s", a, dueindex.Key(shardfile.OrphanPrefix, e))
-			}
-		}
-	}
-	return nil
-}
-
-func isDone(a reconcile.Answer) bool {
-	_, ok := a.(*reconcile.Done)
-	return ok
-}
-
 // Unlisted is the walk: the keys of the LTX files under the data prefix that were
 // written before now less age and that their shard's manifest doesn't list (all of
 // them if the manifest is gone or names another generation), in key order. A key
-// under the prefix that is no shard's file is an error.
+// under the prefix that is no shard's file is an error. A file older than age can
+// never be listed later, since a writer that has not updated its manifest by then
+// has lost its tail anyway (docs/internals.md, Garbage).
 func Unlisted(ctx context.Context, store *blob.Store, age time.Duration, now time.Time) ([]string, error) {
 	old := now.Add(-age)
 	manifests := shardfile.NewManifestStore(store)
@@ -133,14 +86,4 @@ func listedBy(ctx context.Context, manifests shardfile.ManifestStore, n shard.Na
 		}
 	}
 	return keys, nil
-}
-
-// at is a clock that stands still.
-type at time.Time
-
-func (a at) Now() time.Time { return time.Time(a) }
-
-func (at) NewTimer(d time.Duration) (<-chan time.Time, func() bool) {
-	t := time.NewTimer(d)
-	return t.C, t.Stop
 }

@@ -388,4 +388,4 @@ CREATE TABLE _shardlite_delete (
 
 ### Reconcilers
 
-Every node also does a share of the cluster's own work: the dispatcher wakes the shards whose reminders are due while they are inactive, and the collector deletes LTX files that no manifest lists once they are past the journal's expiry. They need no setting and serve no route. How they work is in [reconcilers](internals.md#reconcilers).
+Every node also does a share of the cluster's own work: the dispatcher wakes the shards whose reminders are due while they are inactive. It needs no setting and serves no route. How it works is in [reconcilers](internals.md#reconcilers).

@@ -23,8 +23,9 @@ func TestUnknownFaultValueFailsTheStart(t *testing.T) {
 		{"SHARDLITE_FAULT_KILL_AT", "segment-befor", "no kill point"},
 		{"SHARDLITE_FAULT_STORAGE", "break:10:1ms", "mode is fail"},
 		{"SHARDLITE_FAULT_STORAGE", "fail:10", "three fields"},
-		{"SHARDLITE_FAULT_STORAGE", "fail:10:1ms:index", "target is segments or orphans"},
-		{"SHARDLITE_FAULT_STORAGE", "fail:10:1ms:orphans:x", "three fields"},
+		{"SHARDLITE_FAULT_STORAGE", "fail:10:1ms:index", "target is segments, files"},
+		{"SHARDLITE_FAULT_STORAGE", "fail:10:1ms:orphans", "target is segments, files"},
+		{"SHARDLITE_FAULT_STORAGE", "fail:10:1ms:segments:x", "three fields"},
 		{"SHARDLITE_FAULT_STORAGE", "fail:2000:1ms", "permille"},
 		{"SHARDLITE_FAULT_STORAGE", "fail:10:soon", "duration"},
 		{"SHARDLITE_FAULT_TEMP", "rename:10", "op is create"},
@@ -49,7 +50,7 @@ func TestUnknownFaultValueFailsTheStart(t *testing.T) {
 
 func TestKnownFaultValuesArm(t *testing.T) {
 	t.Parallel()
-	env := map[string]string{"SHARDLITE_FAULT_KILL_AT": "segment-after", "SHARDLITE_FAULT_STORAGE": "lost:5:2ms:orphans", "SHARDLITE_FAULT_TEMP": "dup:7", "SHARDLITE_FAULT_PEER_HEADER": "garble:300", "SHARDLITE_FAULT_MAX_FILES": "2"}
+	env := map[string]string{"SHARDLITE_FAULT_KILL_AT": "segment-after", "SHARDLITE_FAULT_STORAGE": "lost:5:2ms:segments", "SHARDLITE_FAULT_TEMP": "dup:7", "SHARDLITE_FAULT_PEER_HEADER": "garble:300", "SHARDLITE_FAULT_MAX_FILES": "2"}
 	opts, err := faultOptions(func(k string) string { return env[k] })
 	if err != nil || len(opts) != 1 {
 		t.Fatalf("faultOptions: %d options, %v", len(opts), err)
@@ -78,8 +79,8 @@ func TestPeerHeaderFaultGarblesAndDrops(t *testing.T) {
 		return !ok || tok != "avoid"
 	}
 	for _, c := range []struct {
-		name  string
-		pool  []string
+		name   string
+		pool   []string
 		reject func(string) bool
 	}{
 		{"Shardlite-Node", garbledNode, notAName},
@@ -112,33 +113,34 @@ func TestPeerHeaderFaultGarblesAndDrops(t *testing.T) {
 	}
 }
 
-// The storage fault's target says which creates fail: the journal's segments by
-// default and the orphan index's entries when asked, and only those.
-func TestStorageFaultTargetsItsCreates(t *testing.T) {
+// The storage fault's target says which calls fail: the creates of the journal's
+// segments (the default), the creates of LTX files or the deletes of LTX files, and
+// only those. Any other target is refused.
+func TestStorageFaultTargetsItsCalls(t *testing.T) {
 	t.Parallel()
-	entry := shardfile.OrphanPrefix + "6/2026-10-19T14:05Z/users/42/abc123"
-	segment := journal.Root + "n1/00000000000000000001"
+	seg := journal.Root + "n1/00000000000000000001"
+	file := shardfile.FilesPrefix + "6/users/42/abc123/0000000000000001-0000000000000002.ltx"
 	for _, c := range []struct {
-		value        string
-		entry, segnt bool // whether a create of each fails
+		value string
+		fails map[blobtest.Op]string // the key whose call of that op fails
 	}{
-		{"fail:1000:0s", false, true},
-		{"fail:1000:0s:segments", false, true},
-		{"fail:1000:0s:orphans", true, false},
+		{"fail:1000:0s", map[blobtest.Op]string{blobtest.OpCreate: seg}},
+		{"fail:1000:0s:segments", map[blobtest.Op]string{blobtest.OpCreate: seg}},
+		{"fail:1000:0s:files", map[blobtest.Op]string{blobtest.OpCreate: file}},
+		{"fail:1000:0s:file-deletes", map[blobtest.Op]string{blobtest.OpDelete: file}},
 	} {
 		hook, err := storageFault(c.value, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 		ctx := context.Background()
-		if got := hook(ctx, blobtest.OpCreate, entry, false) != nil; got != c.entry {
-			t.Errorf("%s: create of an orphan entry fails: %v, want %v", c.value, got, c.entry)
-		}
-		if got := hook(ctx, blobtest.OpCreate, segment, false) != nil; got != c.segnt {
-			t.Errorf("%s: create of a segment fails: %v, want %v", c.value, got, c.segnt)
-		}
-		if hook(ctx, blobtest.OpUpdate, entry, false) != nil {
-			t.Errorf("%s: an update fails", c.value)
+		for _, op := range []blobtest.Op{blobtest.OpCreate, blobtest.OpUpdate, blobtest.OpDelete} {
+			for _, key := range []string{seg, file} {
+				want := c.fails[op] == key
+				if got := hook(ctx, op, key, false) != nil; got != want {
+					t.Errorf("%s: %s of %s fails: %v, want %v", c.value, op, key, got, want)
+				}
+			}
 		}
 	}
 }

@@ -126,7 +126,7 @@ func TestDeleteRacingWithAWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = stale.DeleteShard(ctx, shardfile.Hooks{})
+	err = stale.DeleteShard(ctx)
 	if !errors.Is(err, blob.ErrConflict) {
 		t.Fatalf("delete with a stale ETag: %v, want a conflict", err)
 	}
@@ -533,7 +533,7 @@ func TestMarkedShardWithAFailingManifestDeleteIsKept(t *testing.T) {
 // Once the manifest is deleted the shard is gone. LTX files that couldn't be
 // deleted are left in blob storage, which nothing refers to, and a new shard of the
 // same id has a new generation.
-func TestMarkedShardWithAFailingFileDeleteLeavesOrphans(t *testing.T) {
+func TestMarkedShardWithAFailingFileDeleteLeavesItsFiles(t *testing.T) {
 	t.Parallel()
 	r := newMRigWith(t, withDeltas)
 	r.local.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
@@ -550,8 +550,10 @@ func TestMarkedShardWithAFailingFileDeleteLeavesOrphans(t *testing.T) {
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the local file is still there: %v", err)
 	}
-	if len(r.leftInBlob("lobby/f2")) == 0 {
-		t.Fatal("the orphaned LTX files were deleted although deleting them was made to fail")
+	if left := r.leftInBlob("lobby/f2"); len(left) == 0 {
+		t.Fatal("the LTX files were deleted although deleting them was made to fail")
+	} else if got := r.m.Stats.LeakedFiles.Load(); got != uint64(len(left)) {
+		t.Fatalf("%d files leaked, %d counted in Stats.LeakedFiles, want one count per file", len(left), got)
 	}
 	ref := r.acquire("lobby/f2")
 	defer ref.Release()
@@ -561,7 +563,7 @@ func TestMarkedShardWithAFailingFileDeleteLeavesOrphans(t *testing.T) {
 }
 
 // A crash after the manifest is deleted and before the files are: the shard is gone
-// for good, its LTX files are orphans, and its local files (still in the index as
+// for good, its LTX files are left unlisted, and its local files (still in the index as
 // active) are discarded.
 func TestMarkedShardCrashAfterTheManifestDelete(t *testing.T) {
 	t.Parallel()
@@ -612,6 +614,6 @@ func TestMarkedShardCrashAfterTheManifestDelete(t *testing.T) {
 		t.Fatalf("the old local file is still there: %v", err)
 	}
 	if len(r.leftInBlob("lobby/f3")) == 0 {
-		t.Fatal("the orphaned LTX files are gone: the hook did not stop their deletion")
+		t.Fatal("the unlisted LTX files are gone: the hook did not stop their deletion")
 	}
 }

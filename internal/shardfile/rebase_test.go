@@ -348,7 +348,7 @@ func TestCrashBetweenBaseAndManifest(t *testing.T) {
 	if err != nil || !slices.Equal(m.Files, files) {
 		t.Fatalf("stored manifest %+v err=%v, want files %v", m, err, files)
 	}
-	// The three deltas and the orphan base are there.
+	// The three deltas and the unlisted base are there.
 	if n := countFiles(t, e); n != 4 {
 		t.Fatalf("%d objects, want 3 files and the unreferenced base", n)
 	}
@@ -359,7 +359,7 @@ func TestCrashBetweenBaseAndManifest(t *testing.T) {
 	if len(tailOf(t, sh).Files) == 0 {
 		t.Fatal("the tail was dropped though the manifest does not cover it")
 	}
-	// A later rebase works, whatever the orphan.
+	// A later rebase works, whatever the unlisted base.
 	if did, err := h.Rebase(ctx, sh, shardfile.Hooks{}); err != nil || !did {
 		t.Fatalf("second rebase: did=%v err=%v", did, err)
 	}

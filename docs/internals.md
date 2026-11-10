@@ -11,8 +11,7 @@ How the node works: its architecture and the rules that keep it correct. It desc
 | **Snapshot** | A shard as of one commit, as immutable LTX files: a base and deltas. An inactive shard lives only in its snapshot. |
 | **Manifest** | A shard's state in storage: owner and epoch, files, the journal holding later commits, when it next needs waking. |
 | **Reminder index** | Empty objects saying a shard may need waking at a minute. The dispatcher reads them. |
-| **Orphan index** | Empty objects saying a generation of a shard may hold LTX files no manifest lists. The collector reads them. |
-| **Reconciler** | A due index (the reminder or the orphan index) and the handler for its entries, run by one loop on every node. |
+| **Reconciler** | A due index (the reminder index) and the handler for its entries, run by one loop on every node. |
 | **Lane** | One of 16 hash classes of shard names. A shard's index entries, LTX files and manifest (`state/shards/{lane}/{kind}/{id}`) have keys that start with its lane, and each lane's index entries are handled by the node that ranks first for it. |
 
 The other terms are in the [overview](overview.md#concepts).
@@ -21,7 +20,7 @@ The other terms are in the [overview](overview.md#concepts).
 
 The node is one Go process. It reads each shard's WAL itself and encodes what it reads as [LTX](https://github.com/superfly/ltx) files. Capture is driven, never polled: the flush loop spots commits by mapping each active shard's wal-index header, which SQLite updates on every commit. Nothing shard-sized lives in memory: tails, deltas, restores and rebases all go through unnamed files in `{data}/.tmp`.
 
-Blob storage is the source of truth: manifests, LTX files, one journal per node, the reminder and orphan indexes. The node's disk holds only the working copy of each active shard, deleted when the shard is released, so an inactive shard is in storage and nowhere else.
+Blob storage is the source of truth: manifests, LTX files, one journal per node, the reminder index. The node's disk holds only the working copy of each active shard, deleted when the shard is released, so an inactive shard is in storage and nowhere else.
 
 Leases and manifests are objects changed with conditional writes, which are linearizable on every supported store, so there is no leader and no election. Every write carries a CRC32 the store verifies and every read checks the checksum the store returns. Callers go through `blob.Store`, which makes writes safe to retry (see [Lost responses](#lost-responses)), and the node refuses to start if its store's conditional writes misbehave on a scratch key.
 
@@ -141,7 +140,7 @@ The same split as a database's WAL and data files: the journal is the shared WAL
 |---|---|---|---|
 | **Data** | journal segments, LTX files | create once, delete by garbage collection | never modified |
 | **State** | leases, manifests | compare-and-swap by the owner | the truth, naming the data it points at |
-| **Index** | due index entries (the reminder and orphan indexes) | created by anyone before the write they are for, moved and deleted by the index's [reconciler](#reconcilers) | deleted only by the index's own rule, once the truth they point at no longer needs them |
+| **Index** | due index entries (the reminder index) | created by anyone before the write they are for, moved and deleted by the index's [reconciler](#reconcilers) | deleted only by the index's own rule, once the truth they point at no longer needs them |
 
 Journal segments go to blob storage, which is the only copy: a restore, an adoption and a restart all read it, and the fence is created there. Listings stay per prefix (leases, a node's journal, a lane's entries of one index, one generation of a shard's LTX files), so none grows with the rest. Index entries, LTX files and manifests all have keys that start with the shard's lane (`shard.Name.Lane`, a hash of the name), so the store's writes and a launch spike of claims spread over 16 key ranges from the start.
 
@@ -156,19 +155,9 @@ An inactive shard's reminder needs someone to wake it. `next_reminder` in the ma
 
 `specs/dispatch.qnt` checks that a shard with a reminder in its durable state always has a backed entry or a tail an adoption will still write a delta for.
 
-### Orphan index
-
-An orphan is an LTX file no manifest lists: an upload whose manifest update never lands, or a deleted shard's files when its node crashed between the manifest's delete and theirs. An entry (`internal/shardfile/orphan.go`) names a shard and a generation that may hold orphans, and almost every entry finds none. Its minute is the write's minute plus the **age rule**, the journal's expiry (a day, or four times the tail alert age if that is longer), by when no upload can still be on its way to a manifest.
-
-- **Index first.** Every LTX upload goes through one function (`Handle.putFile`), which creates the entry for the manifest's generation before the upload, and `DeleteShard` creates it before it deletes the manifest. A failed create fails the write before any of its files or its manifest change. Only the collector deletes entries.
-- **The collector's rule.** For a due entry it reads the manifest, lists the generation's files and deletes each `.ltx` file the manifest doesn't list (every one if the manifest is gone or names another generation) that is older than the age rule by the store's time, the lease checked before each delete. The age is checked on each file, so a later upload into the same generation is never deleted early. An entry with no young unlisted file left is done, one with some moves to the minute after the youngest turns the age, and a failure moves it 16 minutes later.
-- **Anyone may apply the rule.** A file older than the age that is unlisted when the manifest is read can never be listed later, since a manifest only adds files its writer has just uploaded.
-
-The index finds only what a path recorded, where a walk of every file finds orphans whatever left them. So the fault tests keep the walk as an audit (`internal/audit`): after every scenario it fails on any LTX file past the age rule that no manifest lists, which only a write path that made no entry first can leave.
-
 ## Reconcilers
 
-Some of the node's work is the cluster's: waking the inactive shards whose reminders are due, and deleting the LTX files no manifest lists. Each is a **reconciler**, a due index and a handler for its entries, the shape of a Kubernetes controller (a work queue of keys and a handler that reads the truth and converges). One loop on every node runs them all, as one of the shardset's services. **A reconciler may be late, never wrong.**
+Some of the node's work is the cluster's: waking the inactive shards whose reminders are due. It is a **reconciler**, a due index and a handler for its entries, the shape of a Kubernetes controller (a work queue of keys and a handler that reads the truth and converges). One loop on every node runs it, as one of the shardset's services. **A reconciler may be late, never wrong.**
 
 ### The due index and the handler
 
@@ -187,7 +176,6 @@ A reconciler is idempotent and convergent: every write it makes is conditional o
 | Reconciler | Index | Passes | What it does |
 |---|---|---|---|
 | the dispatcher (`internal/reconcile/dispatch`) | the [reminder index](#reminder-index) | every minute | wakes the shards whose reminders are due while they are inactive |
-| the collector (`internal/reconcile/collect`) | the [orphan index](#orphan-index) | every ten minutes, since its entries fall due a day after their write | deletes the LTX files no manifest lists |
 
 ### The dispatcher
 
@@ -279,9 +267,13 @@ A lost app is not a failure. Once the app has answered the declaration poll, 30 
 
 ## Garbage
 
-LTX files no manifest lists are deleted by the collector (see [Orphan index](#orphan-index)). A rebase deletes the files it superseded itself, and a deleted shard's files go with it. Journal segments are each node's own to expire (see [Node journals and snapshots](#node-journals-and-snapshots)). Dead nodes' leases stay: a node of the same name starting again at epoch 1 would collide with its old files, so nothing retires them and every lease scan lists them.
+An LTX file no manifest lists is harmless (a restore never reads it) and costs storage only. The write path deletes what it knows is garbage, best effort: a write whose manifest update loses with a conflict deletes the file it just uploaded (the only outcome that means nothing can list it), a rebase once its swap has landed deletes every `.ltx` file the new manifest doesn't list, so what earlier crashes left in a shard still in use goes at its next rebase, and a deleted shard's files go with it. A file the handle holds a write id for is skipped, an upload waiting for its own update.
 
-Local files have no collector. Every file the node stops needing is deleted at once (`removeLocal` in `internal/node/localfiles.go`), whether or not an app has it open, since no path is ever reused (see [Activation](#activation)). A start deletes every shard file left in the data directory, since after an OS crash none can be trusted to agree with blob storage, and its shard activates at a new path with its data.
+The sweep needs no age rule: a manifest only adds files its own writer just uploaded, and after the swap the only writer that can list a file in the generation is one taking the shard from the node, which writes the node's lease first. The sweep reads the lease after its listing and deletes only while it still holds. A conflict needs one check of its own, since it can hide the write's own update, landed and then replaced by another writer's (see [Lost responses](#lost-responses)): the write reads the stored manifest first and keeps a file it lists. A failed delete, or a failed read that stops one, logs the shard (and the key, when there is one) and counts in `Stats.LeakedFiles`; a crash leaks silently. A leftover of the node's own epoch never blocks its range's next write, which deletes it and takes the name back. What the write path leaves, a shard's next rebase or a separate cleanup past the journal's expiry takes: by then a writer that has not updated its manifest has lost its tail anyway.
+
+Journal segments are each node's own to expire (see [Node journals and snapshots](#node-journals-and-snapshots)). Dead nodes' leases stay: a node of the same name starting again at epoch 1 would collide with its old files, so nothing retires them and every lease scan lists them.
+
+Local files need no cleanup. Every file the node stops needing is deleted at once (`removeLocal` in `internal/node/localfiles.go`), whether or not an app has it open, since no path is ever reused (see [Activation](#activation)). A start deletes every shard file left in the data directory, since after an OS crash none can be trusted to agree with blob storage, and its shard activates at a new path with its data.
 
 ## The models
 
@@ -291,7 +283,7 @@ Only capture's traces are replayed against the code: `internal/capture/replay_te
 
 ## Testing
 
-- **Fault injection** kills and fails the real `shardlite` binary, built with the `fault` tag (`e2e`, `fault_*_test.go`, the settings in `cmd/shardlite/fault.go`). A test arms a kill point (`internal/kill`) after the node is up, drives it through the e2e app and checks that every write a `storage` request acknowledged is in blob storage after a restore and that the database passes `integrity_check`. It covers crashes between every step of capture, snapshots and restore, failing storage and temporary files, a node killed while it stops, and peer headers that two nodes drop or garble. Every scenario ends with the [orphan index](#orphan-index)'s audit.
+- **Fault injection** kills and fails the real `shardlite` binary, built with the `fault` tag (`e2e`, `fault_*_test.go`, the settings in `cmd/shardlite/fault.go`). A test arms a kill point (`internal/kill`) after the node is up, drives it through the e2e app and checks that every write a `storage` request acknowledged is in blob storage after a restore and that the database passes `integrity_check`. It covers crashes between every step of capture, snapshots and restore, failing storage (the journal's segments, the uploads of LTX files and their deletes) and temporary files, a node killed while it stops, and peer headers that two nodes drop or garble. Every scenario ends with the walk in `internal/audit`, which fails when the LTX files no manifest lists and no node logged as a leak outnumber what the scenario's kills explain (per node killed, each of the rig's two shards can leave one upload on its way to the manifest or, killed just after a rebase's swap, the files the swap superseded). The scenario that fails every delete stops its nodes gracefully instead, so it allows none, and it fails unless the node reports a failed delete.
 - **Fencing** is tested by killing nodes and by taking a live node's lease the way an adopter does while the node hears of nothing: a `storage` read must then fail and the node must stop, and a `none` read answers (`TestHiddenPauseFailsStorageReads`). Pausing and partitioning real processes is on the [roadmap](roadmap.md).
 - **The protocol** is checked in Quint before it is implemented, and **time** (lease expiry, timeouts) runs on `testing/synctest`'s fake clock.
 
@@ -304,11 +296,11 @@ Only capture's traces are replayed against the code: `internal/capture/replay_te
 | `internal/blob`, `internal/blobtest` | object storage with write ids, the startup check and the clock warning, and the in-memory store (`SHARDLITE_BLOB=memory://`) |
 | `internal/journal` | a node's journal: its segment store, writer and fencing |
 | `internal/capture` | reading a shard's WAL and the [read rule](#the-read-rule) |
-| `internal/shardfile` | the manifest, deltas, snapshots, restores and adoption, and the indexes' keys and rules |
+| `internal/shardfile` | the manifest, deltas, snapshots, restores and adoption, and the reminder index's keys and rules |
 | `internal/dueindex`, `internal/reconcile` | the due index and the [reconcilers](#reconcilers) |
 | `internal/peers` | the lease scan, the peers' addresses, placement and the peer headers |
 | `internal/node` | `Run` and everything it stages: shardset, actor, flusher, gates, routing, reminders, servers, adoption, local files |
-| `internal/kill`, `internal/audit`, `internal/harness` | the fault rig's kill points, the store audit and shared test pieces |
+| `internal/kill`, `internal/audit`, `internal/harness` | the fault rig's kill points, the store walk and shared test pieces |
 | `specs/` | the Quint models |
 | `sdk/go`, `sdk/ts`, `sdk/testdata` | the SDKs (see the guide's [Using the SDK](guide.md#using-the-sdk)) and the node's app-visible reasons they check themselves against |
 | `migrate` | numbered SQL migrations run inside the app's own transaction (see the guide's [Schema migrations](guide.md#schema-migrations)), which the node never imports |

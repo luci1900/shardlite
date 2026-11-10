@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -19,7 +20,6 @@ import (
 	"github.com/luci1900/shardlite/internal/audit"
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/kill"
-	"github.com/luci1900/shardlite/internal/node"
 	"github.com/luci1900/shardlite/internal/pos"
 )
 
@@ -38,10 +38,12 @@ const (
 
 // faultEnv is what every node of the rig runs with: tails become deltas within
 // a few snapshot passes, and a manifest with three files is due a rebase.
-var faultEnv = []string{"SHARDLITE_DELTA_AGE=" + faultDeltaAge.String(), "SHARDLITE_FAULT_MAX_FILES=2"}
+var faultEnv = []string{"SHARDLITE_DELTA_AGE=" + faultDeltaAge.String(), "SHARDLITE_FAULT_MAX_FILES=" + strconv.Itoa(faultMaxFiles)}
 
-// faultDeltaAge is the delta age of every node of the rig, which sets the node's age
-// rule for orphans (node.JournalExpiry).
+// faultMaxFiles is how many files a manifest of the rig lists before a rebase.
+const faultMaxFiles = 2
+
+// faultDeltaAge is the delta age of every node of the rig.
 const faultDeltaAge = 300 * time.Millisecond
 
 // activationPoints are where an activation of a restored shard can be killed
@@ -59,6 +61,14 @@ type faultRig struct {
 	fires int
 	fire  string   // the file whose existence arms the kill point of this life
 	base  []string // the environment of every node of the rig
+
+	killed *proc           // the last node crash counted
+	kills  int             // nodes the rig has killed, the final crash included
+	logs   strings.Builder // what every node killed so far logged
+	// reportedLeaks is for a scenario that fails every delete of an LTX file:
+	// its nodes stop gracefully instead of being killed, the faulty node must
+	// report a failed delete, and every file left must be in a node's log.
+	reportedLeaks bool
 }
 
 // newFaultRig starts a node with faultEnv and extra, and creates the rig's shards.
@@ -85,18 +95,29 @@ func newFaultRig(t *testing.T, extra ...string) *faultRig {
 
 // audit is the end of every scenario, run as the rig's cleanup before the processes are
 // killed (they are older cleanups): it stops the node, so no upload is on its way to a
-// manifest, and walks the store as it would stand after the age rule (internal/audit).
-// A path that writes LTX files without an orphan index entry first leaves a file that
-// the walk finds. The age is the node's own, which the rig's delta age sets.
-// A scenario that failed is left as it is.
+// manifest, and walks the store for the LTX files no manifest lists (internal/audit).
+// A file a node logged is a leak it reported (a failed delete). The rest are allowed up
+// to what the kills explain: per node killed, each of the rig's two shards can leave one
+// upload on its way to the manifest (a delta, or a rebase's base) or, killed just after a
+// rebase's swap, the files the swap superseded (faultMaxFiles+1). A scenario whose nodes
+// stop gracefully (reportedLeaks) is allowed none. A scenario that failed is left as it is.
 func (r *faultRig) audit() {
 	if r.t.Failed() {
 		return
 	}
 	r.crash()
-	age := node.JournalExpiry(faultDeltaAge)
-	if err := audit.Run(context.Background(), r.v.files.Blob, age, time.Now().Add(age+time.Hour)); err != nil {
-		r.t.Errorf("the audit of the store after the scenario: %v", err)
+	left, err := audit.Unlisted(context.Background(), r.v.files.Blob, 0, time.Now().Add(time.Hour))
+	if err != nil {
+		r.t.Errorf("the walk of the store after the scenario: %v", err)
+	}
+	logged := r.logs.String()
+	unlogged := slices.DeleteFunc(left, func(key string) bool { return strings.Contains(logged, key) })
+	limit := 2 * (faultMaxFiles + 1) * r.kills
+	if r.reportedLeaks {
+		limit = 0
+	}
+	if len(unlogged) > limit {
+		r.t.Errorf("%d LTX files no manifest lists and no node logged after the scenario, and %d kills explain %d:\n%s", len(unlogged), r.kills, limit, strings.Join(unlogged, "\n"))
 	}
 }
 
@@ -115,7 +136,20 @@ func (r *faultRig) restart(extra ...string) {
 // crash kills the node and checks what it logged.
 func (r *faultRig) crash() {
 	r.t.Helper()
+	if r.reportedLeaks {
+		// A scenario that fails deletes runs no kills: a kill mid-sweep leaks files
+		// silently, which is the crash's leak and not the failed delete's. The node
+		// stops the way a supervisor stops it, so a sweep ends and reports.
+		if err := r.s.node.term(30 * time.Second); err != nil {
+			r.t.Logf("the node did not stop cleanly: %v", err)
+		}
+	}
 	r.s.node.kill()
+	if r.killed != r.s.node {
+		r.killed = r.s.node
+		r.kills++
+		r.logs.WriteString(r.s.node.out.String())
+	}
 	// The capture went wrong somewhere: the fault tests must never see it.
 	if out := r.s.node.out.String(); strings.Contains(out, "the capture went wrong somewhere") {
 		r.t.Fatalf("the node logged a checksum error:\n%s", out)

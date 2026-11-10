@@ -13,7 +13,7 @@ What is left to make v1, in order, riskiest parts first. The one node and the cl
 - Metrics for everything the node does. Shards the app holds open past their idle timeout need a gauge beside the count of holds warned, so a leak shows as a level and not only in the logs.
 - Protocol versions for rolling node upgrades: each node publishes the range it speaks in its lease, and every request between nodes names the highest version both sides speak.
 - Format versions for everything shardlite stores, with a marker per deployment that a node from an older release refuses.
-- The `shardlite` command for operators: `ls`, `export`, `import` and `verify`.
+- The `shardlite` command for operators: `ls`, `export`, `import`, `verify` and `gc`. `gc` deletes the LTX files no manifest lists, past the journal's expiry, with the walk in `internal/audit`, and `verify` reports them.
 - A soak test: the fault rig running for hours against a cluster, with kills, pauses, partitions, slow storage and restarts, checking the same guarantees as the per-scenario tests.
 - A linearizability check of single shards under faults, as Jepsen does: clients record every read and write, and a checker (Porcupine, or Jepsen with Knossos) confirms the history per shard on the `storage` tier.
 - What a store outage does to the cluster: the lease lives in blob storage, so a store no node can reach stops every node until it returns. What is left: how fast the cluster comes back, what the operator sees, and whether a degraded mode is worth having. The fault rig should have a scenario for it.
