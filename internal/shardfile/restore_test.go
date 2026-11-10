@@ -3,6 +3,9 @@ package shardfile_test
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -281,4 +284,37 @@ func TestRestoreFindsTailAfterOldSegmentsExpire(t *testing.T) {
 		t.Fatal("restore from an explicit starting segment differs")
 	}
 	sh.Close(ctx)
+}
+
+// A BeforeRename that fails ends the restore with its error and leaves the
+// .restoring file where it is, as a crash would, and nothing at the destination.
+// The temporary files the restore read, the journal's tail among them, are closed.
+func TestRestoreLeavesFileWhenBeforeRenameFails(t *testing.T) {
+	t.Parallel()
+	e, ctx := harness.New(t), context.Background()
+	app := e.StartApp(shard)
+	h, sh := e.NewShard(shard)
+	write(t, e, app, func() error { return sh.Sync(ctx) }, 0)
+	if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); err != nil {
+		t.Fatal(err)
+	}
+	write(t, e, app, func() error { return sh.Sync(ctx) }, 1) // a tail only the journal holds
+	defer sh.Close(ctx)
+
+	open := e.Files.Temp.Open() // the live shard holds some of its own
+	boom := errors.New("boom")
+	dst := filepath.Join(t.TempDir(), "restored.db")
+	_, err := e.Files.Restore(ctx, shardName(shard), dst, shardfile.RestoreOptions{BeforeRename: func() error { return boom }})
+	if !errors.Is(err, boom) {
+		t.Fatalf("restore: %v, want the hook's error", err)
+	}
+	if _, err := os.Stat(dst + ".restoring"); err != nil {
+		t.Fatalf("the .restoring file: %v, want it left", err)
+	}
+	if _, err := os.Stat(dst); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the destination: %v, want none", err)
+	}
+	if n := e.Files.Temp.Open(); n != open {
+		t.Fatalf("%d temporary files are open after the restore, %d before", n, open)
+	}
 }

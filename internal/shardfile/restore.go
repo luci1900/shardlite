@@ -218,6 +218,7 @@ func (f *Files) Restore(ctx context.Context, n shard.Name, dst string, opt Resto
 	}
 	if opt.BeforeRename != nil {
 		if err := opt.BeforeRename(); err != nil {
+			tail.Close()
 			return nil, err // leaves the .restoring file, as a crash would
 		}
 	}
