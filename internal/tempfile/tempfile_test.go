@@ -84,7 +84,7 @@ func TestTheDirectoryStaysEmpty(t *testing.T) {
 	}
 	l.Close()
 	d.Close()
-	c, err := dir.Collect(bytes.NewReader(payload(10)))
+	c, _, err := dir.Build(fillWith(payload(10)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,8 +291,8 @@ func TestTheHookFailsACreateAndADup(t *testing.T) {
 	if _, err := dir.Create(); !errors.Is(err, boom) {
 		t.Fatalf("create: %v", err)
 	}
-	if _, err := dir.Collect(bytes.NewReader(nil)); !errors.Is(err, boom) {
-		t.Fatalf("collect: %v", err)
+	if _, _, err := dir.Build(fillWith(nil)); !errors.Is(err, boom) {
+		t.Fatalf("build: %v", err)
 	}
 	if _, err := l.Dup(); !errors.Is(err, boom) {
 		t.Fatalf("dup: %v", err)
@@ -305,29 +305,37 @@ func TestTheHookFailsACreateAndADup(t *testing.T) {
 	}
 }
 
-func TestCollectReadsAStreamIntoALogOfItsOwn(t *testing.T) {
+func TestBuildFillsALogOfItsOwn(t *testing.T) {
 	t.Parallel()
 	dir := NewDir(t.TempDir())
 	want := payload(3<<20 + 7)
-	l, err := dir.Collect(bytes.NewReader(want))
+	l, f, err := dir.Build(fillWith(want))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer l.Close()
-	got, err := l.File().Bytes()
+	got, err := f.Bytes()
 	if err != nil || !bytes.Equal(got, want) {
-		t.Fatalf("collected %d bytes, %v", len(got), err)
+		t.Fatalf("built %d bytes, %v", len(got), err)
 	}
-	boom := errors.New("stream broke")
-	r := io.MultiReader(bytes.NewReader(payload(100)), &failing{boom})
-	if _, err := dir.Collect(r); !errors.Is(err, boom) {
-		t.Fatalf("collect of a failing stream: %v", err)
+	boom := errors.New("fill broke")
+	if _, _, err := dir.Build(func(w io.Writer) error {
+		if _, err := w.Write(payload(100)); err != nil {
+			return err
+		}
+		return boom
+	}); !errors.Is(err, boom) {
+		t.Fatalf("build of a failing fill: %v", err)
+	}
+	if got := dir.Open(); got != 1 {
+		t.Fatalf("%d open after a failed build, want only the first log", got)
 	}
 }
 
-type failing struct{ err error }
-
-func (f *failing) Read([]byte) (int, error) { return 0, f.err }
+// fillWith is a fill that writes b.
+func fillWith(b []byte) func(io.Writer) error {
+	return func(w io.Writer) error { _, err := w.Write(b); return err }
+}
 
 func TestConcurrentReadersShareADescriptor(t *testing.T) {
 	t.Parallel()
@@ -378,12 +386,12 @@ func TestOpenCountsTheDescriptorsNotYetClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := dir.Collect(bytes.NewReader(payload(10)))
+	c, _, err := dir.Build(fillWith(payload(10)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := dir.Open(); got != 3 {
-		t.Fatalf("%d open with a log, its dup and a collected log", got)
+		t.Fatalf("%d open with a log, its dup and a built log", got)
 	}
 	l.Close()
 	l.Close() // an error, and no second decrement
@@ -392,12 +400,12 @@ func TestOpenCountsTheDescriptorsNotYetClosed(t *testing.T) {
 	if got := dir.Open(); got != 0 {
 		t.Fatalf("%d open after every close", got)
 	}
-	// A failed collect closes its log too.
-	boom := errors.New("stream broke")
-	if _, err := dir.Collect(&failing{boom}); !errors.Is(err, boom) {
+	// A failed build closes its log too.
+	boom := errors.New("fill broke")
+	if _, _, err := dir.Build(func(io.Writer) error { return boom }); !errors.Is(err, boom) {
 		t.Fatal(err)
 	}
 	if got := dir.Open(); got != 0 {
-		t.Fatalf("%d open after a failed collect", got)
+		t.Fatalf("%d open after a failed build", got)
 	}
 }

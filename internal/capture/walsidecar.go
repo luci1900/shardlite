@@ -60,10 +60,6 @@ func (s WALSidecars) Remove() error {
 	return nil
 }
 
-// Paths returns the pair, for listing a database's local files among others
-// (a cleanup that also takes the database itself, or a rollback journal).
-func (s WALSidecars) Paths() []string { return []string{s.wal, s.shm} }
-
 // Held reports whether a process other than this one has the database open.
 // It asks with F_GETLK for a write lock on the wal-index's deadman switch
 // byte, which neither takes a lock nor races a connection that is opening.

@@ -271,18 +271,6 @@ func TestRestoreFindsTailAfterOldSegmentsExpire(t *testing.T) {
 	if got := restoreDump(t, e, "expired"); got != want {
 		t.Fatal("restore after the journal's first segments expired lost the tail")
 	}
-	// And a caller that loaded the journal itself can pass it.
-	idx, err := e.Files.LoadJournal(ctx, e.Node, firstTail, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	dst := filepath.Join(t.TempDir(), "explicit.db")
-	if _, err := e.Files.Restore(ctx, shardName(shard), dst, shardfile.RestoreOptions{Journal: idx}); err != nil {
-		t.Fatal(err)
-	}
-	if got := sqlitetest.Dump(t, dst); got != want {
-		t.Fatal("restore from an explicit starting segment differs")
-	}
 	sh.Close(ctx)
 }
 

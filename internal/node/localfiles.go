@@ -48,7 +48,7 @@ func cleanDataDir(data string) error {
 		}
 		// A database's files beside it: the WAL sidecars, and the leftover of
 		// an interrupted restore.
-		for _, suffix := range append(capture.WALSidecarSuffixes(), ".restoring") {
+		for _, suffix := range localSuffixes() {
 			p = strings.TrimSuffix(p, suffix)
 		}
 		bases[p] = true
@@ -66,9 +66,16 @@ func cleanDataDir(data string) error {
 // removeLocal deletes a shard's files: the database, its sidecars and a restore's leftover. A process that
 // has them open keeps its handles on the inodes until it closes them.
 func removeLocal(path string) {
-	for _, p := range append(capture.WALSidecarsOf(path).Paths(), path, path+".restoring") {
-		os.RemoveAll(p)
+	os.RemoveAll(path)
+	for _, suffix := range localSuffixes() {
+		os.RemoveAll(path + suffix)
 	}
+}
+
+// localSuffixes are the names of a database's other local files: the WAL
+// sidecars and a restore's leftover.
+func localSuffixes() []string {
+	return append(capture.WALSidecarSuffixes(), ".restoring")
 }
 
 // pathFor is the opaque name of a new local file of a shard: id.generation.unique.db

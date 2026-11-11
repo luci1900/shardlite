@@ -284,7 +284,7 @@ func TestReactivationFoldsTheWALItLeft(t *testing.T) {
 		t.Fatalf("expected a WAL left behind: %v", err)
 	}
 	// The next activation continues from the position the last one reached.
-	sh2 := e.Activate(res.Handle, &capture.Restored{Position: sh.Position(), Tail: sh.TakeTail()})
+	sh2 := e.Activate(res.Handle, &capture.Restored{Position: sh.Position(), Tail: sh.TakeTail(), Checksums: sh.Checksums()})
 	sh.Discard()
 	if err := sh2.Sync(ctx); err != nil {
 		t.Fatal(err)
@@ -484,5 +484,19 @@ func TestSeedAnyPageSize(t *testing.T) {
 			}
 			sh.Close(ctx)
 		})
+	}
+}
+
+// A restored shard has to bring its checksums: capture does not read the
+// database to find them.
+func TestRestoredWithoutChecksumsIsRefused(t *testing.T) {
+	t.Parallel()
+	e := harness.New(t)
+	res := stored(t, e, 1)
+	res.Capture.Checksums = nil
+	sh, err := capture.New(capture.Config{Name: res.Handle.Name, Path: e.Path(name), Generation: res.Handle.Manifest.Generation, Writer: e.W, Restored: res.Capture, TempDir: e.Files.Temp})
+	if err == nil {
+		sh.Discard()
+		t.Fatal("New accepted a restored shard without checksums")
 	}
 }

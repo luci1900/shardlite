@@ -428,7 +428,7 @@ func (a *actor) snapshot(ctx context.Context) {
 		defer func() { <-d.sems.rebase }()
 	}
 	hooks := shardfile.Hooks{BeforeUpdate: a.reminderAtDelta, At: d.opts.At}
-	if _, err := a.h.MaybeSnapshot(ctx, sh, d.opts.DeltaAge, policy, hooks); err != nil && ctx.Err() == nil {
+	if err := a.h.MaybeSnapshot(ctx, sh, d.opts.DeltaAge, policy, hooks); err != nil && ctx.Err() == nil {
 		d.log.Warn("snapshot failed", "shard", a.Name, "err", err)
 	}
 }

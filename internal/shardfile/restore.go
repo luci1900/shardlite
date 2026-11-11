@@ -88,11 +88,7 @@ func (idx *JournalIndex) tail(ctx context.Context, f *Files, n shard.Name, gener
 		// An entry can be as large as the database, so the tail is read into a log
 		// of its own, which the restored shard goes on to append to.
 		if tail.Logs == nil {
-			dir, err := f.dir()
-			if err != nil {
-				return capture.TailFiles{}, err
-			}
-			log, err := dir.Create()
+			log, err := f.Temp.Create()
 			if err != nil {
 				return capture.TailFiles{}, err
 			}
@@ -114,10 +110,8 @@ var ErrNothingToRestore = errors.New("shardfile: no commits to restore")
 
 // RestoreOptions tune Restore.
 type RestoreOptions struct {
-	Journal      *JournalIndex // the journal to read the tail from, loaded from the manifest's journal if nil
-	BeforeRename func() error  // called with the file complete and synced, for tests
-	TailAge      time.Time     // age given to tail files read from the journal (now if zero)
-	NoJournal    bool          // the caller knows the shard has no tail in any journal (an activation, which has just claimed it), so none is read
+	BeforeRename func() error // called with the file complete and synced (the node's kill point, and tests)
+	NoJournal    bool         // the caller knows the shard has no tail in any journal (an activation, which has just claimed it), so none is read
 }
 
 // Restored is the result of Restore.
@@ -185,21 +179,14 @@ func (f *Files) Restore(ctx context.Context, n shard.Name, dst string, opt Resto
 	}
 
 	// Then the commits that only reached the node journal.
-	journal := opt.Journal
-	if journal == nil && m.Journal != "" && !opt.NoJournal {
+	journal := &JournalIndex{}
+	if m.Journal != "" && !opt.NoJournal {
 		// The journal's lease says where its live range starts: old segments expire.
 		if journal, err = f.LoadLeasedJournal(ctx, m.Journal); err != nil {
 			return fail(err)
 		}
 	}
-	if journal == nil {
-		journal = &JournalIndex{}
-	}
-	at := opt.TailAge
-	if at.IsZero() {
-		at = time.Now()
-	}
-	if tail, err = journal.tail(ctx, f, n, m.Generation, ap.State().Position, at); err != nil {
+	if tail, err = journal.tail(ctx, f, n, m.Generation, ap.State().Position, time.Now()); err != nil {
 		return fail(err)
 	}
 	for _, tf := range tail.Files {

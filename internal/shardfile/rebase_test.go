@@ -76,28 +76,22 @@ func TestOneDeltaPerSnapshotUntilThereAreTooManyFiles(t *testing.T) {
 	defer sh.Close(ctx)
 	policy := shardfile.Policy{MaxFiles: 5}
 
-	snapshot := func(n int, want shardfile.Snapshotted) {
+	snapshot := func(n, wantFiles int) {
 		t.Helper()
 		ack(t, app, sh, n)
-		if got, err := h.MaybeSnapshot(ctx, sh, 0, policy, shardfile.Hooks{}); err != nil || got != want {
-			t.Fatalf("snapshot %d: wrote %v (want %v), err=%v", n, got, want, err)
+		if err := h.MaybeSnapshot(ctx, sh, 0, policy, shardfile.Hooks{}); err != nil {
+			t.Fatalf("snapshot %d: %v", n, err)
+		}
+		if got := len(h.Manifest.Files); got != wantFiles {
+			t.Fatalf("snapshot %d: %d files, want %d: %v", n, got, wantFiles, h.Manifest.Files)
 		}
 	}
 	for i := 1; i <= 6; i++ {
-		snapshot(i, shardfile.WroteDelta) // (six files: the rebase is for the one after the limit)
+		snapshot(i, i) // a delta each (six files: the rebase is for the one after the limit)
 	}
-	if got := len(h.Manifest.Files); got != 6 {
-		t.Fatalf("%d files after six snapshots, want 6: %v", got, h.Manifest.Files)
-	}
-	snapshot(7, shardfile.WroteRebase)
-	if got := h.Manifest.Files; len(got) != 1 {
-		t.Fatalf("files %v after the rebase, want one", got)
-	}
-	snapshot(8, shardfile.WroteDelta)
-	snapshot(9, shardfile.WroteDelta)
-	if got := len(h.Manifest.Files); got != 3 {
-		t.Fatalf("%d files, want the base and two deltas: %v", got, h.Manifest.Files)
-	}
+	snapshot(7, 1) // the rebase
+	snapshot(8, 2)
+	snapshot(9, 3) // the base and two deltas
 	if got := acksOf(t, restoreTo(t, e, "r")); !slices.Equal(got, upTo(9)) {
 		t.Fatalf("restored acks %v", got)
 	}
@@ -121,11 +115,17 @@ func TestMaybeSnapshotBySize(t *testing.T) {
 	if size == 0 {
 		t.Fatal("the tail has no bytes")
 	}
-	if got, err := h.MaybeSnapshot(ctx, sh, time.Hour, shardfile.Policy{MaxBytes: size + 1}, shardfile.Hooks{}); err != nil || got != shardfile.Nothing {
-		t.Fatalf("a tail under the size and the age: wrote %v, err=%v", got, err)
+	if err := h.MaybeSnapshot(ctx, sh, time.Hour, shardfile.Policy{MaxBytes: size + 1}, shardfile.Hooks{}); err != nil {
+		t.Fatal(err)
 	}
-	if got, err := h.MaybeSnapshot(ctx, sh, time.Hour, shardfile.Policy{MaxBytes: size}, shardfile.Hooks{}); err != nil || got != shardfile.WroteDelta {
-		t.Fatalf("a tail at the size: wrote %v, err=%v", got, err)
+	if got := len(h.Manifest.Files); got != 0 || sh.TailBytes() != size {
+		t.Fatalf("a tail under the size and the age: %d files, %d tail bytes, want none and %d", got, sh.TailBytes(), size)
+	}
+	if err := h.MaybeSnapshot(ctx, sh, time.Hour, shardfile.Policy{MaxBytes: size}, shardfile.Hooks{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(h.Manifest.Files); got != 1 {
+		t.Fatalf("a tail at the size: %d files, want its delta", got)
 	}
 	if sh.TailBytes() != 0 {
 		t.Fatalf("the tail still holds %d bytes after its delta", sh.TailBytes())
@@ -146,15 +146,12 @@ func TestRebaseWhenThereAreManyFiles(t *testing.T) {
 	var rebases []int
 	for i := 1; i <= 20; i++ {
 		ack(t, app, sh, i)
-		got, err := h.MaybeSnapshot(ctx, sh, 0, policy, shardfile.Hooks{})
-		if err != nil {
+		before := len(h.Manifest.Files)
+		if err := h.MaybeSnapshot(ctx, sh, 0, policy, shardfile.Hooks{}); err != nil {
 			t.Fatal(err)
 		}
-		if got == shardfile.WroteRebase {
+		if before > 1 && len(h.Manifest.Files) == 1 {
 			rebases = append(rebases, i)
-			if len(h.Manifest.Files) != 1 {
-				t.Fatalf("round %d: files %v after a rebase", i, h.Manifest.Files)
-			}
 		}
 		if len(h.Manifest.Files) > 9 {
 			t.Fatalf("round %d: %d files", i, len(h.Manifest.Files))
@@ -185,15 +182,19 @@ func TestRebaseWithoutATail(t *testing.T) {
 		}
 	}
 	policy := shardfile.Policy{MaxFiles: 3}
-	if got, err := h.MaybeSnapshot(ctx, sh, time.Hour, policy, shardfile.Hooks{}); err != nil || got != shardfile.WroteRebase {
-		t.Fatalf("wrote %v, err=%v", got, err)
+	if err := h.MaybeSnapshot(ctx, sh, time.Hour, policy, shardfile.Hooks{}); err != nil {
+		t.Fatal(err)
 	}
 	if len(h.Manifest.Files) != 1 {
 		t.Fatalf("files %v", h.Manifest.Files)
 	}
 	// And a shard of one file has nothing to rebase.
-	if got, err := h.MaybeSnapshot(ctx, sh, time.Hour, policy, shardfile.Hooks{}); err != nil || got != shardfile.Nothing {
-		t.Fatalf("wrote %v, err=%v", got, err)
+	base := h.Manifest.Files[0]
+	if err := h.MaybeSnapshot(ctx, sh, time.Hour, policy, shardfile.Hooks{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.Manifest.Files; len(got) != 1 || got[0] != base {
+		t.Fatalf("files %v, want %v unchanged", got, base)
 	}
 }
 

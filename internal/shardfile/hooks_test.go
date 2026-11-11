@@ -19,7 +19,7 @@ func storedFiles(t *testing.T, e *harness.Env) []shardfile.File {
 	return m.Files
 }
 
-// BeforeUpdate runs once the file is written and before the manifest changes,
+// BeforeUpdate runs before the file is written and before the manifest changes,
 // with the position the files reach, for a delta, MaybeSnapshot's delta and
 // rebase, and a rebase.
 func TestBeforeUpdateRunsBeforeTheManifestUpdate(t *testing.T) {
@@ -50,12 +50,18 @@ func TestBeforeUpdateRunsBeforeTheManifestUpdate(t *testing.T) {
 		t.Fatalf("the hook was given %d, the manifest reaches %d and the shard is at %d", end, last, sh.Position())
 	}
 	ack(t, app, sh, 2)
-	if got, err := h.MaybeSnapshot(ctx, sh, 0, shardfile.Policy{}, hooks(1)); got != shardfile.WroteDelta || err != nil {
-		t.Fatalf("snapshot: %v %v", got, err)
+	if err := h.MaybeSnapshot(ctx, sh, 0, shardfile.Policy{}, hooks(1)); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if got := len(h.Manifest.Files); got != 2 {
+		t.Fatalf("%d files after the snapshot's delta, want 2", got)
 	}
 	ack(t, app, sh, 3)
-	if got, err := h.MaybeSnapshot(ctx, sh, 0, shardfile.Policy{MaxFiles: 1}, hooks(2)); got != shardfile.WroteRebase || err != nil {
-		t.Fatalf("snapshot: %v %v", got, err)
+	if err := h.MaybeSnapshot(ctx, sh, 0, shardfile.Policy{MaxFiles: 1}, hooks(2)); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if got := len(h.Manifest.Files); got != 1 {
+		t.Fatalf("%d files after the snapshot's rebase, want 1", got)
 	}
 	ack(t, app, sh, 4)
 	if did, err := h.Rebase(ctx, sh, hooks(1)); !did || err != nil {

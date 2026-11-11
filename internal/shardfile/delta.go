@@ -336,7 +336,7 @@ func (h *Handle) putTail(ctx context.Context, tail []capture.TailFile, hooks Hoo
 			return fmt.Errorf("tail of %s has a gap before position %d", h.Name, tail[i].Position)
 		}
 	}
-	log, delta, err := h.F.build(func(w io.Writer) error { return reencode(w, tail, r) })
+	log, delta, err := h.F.Temp.Build(func(w io.Writer) error { return reencode(w, tail, r) })
 	if err != nil {
 		return fmt.Errorf("delta for %s: %w", h.Name, err)
 	}
@@ -372,68 +372,29 @@ func (h *Handle) putTail(ctx context.Context, tail []capture.TailFile, hooks Hoo
 	return nil
 }
 
-// Snapshotted says what MaybeSnapshot wrote. The zero value is Nothing, which
-// is the safe answer: nothing was written and nothing needs waiting for
-// (docs/internals.md, Failing loudly, the zero-value policy).
-type Snapshotted int
-
-const (
-	Nothing Snapshotted = iota
-	WroteDelta
-	WroteRebase
-)
-
-// String names what was written, for the logs and the errors.
-func (s Snapshotted) String() string {
-	switch s {
-	case Nothing:
-		return "nothing"
-	case WroteDelta:
-		return "delta"
-	case WroteRebase:
-		return "rebase"
-	}
-	return "unknown"
-}
-
-// Valid reports whether s is one of the outcomes. The zero is one of them.
-func (s Snapshotted) Valid() bool {
-	switch s {
-	case Nothing, WroteDelta, WroteRebase:
-		return true
-	}
-	return false
-}
-
 // MaybeSnapshot is the snapshot of an active shard (docs/internals.md, Node journals
 // and snapshots): a delta when the oldest tail file is older than maxAge or the
 // tail holds at least p.MaxBytes, whichever comes first, or a rebase instead if
 // one is due (RebaseDue). A shard that is due for a rebase and has no tail is
 // rebased too if that leaves it with fewer files; one that is not due and has
 // a small, young tail is left alone.
-func (h *Handle) MaybeSnapshot(ctx context.Context, sh *capture.Shard, maxAge time.Duration, p Policy, hooks Hooks) (Snapshotted, error) {
+func (h *Handle) MaybeSnapshot(ctx context.Context, sh *capture.Shard, maxAge time.Duration, p Policy, hooks Hooks) error {
 	tailN, oldest := sh.TailInfo()
 	due := h.RebaseDue(p)
 	switch {
 	case tailN == 0:
 		if due && len(h.Manifest.Files) > 1 {
-			return h.rebase(ctx, sh, hooks)
+			_, err := h.Rebase(ctx, sh, hooks)
+			return err
 		}
 	case time.Since(oldest) >= maxAge || sh.TailBytes() >= p.withDefaults().MaxBytes:
 		if due {
-			return h.rebase(ctx, sh, hooks)
+			_, err := h.Rebase(ctx, sh, hooks)
+			return err
 		}
-		return WroteDelta, h.WriteDelta(ctx, sh, hooks)
+		return h.WriteDelta(ctx, sh, hooks)
 	}
-	return Nothing, nil
-}
-
-func (h *Handle) rebase(ctx context.Context, sh *capture.Shard, hooks Hooks) (Snapshotted, error) {
-	did, err := h.Rebase(ctx, sh, hooks)
-	if did {
-		return WroteRebase, err
-	}
-	return Nothing, err
+	return nil
 }
 
 // Rebase replaces the manifest's files with one base: a full snapshot of the
@@ -453,7 +414,7 @@ func (h *Handle) Rebase(ctx context.Context, sh *capture.Shard, hooks Hooks) (bo
 	}
 	// The snapshot goes to a file of its own: it is the whole database.
 	var position pos.Position
-	log, snap, err := h.F.build(func(w io.Writer) (err error) {
+	log, snap, err := h.F.Temp.Build(func(w io.Writer) (err error) {
 		position, err = h.snapshotTo(ctx, sh, w)
 		return err
 	})
@@ -589,9 +550,9 @@ func (h *Handle) getFile(ctx context.Context, f File) (*tempfile.Log, error) {
 		return nil, err
 	}
 	defer rc.Close()
-	dir, err := h.F.dir()
-	if err != nil {
-		return nil, err
-	}
-	return dir.Collect(rc)
+	log, _, err := h.F.Temp.Build(func(w io.Writer) error {
+		_, err := io.Copy(w, rc)
+		return err
+	})
+	return log, err
 }

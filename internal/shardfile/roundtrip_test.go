@@ -67,6 +67,7 @@ type shardSim struct {
 	sh     *capture.Shard
 	h      *shardfile.Handle
 	active bool
+	cks    *capture.Checksums // the checksums of the last activation's database, which a reactivation of the same file continues from
 
 	synced string // dump as of the last completed sync (or deactivation)
 	// The app's tables and indexes as of that sync: a crash forgets later ones.
@@ -115,7 +116,7 @@ func (s *shardSim) activate(res *shardfile.Restored) {
 	if res != nil {
 		s.h, s.sh = res.Handle, s.e.Activate(res.Handle, res.Capture)
 	} else {
-		s.sh = s.e.Activate(s.h, &capture.Restored{Position: s.h.Manifest.LastPosition()})
+		s.sh = s.e.Activate(s.h, &capture.Restored{Position: s.h.Manifest.LastPosition(), Checksums: s.cks})
 	}
 	if err := s.sh.Sync(s.ctx); err != nil {
 		s.rt.Fatalf("sync of the reactivated shard: %v", err)
@@ -156,6 +157,7 @@ func (s *shardSim) deactivate() {
 		s.rt.Fatalf("delta on deactivation: %v", err)
 	}
 	s.markSynced(want)
+	s.cks = s.sh.Checksums()
 	s.active, s.sh, s.app = false, nil, nil
 }
 
@@ -405,7 +407,7 @@ func TestShardRoundTripsProperty(t *testing.T) {
 		c := &caseTB{TB: t, rt: rt, dir: dir}
 		defer c.finish()
 		e := harness.New(c)
-		s := &shardSim{rt: rt, e: e, ctx: context.Background(), tables: map[string]bool{}, indexes: map[string]string{}}
+		s := &shardSim{cks: capture.NewChecksums(), rt: rt, e: e, ctx: context.Background(), tables: map[string]bool{}, indexes: map[string]string{}}
 		s.startApp()
 		s.h, s.sh = e.NewShard(shard)
 		s.active = true

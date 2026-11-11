@@ -47,8 +47,8 @@ type Restored struct {
 	Tail TailFiles
 	// Checksums is the CRC of each page of the restored database, which the
 	// restore computed as it applied the files. Capture continues from it, so
-	// the activation reads no pages. It is nil for a shard whose checksums are
-	// not known, and capture reads them from the file then.
+	// the activation reads no pages. It is required, and New keeps it, so the
+	// caller must not use it again.
 	Checksums *Checksums
 }
 
@@ -182,6 +182,9 @@ func New(cfg Config) (sh *Shard, err error) {
 	if cfg.TempDir == nil {
 		return nil, fmt.Errorf("capture: temporary directory required")
 	}
+	if cfg.Restored != nil && cfg.Restored.Checksums == nil {
+		return nil, fmt.Errorf("capture: the restored shard's checksums are required")
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.DiscardHandler)
 	}
@@ -211,21 +214,12 @@ func New(cfg Config) (sh *Shard, err error) {
 		return nil, err
 	}
 	// The checksums of the database: the ones the restore computed for a
-	// restored shard, and the ones read from the file for a shard whose are not
-	// known.
-	switch {
-	case cfg.Restored == nil:
-		s.cks = NewChecksums() // a new shard: an empty database
-	case cfg.Restored.Checksums != nil:
-		// A copy: the capture's own goes on with the next sync, and the
-		// caller's is the restore's.
-		s.cks = cfg.Restored.Checksums.Clone()
-	default:
-		if s.cks, err = readChecksums(cfg.Path, s.pageSize, s.dbPages); err != nil {
-			s.closeConns()
-			s.unmap()
-			return nil, err
-		}
+	// restored shard (the caller's own copy, which the restore or the old
+	// capture gave up), and an empty database's for a new one.
+	if cfg.Restored == nil {
+		s.cks = NewChecksums()
+	} else {
+		s.cks = cfg.Restored.Checksums
 	}
 	// The WAL is empty: the transaction gets mark 0, and nothing the app writes
 	// from here on is copied or wiped before a sync reads it.

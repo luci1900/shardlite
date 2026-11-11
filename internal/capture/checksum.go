@@ -1,7 +1,6 @@
 package capture
 
 import (
-	"fmt"
 	"hash"
 
 	"github.com/superfly/ltx"
@@ -75,25 +74,6 @@ func (c *Checksums) Clone() *Checksums {
 	out := &Checksums{sum: c.sum, pages: make([]ltx.Checksum, len(c.pages))}
 	copy(out.pages, c.pages)
 	return out
-}
-
-// readChecksums reads the CRCs of the pages of the database at path, which
-// holds nPages of them. It is the fallback for a shard whose checksums are
-// not known: it reads the whole file, once.
-func readChecksums(path string, pageSize PageSize, nPages Pages) (*Checksums, error) {
-	c := &Checksums{}
-	if nPages == 0 {
-		return c, nil
-	}
-	pages := make([]ltx.Checksum, nPages)
-	if _, err := ltx.ChecksumPages(path, uint32(pageSize), uint32(nPages), 0, pages); err != nil {
-		return nil, fmt.Errorf("capture: read the checksums of %s: %w", path, err)
-	}
-	c.pages = pages
-	for _, p := range c.pages {
-		c.sum ^= p & checksumMask
-	}
-	return c, nil
 }
 
 // pending is the CRCs of the pages a file writes, held until the file is

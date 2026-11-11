@@ -124,12 +124,18 @@ func TestMaybeSnapshotByAge(t *testing.T) {
 	app := e.StartApp(shard)
 	h, sh := e.NewShard(shard)
 	write(t, e, app, func() error { return sh.Sync(ctx) }, 0)
-	if got, err := h.MaybeSnapshot(ctx, sh, time.Hour, shardfile.Policy{}, shardfile.Hooks{}); got != shardfile.Nothing || err != nil {
-		t.Fatalf("wrote a delta too early: %v %v", got, err)
+	if err := h.MaybeSnapshot(ctx, sh, time.Hour, shardfile.Policy{}, shardfile.Hooks{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(h.Manifest.Files); got != 0 {
+		t.Fatalf("wrote a delta too early: %d files", got)
 	}
 	// The tail is older than a nanosecond by now.
-	if got, err := h.MaybeSnapshot(ctx, sh, time.Nanosecond, shardfile.Policy{}, shardfile.Hooks{}); got != shardfile.WroteDelta || err != nil {
-		t.Fatalf("no delta: %v %v", got, err)
+	if err := h.MaybeSnapshot(ctx, sh, time.Nanosecond, shardfile.Policy{}, shardfile.Hooks{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(h.Manifest.Files); got != 1 {
+		t.Fatalf("no delta: %d files", got)
 	}
 	sh.Close(ctx)
 }

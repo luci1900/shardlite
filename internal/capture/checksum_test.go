@@ -148,6 +148,7 @@ func TestRestoredShardContinuesFromTheRestoresChecksum(t *testing.T) {
 	e := harness.New(t)
 	ctx := context.Background()
 	res := stored(t, e, 2)
+	restored := res.Capture.Checksums.Checksum() // New takes the checksums over
 	sh := e.Activate(res.Handle, res.Capture)
 	defer sh.Close(ctx)
 	app := e.StartApp(name)
@@ -163,7 +164,7 @@ func TestRestoredShardContinuesFromTheRestoresChecksum(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := preApplyChecksum(t, b), res.Capture.Checksums.Checksum(); got != want {
+	if got, want := preApplyChecksum(t, b), restored; got != want {
 		t.Fatalf("the file after the restore has %s before it, the restore's is %s", got, want)
 	}
 }

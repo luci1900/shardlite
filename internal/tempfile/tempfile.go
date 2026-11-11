@@ -308,25 +308,28 @@ func (a *Appender) end() {
 	a.buf = nil
 }
 
-// Collect reads r to the end into a log of its own, which the caller closes.
-func (d *Dir) Collect(r io.Reader) (*Log, error) {
+// Build writes a file with fill into a log of its own and returns the log and
+// the file's range in it. The caller closes the log. A failed fill leaves
+// nothing behind.
+func (d *Dir) Build(fill func(io.Writer) error) (*Log, File, error) {
 	l, err := d.Create()
 	if err != nil {
-		return nil, err
+		return nil, File{}, err
 	}
 	a, err := l.Append()
 	if err != nil {
 		l.Close()
-		return nil, err
+		return nil, File{}, err
 	}
-	if _, err := io.Copy(a, r); err != nil {
+	if err := fill(a); err != nil {
 		a.Abort()
 		l.Close()
-		return nil, err
+		return nil, File{}, err
 	}
-	if _, err := a.Finish(); err != nil {
+	f, err := a.Finish()
+	if err != nil {
 		l.Close()
-		return nil, err
+		return nil, File{}, err
 	}
-	return l, nil
+	return l, f, nil
 }
