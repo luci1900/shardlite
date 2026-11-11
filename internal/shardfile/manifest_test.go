@@ -259,3 +259,21 @@ func TestManifestKeyPutsTheLaneFirst(t *testing.T) {
 		}
 	}
 }
+
+// The write ids of a journal store name the node that writes, not the node whose
+// journal it is. An adopter's fence in a dead node's journal must never read
+// back as that node's own segment, which a zombie of it at the same epoch could
+// have written under the same number with the same counter.
+func TestJournalWriteIDsNameTheWriter(t *testing.T) {
+	t.Parallel()
+	e := harness.New(t)
+	adopter := &shardfile.Files{Blob: blob.NewStore(e.Blob, "n2", e.Store.Epoch(), blob.Options{}), Backend: e.Blob, Node: "n2", Temp: e.Files.Temp}
+	zombie := e.Files.Journal(e.Node)
+	theirs, ours := zombie.NewWriteID(), adopter.Journal(e.Node).NewWriteID()
+	if ours.Node != "n2" || ours.Epoch != e.Store.Epoch() {
+		t.Fatalf("the adopter writes into %s's journal with write id %+v, want one naming n2 at epoch %d", e.Node, ours, e.Store.Epoch())
+	}
+	if ours == theirs {
+		t.Fatalf("the adopter's first write id %+v is the zombie's", ours)
+	}
+}

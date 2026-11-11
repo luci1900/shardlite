@@ -234,9 +234,12 @@ func (f *Files) manifests() ManifestStore { return ManifestStore{f.Blob} }
 // recognised as its own. The journal is the one named by node: this Files' own
 // (f.Node), or a dead one's being adopted or read for a restore.
 //
-// A store is remembered per journal, so every write this node does through
-// these shares one counter: a write id is the node, the epoch and that
-// counter, and a repeated one would name two attempts as one.
+// The write ids name this node, the writer, whichever journal it writes: an
+// adopter's fence must never read as the dead node's own segment, which a
+// zombie of that node at the same epoch could have written under the same
+// number. A store is remembered per journal, so the ids this node puts in one
+// journal come from one counter and never repeat: a repeated one would name
+// two attempts as one.
 func (f *Files) Journal(node cluster.Node) *journal.Store {
 	f.journalsMu.Lock()
 	defer f.journalsMu.Unlock()
@@ -246,7 +249,7 @@ func (f *Files) Journal(node cluster.Node) *journal.Store {
 	if s := f.journals[node]; s != nil {
 		return s
 	}
-	s := journal.NewStore(journal.NewBlob(f.Backend, node), node, f.Blob.Epoch(), f.JournalOptions)
+	s := journal.NewStore(journal.NewBlob(f.Backend, node), f.Node, f.Blob.Epoch(), f.JournalOptions)
 	f.journals[node] = s
 	return s
 }
