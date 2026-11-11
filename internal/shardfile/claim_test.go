@@ -28,7 +28,7 @@ func otherNode(t *testing.T, e *harness.Env, name cluster.Node, o lease.Registry
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &node{reg, l, &shardfile.Files{Blob: blob.NewStore(e.Blob, name, l.Epoch, blob.Options{}), Backend: e.Blob, Node: name, Leases: reg, Temp: tempfile.NewDir(t.TempDir())}}
+	return &node{reg, l, &shardfile.Files{Blob: blob.NewStore(e.Blob, name, l.Epoch, blob.Options{}), Node: name, Leases: reg, Temp: tempfile.NewDir(t.TempDir())}}
 }
 
 func (n *node) create(t *testing.T, shard string) {

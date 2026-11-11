@@ -80,7 +80,7 @@ func TestClaim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	n2files := &shardfile.Files{Blob: blob.NewStore(e.Blob, "n2", l2.Epoch, blob.Options{}), Backend: e.Blob, Node: "n2", Leases: other, Temp: tempfile.NewDir(t.TempDir())}
+	n2files := &shardfile.Files{Blob: blob.NewStore(e.Blob, "n2", l2.Epoch, blob.Options{}), Node: "n2", Leases: other, Temp: tempfile.NewDir(t.TempDir())}
 	h2, _, err := n2files.Open(ctx, shardName("users/2"))
 	if err != nil {
 		t.Fatal(err)
@@ -114,7 +114,7 @@ func TestCreatorsRacing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	n2 := &shardfile.Files{Blob: blob.NewStore(e.Blob, "n2", l2.Epoch, blob.Options{}), Backend: e.Blob, Node: "n2", Leases: other, Temp: tempfile.NewDir(t.TempDir())}
+	n2 := &shardfile.Files{Blob: blob.NewStore(e.Blob, "n2", l2.Epoch, blob.Options{}), Node: "n2", Leases: other, Temp: tempfile.NewDir(t.TempDir())}
 
 	for round := range 20 {
 		shard := fmt.Sprintf("users/race%d", round)
@@ -267,7 +267,7 @@ func TestManifestKeyPutsTheLaneFirst(t *testing.T) {
 func TestJournalWriteIDsNameTheWriter(t *testing.T) {
 	t.Parallel()
 	e := harness.New(t)
-	adopter := &shardfile.Files{Blob: blob.NewStore(e.Blob, "n2", e.Store.Epoch(), blob.Options{}), Backend: e.Blob, Node: "n2", Temp: e.Files.Temp}
+	adopter := &shardfile.Files{Blob: blob.NewStore(e.Blob, "n2", e.Store.Epoch(), blob.Options{}), Node: "n2", Temp: e.Files.Temp}
 	zombie := e.Files.Journal(e.Node)
 	theirs, ours := zombie.NewWriteID(), adopter.Journal(e.Node).NewWriteID()
 	if ours.Node != "n2" || ours.Epoch != e.Store.Epoch() {

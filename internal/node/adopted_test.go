@@ -36,8 +36,8 @@ func TestRestartAfterAnotherNodeAdoptedIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	files2 := &shardfile.Files{Blob: blob.NewStore(r.local, "n2", l2.Epoch, blob.Options{Backoff: time.Millisecond}), Backend: r.local, Node: "n2",
-		JournalOptions: journal.Options{Backoff: time.Millisecond}, Leases: reg2, Temp: tempfile.NewDir(t.TempDir())}
+	files2 := &shardfile.Files{Blob: blob.NewStore(r.local, "n2", l2.Epoch, blob.Options{Backoff: time.Millisecond}), Node: "n2",
+		Leases: reg2, Temp: tempfile.NewDir(t.TempDir())}
 	marked, err := reg2.Adopt(ctx, dead, l2.Incarnation())
 	if err != nil {
 		t.Fatal(err)

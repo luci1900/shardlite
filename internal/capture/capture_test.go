@@ -60,7 +60,7 @@ func shardName(s string) shardpkg.Name { return shardpkg.MustParse(s) }
 type env struct {
 	dir     string
 	meta    string
-	journal *journal.Store
+	journal journal.Store
 	w       *journal.Writer
 }
 
@@ -69,7 +69,7 @@ type env struct {
 func newEnv(t *testing.T) *env {
 	t.Helper()
 	local := blobtest.WithHook(blob.NewMemory())
-	js := journal.NewStore(journal.NewBlob(local, "n1"), "n1", 1, journal.Options{Backoff: time.Millisecond})
+	js := journal.NewBlob(blob.NewStore(local, "n1", 1, blob.Options{Backoff: time.Millisecond}), "n1")
 	w := journal.NewWriter(js, journal.WriterOptions{})
 	serveWriter(t, w)
 	return &env{dir: t.TempDir(), meta: t.TempDir(), journal: js, w: w}
@@ -321,7 +321,7 @@ func TestSyncOutlivesItsCaller(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	local := blobtest.WithHook(blob.NewMemory())
-	e.journal = journal.NewStore(journal.NewBlob(local, "n1"), "n1", 1, journal.Options{Backoff: time.Millisecond})
+	e.journal = journal.NewBlob(blob.NewStore(local, "n1", 1, blob.Options{Backoff: time.Millisecond}), "n1")
 	e.w = journal.NewWriter(e.journal, journal.WriterOptions{Retry: time.Millisecond})
 	serveWriter(t, e.w)
 

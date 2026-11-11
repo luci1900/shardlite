@@ -201,7 +201,7 @@ func NewShardset(n *Node, opts ShardsetOptions, newRouting func(*Shardset) routi
 	m.rem = newReminders(opts.Reminders, clk, log, st, rt.wake)
 	m.flush = newFlusher(m.tab, n.Writer, n.Keeper, n.Confirmer, log, opts.Flush)
 	self := func() lease.Incarnation { l := n.Keeper.Lease(); return l.Incarnation() }
-	ad := &adopter{reg: n.Registry, files: n.Files, store: n.Store, self: self, nodeErr: n.Err, clock: clk, log: log, adopted: &st.Adoptions}
+	ad := &adopter{reg: n.Registry, files: n.Files, self: self, nodeErr: n.Err, clock: clk, log: log, adopted: &st.Adoptions}
 	m.leases = &peers.Scan{
 		Registry: n.Registry, Self: self, Clock: clk, Options: opts.Leases, Log: log,
 		Scans: &st.LeaseScans, Adopt: ad.adopt, Died: m.died,

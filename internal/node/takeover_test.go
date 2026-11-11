@@ -67,7 +67,7 @@ func (c *cnode) scanning(t *testing.T) *cnode {
 	self := func() lease.Incarnation { l := c.Keeper.Lease(); return l.Incarnation() }
 	log := slog.New(slog.DiscardHandler)
 	c.adopt = &adopter{
-		reg: c.Registry, files: c.Files, store: c.Store, self: self, nodeErr: c.Err,
+		reg: c.Registry, files: c.Files, self: self, nodeErr: c.Err,
 		clock: realClock{}, log: log, adopted: &notify.Counter{},
 	}
 	c.scan = &peers.Scan{

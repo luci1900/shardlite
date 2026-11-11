@@ -29,7 +29,7 @@ type journalRef struct {
 // JournalIndex lists which segment entries belong to which shard. It carries
 // the store of the journal it read, so its tail is read from the same place.
 type JournalIndex struct {
-	store   *journal.Store
+	store   journal.Store
 	byShard map[shard.Name][]journalRef
 }
 

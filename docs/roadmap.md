@@ -24,7 +24,7 @@ What is left to make v1, in order, riskiest parts first. The one node and the cl
 - Refusing commits through a connection an app kept open past a stop's let-go, which are lost today, by holding SQLite's WAL write lock on the deleted file until the app closes it. Blocked on making a lost POSIX lock visible.
 - Encryption and authentication of [traffic between nodes](#securing-traffic-between-nodes).
 - Checking tokens at the node, which closes the gap the [overview](overview.md#goal) names. It rewords "the node never inspects credentials" in the [guide](guide.md#routing-requests-to-shards), so it is a design decision of its own.
-- A journal store of its own, a tier that waits for a fast store instead of blob storage, behind `internal/journal` and its conformance suite. Candidates: Postgres with synchronous replication, S3 Express One Zone.
+- A journal store of its own, a tier that waits for a fast store instead of blob storage, behind the `journal.Store` interface (`internal/journal`) and its conformance suite. Candidates: Postgres with synchronous replication, S3 Express One Zone.
 - Blob backends for GCS and Azure Blob behind `blob.Backend`, passing the conformance suite and the startup check. Until then, GCP or Azure runs its own RustFS (see [deployment](deployment.md#stores)).
 
 ## Later designs

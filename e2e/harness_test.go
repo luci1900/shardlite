@@ -25,7 +25,6 @@ import (
 	"github.com/luci1900/shardlite/e2e/e2eapp"
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/journal"
 	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/s3test"
 	shardpkg "github.com/luci1900/shardlite/internal/shard"
@@ -297,9 +296,8 @@ type verifier struct {
 func newVerifier(t testing.TB, s *stack) *verifier {
 	l := s.store.Backend(t)
 	return &verifier{t, &shardfile.Files{
-		Blob: blob.NewStore(l, "verifier", 1, blob.Options{}), Backend: l, Node: "verifier",
-		JournalOptions: journal.Options(blob.Options{}),
-		Leases:         lease.NewRegistry(l, "verifier", lease.RegistryOptions{}), Temp: tempfile.NewDir(t.TempDir()),
+		Blob: blob.NewStore(l, "verifier", 1, blob.Options{}), Node: "verifier",
+		Leases: lease.NewRegistry(l, "verifier", lease.RegistryOptions{}), Temp: tempfile.NewDir(t.TempDir()),
 	}}
 }
 

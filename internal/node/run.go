@@ -268,7 +268,7 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 	if srv.declarations != nil {
 		front.Add(srv.declarations)
 	}
-	front.Add(&expiry{store: n.Store, node: n.Name, age: expireAge, log: log})
+	front.Add(&expiry{journal: n.Journal, age: expireAge, log: log})
 	if pprof != nil {
 		front.Add(&httpServer{name: "pprof", log: log, lns: []net.Listener{pprof}, handler: http.DefaultServeMux, grace: ro.grace})
 	}

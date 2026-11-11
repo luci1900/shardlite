@@ -73,7 +73,7 @@ A confirmation that finds the lease taken fails the keeper with `ErrLost`, so th
 
 ### Lost responses
 
-Any write can succeed while its response is lost. `blob.Store` stores a write id with each object and, when a retry meets "exists" or "conflict", reads it back to recognise its own attempt, and `journal.Store` gives the journals the same, so a caller sees success, a conflict, or an unknown outcome. The journal writer retries the same segment until the outcome is known, and a manifest handle compares the stored manifest with the one it tried. The node never retries a request the app may have seen.
+Any write can succeed while its response is lost. `blob.Store` stores a write id with each object and, when a retry meets "exists" or "conflict", reads it back to recognise its own attempt, and the journals use that same `blob.Store` (`journal.Blob` delegates to it), so a caller sees success, a conflict, or an unknown outcome. The journal writer retries the same segment until the outcome is known, and a manifest handle compares the stored manifest with the one it tried. The node never retries a request the app may have seen.
 
 ### Takeover
 

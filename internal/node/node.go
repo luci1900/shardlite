@@ -54,7 +54,7 @@ type Node struct {
 	Confirmer *lease.Confirmer
 	Store     *blob.Store
 	Files     *shardfile.Files
-	Journal   *journal.Store
+	Journal   journal.Store
 	Writer    *journal.Writer
 	// Adopted is what adopting the previous process's journal did (zero if the node
 	// had no previous lease).
@@ -104,8 +104,8 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		Config:   cfg,
 		Registry: reg,
 		Store:    store,
-		Files: &shardfile.Files{Blob: store, Backend: cfg.Backend, Node: cfg.Name, Leases: reg,
-			JournalOptions: journal.Options(cfg.Blob), Temp: tempfile.NewDir(cfg.TempDir), Log: cfg.Logger},
+		Files: &shardfile.Files{Blob: store, Node: cfg.Name, Leases: reg,
+			Temp: tempfile.NewDir(cfg.TempDir), Log: cfg.Logger},
 	}
 	if cfg.Faults.Temp != nil {
 		n.Files.Temp.SetHook(cfg.Faults.Temp)

@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
@@ -192,16 +191,9 @@ func (b ManifestStore) Delete(ctx context.Context, n shard.Name, expected Versio
 // Lost responses are handled by blob.Store, which tags every write with a
 // write id and recognises its own earlier attempts.
 type Files struct {
-	Blob *blob.Store
-	// Backend is the blob backend Blob reads and writes through, given to the
-	// per-node journal stores (Journal) instead of Blob, which is one journal's
-	// caller at a time.
-	Backend blob.Backend
-	Node    cluster.Node // the node whose journal new shards write to
-	Leases  *lease.Registry
-	// JournalOptions tune the retries of the journals' stores (Journal). Zero
-	// is the journal store's own defaults.
-	JournalOptions journal.Options
+	Blob   *blob.Store
+	Node   cluster.Node // the node whose journal new shards write to
+	Leases *lease.Registry
 	// Temp is where files are built and downloaded (deltas, snapshots, the
 	// files of a restore, the commits of a restored tail). It is in the data
 	// directory, and required.
@@ -215,9 +207,6 @@ type Files struct {
 	// delete (see garbage.go): the node's Stats.LeakedFiles, nil where nobody
 	// counts.
 	Leaked *notify.Counter
-
-	journals   map[cluster.Node]*journal.Store // one store per journal this node has touched
-	journalsMu sync.Mutex
 }
 
 func (f *Files) now() time.Time {
@@ -229,30 +218,17 @@ func (f *Files) now() time.Time {
 
 func (f *Files) manifests() ManifestStore { return ManifestStore{f.Blob} }
 
-// Journal returns the store of one node's journal: the segment numbers in blob storage behind
-// journal.Store, with this writer's write ids, so a lost response is
-// recognised as its own. The journal is the one named by node: this Files' own
-// (f.Node), or a dead one's being adopted or read for a restore.
+// Journal returns one node's journal, in blob storage through Blob, so its
+// retries and write ids are Blob's and a lost response is recognised as this
+// node's own. The journal is the one named by node: this Files' own (f.Node),
+// or a dead one's being adopted or read for a restore.
 //
 // The write ids name this node, the writer, whichever journal it writes: an
 // adopter's fence must never read as the dead node's own segment, which a
 // zombie of that node at the same epoch could have written under the same
-// number. A store is remembered per journal, so the ids this node puts in one
-// journal come from one counter and never repeat: a repeated one would name
-// two attempts as one.
-func (f *Files) Journal(node cluster.Node) *journal.Store {
-	f.journalsMu.Lock()
-	defer f.journalsMu.Unlock()
-	if f.journals == nil {
-		f.journals = map[cluster.Node]*journal.Store{}
-	}
-	if s := f.journals[node]; s != nil {
-		return s
-	}
-	s := journal.NewStore(journal.NewBlob(f.Backend, node), f.Node, f.Blob.Epoch(), f.JournalOptions)
-	f.journals[node] = s
-	return s
-}
+// number. Every journal shares Blob's one counter, so the ids never repeat: a
+// repeated one would name two attempts as one.
+func (f *Files) Journal(node cluster.Node) journal.Store { return journal.NewBlob(f.Blob, node) }
 
 // GetManifest returns a shard's manifest and its version (blob.ErrNotFound if
 // there is none).

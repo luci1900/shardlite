@@ -360,7 +360,7 @@ func TestJournalExpiryRunsAndStopJoins(t *testing.T) {
 
 // expiry builds the node's journal expiry from the node's parts, as Run does.
 func (r *mrig) expiry(age time.Duration) *expiry {
-	return &expiry{store: r.n.Store, node: r.n.Name, age: age, log: r.n.Logger}
+	return &expiry{journal: r.n.Journal, age: age, log: r.n.Logger}
 }
 
 // startExpiry runs the node's journal expiry, as Run does, until the returned

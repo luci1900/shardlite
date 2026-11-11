@@ -5,7 +5,6 @@ import (
 	"errors"
 	"log/slog"
 
-	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/notify"
 	"github.com/luci1900/shardlite/internal/shardfile"
@@ -22,7 +21,6 @@ import (
 type adopter struct {
 	reg     *lease.Registry
 	files   *shardfile.Files
-	store   *blob.Store
 	self    func() lease.Incarnation // this node's own incarnation
 	nodeErr func() error             // nil while this node may write (Node.Err)
 	clock   Clock
@@ -67,7 +65,7 @@ func (a *adopter) adopt(ctx context.Context, l *lease.Record) (done bool) {
 		return false
 	}
 	// Segments from the fence on may be the node's next life's by now.
-	sw := &expiry{store: a.store, node: x, below: rep.Fence, log: a.log}
+	sw := &expiry{journal: a.files.Journal(x), below: rep.Fence, log: a.log}
 	if _, err := sw.expire(ctx, a.clock.Now()); err != nil && ctx.Err() == nil {
 		a.log.Warn("could not sweep a dead node's journal", "node", x, "err", err)
 	}

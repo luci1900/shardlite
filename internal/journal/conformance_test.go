@@ -13,63 +13,75 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/blobtest"
-	"github.com/luci1900/shardlite/internal/cluster"
 	"github.com/luci1900/shardlite/internal/pos"
 )
 
-// The conformance suite: what every journal's store has to do, whatever backend
-// is under it. It holds the semantics the protocol leans on (a number is taken
-// once, a fence is an empty segment, a listing is in number order, a write id
-// comes back on a head, a lost response costs a retry and never a fence)
-// rather than spelling them per backend, so two very different engines are
-// interchangeable behind one interface. It runs through a Store, as everything
-// does, and the test's own writes go to the store underneath it, as a foreign
-// writer's would.
+// The conformance suite: what every journal Store has to do, whatever sits
+// under it. It holds the semantics the protocol leans on (a number is taken
+// once, a fence is an empty segment, a listing is in number order, a lost
+// response is told from somebody else's segment) and leaves retries and the
+// outcome table to the blob package, which tests them for blob.Store. A new
+// journal store runs it by adding a factory.
 //
 // It is the memory backend by default, and the S3 backend on the emulator when
 // SHARDLITE_TEST_S3_ENDPOINT is set (docker/compose.s3.yaml's).
 
-// factory builds one test journal. Its store speaks for the journal of node
-// "n1" at epoch 1, over a backing store whose keys sit under Prefix.
-type factory func(t *testing.T) (*Store, backing)
-
-// backing is the store behind a test journal's adapter (blob storage for the
-// memory and S3 backends).
-type backing struct {
-	Below  blob.Backend
-	Prefix string // before the journal's keys in Below, "" when Below is the memory backend's root
-	// Foreign writes a segment as another writer would, for the tests that need
-	// one.
-	Foreign func(t *testing.T, seq pos.Seg, body string)
+// rig is one test journal: the store of node "n1"'s journal, written by "n1"
+// at epoch 1, with the two hooks into whatever is under it that the cases need.
+type rig struct {
+	js Store
+	// foreign writes a segment into the journal as another writer would,
+	// bypassing the store.
+	foreign func(seq pos.Seg, body string)
+	// lose makes the responses of the next n calls of op ("create", "delete" or
+	// "list", or any call if op is "") on the journal's segments lost: the call
+	// is applied, and the store sees a failure of unknown outcome.
+	lose func(op string, n int)
 }
 
-func (r backing) key(node cluster.Node, seq pos.Seg) string { return r.Prefix + Key(node, seq) }
+type factory func(t *testing.T) rig
 
-// foreign writes a segment under the journal's number as another writer, in
-// blob storage.
-func (r backing) foreign(t *testing.T, seq pos.Seg, body string) {
-	t.Helper()
-	if _, err := r.Below.Create(context.Background(), r.key("n1", seq), strings.NewReader(body),
-		blob.WriteID{Node: "n9", Epoch: 1, N: 1}); err != nil {
-		t.Fatal(err)
+// blobFactory builds the factory for a blob backend: the blob store the
+// journal delegates to sits over a fault hook, which lose arms.
+func blobFactory(b blob.Backend) factory {
+	return func(t *testing.T) rig {
+		hooked := blobtest.WithHook(b)
+		var op atomic.Pointer[blobtest.Op]
+		var left atomic.Int64
+		hooked.SetHook(func(ctx context.Context, o blobtest.Op, key string, after bool) error {
+			if want := op.Load(); after && strings.HasPrefix(key, Prefix("n1")) && (*want == "" || *want == o) && left.Add(-1) >= 0 {
+				return errors.New("injected: the response was lost")
+			}
+			return nil
+		})
+		none := blobtest.Op("")
+		op.Store(&none)
+		return rig{
+			js: testJournal(hooked, "n1", "n1", 1),
+			foreign: func(seq pos.Seg, body string) {
+				t.Helper()
+				other := blob.NewStore(b, "n9", 1, blob.Options{})
+				if _, err := other.Create(context.Background(), Key("n1", seq), strings.NewReader(body)); err != nil {
+					t.Fatal(err)
+				}
+			},
+			lose: func(name string, n int) {
+				o := blobtest.Op(name)
+				op.Store(&o)
+				left.Store(int64(n))
+			},
+		}
 	}
 }
 
-func memoryFactory(t *testing.T) (*Store, backing) {
-	t.Helper()
-	m := blob.NewMemory()
-	bk := backing{Below: m}
-	bk.Foreign = bk.foreign
-	return NewStore(NewBlob(m, "n1"), "n1", 1, Options{Backoff: time.Millisecond}), bk
-}
+func memoryFactory(t *testing.T) rig { return blobFactory(blob.NewMemory())(t) }
 
 // s3Factory returns blob storage on the emulator, with the test's keys under a
 // prefix of their own.
-func s3Factory(t *testing.T) (*Store, backing) {
+func s3Factory(t *testing.T) rig {
 	t.Helper()
 	endpoint := os.Getenv("SHARDLITE_TEST_S3_ENDPOINT")
 	if endpoint == "" {
@@ -80,12 +92,7 @@ func s3Factory(t *testing.T) (*Store, backing) {
 		bucket = "shardlite-test"
 	}
 	o := blob.S3Options{Bucket: bucket, Endpoint: endpoint}
-	// The bucket is made with a plain client: the one configured may have a
-	// short timeout or faults, and the endpoint asked for may be unreachable
-	// on purpose.
-	po := o
-	po.Endpoint = endpoint
-	if plain, err := blob.NewS3(context.Background(), po); err != nil {
+	if plain, err := blob.NewS3(context.Background(), o); err != nil {
 		t.Fatal(err)
 	} else if err := plain.EnsureBucket(context.Background()); err != nil {
 		t.Fatal(err)
@@ -96,14 +103,7 @@ func s3Factory(t *testing.T) (*Store, backing) {
 	}
 	var id [8]byte
 	rand.Read(id[:])
-	prefix := "journal-conformance/" + hex.EncodeToString(id[:]) + "/"
-	prefixed := blob.WithPrefix(b, prefix)
-	// The backing store sees the keys Below does: WithPrefix hides its prefix, so the
-	// backing keys are relative to it, like the memory backend's are to its
-	// root.
-	bk := backing{Below: prefixed}
-	bk.Foreign = bk.foreign
-	return NewStore(NewBlob(prefixed, "n1"), "n1", 1, Options{Backoff: time.Millisecond}), bk
+	return blobFactory(blob.WithPrefix(b, "journal-conformance/"+hex.EncodeToString(id[:])+"/"))(t)
 }
 
 func TestConformanceMemory(t *testing.T) { conformance(t, memoryFactory) }
@@ -113,16 +113,14 @@ func TestConformanceS3(t *testing.T) { conformance(t, s3Factory) }
 // conformance runs every case against one factory.
 func conformance(t *testing.T, mk factory) {
 	ctx := context.Background()
-	run := func(name string, f func(t *testing.T, js *Store, bk backing)) {
-		t.Run(name, func(t *testing.T) {
-			js, bk := mk(t)
-			f(t, js, bk)
-		})
+	run := func(name string, f func(t *testing.T, r rig)) {
+		t.Run(name, func(t *testing.T) { f(t, mk(t)) })
 	}
 
 	// A number is taken once: the second create fails with blob.ErrExists and
 	// the first segment stays exactly as it was.
-	run("CreateOnce", func(t *testing.T, js *Store, bk backing) {
+	run("CreateOnce", func(t *testing.T, r rig) {
+		js := r.js
 		if err := js.Create(ctx, 1, body("one")); err != nil {
 			t.Fatal(err)
 		}
@@ -134,10 +132,11 @@ func conformance(t *testing.T, mk factory) {
 		}
 	})
 
-	// A write retried with its own write id succeeds: the read-back tells an
-	// own earlier attempt from a foreign segment. A retry that names another
+	// A write retried with its own write id succeeds: the store tells an own
+	// earlier attempt from a foreign segment. A retry that names another
 	// writer's id does not.
-	run("OwnRetryIsSettled", func(t *testing.T, js *Store, bk backing) {
+	run("OwnRetryIsSettled", func(t *testing.T, r rig) {
+		js := r.js
 		id := js.NewWriteID()
 		if err := js.CreateWithID(ctx, 1, body("one"), id); err != nil {
 			t.Fatal(err)
@@ -148,21 +147,23 @@ func conformance(t *testing.T, mk factory) {
 		if got, err := allOf(ctx, js, 1); err != nil || got != "one" {
 			t.Fatalf("the retry rewrote the segment: %q %v", got, err)
 		}
-		// Another writer's write id under a number stays there: blob.ErrExists.
-		if err := js.Create(ctx, 2, body("mine")); err != nil {
-			t.Fatal(err)
+		if id2 := js.NewWriteID(); id2 == id {
+			t.Fatalf("two write ids are %+v", id)
 		}
-		if err := js.CreateWithID(ctx, 2, body("theirs"), blob.WriteID{Node: "n9", Epoch: 1, N: 1}); !errors.Is(err, blob.ErrExists) {
-			t.Fatalf("a foreign write id: got %v, want blob.ErrExists", err)
+		if err := js.CreateWithID(ctx, 1, body("three"), js.NewWriteID()); !errors.Is(err, blob.ErrExists) {
+			t.Fatalf("a retry under another id of ours: got %v, want blob.ErrExists", err)
 		}
 	})
 
-	// Blob storage can hold a foreign segment under the journal's number again
-	// only if the write id says so: the store asks, not takes a plain "exists"
-	// for its own lost response.
-	run("ForeignSegmentIsSomebodyElses", func(t *testing.T, js *Store, bk backing) {
-		bk.Foreign(t, 1, "theirs")
+	// Somebody else's segment under the number stays there, and a create of ours
+	// is told so, retried or not.
+	run("ForeignSegmentIsSomebodyElses", func(t *testing.T, r rig) {
+		js := r.js
+		r.foreign(1, "theirs")
 		if err := js.CreateWithID(ctx, 1, body("ours"), js.NewWriteID()); !errors.Is(err, blob.ErrExists) {
+			t.Fatalf("got %v, want blob.ErrExists", err)
+		}
+		if err := js.Create(ctx, 1, body("ours")); !errors.Is(err, blob.ErrExists) {
 			t.Fatalf("got %v, want blob.ErrExists", err)
 		}
 		if got, err := allOf(ctx, js, 1); err != nil || got != "theirs" {
@@ -170,36 +171,35 @@ func conformance(t *testing.T, mk factory) {
 		}
 	})
 
-	// An empty segment is a fence: size 0, a real object, and its create and
-	// write id behave like any other segment's.
-	run("FenceIsAnEmptySegment", func(t *testing.T, js *Store, bk backing) {
-		id := js.NewWriteID()
-		if err := js.CreateWithID(ctx, 1, body(""), id); err != nil {
+	// An empty segment is a fence: a real segment whose number is taken, with
+	// no bytes and no tail.
+	run("FenceIsAnEmptySegment", func(t *testing.T, r rig) {
+		js := r.js
+		if err := js.CreateWithID(ctx, 1, body(""), js.NewWriteID()); err != nil {
 			t.Fatal(err)
 		}
-		info, err := js.Head(ctx, 1)
-		if err != nil || info.Size != 0 {
-			t.Fatalf("head: %+v %v, want size 0", info, err)
-		}
-		if info.WriteID != id {
-			t.Fatalf("head: %+v, want write id %+v", info.WriteID, id)
-		}
-		if rc, err := js.Get(ctx, 1); err != nil {
-			t.Fatal(err)
-		} else if b, err := io.ReadAll(rc); err != nil || len(b) != 0 {
-			t.Fatalf("a fence's body is %d bytes: %v", len(b), err)
-		} else {
-			rc.Close()
+		if got, err := allOf(ctx, js, 1); err != nil || got != "" {
+			t.Fatalf("a fence's body is %q: %v", got, err)
 		}
 		if err := js.Create(ctx, 1, body("")); !errors.Is(err, blob.ErrExists) {
 			t.Fatalf("second create of a fence: %v, want blob.ErrExists", err)
+		}
+		rc, err := js.GetRange(ctx, 1, -10, 0)
+		if err != nil {
+			t.Fatalf("tail of an empty segment: %v", err)
+		}
+		got, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil || len(got) != 0 {
+			t.Fatalf("tail of an empty segment: got %q: %v", got, err)
 		}
 	})
 
 	// A listing is in number order, not the order of the keys of unpadded
 	// numbers: 10 after 2. List starts at the number it is given, and lists to
 	// the end of the journal.
-	run("ListingIsInNumberOrder", func(t *testing.T, js *Store, bk backing) {
+	run("ListingIsInNumberOrder", func(t *testing.T, r rig) {
+		js := r.js
 		for _, seq := range []pos.Seg{1, 2, 10, 22} {
 			if err := js.Create(ctx, seq, body(fmt.Sprint(seq))); err != nil {
 				t.Fatal(err)
@@ -210,27 +210,36 @@ func conformance(t *testing.T, mk factory) {
 		assertListing(t, js.List(ctx, 23))
 	})
 
-	// The storage keys are the layout the other blob callers compose: keys
-	// are found by one path, not two.
-	run("KeysAreTheStorageLayout", func(t *testing.T, js *Store, bk backing) {
-		for _, seq := range []pos.Seg{1, 2} {
-			if err := js.Create(ctx, seq, body("v")); err != nil {
+	// A listing says each segment's size and when the store says it was
+	// written, which is what journal expiry decides by: a fence is size 0 (it is
+	// never deleted), and an old segment is told by its write time.
+	run("ListingSaysSizesAndWriteTimes", func(t *testing.T, r rig) {
+		js := r.js
+		if err := js.Create(ctx, 1, body("0123456789")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Fence(ctx, js, 2); err != nil {
+			t.Fatal(err)
+		}
+		var got []Segment
+		for seg, err := range js.List(ctx, 1) {
+			if err != nil {
 				t.Fatal(err)
 			}
+			got = append(got, seg)
 		}
-		for _, seq := range []pos.Seg{1, 2} {
-			key := bk.key("n1", seq)
-			info, err := bk.Below.Head(ctx, key)
-			if err != nil {
-				t.Fatalf("%s: %v", key, err)
-			}
-			if info.Size != 1 {
-				t.Fatalf("%s: %d bytes", key, info.Size)
+		if len(got) != 2 || got[0].Seq != 1 || got[0].Size != 10 || got[1].Seq != 2 || got[1].Size != 0 {
+			t.Fatalf("listing %+v, want segment 1 of 10 bytes and the fence 2 of 0", got)
+		}
+		for _, seg := range got {
+			if seg.Written.IsZero() {
+				t.Fatalf("segment %d lists no write time", seg.Seq)
 			}
 		}
 	})
 
-	run("GetRange", func(t *testing.T, js *Store, bk backing) {
+	run("GetRange", func(t *testing.T, r rig) {
+		js := r.js
 		if err := js.Create(ctx, 1, body("0123456789")); err != nil {
 			t.Fatal(err)
 		}
@@ -243,7 +252,7 @@ func conformance(t *testing.T, mk factory) {
 				t.Fatalf("range %d+%d: %v", tc.off, tc.n, err)
 			}
 			if got, err := io.ReadAll(rc); err != nil || string(got) != tc.want {
-				t.Fatalf("range %d+%d: got %q, want %q", tc.off, tc.n, got, err)
+				t.Fatalf("range %d+%d: got %q, want %q: %v", tc.off, tc.n, got, tc.want, err)
 			}
 			rc.Close()
 		}
@@ -254,9 +263,9 @@ func conformance(t *testing.T, mk factory) {
 
 	// A tail: a negative offset asks for the last bytes of a segment, which is
 	// how a footer is read, and which a reader of the end of a segment cannot
-	// ask for by offset because it does not know where the end is. An empty
-	// segment has no tail, which is an empty read and not an error.
-	run("GetRangeTail", func(t *testing.T, js *Store, bk backing) {
+	// ask for by offset because it does not know where the end is.
+	run("GetRangeTail", func(t *testing.T, r rig) {
+		js := r.js
 		if err := js.Create(ctx, 1, body("0123456789")); err != nil {
 			t.Fatal(err)
 		}
@@ -281,50 +290,100 @@ func conformance(t *testing.T, mk factory) {
 		if _, err := js.GetRange(ctx, 9, -3, 0); !errors.Is(err, blob.ErrNotFound) {
 			t.Fatalf("tail of a missing segment: %v", err)
 		}
-		// An empty segment is a fence, and has no last bytes.
+	})
+
+	// A lost response is a retry of the same body and the same write id, never
+	// a fence: the create lands and its response is lost, and the caller sees
+	// success (not blob.ErrExists), with the first body and id kept. Both
+	// creates settle: the writer's, with its write id, and the adopter's fence.
+	run("LostCreateResponseIsOurs", func(t *testing.T, r rig) {
+		js := r.js
+		r.lose("create", 1)
+		if err := js.CreateWithID(ctx, 1, body("one"), js.NewWriteID()); err != nil {
+			t.Fatal("a lost response turned into an error:", err)
+		}
+		r.lose("create", 1)
 		if err := js.Create(ctx, 2, body("")); err != nil {
-			t.Fatal(err)
+			t.Fatal("a lost response to a fence turned into an error:", err)
 		}
-		rc, err := js.GetRange(ctx, 2, -10, 0)
-		if err != nil {
-			t.Fatalf("tail of an empty segment: %v", err)
+		if got, err := allOf(ctx, js, 1); err != nil || got != "one" {
+			t.Fatalf("the retry rewrote the segment: %q %v", got, err)
 		}
-		got, err := io.ReadAll(rc)
-		rc.Close()
-		if err != nil || len(got) != 0 {
-			t.Fatalf("tail of an empty segment: got %q: %v", got, err)
+		if err := js.Create(ctx, 2, body("")); !errors.Is(err, blob.ErrExists) {
+			t.Fatalf("the fence is taken: got %v, want blob.ErrExists", err)
 		}
 	})
 
-	// A delete is garbage collection, not an update: gone is gone, and deleting
-	// what is gone is done. Nothing of it reads back, not even whole.
-	run("Delete", func(t *testing.T, js *Store, bk backing) {
-		if err := js.Create(ctx, 1, body("v")); err != nil {
-			t.Fatal(err)
+	// A lost response over somebody else's segment is still theirs.
+	run("LostResponseOverAForeignSegment", func(t *testing.T, r rig) {
+		r.foreign(1, "theirs")
+		r.lose("create", 1)
+		if err := r.js.Create(ctx, 1, body("ours")); !errors.Is(err, blob.ErrExists) {
+			t.Fatalf("got %v, want blob.ErrExists", err)
+		}
+		if got, err := allOf(ctx, r.js, 1); err != nil || got != "theirs" {
+			t.Fatalf("the segment changed: %q %v", got, err)
+		}
+	})
+
+	// When every answer is lost, the read-back included, the caller sees an
+	// outcome that stayed unknown, never blob.ErrExists (which would read as
+	// "somebody else's").
+	run("UnknownStaysUnknown", func(t *testing.T, r rig) {
+		r.lose("", 1000)
+		if err := r.js.Create(ctx, 1, body("one")); !errors.Is(err, blob.ErrUnknown) {
+			t.Fatalf("got %v, want blob.ErrUnknown", err)
+		}
+	})
+
+	// A delete is garbage collection: gone is gone, and deleting what is gone
+	// is done, a lost response included.
+	run("Delete", func(t *testing.T, r rig) {
+		js := r.js
+		for _, seq := range []pos.Seg{1, 2} {
+			if err := js.Create(ctx, seq, body("v")); err != nil {
+				t.Fatal(err)
+			}
 		}
 		if err := js.Delete(ctx, 1); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := js.Head(ctx, 1); !errors.Is(err, blob.ErrNotFound) {
+		if _, err := js.GetRange(ctx, 1, 0, 0); !errors.Is(err, blob.ErrNotFound) {
 			t.Fatalf("after delete: %v", err)
-		}
-		if _, err := js.Get(ctx, 1); !errors.Is(err, blob.ErrNotFound) {
-			t.Fatalf("a whole read of a missing segment: %v", err)
 		}
 		if err := js.Delete(ctx, 1); err != nil {
 			t.Fatalf("deleting what isn't there: %v", err)
 		}
+		r.lose("delete", 1)
+		if err := js.Delete(ctx, 2); err != nil {
+			t.Fatalf("a lost response to a delete: %v", err)
+		}
+		if _, err := js.GetRange(ctx, 2, 0, 0); !errors.Is(err, blob.ErrNotFound) {
+			t.Fatalf("after the delete with a lost response: %v", err)
+		}
+	})
+
+	// A listing whose first response is lost is retried, not failed.
+	run("LostListResponse", func(t *testing.T, r rig) {
+		for _, seq := range []pos.Seg{1, 2} {
+			if err := r.js.Create(ctx, seq, body("v")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		r.lose("list", 1)
+		assertListing(t, r.js.List(ctx, 1), 1, 2)
 	})
 
 	// Segments can be as large as a database, and every attempt rereads the
 	// body from its start, so a body that is bigger than memory is fine.
-	run("BigAndBinary", func(t *testing.T, js *Store, bk backing) {
+	run("BigAndBinary", func(t *testing.T, r rig) {
+		js := r.js
 		data := make([]byte, 3<<20+17)
 		rand.Read(data)
 		if err := js.Create(ctx, 1, bodyBytes(data)); err != nil {
 			t.Fatal(err)
 		}
-		rc, err := js.Get(ctx, 1)
+		rc, err := js.GetRange(ctx, 1, 0, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -342,66 +401,37 @@ func conformance(t *testing.T, mk factory) {
 		if !bytes.Equal(got, data[1<<20:1<<20+1000]) {
 			t.Fatal("the range differs")
 		}
-		if info, err := js.Head(ctx, 1); err != nil || info.Size != int64(len(data)) {
-			t.Fatalf("head: %+v %v", info, err)
-		}
-	})
-
-	// A lost response is a retry of the same body and the same write id, never
-	// a fence: the first create lands and its response is lost, the retry finds
-	// it our own and succeeds, and the segment keeps the first body and id.
-	t.Run("LostResponseIsARetry", func(t *testing.T) {
-		_, bk := mk(t)
-		hooked := blobtest.WithHook(bk.Below)
-		store := NewStore(NewBlob(hooked, "n1"), "n1", 1, Options{Backoff: time.Millisecond})
-		var lost atomic.Int64
-		hooked.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
-			if op == blobtest.OpCreate && key == bk.key("n1", 1) && after && lost.Add(1) == 1 {
-				return errors.New("injected: the response was lost")
-			}
-			return nil
-		})
-		id := store.NewWriteID()
-		if err := store.CreateWithID(ctx, 1, body("one"), id); err != nil {
-			t.Fatal("a lost response turned into an error:", err)
-		}
-		info, err := store.Head(ctx, 1)
-		if err != nil || info.Size != int64(len("one")) || info.WriteID != id {
-			t.Fatalf("after the retry: %+v %v", info, err)
-		}
-		if got, err := allOf(ctx, store, 1); err != nil || got != "one" {
-			t.Fatalf("the retry rewrote the segment: %q %v", got, err)
-		}
-	})
-
-	// When every answer is lost and the read-back fails too, the caller sees an
-	// outcome that stayed unknown, never blob.ErrExists (which would read as
-	// "somebody else's").
-	t.Run("UnknownStaysUnknown", func(t *testing.T) {
-		_, bk := mk(t)
-		hooked := blobtest.WithHook(bk.Below)
-		store := NewStore(NewBlob(hooked, "n1"), "n1", 1, Options{Backoff: time.Millisecond, Attempts: 2})
-		hooked.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
-			// The creates land, and every response of create and head is lost.
-			if after && key == bk.key("n1", 1) {
-				return errors.New("injected: the response was lost")
-			}
-			return nil
-		})
-		if err := store.Create(ctx, 1, body("one")); !errors.Is(err, blob.ErrUnknown) {
-			t.Fatalf("got %v, want blob.ErrUnknown", err)
-		}
 	})
 }
 
-func assertListing(t *testing.T, it iter.Seq2[pos.Seg, error], want ...pos.Seg) {
+// The blob journal's segments are at the keys the other blob callers compose
+// (Key), padded so that they list in number order: keys are found by one path,
+// not two.
+func TestBlobKeysAreTheStorageLayout(t *testing.T) {
+	t.Parallel()
+	ctx, m := context.Background(), blob.NewMemory()
+	js := testJournal(m, "n1", "n1", 1)
+	for _, seq := range []pos.Seg{1, 2} {
+		if err := js.Create(ctx, seq, body("v")); err != nil {
+			t.Fatal(err)
+		}
+		if info, err := m.Head(ctx, Key("n1", seq)); err != nil || info.Size != 1 {
+			t.Fatalf("%s: %+v %v", Key("n1", seq), info, err)
+		}
+	}
+	if got := Key("n1", 129); got != "data/journal/n1/00000000000000000129" {
+		t.Fatalf("key %q", got)
+	}
+}
+
+func assertListing(t *testing.T, it iter.Seq2[Segment, error], want ...pos.Seg) {
 	t.Helper()
 	var seqs []pos.Seg
-	for seq, err := range it {
+	for seg, err := range it {
 		if err != nil {
 			t.Fatal(err)
 		}
-		seqs = append(seqs, seq)
+		seqs = append(seqs, seg.Seq)
 	}
 	if fmt.Sprint(seqs) != fmt.Sprint(want) {
 		t.Fatalf("listing: %v, want %v", seqs, want)
@@ -415,8 +445,8 @@ func body(s string) blob.Body { return bodyBytes([]byte(s)) }
 func bodyBytes(b []byte) blob.Body { return bytes.NewReader(b) }
 
 // allOf reads a segment whole.
-func allOf(ctx context.Context, js *Store, seq pos.Seg) (string, error) {
-	rc, err := js.Get(ctx, seq)
+func allOf(ctx context.Context, js Store, seq pos.Seg) (string, error) {
+	rc, err := js.GetRange(ctx, seq, 0, 0)
 	if err != nil {
 		return "", err
 	}

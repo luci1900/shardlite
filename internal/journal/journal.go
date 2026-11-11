@@ -3,12 +3,13 @@
 // blob storage: the fence is created there, and a journal is complete without
 // anything else (docs/internals.md, Node journals and snapshots).
 //
-// The storage side is a narrow Backend behind the one Store every caller writes
-// through, which gives a backend the same handling of a lost response. Blob
-// storage is the only backend today, and the place a faster journal store would
-// plug in. A journal's segments are numbered. A segment is created once and
+// The storage side is the narrow Store interface every caller writes through.
+// Blob storage is the only implementation today (Blob, which delegates to the
+// node's blob.Store), and Store is the seam a faster journal store would plug
+// in at. A journal's segments are numbered. A segment is created once and
 // never modified, so there are no updates and no conditional deletes: deleting
-// one is the caller's choice of garbage, through journal expiry.
+// one is the caller's choice of garbage, through journal expiry, which works on
+// the blob keys.
 //
 // The writing side is the Writer, which queues the LTX files capture produces
 // and writes them as numbered segments, one per flush interval, each holding
@@ -24,8 +25,8 @@
 //	8 bytes: magic "SHLSEG01"
 //
 // An empty segment is a fence (see docs/internals.md, Fencing). The fence that
-// an adopter puts above a dead writer's range lives in blob storage: one store
-// decides the journal's races.
+// an adopter puts above a dead writer's range lives in the journal's own store:
+// one store decides the journal's races.
 package journal
 
 import (
@@ -34,65 +35,74 @@ import (
 	"io"
 	"iter"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/cluster"
 	"github.com/luci1900/shardlite/internal/pos"
 )
 
-// Backend is one node's journal: numbered segments, created once and never
-// modified. One journal per backend, so the name of the node it speaks for
-// belongs to what constructs it, not to the calls.
+// Store is one node's journal: numbered segments, created once and never
+// modified. One journal per store, so the name of the node it speaks for belongs
+// to what constructs it, not to the calls.
 //
-// Like blob.Backend, a Backend does single attempts and reports one of a fixed
-// set of outcomes (see the outcome table in internal/blob): Create returns
-// ErrNotApplied when nothing was written and ErrUnknown when the response was
-// lost or the request may have gone through, and Get, GetRange and Head are
-// ErrNotFound for a number with no segment. Callers don't use a Backend: they
-// use a Store, which retries and settles.
+// A Store tags each create with a write id (the writer's node, epoch and a
+// counter) and, when a create's outcome is not known, reads the number back to
+// tell its own earlier attempt from somebody else's segment, as blob.Store
+// does. Callers see success, blob.ErrExists (somebody else's segment holds the
+// number: a fence, or a newer writer's), or an outcome that stayed unknown
+// (blob.ErrUnknown). A lost response costs a retry of the same body and id,
+// never a fence. Reads are ErrNotFound for a number with no segment.
+//
+// An implementation owns the retries and the settling of lost responses: a
+// Store does not hand a caller an outcome it could have found out itself. The
+// blob one gets both from blob.Store, which it delegates to, and a store of
+// another kind has to do the same (the conformance suite checks it, lost
+// responses included).
 //
 // Three contracts a journal leans on:
 //
 //   - A create is atomic: the segment appears whole or not at all.
 //   - A range read reads the range and not the segment.
 //   - A segment is written once and never modified.
-type Backend interface {
+type Store interface {
 	// Name is the node whose journal this is, for error messages: not the
 	// writer of an entry, which the write id carries, but the journal itself.
 	Name() cluster.Node
-	// Create writes the segment and returns only when it is durable. It fails
-	// with blob.ErrExists if the number is already taken. A Backend can't tell
-	// whose segment it is (ours from an earlier attempt, somebody else's): the
-	// Store reads the write id back to tell them apart.
-	//
-	// The body is read from its start on every attempt, and may be larger than
-	// memory.
-	Create(ctx context.Context, seq pos.Seg, body blob.Body, id blob.WriteID) error
-	// Get returns the whole segment.
-	Get(ctx context.Context, seq pos.Seg) (io.ReadCloser, error)
+	// NewWriteID returns an id for CreateWithID, naming the writer.
+	NewWriteID() blob.WriteID
+	// Create writes the segment once and returns only when it is durable. It
+	// fails with blob.ErrExists if somebody else's segment holds the number.
+	Create(ctx context.Context, seq pos.Seg, body blob.Body) error
+	// CreateWithID is Create for a caller that keeps retrying one write after
+	// it has given up: every call is a retry of the write named by id, so
+	// "exists" is checked against that id whatever happened before. The body
+	// must be the same each time, and is read from its start on every attempt
+	// (it may be larger than memory).
+	CreateWithID(ctx context.Context, seq pos.Seg, body blob.Body, id blob.WriteID) error
 	// GetRange reads length bytes from offset (to the end if length is not
 	// positive or reaches past it). A negative offset asks for the last
 	// -offset bytes of the segment, and the length must then be zero: it is
 	// how a caller asks for a tail whose end it does not know. An empty
 	// segment has no tail, which is an empty read and not an error.
 	GetRange(ctx context.Context, seq pos.Seg, offset, length int64) (io.ReadCloser, error)
-	// Head says the segment's size and write id. A size of 0 is a fence.
-	Head(ctx context.Context, seq pos.Seg) (SegmentInfo, error)
-	// List returns the journal's segment numbers from from (inclusive) on, in
-	// number order. It may lag. A failure before the first number may be
-	// retried by the Store; one afterwards is the caller's to see.
-	List(ctx context.Context, from pos.Seg) iter.Seq2[pos.Seg, error]
-	// Delete removes the segment. Whether a number with no segment is
-	// ErrNotFound or an error-free success depends on the store where it
-	// lives: callers accept both.
+	// Delete removes the segment. A number with no segment is done, not an
+	// error: deleting twice is deleting once.
 	Delete(ctx context.Context, seq pos.Seg) error
+	// List returns the journal's segments from from (inclusive) on, in number
+	// order. It may lag. A failure after the first segment is the caller's to
+	// see.
+	List(ctx context.Context, from pos.Seg) iter.Seq2[Segment, error]
 }
 
-// SegmentInfo is what a journal needs of a segment: its size (0 is a fence)
-// and the write id that created it.
-type SegmentInfo struct {
+// Segment is a segment as a listing of its journal shows it, which is what
+// journal expiry decides by: its number, its size (a fence's is 0) and when the
+// store says it was written, by the store's own clock.
+type Segment struct {
+	Seq     pos.Seg
 	Size    int64
-	WriteID blob.WriteID
+	Written time.Time
 }
 
 // Root is the key prefix of all the journals in blob storage (the data role,
@@ -116,7 +126,11 @@ func Key(node cluster.Node, seq pos.Seg) string {
 // parseKey is the segment number of a key under a node's journal, ok false if
 // the key is not a segment's. Keys are zero-padded decimal numbers, and a
 // number of 0 has no segment, so anything else is not one either.
-func parseKey(key string) (pos.Seg, bool) {
-	n, err := strconv.ParseUint(key, 10, 64)
+func parseKey(node cluster.Node, key string) (pos.Seg, bool) {
+	num, ok := strings.CutPrefix(key, Prefix(node))
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.ParseUint(num, 10, 64)
 	return pos.Seg(n), err == nil && n > 0
 }

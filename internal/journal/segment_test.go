@@ -22,6 +22,7 @@ import (
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/blobtest"
+	"github.com/luci1900/shardlite/internal/cluster"
 	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/service"
 	"github.com/luci1900/shardlite/internal/shard"
@@ -58,7 +59,7 @@ func testLTX(t testing.TB, txid ltx.TXID, fill byte) []byte {
 // testStore is n1's journal store over a memory backend, with the blob store
 // that shapes blob storage by key and the backend's fault hook within reach.
 type testStore struct {
-	*Store
+	Store
 	B *blob.Store
 	L *blobtest.Hooked
 }
@@ -68,11 +69,13 @@ func (s testStore) SetHook(h blobtest.Hook) { s.L.SetHook(h) }
 func newStore(t *testing.T) testStore {
 	t.Helper()
 	l := blobtest.WithHook(blob.NewMemory())
-	return testStore{
-		Store: NewStore(NewBlob(l, "n1"), "n1", 1, Options{Backoff: time.Millisecond}),
-		B:     blob.NewStore(l, "n1", 1, blob.Options{Backoff: time.Millisecond}),
-		L:     l,
-	}
+	b := blob.NewStore(l, "n1", 1, blob.Options{Backoff: time.Millisecond})
+	return testStore{Store: NewBlob(b, "n1"), B: b, L: l}
+}
+
+// testJournal is node's journal in b, written by writer at epoch.
+func testJournal(b blob.Backend, node, writer cluster.Node, epoch pos.Epoch) *Blob {
+	return NewBlob(blob.NewStore(b, writer, epoch, blob.Options{Backoff: time.Millisecond}), node)
 }
 
 // logOf makes a log holding b, and returns it with the range b is in. The caller
@@ -172,15 +175,6 @@ func TestManyGoroutinesOneSegment(t *testing.T) {
 	}
 }
 
-// mustGet reads a segment whole.
-func mustGet(ctx context.Context, s *Store, seq pos.Seg) io.ReadCloser {
-	rc, err := s.Get(ctx, seq)
-	if err != nil {
-		panic(err)
-	}
-	return rc
-}
-
 func TestFlushReturnsAfterPut(t *testing.T) {
 	t.Parallel()
 	store, ctx := newStore(t), context.Background()
@@ -274,7 +268,7 @@ func TestErrExistsFencesWriter(t *testing.T) {
 	store, ctx := newStore(t), context.Background()
 	// A newer writer already took segment 1 (here, as a fence: a fence of
 	// another writer's, so its write id is not this writer's).
-	adopter := NewStore(NewBlob(store.L, "n1"), "n2", 1, Options{})
+	adopter := testJournal(store.L, "n1", "n2", 1)
 	adopter.Create(ctx, 1, strings.NewReader(""))
 	w := NewWriter(store.Store, WriterOptions{})
 	serve(t, w)
@@ -448,7 +442,7 @@ func TestFenceFoundWhileRetrying(t *testing.T) {
 	mustAppend(t, w, "users/1", 2, testLTX(t, 2, 1))
 	// An adopter fences the journal while the writer is stuck.
 	down.Store(false)
-	adopter := NewStore(NewBlob(store.L, "n1"), "n2", 1, Options{})
+	adopter := testJournal(store.L, "n1", "n2", 1)
 	if _, err := Fence(ctx, adopter, 1); err != nil {
 		t.Fatal(err)
 	}
@@ -497,9 +491,9 @@ func TestLostResponseIsNotAFence(t *testing.T) {
 func TestAdopterFence(t *testing.T) {
 	t.Parallel()
 	store, ctx := newStore(t), context.Background()
-	zombie := NewStore(NewBlob(store.L, "dead"), "dead", 7, Options{})
+	zombie := testJournal(store.L, "dead", "dead", 7)
 	zombie.Create(ctx, 5, strings.NewReader("a zombie's segment"))
-	adopter := NewStore(NewBlob(store.L, "dead"), "n2", 1, Options{})
+	adopter := testJournal(store.L, "dead", "n2", 1)
 
 	var lost, creates atomic.Int32
 	store.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
@@ -606,7 +600,7 @@ func TestErrorsRetryingCannotFixAreLogged(t *testing.T) {
 	denied := errors.New("permission denied")
 	fc.err.Store(&denied)
 	store := blob.NewStore(fc, "n1", 1, blob.Options{Backoff: time.Millisecond})
-	js := NewStore(NewBlob(fc, "n1"), "n1", 1, Options{Backoff: time.Millisecond})
+	js := testJournal(fc, "n1", "n1", 1)
 	rec := &recorder{}
 	w := NewWriter(js, WriterOptions{Retry: time.Millisecond, Logger: slog.New(rec)})
 	serve(t, w)
@@ -708,11 +702,7 @@ func TestQueuedFilesAreReadThroughDupsOfTheirLogs(t *testing.T) {
 	if err := w.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
-	apptest.Eventually(t, 5*time.Second, "the batch to be dropped", func() bool {
-		w.mu.Lock()
-		defer w.mu.Unlock()
-		return len(w.batches) == 0
-	})
+	// The writer counts the entries as written only after closing the files.
 	if _, err := queued.Bytes(); err == nil {
 		t.Fatal("the batch's descriptors are still open after the segment was written")
 	}
@@ -892,7 +882,7 @@ func TestFooterReadsTheEndOnce(t *testing.T) {
 }
 
 // readRange reads a range of a segment's bytes.
-func readRange(ctx context.Context, store *Store, seq pos.Seg, off, n int64) ([]byte, error) {
+func readRange(ctx context.Context, store Store, seq pos.Seg, off, n int64) ([]byte, error) {
 	rc, err := store.GetRange(ctx, seq, off, n)
 	if err != nil {
 		return nil, err

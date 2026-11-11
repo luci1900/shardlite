@@ -28,7 +28,7 @@ import (
 )
 
 // ReadEntry returns the LTX file bytes of one journal entry.
-func ReadEntry(ctx context.Context, js *journal.Store, seq pos.Seg, e journal.Entry) ([]byte, error) {
+func ReadEntry(ctx context.Context, js journal.Store, seq pos.Seg, e journal.Entry) ([]byte, error) {
 	rc, err := js.GetRange(ctx, seq, e.Offset, e.Length)
 	if err != nil {
 		return nil, err
@@ -50,7 +50,7 @@ type Env struct {
 	Dir     string           // local shard files
 	Blob    *blobtest.Hooked // the in-memory backend behind its fault hook
 	Store   *blob.Store
-	Journal *journal.Store // the node's own journal
+	Journal journal.Store // the node's own journal
 	Files   *shardfile.Files
 	W       *journal.Writer
 	Node    cluster.Node
@@ -69,9 +69,8 @@ func New(t testing.TB) *Env {
 		t.Fatal(err)
 	}
 	store := blob.NewStore(local, "n1", rec.Epoch, blob.Options{Backoff: time.Millisecond})
-	jopts := journal.Options{Backoff: time.Millisecond}
 	e := &Env{T: t, Dir: t.TempDir(), Blob: local, Store: store, Node: "n1", Reg: reg, Lease: rec,
-		Files: &shardfile.Files{Blob: store, Backend: local, Node: "n1", Leases: reg, JournalOptions: jopts, Temp: tempfile.NewDir(t.TempDir())}}
+		Files: &shardfile.Files{Blob: store, Node: "n1", Leases: reg, Temp: tempfile.NewDir(t.TempDir())}}
 	e.Journal = e.Files.Journal(e.Node)
 	e.W = journal.NewWriter(e.Journal, journal.WriterOptions{})
 	t.Cleanup(service.Background(slog.Default(), e.W))
@@ -94,8 +93,8 @@ func (e *Env) SetJournalRange(from pos.Seg) {
 // Adopter returns another node's store of a journal: the journal named by
 // node, out of Env.Blob, with write ids that name writer. It is what an
 // adopter of another node's journal holds.
-func (e *Env) Adopter(writer, node cluster.Node) *journal.Store {
-	return journal.NewStore(journal.NewBlob(e.Blob, node), writer, e.Store.Epoch(), journal.Options{Backoff: time.Millisecond})
+func (e *Env) Adopter(writer, node cluster.Node) journal.Store {
+	return journal.NewBlob(blob.NewStore(e.Blob, writer, e.Store.Epoch(), blob.Options{Backoff: time.Millisecond}), node)
 }
 
 // Path returns the local path for a shard name like users/42.

@@ -38,7 +38,7 @@ func TestLeaseScanKeepsAnAdoptedNodeDead(t *testing.T) {
 		self := func() lease.Incarnation { return lease.Incarnation{Node: "w", Epoch: 1} }
 		log := slog.New(slog.DiscardHandler)
 		a := &adopter{
-			reg: reg, files: &shardfile.Files{Blob: store, Backend: b, Node: "w", Leases: reg, Temp: tempfile.NewDir(t.TempDir())}, store: store,
+			reg: reg, files: &shardfile.Files{Blob: store, Node: "w", Leases: reg, Temp: tempfile.NewDir(t.TempDir())},
 			self: self, nodeErr: func() error { return nil }, clock: realClock{}, log: log, adopted: &notify.Counter{},
 		}
 		var died notify.Counter

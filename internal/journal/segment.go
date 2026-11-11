@@ -62,7 +62,7 @@ type Entry struct {
 func (e Entry) Last() pos.Position { return e.Position.Add(e.Count) }
 
 // segName names a segment in an error, as its key does but without the zeros: n1/129.
-func segName(store *Store, seq pos.Seg) string {
+func segName(store Store, seq pos.Seg) string {
 	return fmt.Sprintf("%s/%d", store.Name(), uint64(seq))
 }
 
@@ -112,26 +112,6 @@ func (h *held) close() {
 	h.dups = nil
 }
 
-// batch is one segment on its way to storage: its number, its body, the write
-// id of its create and the files it is made of. It is dropped once storage has it.
-type batch struct {
-	seq   pos.Seg
-	body  *segmentBody
-	files []pendingEntry
-	held  held         // the descriptors the files are read through
-	count uint64       // the number of entries, which is what the counters count
-	id    blob.WriteID // the storage create's write id
-
-	dropped atomic.Bool // the batch is dropped: its files are closed
-}
-
-// closeFiles closes the descriptors the batch's files are read through, once.
-func (b *batch) closeFiles() {
-	if b.dropped.CompareAndSwap(false, true) {
-		b.held.close()
-	}
-}
-
 // Writer batches appended LTX files into one segment per Flush. It flushes only
 // when asked.
 //
@@ -146,7 +126,7 @@ func (b *batch) closeFiles() {
 // segment. Nothing is written until it is served, and once Serve has returned the writer is closed for good.
 type Writer struct {
 	opts    WriterOptions
-	storage *Store
+	storage Store
 	kick    *notify.Kick   // wakes the uploader: a Flush wants what is queued written
 	written notify.Counter // the entries storage has
 	done    chan struct{}  // closed once Serve has returned
@@ -154,7 +134,6 @@ type Writer struct {
 	mu       sync.Mutex
 	pending  []pendingEntry
 	hold     held          // the descriptors the pending entries are read through
-	batches  []*batch      // the batches in flight, whose files are open
 	appended uint64        // entries accepted so far
 	seq      pos.Seg       // the number of the next segment to write
 	stopErr  error         // set once fenced or closed
@@ -165,7 +144,7 @@ type Writer struct {
 
 // NewWriter makes a writer over the journal in blob storage. Nothing is written
 // until the writer is served and flushed.
-func NewWriter(storage *Store, opts WriterOptions) *Writer {
+func NewWriter(storage Store, opts WriterOptions) *Writer {
 	if opts.Retry <= 0 {
 		opts.Retry = 25 * time.Millisecond
 	}
@@ -175,9 +154,8 @@ func NewWriter(storage *Store, opts WriterOptions) *Writer {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
-	w := &Writer{opts: opts, storage: storage, seq: opts.StartSeq, fenced: make(chan struct{}),
+	return &Writer{opts: opts, storage: storage, seq: opts.StartSeq, fenced: make(chan struct{}),
 		kick: notify.NewKick(), done: make(chan struct{})}
-	return w
 }
 
 // Fenced is closed once the writer found another writer's segment under one of
@@ -302,9 +280,10 @@ func (w *Writer) serveBlob(ctx context.Context) error {
 
 // writeNext writes what is queued as the next segment, if anything is. A
 // segment whose upload fails is retried with the same body and write id until
-// the outcome is known, so Store can tell a lost response from
+// the outcome is known, so the store can tell a lost response from
 // somebody else's segment. It reports whether the writer goes on: false once
-// it is fenced or closed.
+// it is fenced or closed. Whatever the outcome, the files the segment was read
+// through are closed once the upload has returned.
 func (w *Writer) writeNext(ctx context.Context) bool {
 	w.mu.Lock()
 	pending, hold, seq := w.pending, w.hold, w.seq
@@ -315,24 +294,12 @@ func (w *Writer) writeNext(ctx context.Context) bool {
 	}
 	// The segment is built without the lock: it can be a lot of copying, and
 	// other shards keep appending meanwhile.
-	body, err := w.build(ctx, seq, pending)
-	if err != nil {
-		// The build gives up only when the context ends, so the entries are
-		// lost with the writer.
-		hold.close()
-		w.stop(ErrClosed)
-		return false
-	}
-	b := &batch{seq: seq, body: body, files: pending, held: hold, count: uint64(len(pending))}
-	b.id = w.storage.NewWriteID()
-	w.mu.Lock()
-	w.batches = append(w.batches, b)
-	w.mu.Unlock()
-	err = w.send(ctx, seq, body, b.id)
+	err := w.send(ctx, seq, w.compose(pending), w.storage.NewWriteID())
+	hold.close()
 	switch {
 	case err == nil:
 	case errors.Is(err, blob.ErrExists):
-		// Someone else's segment holds our number (Store has already
+		// Someone else's segment holds our number (the store has already
 		// ruled out our own earlier attempts), so a newer writer owns this
 		// journal. Fail whatever queued up behind it too.
 		w.stop(ErrFenced)
@@ -344,32 +311,15 @@ func (w *Writer) writeNext(ctx context.Context) bool {
 	w.seq++
 	w.mu.Unlock()
 	w.flushes.Add(1)
-	w.finish(b)
+	w.written.Add(uint64(len(pending))) // after the files are closed, which the gates wait for
 	return true
-}
-
-// build lays out a segment, trying again (with the same backoff as send) until
-// it succeeds or ctx ends: the entries can't be given up.
-func (w *Writer) build(ctx context.Context, seq pos.Seg, pending []pendingEntry) (*segmentBody, error) {
-	backoff := w.opts.Retry
-	for {
-		body, err := w.compose(pending)
-		if err == nil {
-			return body, nil
-		}
-		w.opts.Logger.Error("building a segment failed, will keep trying", "node", w.storage.Name(), "segment", seq, "err", err)
-		if err := sleep(ctx, backoff); err != nil {
-			return nil, err
-		}
-		backoff = min(backoff*2, 40*w.opts.Retry)
-	}
 }
 
 // compose lays out a segment: the LTX files back to back, then the footer. The
 // footer is computable without reading anything: each entry's offset is the
 // running total of the files' sizes. The result is a reader over the pieces,
 // not a copy of them.
-func (w *Writer) compose(pending []pendingEntry) (*segmentBody, error) {
+func (w *Writer) compose(pending []pendingEntry) *segmentBody {
 	files := make([]filePiece, len(pending))
 	footer := make([]Entry, len(pending))
 	var off int64
@@ -379,37 +329,13 @@ func (w *Writer) compose(pending []pendingEntry) (*segmentBody, error) {
 		off += p.body.Size()
 		footer[i] = p.Entry
 	}
-	fb, err := json.Marshal(footer)
-	if err != nil {
-		return nil, err
-	}
+	fb, _ := json.Marshal(footer) // plain fields: it cannot fail
 	var n [8]byte
 	binary.BigEndian.PutUint64(n[:], uint64(len(fb)))
 	tail := make([]byte, 0, len(n)+len(magic))
 	tail = append(tail, n[:]...)
 	tail = append(tail, magic...)
-	return &segmentBody{files: files, footer: fb, tail: tail, size: off + int64(len(fb)+len(tail))}, nil
-}
-
-// finish drops a batch storage has: its files are closed and it is forgotten,
-// and what it held is counted, which the gates wait for, once the files are
-// closed.
-func (w *Writer) finish(b *batch) {
-	b.closeFiles()
-	w.forget(b)
-	w.written.Add(b.count)
-}
-
-// forget drops a batch from the writer's list of the ones in flight.
-func (w *Writer) forget(b *batch) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	for i, x := range w.batches {
-		if x == b {
-			w.batches = append(w.batches[:i], w.batches[i+1:]...)
-			return
-		}
-	}
+	return &segmentBody{files: files, footer: fb, tail: tail, size: off + int64(len(fb)+len(tail))}
 }
 
 // send retries one segment's create until the outcome is known: it was
@@ -483,15 +409,10 @@ func (w *Writer) close() {
 	}
 	w.closePending()
 	w.pending = nil
-	// The batches in flight: their files are closed.
-	for _, b := range w.batches {
-		b.closeFiles()
-	}
-	w.batches = nil
 }
 
 // ReadFooter returns the entries of a segment. A fence returns ErrFence.
-func ReadFooter(ctx context.Context, store *Store, seq pos.Seg) ([]Entry, error) {
+func ReadFooter(ctx context.Context, store Store, seq pos.Seg) ([]Entry, error) {
 	b, err := readFooter(ctx, store, seq)
 	if err != nil {
 		return nil, err
@@ -499,14 +420,14 @@ func ReadFooter(ctx context.Context, store *Store, seq pos.Seg) ([]Entry, error)
 	if len(b) == 0 {
 		return nil, ErrFence
 	}
-	entries, _, err := splitFooter(b, segName(store, seq))
+	entries, err := splitFooter(b, segName(store, seq))
 	return entries, err
 }
 
 // readFooter reads the end of a segment, big enough to hold the footer whole:
 // the end usually holds it, and a footer bigger than the read asks for the
 // bigger tail once.
-func readFooter(ctx context.Context, store *Store, seq pos.Seg) ([]byte, error) {
+func readFooter(ctx context.Context, store Store, seq pos.Seg) ([]byte, error) {
 	b, err := readTail(ctx, store, seq, footerRead)
 	if err != nil {
 		return nil, err
@@ -530,35 +451,34 @@ func readFooter(ctx context.Context, store *Store, seq pos.Seg) ([]byte, error) 
 }
 
 // splitFooter parses a segment's ending b, the tail readFooter gave, into the
-// entries it names and the footer's own bytes, which a caller holds the
-// streamed ending against. A fence is an empty ending and is the caller's
-// error, not this one.
-func splitFooter(b []byte, name string) ([]Entry, []byte, error) {
+// entries it names. A fence is an empty ending and is the caller's error, not
+// this one.
+func splitFooter(b []byte, name string) ([]Entry, error) {
 	if len(b) < trailerSize {
-		return nil, nil, fmt.Errorf("%w: %s is %d bytes", ErrCorrupt, name, len(b))
+		return nil, fmt.Errorf("%w: %s is %d bytes", ErrCorrupt, name, len(b))
 	}
 	tr := b[len(b)-trailerSize:]
 	if string(tr[8:]) != magic {
-		return nil, nil, fmt.Errorf("%w: %s has bad magic", ErrCorrupt, name)
+		return nil, fmt.Errorf("%w: %s has bad magic", ErrCorrupt, name)
 	}
 	n := binary.BigEndian.Uint64(tr[:8])
 	if n > maxFooterSize {
-		return nil, nil, fmt.Errorf("%w: %s footer length %d", ErrCorrupt, name, n)
+		return nil, fmt.Errorf("%w: %s footer length %d", ErrCorrupt, name, n)
 	}
 	if int64(n)+trailerSize > int64(len(b)) {
-		return nil, nil, fmt.Errorf("%w: %s footer length %d", ErrCorrupt, name, n)
+		return nil, fmt.Errorf("%w: %s footer length %d", ErrCorrupt, name, n)
 	}
 	fb := b[len(b)-trailerSize-int(n) : len(b)-trailerSize]
 	var entries []Entry
 	if err := json.Unmarshal(fb, &entries); err != nil {
-		return nil, nil, fmt.Errorf("%w: %s footer: %v", ErrCorrupt, name, err)
+		return nil, fmt.Errorf("%w: %s footer: %v", ErrCorrupt, name, err)
 	}
-	return entries, fb, nil
+	return entries, nil
 }
 
 // ReadEntryInto appends the LTX file of one entry to log and returns its range.
 // The caller owns the log and closes it.
-func ReadEntryInto(ctx context.Context, store *Store, seq pos.Seg, e Entry, log *tempfile.Log) (tempfile.File, error) {
+func ReadEntryInto(ctx context.Context, store Store, seq pos.Seg, e Entry, log *tempfile.Log) (tempfile.File, error) {
 	rc, err := store.GetRange(ctx, seq, e.Offset, e.Length)
 	if err != nil {
 		return tempfile.File{}, err
@@ -582,7 +502,7 @@ func ReadEntryInto(ctx context.Context, store *Store, seq pos.Seg, e Entry, log 
 // readTail reads the last n bytes of the segment, or all of them when the
 // segment is shorter. It is how a footer is read: the caller does not know
 // where the end is until it asks.
-func readTail(ctx context.Context, store *Store, seq pos.Seg, n int64) ([]byte, error) {
+func readTail(ctx context.Context, store Store, seq pos.Seg, n int64) ([]byte, error) {
 	rc, err := store.GetRange(ctx, seq, -n, 0)
 	if err != nil {
 		return nil, err
@@ -605,7 +525,7 @@ var ErrMissing = errors.New("journal: missing")
 // Footers are read scanWindow at a time, in parallel, and handed to fn in
 // order. With to zero, a window may read past the end, which costs a few
 // requests that find nothing.
-func Scan(ctx context.Context, store *Store, from, to pos.Seg, fn func(seq pos.Seg, e Entry) error) error {
+func Scan(ctx context.Context, store Store, from, to pos.Seg, fn func(seq pos.Seg, e Entry) error) error {
 	for start := from; to == 0 || start <= to; start += scanWindow {
 		n := pos.Seg(scanWindow)
 		if to != 0 {
@@ -646,15 +566,15 @@ func Scan(ctx context.Context, store *Store, from, to pos.Seg, fn func(seq pos.S
 // present (fences included), or 0, 0 for an empty journal. The lowest is
 // where a reader starts, since old segments expire (until the lease records
 // the range still needed, see docs/internals.md, Node leases).
-func Bounds(ctx context.Context, store *Store) (lowest, highest pos.Seg, err error) {
-	for seq, err := range store.List(ctx, 1) {
+func Bounds(ctx context.Context, store Store) (lowest, highest pos.Seg, err error) {
+	for seg, err := range store.List(ctx, 1) {
 		if err != nil {
 			return 0, 0, err
 		}
-		if lowest == 0 || seq < lowest {
-			lowest = seq
+		if lowest == 0 || seg.Seq < lowest {
+			lowest = seg.Seq
 		}
-		highest = max(highest, seq)
+		highest = max(highest, seg.Seq)
 	}
 	return lowest, highest, nil
 }
@@ -664,9 +584,9 @@ func Bounds(ctx context.Context, store *Store) (lowest, highest pos.Seg, err err
 // it finds a free number and creates an empty segment there. If a zombie takes
 // a number first, its segment counts and the adopter tries the next one. It
 // returns the number of its own fence. Lost responses to its create are
-// recognised by Store, so a fence the adopter wrote is never mistaken
+// recognised by the store, so a fence the adopter wrote is never mistaken
 // for somebody else's.
-func Fence(ctx context.Context, store *Store, from pos.Seg) (pos.Seg, error) {
+func Fence(ctx context.Context, store Store, from pos.Seg) (pos.Seg, error) {
 	for seq := from; ; seq++ {
 		err := store.Create(ctx, seq, bytes.NewReader(nil))
 		if err == nil {
