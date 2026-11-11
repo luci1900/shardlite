@@ -4,8 +4,9 @@
 // the shards, then drives closed-loop load. The numbers are relative: the load
 // generator, the node and the app share the machine.
 //
-// The node needs an S3 store: run RustFS (docker/compose.s3.yaml) and pass its
-// endpoint. Each run uses a prefix of its own.
+// The node needs an S3 store: run RustFS (docker/compose.s3.yaml), export the
+// credentials that file names and pass its endpoint. Each run uses a prefix of
+// its own.
 // The app is built from the e2e module: (cd e2e && go build -o ../e2eapp ./cmd/e2eapp).
 //
 //	bench -s3-endpoint http://127.0.0.1:19000 -node ./shardlite -app ./e2eapp -shards 1000 -clients 64 -duration 15s
@@ -33,7 +34,6 @@ import (
 
 	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/s3test"
 )
 
 var (
@@ -90,9 +90,8 @@ type result struct {
 func main() {
 	flag.Parse()
 	if *s3URL == "" {
-		log.Fatal("-s3-endpoint is required: the node needs an S3 store, so start RustFS with docker/compose.s3.yaml")
+		log.Fatal("-s3-endpoint is required: the node needs an S3 store, so start RustFS with docker/compose.s3.yaml and export the credentials it names")
 	}
-	s3test.Export() // the node inherits the emulator's keys too
 	if b, err := blob.NewS3(context.Background(), blob.S3Options{Bucket: *s3Bucket, Endpoint: *s3URL}); err != nil {
 		log.Fatal(err)
 	} else if err := b.EnsureBucket(context.Background()); err != nil {

@@ -2,7 +2,6 @@ package node
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
@@ -212,17 +211,8 @@ func (a *actor) deactivate(ctx context.Context, ifHeld capture.IfHeld) (bool, er
 	}
 	// The next reminder is read inside the release, at the shard's final state. A
 	// marked shard is deleted by this release, so the marker doesn't count.
-	now := d.now()
 	var next int64
-	read := func(db *sql.DB) error {
-		tx, err := db.BeginTx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-		next, err = nextReminderOf(ctx, tx, d.rem.since(now), now.Unix(), false)
-		return err
-	}
+	read := readNextReminder(ctx, d, false, &next)
 	sh := a.cap.load()
 	released, final, err := sh.Release(ctx, read, ifHeld)
 	if err != nil {

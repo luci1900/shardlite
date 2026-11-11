@@ -3,14 +3,16 @@ package blob_test
 import (
 	"os"
 	"testing"
-
-	"github.com/luci1900/shardlite/internal/s3test"
 )
 
-// TestMain sets the keys and region the S3 client reads from the environment
-// once, so that tests need not (t.Setenv would keep them from running side by
-// side). The emulator's keys serve a fake too.
+// TestMain gives the S3 client keys and a region for the fakes, once, so that
+// tests need not (t.Setenv would keep them from running side by side). A fake
+// takes any keys. The long suite sets the emulator's, which are kept.
 func TestMain(m *testing.M) {
-	s3test.Export()
+	for k, v := range map[string]string{"AWS_ACCESS_KEY_ID": "fake", "AWS_SECRET_ACCESS_KEY": "fake", "AWS_REGION": "us-east-1"} {
+		if os.Getenv(k) == "" {
+			os.Setenv(k, v)
+		}
+	}
 	os.Exit(m.Run())
 }

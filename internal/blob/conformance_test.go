@@ -197,6 +197,10 @@ func conformance(t *testing.T, mk backendFactory) {
 		if _, err := s.GetRange(ctx, "k", 11, 1); err == nil || blob.Transient(err) {
 			t.Fatalf("range past the end: %v", err)
 		}
+		// So is a range that starts at the end: it starts at no byte.
+		if _, err := s.GetRange(ctx, "k", 10, 0); err == nil || blob.Transient(err) {
+			t.Fatalf("range at the end: %v", err)
+		}
 	})
 
 	// A tail: a negative offset asks for the last bytes of an object, which is
@@ -231,6 +235,14 @@ func conformance(t *testing.T, mk backendFactory) {
 		}
 		if got := readAll(t, rc); got != "" {
 			t.Fatalf("tail of an empty object: got %q", got)
+		}
+		// And all of it is an empty read too.
+		rc, err = s.GetRange(ctx, "fence", 0, 0)
+		if err != nil {
+			t.Fatalf("all of an empty object: %v", err)
+		}
+		if got := readAll(t, rc); got != "" {
+			t.Fatalf("all of an empty object: got %q", got)
 		}
 	})
 

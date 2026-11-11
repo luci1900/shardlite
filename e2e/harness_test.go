@@ -114,7 +114,7 @@ func (s *stack) declarePath() string { return filepath.Join(s.dir, "declaration.
 // blobEnv is the node's blob storage settings: RustFS with a prefix of this
 // stack's own.
 func (s *stack) blobEnv() []string {
-	return append([]string{"SHARDLITE_BLOB=s3://" + s.store.Bucket, "SHARDLITE_S3_ENDPOINT=" + s.store.Endpoint, "SHARDLITE_PREFIX=" + s.store.Prefix}, s3test.Env()...)
+	return []string{"SHARDLITE_BLOB=s3://" + s.store.Bucket, "SHARDLITE_S3_ENDPOINT=" + s.store.Endpoint, "SHARDLITE_PREFIX=" + s.store.Prefix}
 }
 
 // nodeEnv is the node's environment: later entries (the stack's own extras) win.

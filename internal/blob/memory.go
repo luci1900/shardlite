@@ -153,7 +153,9 @@ func (m *Memory) GetRange(ctx context.Context, key string, offset, length int64)
 		start := max(size+offset, 0)
 		return io.NopCloser(bytes.NewReader(slices.Clone(o.data[start:]))), nil
 	}
-	if offset > size {
+	// A range starts at one of the object's bytes, as S3 has it, but all of an
+	// empty object is an empty read.
+	if offset >= size && offset > 0 {
 		return nil, fmt.Errorf("blob: range offset %d out of bounds (size %d)", offset, size)
 	}
 	if length <= 0 || offset+length > size {

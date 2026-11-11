@@ -8,7 +8,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"os"
-	"strings"
 	"sync"
 	"testing"
 
@@ -23,25 +22,6 @@ type Store struct {
 	Prefix   string // ends in "/"
 }
 
-// Env is the node-side environment (credentials, region) for processes the test starts.
-func Env() []string {
-	return []string{
-		"AWS_ACCESS_KEY_ID=" + envOr("AWS_ACCESS_KEY_ID", "shardlite"),
-		"AWS_SECRET_ACCESS_KEY=" + envOr("AWS_SECRET_ACCESS_KEY", "shardlite-secret"),
-		"AWS_REGION=" + envOr("AWS_REGION", "us-east-1"),
-	}
-}
-
-// Export sets Env in this process, for a client that reads the standard
-// variables. It is for the whole process, not t.Setenv, which parallel tests
-// can't use.
-func Export() {
-	for _, kv := range Env() {
-		k, v, _ := strings.Cut(kv, "=")
-		os.Setenv(k, v)
-	}
-}
-
 func envOr(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
@@ -49,19 +29,19 @@ func envOr(k, def string) string {
 	return def
 }
 
-var bucketOnce, credsOnce sync.Once
+var bucketOnce sync.Once
 
 // Setup returns a store with a prefix of its own, creating the bucket if
 // needed. It skips the test, naming docker/compose.s3.yaml, when
-// SHARDLITE_TEST_S3_ENDPOINT is not set. The test's process gets the emulator's
-// credentials too, unless the environment has its own.
+// SHARDLITE_TEST_S3_ENDPOINT is not set. The credentials come from the
+// environment, which the long suite sets (docker/compose.s3.yaml has them), and
+// the processes a test starts inherit them.
 func Setup(t testing.TB) Store {
 	t.Helper()
 	endpoint := os.Getenv("SHARDLITE_TEST_S3_ENDPOINT")
 	if endpoint == "" {
 		t.Skip("SHARDLITE_TEST_S3_ENDPOINT is not set: start RustFS with docker/compose.s3.yaml (this test runs nodes as separate processes)")
 	}
-	credsOnce.Do(Export)
 	s := Store{Endpoint: endpoint, Bucket: envOr("SHARDLITE_TEST_S3_BUCKET", "shardlite-test")}
 	var err error
 	bucketOnce.Do(func() {

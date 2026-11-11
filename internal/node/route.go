@@ -103,7 +103,14 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, o origin) {
 			return
 		}
 		if activate {
-			serveActivate(w, info.hold.started)
+			// The node's own dispatch.Activate request. Only a node sends one (the
+			// app can't reach a /_shardlite/ path). It routes as any call does and
+			// answers 200 if it activated the shard and 204 if it was active already.
+			if info.hold.started {
+				w.WriteHeader(http.StatusOK)
+			} else {
+				w.WriteHeader(http.StatusNoContent)
+			}
 			return
 		}
 	}

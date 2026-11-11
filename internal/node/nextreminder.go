@@ -25,40 +25,44 @@ import (
 // would make the time late for files that end before them, if one of them
 // removed work.
 func (a *actor) nextReminder(ctx context.Context) (w int64, at pos.Position, err error) {
-	now := a.d.now().Unix()
 	sh := a.cap.load()
 	if sh == nil {
 		return 0, 0, capture.ErrClosed
 	}
-	at, err = sh.UseAt(ctx, func(db *sql.DB) error {
-		tx, err := db.BeginTx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-		w, err = nextReminderOf(ctx, tx, a.d.rem.since(a.d.now()), now, true)
-		return err
-	})
+	at, err = sh.UseAt(ctx, readNextReminder(ctx, a.d, true, &w))
 	if err != nil {
 		return 0, 0, fmt.Errorf("reading the next reminder: %w", err)
 	}
 	return w, at, nil
 }
 
-// nextReminderOf is nextReminder's snapshot. marker says whether the delete marker
-// counts: not at a deactivation, which deletes a marked shard.
-func nextReminderOf(ctx context.Context, tx *sql.Tx, since, now int64, marker bool) (int64, error) {
-	if marker {
-		var marked bool
-		if err := tx.QueryRowContext(ctx, capture.MarkedQuery).Scan(&marked); err != nil || marked {
-			return now, err
+// readNextReminder is the read of nextReminder and of a deactivation's release,
+// one snapshot of the shard's tables, into *w (see nextReminder). marker says
+// whether the delete marker counts: not at a deactivation, which deletes a
+// marked shard.
+func readNextReminder(ctx context.Context, d *actorDeps, marker bool, w *int64) func(*sql.DB) error {
+	now := d.now()
+	return func(db *sql.DB) error {
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
 		}
+		defer tx.Rollback()
+		if marker {
+			var marked bool
+			if err := tx.QueryRowContext(ctx, capture.MarkedQuery).Scan(&marked); err != nil || marked {
+				*w = now.Unix()
+				return err
+			}
+		}
+		due, ok, err := earliest(ctx, tx, d.rem.since(now))
+		if ok {
+			*w = max(due, now.Unix())
+		} else {
+			*w = 0
+		}
+		return err
 	}
-	due, ok, err := earliest(ctx, tx, since)
-	if !ok {
-		return 0, err
-	}
-	return max(due, now), err
 }
 
 // recordedFor is the next_reminder to record for files that reach end (Unix

@@ -288,6 +288,12 @@ func (s *S3) GetRange(ctx context.Context, key string, offset, length int64) (io
 		}
 		return s.getSuffix(ctx, key, -offset)
 	}
+	if offset == 0 && length <= 0 {
+		// The whole object, asked for with no range: a range of an empty object
+		// is one the store cannot serve (416).
+		rc, _, err := s.Get(ctx, key)
+		return rc, err
+	}
 	rng := fmt.Sprintf("bytes=%d-", offset)
 	if length > 0 {
 		rng = fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
