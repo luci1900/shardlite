@@ -19,7 +19,7 @@ import (
 
 // dbChecksum is the checksum of the database at path, which holds nPages pages
 // of pageSize bytes.
-func dbChecksum(t *testing.T, path string, pageSize, nPages uint32) ltx.Checksum {
+func dbChecksum(t testing.TB, path string, pageSize, nPages uint32) ltx.Checksum {
 	t.Helper()
 	if nPages == 0 {
 		return ltx.ChecksumFlag
@@ -36,7 +36,7 @@ func dbChecksum(t *testing.T, path string, pageSize, nPages uint32) ltx.Checksum
 }
 
 // fileChecksum is the checksum of the database at path, from its size.
-func fileChecksum(t *testing.T, path string, pageSize uint32) ltx.Checksum {
+func fileChecksum(t testing.TB, path string, pageSize uint32) ltx.Checksum {
 	t.Helper()
 	fi, err := os.Stat(path)
 	if err != nil {
@@ -47,7 +47,7 @@ func fileChecksum(t *testing.T, path string, pageSize uint32) ltx.Checksum {
 
 // replayChecksum is the checksum of the database the shard's captured files
 // produce.
-func replayChecksum(t *testing.T, e *harness.Env, pageSize uint32) ltx.Checksum {
+func replayChecksum(t testing.TB, e *harness.Env, pageSize uint32) ltx.Checksum {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "replayed.db")
 	replayInto(t, e, path)
@@ -131,7 +131,7 @@ func entriesAndSeqs(t *testing.T, e *harness.Env, shard string) (out []journal.E
 
 // preApplyChecksum is the checksum of the database before an LTX file is
 // applied, which is in its header.
-func preApplyChecksum(t *testing.T, b []byte) ltx.Checksum {
+func preApplyChecksum(t testing.TB, b []byte) ltx.Checksum {
 	t.Helper()
 	hdr, _, err := ltx.PeekHeader(bytes.NewReader(b))
 	if err != nil {
@@ -171,7 +171,7 @@ func TestRestoredShardContinuesFromTheRestoresChecksum(t *testing.T) {
 
 // trailerChecksum is the checksum of the database after an LTX file is
 // applied, which is in its trailer.
-func trailerChecksum(t *testing.T, b []byte) ltx.Checksum {
+func trailerChecksum(t testing.TB, b []byte) ltx.Checksum {
 	t.Helper()
 	dec := ltx.NewDecoder(bytes.NewReader(b))
 	if err := dec.DecodeHeader(); err != nil {

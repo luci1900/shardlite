@@ -6,10 +6,14 @@ import (
 	"database/sql"
 	"encoding/json"
 	"io"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,6 +30,14 @@ import (
 
 // restartAt is the model's RESTART_AT: a sync of a WAL of more frames restarts it.
 const restartAt = 2
+
+// appBusy is the busy timeout, in milliseconds, of the app's connection. The
+// replay's steps run one at a time and capture takes the write lock only inside
+// a call, so the app never waits on it: only a checkpoint other than a passive
+// one waits, for capture's read transaction, and always gives up (the guide's
+// apps run only passive ones). The 5000 ms an app sets would make each such
+// step of a trace take five seconds for the same outcome.
+const appBusy = "100"
 
 // snapshotPages is the pages of the replayed database: the reserved tables'
 // (which the create command makes, as the node's activation does), the test
@@ -89,7 +101,7 @@ func loadTrace(t *testing.T, path string) []traceStep {
 	return steps
 }
 
-func bigint(t *testing.T, raw json.RawMessage) int {
+func bigint(t testing.TB, raw json.RawMessage) int {
 	t.Helper()
 	var v struct {
 		N string `json:"#bigint"`
@@ -105,13 +117,13 @@ func bigint(t *testing.T, raw json.RawMessage) int {
 }
 
 // int is a variable of the model that is an integer.
-func (s traceStep) int(t *testing.T, v string) int {
+func (s traceStep) int(t testing.TB, v string) int {
 	t.Helper()
 	return bigint(t, s.vars[v])
 }
 
 // length is the length of a variable of the model that is a list.
-func (s traceStep) length(t *testing.T, v string) int {
+func (s traceStep) length(t testing.TB, v string) int {
 	t.Helper()
 	var l []json.RawMessage
 	if err := json.Unmarshal(s.vars[v], &l); err != nil {
@@ -129,7 +141,7 @@ func (s traceStep) length(t *testing.T, v string) int {
 // release that wrote the whole database, which is one file for however many
 // commits it holds (see want).
 type replayer struct {
-	t        *testing.T
+	t        testing.TB
 	e        *harness.Env
 	app      *apptest.App
 	appOpen  bool
@@ -145,8 +157,11 @@ type replayer struct {
 	gens     int
 
 	// The snapshot being read: the reads are held at kill.SnapshotPage until the
-	// model's step reads the next page.
+	// model's step reads the next page, or until the snapshot's letGo closes
+	// (the replayer does that before it closes a snapshot the trace left open).
+	// abandoned closes when the test ends, for a goroutine left by a failure.
 	arrived, proceed, abandoned chan struct{}
+	letGo                       chan struct{}
 	snap                        *snapshot
 
 	// What the app does while Release waits: the model's steps between a
@@ -161,7 +176,7 @@ type snapshot struct {
 	body     []byte // what it gave, once every page is read
 }
 
-func newReplayer(t *testing.T) *replayer {
+func newReplayer(t testing.TB) *replayer {
 	t.Helper()
 	r := &replayer{t: t, e: harness.New(t), arrived: make(chan struct{}), proceed: make(chan struct{}), abandoned: make(chan struct{})}
 	t.Cleanup(func() { close(r.abandoned) })
@@ -204,7 +219,8 @@ func newReplayer(t *testing.T) *replayer {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r.app = r.e.StartApp(name)
+	r.app = apptest.Start(t)
+	r.app.Must(t, "create", "a", r.e.Path(name), appBusy)
 	r.appOpen = true
 	r.pageSize = 4096
 	if v := apptest.Query(t, r.e.Path(name), `PRAGMA page_size`); v != "" {
@@ -230,11 +246,14 @@ func (r *replayer) at(p kill.Point) {
 	}
 	select {
 	case r.arrived <- struct{}{}:
+	case <-r.letGo:
+		return
 	case <-r.abandoned:
 		return
 	}
 	select {
 	case <-r.proceed:
+	case <-r.letGo:
 	case <-r.abandoned:
 	}
 }
@@ -258,11 +277,23 @@ func (r *replayer) wait(ch chan struct{}, what string) {
 	}
 }
 
+// mismatchPrefix starts the failure of a check of an outcome, as against a
+// trace the replayer can't play or a setup that fails, so that a test of a
+// broken variant's trace can tell the replay caught it.
+const mismatchPrefix = "mismatch: "
+
+// mismatch fails the replay on an outcome the model or the database disagrees
+// with.
+func (r *replayer) mismatch(format string, args ...any) {
+	r.t.Helper()
+	r.t.Fatalf(mismatchPrefix+format, args...)
+}
+
 // openApp opens the app's connection if it has none.
 func (r *replayer) openApp() {
 	r.t.Helper()
 	if !r.appOpen {
-		r.app.Must(r.t, "create", "a", r.e.Path(name))
+		r.app.Must(r.t, "create", "a", r.e.Path(name), appBusy)
 		r.appOpen = true
 	}
 }
@@ -309,7 +340,7 @@ func (r *replayer) observeGeneration(s traceStep) {
 	r.salt, r.haveSalt = salt, true
 	// The model counts the first write of the WAL, which is this one.
 	if got, want := r.gens, s.int(r.t, "gen")-1; got != want {
-		r.t.Fatalf("after a commit the WAL has restarted %d times, the model's generation is %d", got, want)
+		r.mismatch("after a commit the WAL has restarted %d times, the model's generation is %d", got, want)
 	}
 }
 
@@ -341,7 +372,7 @@ func (r *replayer) play(steps []traceStep) {
 			t.Fatalf("step %d: action %s is not replayed", i, s.action)
 		}
 		if got := r.sh.Position(); got != r.want {
-			t.Fatalf("step %d (%s): captured position %d, the model's is %d", i, s.action, got, r.want)
+			r.mismatch("step %d (%s): captured position %d, the model's is %d", i, s.action, got, r.want)
 		}
 	}
 	r.endSnapshot()
@@ -360,24 +391,27 @@ func (r *replayer) play(steps []traceStep) {
 func (r *replayer) release(steps []traceStep, i int) int {
 	t, ctx := r.t, context.Background()
 	s := steps[i]
-	r.want += pos.Position(s.int(t, "capSeq") - steps[i-1].int(t, "capSeq"))
 	j := i + 1
 	for j < len(steps) && (steps[j].action == "commit" || steps[j].action == "checkpoint") {
 		j++
 	}
+	if j == len(steps) && j > i+1 {
+		// The model has not decided the release: drop it and the app's steps
+		// (the sync its start makes is dropped with it).
+		t.Logf("step %d: dropped a release still waiting at the end of the trace, and its %d app steps", i, j-i-1)
+		return j - 1
+	}
+	r.want += pos.Position(s.int(t, "capSeq") - steps[i-1].int(t, "capSeq"))
 	read := func(*sql.DB) error { return nil }
 	if j == len(steps) {
-		if j > i+1 {
-			t.Fatalf("step %d: a release whose app steps are never followed by a resume is not replayed", i)
-		}
 		r.app.Must(t, "close", "a")
 		r.appOpen = false
 		released, f, err := r.sh.Release(ctx, read, capture.ResumeIfHeld)
 		if err != nil || !released {
-			t.Fatalf("step %d: the model releases, capture: released=%v err=%v", i, released, err)
+			r.mismatch("step %d: the model releases, capture: released=%v err=%v", i, released, err)
 		}
 		if k, ok := f.(*capture.Kept); !ok || k.At != r.want {
-			t.Fatalf("step %d: released as %#v, the model's captured end is %d", i, f, r.want)
+			r.mismatch("step %d: released as %#v, the model's captured end is %d", i, f, r.want)
 		}
 		return i
 	}
@@ -388,7 +422,7 @@ func (r *replayer) release(steps []traceStep, i int) int {
 	r.inflight = steps[i+1 : j]
 	released, _, err := r.sh.Release(ctx, read, capture.ResumeIfHeld)
 	if err != nil || released {
-		t.Fatalf("step %d: the model resumes, capture: released=%v err=%v", j, released, err)
+		r.mismatch("step %d: the model resumes, capture: released=%v err=%v", j, released, err)
 	}
 	// A resume syncs what is left of the same WAL, or writes the whole database
 	// as one file.
@@ -414,7 +448,7 @@ func (r *replayer) checkFiles(i int, s traceStep) {
 	}
 	got := r.sh.Position()
 	if got != r.want {
-		t.Fatalf("step %d (%s): captured position %d, the model's is %d", i, s.action, got, r.want)
+		r.mismatch("step %d (%s): captured position %d, the model's is %d", i, s.action, got, r.want)
 	}
 	var files []capture.TailFile
 	for _, f := range tailOf(t, r.sh).Files {
@@ -425,32 +459,32 @@ func (r *replayer) checkFiles(i int, s traceStep) {
 	end := r.synced
 	for _, f := range files {
 		if f.Position != end+1 {
-			t.Fatalf("step %d: a file starts at %d after %d", i, f.Position, end)
+			r.mismatch("step %d: a file starts at %d after %d", i, f.Position, end)
 		}
 		end = f.Last()
 	}
 	if end != got {
-		t.Fatalf("step %d: the files reach %d, the capture is at %d", i, end, got)
+		r.mismatch("step %d: the files reach %d, the capture is at %d", i, end, got)
 	}
 	cks := r.sh.Checksums().Checksum()
 	if len(files) > 0 {
 		first, last := read(t, files[0]), read(t, files[len(files)-1])
 		if c := preApplyChecksum(t, first); c != r.cks {
-			t.Fatalf("step %d: the first file has %s before it, the database was %s", i, c, r.cks)
+			r.mismatch("step %d: the first file has %s before it, the database was %s", i, c, r.cks)
 		}
 		if c := trailerChecksum(t, last); c != cks {
-			t.Fatalf("step %d: the last file has %s after it, the capture's is %s", i, c, cks)
+			r.mismatch("step %d: the last file has %s after it, the capture's is %s", i, c, cks)
 		}
 	} else if cks != r.cks {
-		t.Fatalf("step %d: no file written and the checksum moved from %s to %s", i, r.cks, cks)
+		r.mismatch("step %d: no file written and the checksum moved from %s to %s", i, r.cks, cks)
 	}
 	if want := replayChecksum(t, r.e, r.pageSize); cks != want {
-		t.Fatalf("step %d: the capture's checksum is %s, the database its files give is %s", i, cks, want)
+		r.mismatch("step %d: the capture's checksum is %s, the database its files give is %s", i, cks, want)
 	}
 	r.cks, r.synced = cks, got
 }
 
-func read(t *testing.T, f capture.TailFile) []byte {
+func read(t testing.TB, f capture.TailFile) []byte {
 	t.Helper()
 	b, err := io.ReadAll(f.Body.Reader())
 	if err != nil {
@@ -466,13 +500,14 @@ func (r *replayer) snapStart(i int, s traceStep) {
 	if r.snap != nil {
 		t.Fatalf("step %d: a snapshot while one is open", i)
 	}
+	r.letGo = make(chan struct{})
 	p, rd, err := r.sh.Snapshot(context.Background())
 	if err != nil {
 		t.Fatalf("step %d: %v", i, err)
 	}
 	r.snap = &snapshot{position: p, r: rd}
 	if p != r.want {
-		t.Fatalf("step %d: the snapshot is at %d, the model's captured end is %d", i, p, r.want)
+		r.mismatch("step %d: the snapshot is at %d, the model's captured end is %d", i, p, r.want)
 	}
 	for range snapshotPages - 2 {
 		r.wait(r.arrived, "a page of the snapshot")
@@ -525,7 +560,15 @@ func (r *replayer) endSnapshot() {
 		return
 	}
 	r.snap = nil
-	snap.r.Close()
+	// Let go of the reads held in the hook, then close, which waits for the
+	// goroutine writing the snapshot.
+	close(r.letGo)
+	closed := make(chan struct{})
+	go func() {
+		snap.r.Close()
+		close(closed)
+	}()
+	r.wait(closed, "the snapshot to close")
 	if snap.read != 2 {
 		return
 	}
@@ -543,7 +586,7 @@ func (r *replayer) endSnapshot() {
 		t.Fatal(err)
 	}
 	if got := int(dec.Header().Commit) * int(r.pageSize); got != len(wb) {
-		t.Fatalf("the snapshot holds %d bytes of database, the files give %d", got, len(wb))
+		r.mismatch("the snapshot holds %d bytes of database, the files give %d", got, len(wb))
 	}
 	buf := make([]byte, r.pageSize)
 	for {
@@ -553,7 +596,7 @@ func (r *replayer) endSnapshot() {
 		}
 		off := int(ph.Pgno-1) * int(r.pageSize)
 		if !bytes.Equal(buf, wb[off:off+int(r.pageSize)]) {
-			t.Fatalf("page %d of the snapshot at %d is not the database at that position", ph.Pgno, snap.position)
+			r.mismatch("page %d of the snapshot at %d is not the database at that position", ph.Pgno, snap.position)
 		}
 	}
 }
@@ -607,6 +650,77 @@ func tracePaths(t *testing.T) []string {
 		t.Fatalf("no traces: %v", err)
 	}
 	return paths
+}
+
+// The counterexamples of the model's broken variants (testdata/traces/variants)
+// played against the code. lockNoSync's locked restart skips its sync, so the
+// model's captured end falls behind the code's and the replay must catch it.
+// noSalts and mapAll break what capture reads, not how far it gets, and the
+// replay checks what capture reads against the database rather than the model,
+// so they must replay clean: the code stays correct along the paths where those
+// designs lose commits. (lockGap has none here: its gap has no counterpart in
+// the code.)
+func TestReplayCounterexamples(t *testing.T) {
+	for variant, caught := range map[string]bool{"lockNoSync": true, "noSalts": false, "mapAll": false} {
+		t.Run(variant, func(t *testing.T) {
+			t.Parallel()
+			steps := loadTrace(t, filepath.Join("testdata/traces/variants", variant+".itf.json"))
+			if !caught {
+				newReplayer(t).play(steps)
+				return
+			}
+			f := &failures{TB: t}
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				newReplayer(f).play(steps)
+			}()
+			select {
+			case <-done:
+			case <-time.After(time.Minute):
+				t.Fatal("timed out waiting for the replay")
+			}
+			got := f.all()
+			if len(got) == 0 {
+				t.Fatal("the replay passed a trace the variant goes wrong on")
+			}
+			if !strings.HasPrefix(got[0], mismatchPrefix) {
+				t.Fatalf("the replay failed, but not on an outcome: %s", got[0])
+			}
+			t.Logf("caught: %s", got[0])
+		})
+	}
+}
+
+// failures is a testing.TB that keeps its failures instead of reporting them. A
+// Fatal ends the goroutine it is called from, as testing.T's does.
+type failures struct {
+	testing.TB
+	mu  sync.Mutex
+	got []string
+}
+
+func (f *failures) add(msg string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.got = append(f.got, msg)
+}
+
+func (f *failures) all() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.got)
+}
+
+func (f *failures) Failed() bool                      { return len(f.all()) > 0 }
+func (f *failures) Fail()                             { f.add("failed") }
+func (f *failures) Error(args ...any)                 { f.add(fmt.Sprint(args...)) }
+func (f *failures) Errorf(format string, args ...any) { f.add(fmt.Sprintf(format, args...)) }
+func (f *failures) FailNow()                          { f.add("failed"); runtime.Goexit() }
+func (f *failures) Fatal(args ...any)                 { f.add(fmt.Sprint(args...)); runtime.Goexit() }
+func (f *failures) Fatalf(format string, args ...any) {
+	f.add(fmt.Sprintf(format, args...))
+	runtime.Goexit()
 }
 
 // Between them the traces take every action of the model's protocol, so a

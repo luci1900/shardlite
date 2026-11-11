@@ -8,9 +8,7 @@
 // expires, the process crashes, the app opens and closes the file. See docs/internals.md (Activation,
 // Letting go of a shard, Fencing, Takeover) and internal/node/actor.go and shardset.go.
 //
-// Run:
-//   quint typecheck specs/shard.qnt
-//   quint run specs/shard.qnt --invariant=safe --max-steps=40 --max-samples=20000
+// specs/check.sh runs this model's checks.
 
 module shard {
   // Positions stop here so the state space stays finite.

@@ -43,16 +43,9 @@
 // `next_reminder` to now, which is no different here), how far a move goes (any later minute is as safe as
 // another, so moves go one minute on), where dispatches go and limits.
 //
-// Run (simulation only: `quint verify` fails on a file with four or more instances before it starts, and a copy
-// with the protocol's instance alone verifies 4 steps in seconds but not 6 in 15 minutes):
-//   quint typecheck specs/dispatch.qnt
-//   quint run specs/dispatch.qnt --main=dispatchProtocol --invariant=safe --max-steps=40 --max-samples=50000
-//   quint run specs/dispatch.qnt --main=pruneWithoutBase --invariant=covered --max-steps=40 --max-samples=50000   (should fail)
-//   quint run specs/dispatch.qnt --main=deleteOnAnswer --invariant=covered --max-steps=40 --max-samples=50000   (should fail)
-//   quint run specs/dispatch.qnt --main=manifestFirst --invariant=covered --max-steps=40 --max-samples=50000   (should fail)
-//   quint run specs/dispatch.qnt --main=noAdoptionEntry --invariant=covered --max-steps=40 --max-samples=50000   (should fail)
-//   quint test specs/dispatch.qnt --main=dispatchProtocol
-//   quint test specs/dispatch.qnt --main=sharedEntry --match=sharedEntryExample   (should fail)
+// Simulation only: `quint verify` fails on a file with four or more instances before it starts, and a copy with the
+// protocol's instance alone verifies 4 steps in seconds but not 6 in 15 minutes. specs/check.sh runs this model's
+// checks, and says which must fail.
 //
 // Simulation rarely reaches sharedEntry's counterexample (it needs three writes, a stale entry and a dispatcher's read
 // in one trace), so it has a scripted example instead.

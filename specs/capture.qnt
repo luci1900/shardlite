@@ -54,16 +54,9 @@
 // Traces of this model are replayed against the capture code (docs/internals.md, The models): the reachability checks
 // below end them, and internal/capture/testdata/traces/generate.sh makes them.
 //
-// Run (simulation is the check at depth: `quint verify` holds `safe` to 8 steps in about 8 minutes, and the ranges
-// are bounded by MAX_COMMITS because Apalache needs constant ones):
-//   quint typecheck specs/capture.qnt
-//   quint run specs/capture.qnt --main=captureProtocol --invariant=safe --max-steps=40 --max-samples=50000
-//   quint verify specs/capture.qnt --main=captureProtocol --invariant=safe --max-steps=8
-//   quint run specs/capture.qnt --main=lockNoSync --invariant=safe --max-steps=40 --max-samples=50000   (should fail)
-//   quint run specs/capture.qnt --main=lockGap --invariant=safe --max-steps=40 --max-samples=50000   (should fail)
-//   quint run specs/capture.qnt --main=noSalts --invariant=safe --max-steps=40 --max-samples=50000   (should fail)
-//   quint run specs/capture.qnt --main=mapAll --invariant=safe --max-steps=40 --max-samples=50000   (should fail)
-//   quint run specs/capture.qnt --main=captureProtocol --invariant=neverRestarts --max-steps=40 --max-samples=50000   (should fail: a restart is reachable)
+// Simulation is the check at depth: `quint verify` holds `safe` to 8 steps in about 8 minutes, and the ranges are
+// bounded by MAX_COMMITS because Apalache needs constant ones. specs/check.sh runs this model's checks, and says which
+// must fail (every variant, and `neverRestarts`, because a restart is reachable).
 
 module capture {
   // At most this many commits.
@@ -349,15 +342,18 @@ module capture {
 
   val safe: bool = noLoss and replay and snapOk
 
-  // Reachability checks, which should fail. Four of them end a path where the code is replayed along it (see
+  // Reachability checks, which should fail. Six of them end a path where the code is replayed along it (see
   // internal/capture/testdata/traces): a commit and a release, which is two steps; a WAL of three frames all copied
   // (a locked restart, or a resume after one); four commits captured with nothing open, which a random walk reaches
-  // by many paths; and a snapshot finished after a WAL restart.
+  // by many paths; a snapshot finished after a WAL restart; a snapshot half read after a commit (the path ends with
+  // it open); and a release waiting after the app has committed (the path ends before the resume).
   val neverRestarts: bool = gen <= 1
   val neverReleasedAfterOneCommit: bool = not(phase == 1 and capSeq == 1 and back == 0)
   val neverThreeFramesCopied: bool = not(phase == 0 and back >= 3)
   val neverFourCapturedAtRest: bool = not(capSeq >= 4 and phase == 0 and sPhase == 0)
   val neverSnapshotAfterRestart: bool = not(sPhase == 2 and gen >= 1)
+  val neverSnapshotHalfRead: bool = not(sPhase == 1 and sNext >= 1 and hist.length() >= 1)
+  val neverReleaseWaitingAfterCommit: bool = not(phase == 1 and hist.length() > capSeq)
 }
 
 module captureProtocol {

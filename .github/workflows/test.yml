@@ -1,7 +1,7 @@
 # The tests run only when started by hand (Actions, test, Run workflow). The fast
-# suite always runs, and the long suite (against RustFS, with the fault tests and
-# e2e) only if long is ticked. Both are the Makefile's test targets, which are
-# the way to run them locally too.
+# suite always runs, the long suite (against RustFS, with the fault tests and
+# e2e) only if long is ticked, and the model suite (with Quint) only if model is.
+# Each is a Makefile test target, which is the way to run it locally too.
 name: test
 
 on:
@@ -9,6 +9,10 @@ on:
     inputs:
       long:
         description: Also run the long suite
+        type: boolean
+        default: false
+      model:
+        description: Also run the model suite
         type: boolean
         default: false
 
@@ -49,6 +53,7 @@ jobs:
         run: |
           go vet ./...
           go vet -tags fault ./...
+          go vet -tags model ./...
           (cd e2e && go vet -tags fault ./...)
           (cd migrate && go vet ./...)
           (cd sdk/go && go vet ./...)
@@ -117,5 +122,34 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: long-test-output
+          path: ${{ runner.temp }}/testwatch
+          if-no-files-found: ignore
+
+  model:
+    if: inputs.model
+    runs-on: ubuntu-latest
+    # A guess, to adjust from real runs.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 24
+      - name: Install Quint
+        # The version the suite pins, read from model.sh.
+        run: npm install -g "@informalsystems/quint@$(sed -n 's/^quint_version=//p' internal/tools/testwatch/model.sh)"
+      - name: Model suite
+        run: make test-model
+        env:
+          TESTWATCH_OUT: ${{ runner.temp }}/testwatch
+      - name: Upload test output
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: model-test-output
           path: ${{ runner.temp }}/testwatch
           if-no-files-found: ignore

@@ -37,6 +37,7 @@ Always use simulation for non-trivial Quint models (`quint run`): verification (
 ## Tests
 
 - After a change, run the fast suite: `make test` from the repo root (in-memory blob backend, under testwatch).
+- After a change to `specs/` or `internal/capture`, also run the model suite: `make test-model` (Quint, about 3.5 minutes).
 - Ask before running the long suite: `make test-long` (RustFS, the fault tests and the e2e module). It starts nothing itself, so bring RustFS up with `docker compose -f docker/compose.s3.yaml up -d` first.
 - Tests wait on counters or events, never a fixed sleep followed by an assert.
 

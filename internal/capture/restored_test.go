@@ -51,7 +51,7 @@ func stored(t *testing.T, e *harness.Env, mb int) *shardfile.Restored {
 }
 
 // restore restores the shard from blob storage to its path.
-func restore(t *testing.T, e *harness.Env) *shardfile.Restored {
+func restore(t testing.TB, e *harness.Env) *shardfile.Restored {
 	t.Helper()
 	res, err := e.Files.Restore(context.Background(), shardName(name), e.Path(name), shardfile.RestoreOptions{})
 	if err != nil {
@@ -118,7 +118,7 @@ func TestActivatingARestoredShardReadsNoPages(t *testing.T) {
 
 // replayInto applies a shard's whole history onto path: the entries of each of
 // its activations, in order.
-func replayInto(t *testing.T, e *harness.Env, path string) {
+func replayInto(t testing.TB, e *harness.Env, path string) {
 	t.Helper()
 	ap, err := shardfile.NewApplier(path)
 	if err != nil {

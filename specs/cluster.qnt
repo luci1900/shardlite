@@ -45,18 +45,8 @@
 // and the gate is a guard on `respond`. Also left out: the interior of the database, deletion, messages,
 // forwarding, rebasing, renewals and sweeping the journal.
 //
-// Run:
-//   quint typecheck specs/cluster.qnt
-//   quint run specs/cluster.qnt --main=protocol --invariant=safe --max-steps=40 --max-samples=50000
-//   quint run specs/cluster.qnt --main=protocol --invariant=liveNeverFenced --max-steps=40 --max-samples=50000
-//   quint run specs/cluster.qnt --main=protocol --invariant=claimRulesAgree --max-steps=40 --max-samples=50000
-//   quint test specs/cluster.qnt --main=uncheckedConfirm --match=staleConfirm   (the same test fails under protocol)
-//   quint run specs/cluster.qnt --main=claimAfterLease --invariant=ackedKept --max-steps=40   (should fail)
-//   quint run specs/cluster.qnt --main=resumeAfterUnknown --invariant=ackedKept --max-steps=40   (should fail)
-//   quint run specs/cluster.qnt --main=restartOverrides --invariant=liveNeverFenced --max-steps=40   (should fail)
-//   quint test specs/cluster.qnt --main=protocol
-//   quint test specs/cluster.qnt --main=claimNeedsCleared --match=namedJournalClaim   (should fail)
-//   quint test specs/cluster.qnt --main=claimNeedsAdopted --match=earlyClaim   (should fail)
+// specs/check.sh runs this model's checks, and says which must fail. (The test staleConfirmTest passes under
+// uncheckedConfirm and fails under protocol, which is what it shows.)
 //
 // Simulation is the check on protocol: three nodes are what makes the interesting traces reachable, and
 // bounded verification (quint verify) doesn't get to an adoption's five steps in useful time at that size.

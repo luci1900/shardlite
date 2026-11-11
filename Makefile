@@ -1,14 +1,14 @@
 # The linter for the code's closed sets. See docs/internals.md.
 #
 # The test suites are more plumbing than a recipe line wants, so their logic
-# stays in scripts beside testwatch (internal/tools/testwatch/fast.sh and
-# long.sh) and these targets are only the way to call them from anywhere, as
+# stays in scripts beside testwatch (internal/tools/testwatch/fast.sh, long.sh
+# and model.sh) and these targets are only the way to call them from anywhere, as
 # CI does. The suites take their extra go test arguments in ARGS: one flag
 # bare, more than one word quoted on the assignment alone, as in
 # make test-long ARGS='-race ./internal/node'. Quoting the whole line instead
 # defines a variable named "test-long ARGS".
 
-.PHONY: lint test test-long
+.PHONY: lint test test-long test-model test-all
 
 lint:
 	go tool -modfile=tools.mod exhaustive -check switch,typeswitch,mapliteral ./...
@@ -24,3 +24,14 @@ test:
 
 test-long:
 	./internal/tools/testwatch/long.sh $(ARGS)
+
+test-model:
+	./internal/tools/testwatch/model.sh $(ARGS)
+
+# Every suite in turn, each run even if one before it failed.
+test-all:
+	status=0; \
+	$(MAKE) test || status=1; \
+	$(MAKE) test-long || status=1; \
+	$(MAKE) test-model || status=1; \
+	exit $$status
