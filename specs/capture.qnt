@@ -52,11 +52,10 @@
 // against a busy writer, and liveness.
 //
 // Traces of this model are replayed against the capture code (docs/internals.md, The models): the reachability checks
-// below end them, and internal/capture/testdata/traces/generate.sh makes them.
+// below end them, and `go test -tags model ./internal/capture -run TestModelTracesCurrent -update` makes them.
 //
 // Simulation is the check at depth: `quint verify` holds `safe` to 8 steps in about 8 minutes, and the ranges are
-// bounded by MAX_COMMITS because Apalache needs constant ones. specs/check.sh runs this model's checks, and says which
-// must fail (every variant, and `neverRestarts`, because a restart is reachable).
+// bounded by MAX_COMMITS because Apalache needs constant ones.
 
 module capture {
   // At most this many commits.

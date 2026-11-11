@@ -45,8 +45,7 @@
 // and the gate is a guard on `respond`. Also left out: the interior of the database, deletion, messages,
 // forwarding, rebasing, renewals and sweeping the journal.
 //
-// specs/check.sh runs this model's checks, and says which must fail. (The test staleConfirmTest passes under
-// uncheckedConfirm and fails under protocol, which is what it shows.)
+// The test staleConfirmTest passes under uncheckedConfirm and fails under protocol, which is what it shows.
 //
 // Simulation is the check on protocol: three nodes are what makes the interesting traces reachable, and
 // bounded verification (quint verify) doesn't get to an adoption's five steps in useful time at that size.

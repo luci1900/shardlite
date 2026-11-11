@@ -1,7 +1,7 @@
 #!/bin/sh
 # The long suite: what the fast suite leaves out, under the same watcher and
-# against RustFS, with gotestsum's report. The runs, the reports and the
-# arguments are in the testwatch README.
+# against RustFS, with gotestsum's report: one run per call of run below. How
+# to call it is in the testwatch README.
 set -eu
 cd "$(dirname "$0")/../../.."
 root=$(pwd)

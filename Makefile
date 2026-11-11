@@ -1,8 +1,8 @@
 # The linter for the code's closed sets. See docs/internals.md.
 #
 # The test suites are more plumbing than a recipe line wants, so their logic
-# stays in scripts beside testwatch (internal/tools/testwatch/fast.sh, long.sh
-# and model.sh) and these targets are only the way to call them from anywhere, as
+# stays in scripts beside testwatch (internal/tools/testwatch/fast.sh and
+# long.sh) and these targets are only the way to call them from anywhere, as
 # CI does. The suites take their extra go test arguments in ARGS: one flag
 # bare, more than one word quoted on the assignment alone, as in
 # make test-long ARGS='-race ./internal/node'. Quoting the whole line instead
@@ -25,8 +25,12 @@ test:
 test-long:
 	./internal/tools/testwatch/long.sh $(ARGS)
 
+# The spec checks wait on quint, which testwatch can't see. ARGS goes to the capture tests only.
 test-model:
-	./internal/tools/testwatch/model.sh $(ARGS)
+	status=0; \
+	./internal/tools/testwatch/fast.sh -tags=model ./internal/capture $(ARGS) || status=1; \
+	go tool -modfile=tools.mod gotestsum -- -tags=model -timeout 15m ./specs || status=1; \
+	exit $$status
 
 # Every suite in turn, each run even if one before it failed.
 test-all:

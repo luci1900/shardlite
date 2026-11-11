@@ -140,8 +140,8 @@ jobs:
         with:
           node-version: 24
       - name: Install Quint
-        # The version the suite pins, read from model.sh.
-        run: npm install -g "@informalsystems/quint@$(sed -n 's/^quint_version=//p' internal/tools/testwatch/model.sh)"
+        # The version the suite pins, read from internal/quinttest.
+        run: npm install -g "@informalsystems/quint@$(cat internal/quinttest/quint-version)"
       - name: Model suite
         run: make test-model
         env:

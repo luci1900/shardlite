@@ -44,8 +44,7 @@
 // another, so moves go one minute on), where dispatches go and limits.
 //
 // Simulation only: `quint verify` fails on a file with four or more instances before it starts, and a copy with the
-// protocol's instance alone verifies 4 steps in seconds but not 6 in 15 minutes. specs/check.sh runs this model's
-// checks, and says which must fail.
+// protocol's instance alone verifies 4 steps in seconds but not 6 in 15 minutes.
 //
 // Simulation rarely reaches sharedEntry's counterexample (it needs three writes, a stale entry and a dispatcher's read
 // in one trace), so it has a scripted example instead.
