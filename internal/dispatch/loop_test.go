@@ -96,14 +96,16 @@ func TestALaneTakenOverIsHandled(t *testing.T) {
 // A pass lists one page over all the lanes together, not one page for each.
 func TestPageIsSharedOverLanes(t *testing.T) {
 	t.Parallel()
-	r := newRigOn(t, nil, Options{Rate: 1e6, Page: 5})
-	for i := range 40 {
-		r.backed(fmt.Sprintf("users/u%d", i))
-	}
-	r.passOK()
-	if got := r.sentCount(); got != 5 {
-		t.Fatalf("a pass with a page of 5 handled %d", got)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		r := newRigOn(t, realClock{}, Options{})
+		for i := range 2 * pageSize {
+			r.backed(fmt.Sprintf("users/u%d", i))
+		}
+		r.passOK()
+		if got := r.sentCount(); got != pageSize {
+			t.Fatalf("a pass over %d entries in all lanes handled %d, want a page of %d", 2*pageSize, got, pageSize)
+		}
+	})
 }
 
 // A pass that fails because the node's lease does reports it and says it was busy,
@@ -130,11 +132,11 @@ func TestAPassWithoutALeaseFails(t *testing.T) {
 	}
 }
 
-// A pass handles at most InFlight entries at once.
+// A pass handles at most maxInFlight entries at once.
 func TestPassKeepsToInFlight(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
-		r := newRigOn(t, realClock{}, Options{InFlight: 3, Rate: 1e6})
+		r := newRigOn(t, realClock{}, Options{})
 		var cur, most atomic.Int64
 		r.reply = func(context.Context, shard.Name) (int, error) {
 			n := cur.Add(1)
@@ -143,16 +145,18 @@ func TestPassKeepsToInFlight(t *testing.T) {
 			cur.Add(-1)
 			return http.StatusOK, nil
 		}
-		for i := range 10 {
+		const n = 3 * maxInFlight
+		for i := range n {
 			r.backed(fmt.Sprintf("users/u%d", i))
 		}
 		start := time.Now()
 		r.passOK()
-		if most.Load() != 3 {
-			t.Fatalf("%d handled at once, want 3", most.Load())
+		if most.Load() != maxInFlight {
+			t.Fatalf("%d handled at once, want %d", most.Load(), maxInFlight)
 		}
-		if took := time.Since(start); took < 4*time.Second || took > 4*time.Second+time.Millisecond {
-			t.Fatalf("10 entries, 3 at a time, took %v, want 4s", took)
+		// Three waves of a second each, so the third starts after the first two.
+		if took := time.Since(start); took < 3*time.Second {
+			t.Fatalf("%d entries, %d at a time, took %v, want at least 3s", n, maxInFlight, took)
 		}
 		for _, e := range r.all() {
 			if e.N != 1 {
@@ -162,33 +166,35 @@ func TestPassKeepsToInFlight(t *testing.T) {
 	})
 }
 
-// A pass stops handing out entries when its Budget ends, and the call it was making
+// A pass stops handing out entries when its budget ends, and the call it was making
 // sees its context end. What it had not finished stays due.
 func TestPassKeepsToItsBudget(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
-		r := newRigOn(t, realClock{}, Options{InFlight: 1, Rate: 1e6, Budget: 2500 * time.Millisecond})
+		r := newRigOn(t, realClock{}, Options{})
 		r.reply = func(ctx context.Context, _ shard.Name) (int, error) {
 			select {
-			case <-time.After(time.Second):
+			case <-time.After(2 * budget / 5):
 				return http.StatusOK, nil
 			case <-ctx.Done():
 				return 0, ctx.Err()
 			}
 		}
-		for i := range 10 {
+		for i := range 4 * maxInFlight {
 			r.backed(fmt.Sprintf("users/u%d", i))
 		}
 		r.passOK()
-		if got := r.sentCount(); got != 3 {
-			t.Fatalf("%d entries sent, want 3 (two finished and one cut off)", got)
+		// Each call takes two fifths of the budget, so two waves finish and the third
+		// is cut off.
+		if got := r.sentCount(); got != 3*maxInFlight {
+			t.Fatalf("%d entries sent, want %d (two waves finished and one cut off)", got, 3*maxInFlight)
 		}
 		moved := 0
 		for _, e := range r.all() {
 			moved += e.N
 		}
-		if got := len(r.all()); got != 10 || moved != 2 {
-			t.Fatalf("%d entries left and %d moves, want 10 entries and 2 moves", got, moved)
+		if got := len(r.all()); got != 4*maxInFlight || moved != 2*maxInFlight {
+			t.Fatalf("%d entries left and %d moves, want %d entries and %d moves", got, moved, 4*maxInFlight, 2*maxInFlight)
 		}
 		if r.p.Failed.Load() != 0 {
 			t.Fatalf("%d dispatches counted failed: the one cut off is not a failure", r.p.Failed.Load())
@@ -196,11 +202,11 @@ func TestPassKeepsToItsBudget(t *testing.T) {
 	})
 }
 
-// A pass sends at Rate a second.
+// A pass sends at maxRate a second.
 func TestPassKeepsToRate(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
-		r := newRigOn(t, realClock{}, Options{Rate: 2})
+		r := newRigOn(t, realClock{}, Options{})
 		var mu sync.Mutex
 		var starts []time.Time
 		r.reply = func(context.Context, shard.Name) (int, error) {
@@ -209,15 +215,16 @@ func TestPassKeepsToRate(t *testing.T) {
 			mu.Unlock()
 			return http.StatusOK, nil
 		}
-		for i := range 5 {
+		const n = 11
+		for i := range n {
 			r.backed(fmt.Sprintf("users/u%d", i))
 		}
 		r.passOK()
-		if len(starts) != 5 {
+		if len(starts) != n {
 			t.Fatalf("%d entries handled", len(starts))
 		}
-		if span := starts[4].Sub(starts[0]); span != 2*time.Second {
-			t.Fatalf("5 entries at 2 a second took %v from first to last, want 2s", span)
+		if span, want := starts[n-1].Sub(starts[0]), (n-1)*time.Second/maxRate; span != want {
+			t.Fatalf("%d entries at %d a second took %v from first to last, want %v", n, maxRate, span, want)
 		}
 	})
 }
@@ -228,7 +235,7 @@ func TestPassKeepsToRate(t *testing.T) {
 func TestServeTiming(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
-		r := newRigOn(t, realClock{}, Options{Rate: 1e6})
+		r := newRigOn(t, realClock{}, Options{})
 		none := []shard.Lane{}
 		r.mine.Store(&none)
 		r.listed.Store(false)
@@ -279,7 +286,7 @@ func TestServeTiming(t *testing.T) {
 func TestFailedPassesBackOff(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
-		r := newRigOn(t, realClock{}, Options{Rate: 1e6})
+		r := newRigOn(t, realClock{}, Options{})
 		r.leased.Store(false)
 		ctx, cancel := context.WithCancel(context.Background())
 		var wg sync.WaitGroup

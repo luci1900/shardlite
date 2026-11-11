@@ -23,7 +23,7 @@ import (
 )
 
 // The tests here drive the writers and watch what they leave in storage: what
-// a write whose update loses its compare-and-swap deletes, what a rebase's
+// a write whose update loses its compare-and-swap leaves, what a rebase's
 // sweep reclaims, and what each failure reports (docs/internals.md, Garbage).
 
 // garbageRig is an Env whose blob operations are recorded and can be made to
@@ -57,10 +57,8 @@ type blobLog struct {
 	failHeads     atomic.Bool
 	failDrops     bool // deletes of the shard's LTX files fail while set
 	failList      bool // listings of the shard's files fail while set
-	// failManifestGets and failLeaseGets fail the reads of the shard's
-	// manifest and of the node's lease while set.
-	failManifestGets atomic.Bool
-	failLeaseGets    atomic.Bool
+	// failLeaseGets fails the reads of the node's lease while set.
+	failLeaseGets atomic.Bool
 }
 
 func (r *garbageRig) add(s string) {
@@ -112,8 +110,7 @@ func (r *garbageRig) hook() blobtest.Hook {
 			if r.ops.failDrops {
 				return errors.New("storage is down")
 			}
-		case op == blobtest.OpGet && key == manifest && r.ops.failManifestGets.Load(),
-			op == blobtest.OpGet && key == leaseKey && r.ops.failLeaseGets.Load():
+		case op == blobtest.OpGet && key == leaseKey && r.ops.failLeaseGets.Load():
 			return errors.New("storage is down")
 		case op == blobtest.OpList && strings.HasPrefix(key, files):
 			if r.ops.failList {
@@ -167,9 +164,9 @@ func (r *garbageRig) keys(t *testing.T, prefix string) []string {
 }
 
 // A write whose manifest update is rejected because the manifest changed
-// deletes the file it uploaded: the manifest changed under the handle, so no
-// update of its can ever list it.
-func TestADeltaWhoseUpdateLosesToAnotherWriterLeavesNoFile(t *testing.T) {
+// deletes nothing and leaves its file unlisted, since nothing can list it
+// later. The shard's next rebase sweeps it.
+func TestADeltaWhoseUpdateLosesToAnotherWriterLeavesItsFileForTheNextRebase(t *testing.T) {
 	t.Parallel()
 	r := newGarbageRig(t)
 	ctx := context.Background()
@@ -177,25 +174,42 @@ func TestADeltaWhoseUpdateLosesToAnotherWriterLeavesNoFile(t *testing.T) {
 	h, sh := r.NewShard(shard)
 	defer sh.Close(ctx)
 	ack(t, app, sh, 1)
+	if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); err != nil {
+		t.Fatal(err)
+	}
+	ack(t, app, sh, 2)
 	r.ops.supersede.Store(true)
 
 	if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); !errors.Is(err, blob.ErrConflict) {
 		t.Fatalf("got %v, want the update to lose to the other writer", err)
 	}
-	if keys := r.keys(t, shardfile.ShardPrefix(shardName(shard))); len(keys) != 0 {
-		t.Fatalf("the lost delta left %v behind", keys)
+	if n := r.count("drop"); n != 0 {
+		t.Fatalf("%d deletes, want none", n)
 	}
-	if n := r.count("drop"); n != 1 {
-		t.Fatalf("%d deletes, want the one best-effort delete", n)
+	if keys := r.keys(t, shardfile.ShardPrefix(shardName(shard))); len(keys) != 2 {
+		t.Fatalf("objects %v, want the listed delta and the lost one", keys)
 	}
 	if r.leaks.Load() != 0 {
-		t.Fatalf("%d leaks, want none: the delete worked", r.leaks.Load())
+		t.Fatalf("%d leaks, want none: nothing failed to delete", r.leaks.Load())
+	}
+
+	h2, err := r.Files.Attach(ctx, shardName(shard))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if did, err := h2.Rebase(ctx, sh, shardfile.Hooks{}); !did || err != nil {
+		t.Fatalf("rebase %v %v", did, err)
+	}
+	base := shardfile.File{Range: shardfile.Range{Min: 1, Max: sh.Position()}, Epoch: r.Store.Epoch()}
+	want := []string{shardfile.FileKey(shardName(shard), h2.Manifest.Generation, base)}
+	if keys := r.keys(t, shardfile.ShardPrefix(shardName(shard))); !slices.Equal(keys, want) {
+		t.Fatalf("objects %v, want the base alone: the sweep takes the lost delta", keys)
 	}
 }
 
-// The same write as a rebase's base: the base goes when the swap loses, and
-// the files the manifest lists stay.
-func TestARebaseWhoseUpdateLosesToAnotherWriterLeavesNoBase(t *testing.T) {
+// The same write as a rebase's base: the files the manifest lists stay, and
+// so does the base, unlisted.
+func TestARebaseWhoseUpdateLosesToAnotherWriterLeavesItsBase(t *testing.T) {
 	t.Parallel()
 	r := newGarbageRig(t)
 	ctx := context.Background()
@@ -213,20 +227,19 @@ func TestARebaseWhoseUpdateLosesToAnotherWriterLeavesNoBase(t *testing.T) {
 	if did, err := h.Rebase(ctx, sh, shardfile.Hooks{}); did || !errors.Is(err, blob.ErrConflict) {
 		t.Fatalf("rebase %v %v, want the swap to lose to the other writer", did, err)
 	}
-	gen := h.Manifest.Generation
-	want := make([]string, 0, len(h.Manifest.Files))
-	for _, f := range h.Manifest.Files {
-		want = append(want, shardfile.FileKey(shardName(shard), gen, f))
+	if n := r.count("drop"); n != 0 {
+		t.Fatalf("%d deletes, want none", n)
 	}
-	if keys := r.keys(t, shardfile.ShardPrefix(shardName(shard))); !slices.Equal(keys, want) {
-		t.Fatalf("objects %v, want the listed deltas %v and no base", keys, want)
+	if keys := r.keys(t, shardfile.ShardPrefix(shardName(shard))); len(keys) != 3 {
+		t.Fatalf("objects %v, want the two listed deltas and the base", keys)
 	}
 }
 
 // The same write as an adoption's delta. The adoption looks again after the
-// conflict and writes its delta again, so the generation ends with the one
-// file the manifest lists.
-func TestAnAdoptionDeltaWhoseUpdateLosesToAnotherWriterLeavesNoFile(t *testing.T) {
+// conflict and writes its delta again, which replaces the first upload (the
+// same name, putFile), so the generation ends with the one file the manifest
+// lists.
+func TestAnAdoptionDeltaWhoseUpdateLosesToAnotherWriterEndsWithTheOneListedFile(t *testing.T) {
 	t.Parallel()
 	r := newGarbageRig(t)
 	ctx := context.Background()
@@ -353,104 +366,6 @@ func TestAMovedOnUpdateDeletesNothing(t *testing.T) {
 	}
 	if keys := r.keys(t, shardfile.ShardPrefix(shardName(shard))); len(keys) != 1 {
 		t.Fatalf("objects %v, want the one listed delta", keys)
-	}
-}
-
-// A conflict can hide this writer's own update: the first attempt lands and
-// loses its response, another writer then changes the manifest (keeping the
-// delta it lists), and the store's retry sees a manifest that is not its own.
-// The write fails with the conflict, but the stored manifest lists the delta,
-// so it is data and stays.
-func TestAConflictThatHidesALandedUpdateDeletesNothing(t *testing.T) {
-	t.Parallel()
-	r := newGarbageRig(t)
-	ctx := context.Background()
-	app := r.StartApp(shard)
-	h, sh := r.NewShard(shard)
-	defer sh.Close(ctx)
-	ack(t, app, sh, 1)
-	r.ops.loseUpdate.Store(true)
-	r.ops.supersedeHead.Store(true)
-
-	if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); !errors.Is(err, blob.ErrConflict) {
-		t.Fatalf("got %v, want a conflict that hides the landed update", err)
-	}
-	if n := r.count("drop"); n != 0 {
-		t.Fatalf("%d deletes, want none: the stored manifest lists the delta", n)
-	}
-	m, _, err := r.Files.GetManifest(ctx, shardName(shard))
-	if err != nil || len(m.Files) != 1 {
-		t.Fatalf("manifest %+v (%v), want the other writer kept the delta listed", m, err)
-	}
-	if keys := r.keys(t, shardfile.ShardPrefix(shardName(shard))); len(keys) != 1 || keys[0] != shardfile.FileKey(shardName(shard), m.Generation, m.Files[0]) {
-		t.Fatalf("objects %v, want the one listed delta", keys)
-	}
-}
-
-// A conflict whose stored manifest can't then be read deletes nothing, since
-// nothing says whether the file is listed, and reports the file as a leak.
-func TestAFailedReadAfterAConflictReportsALeak(t *testing.T) {
-	t.Parallel()
-	r := newGarbageRig(t)
-	ctx := context.Background()
-	app := r.StartApp(shard)
-	h, sh := r.NewShard(shard)
-	defer sh.Close(ctx)
-	ack(t, app, sh, 1)
-	// Another writer changes the manifest once the file is up, and from then
-	// on the manifest can't be read.
-	supersede := func() error {
-		if err := r.changeManifest(ctx); err != nil {
-			return err
-		}
-		r.ops.failManifestGets.Store(true)
-		return nil
-	}
-
-	if err := h.WriteDelta(ctx, sh, shardfile.Hooks{AfterFileWrite: supersede}); !errors.Is(err, blob.ErrConflict) {
-		t.Fatalf("got %v, want the update's conflict", err)
-	}
-	r.ops.failManifestGets.Store(false)
-	if n := r.count("drop"); n != 0 {
-		t.Fatalf("%d deletes, want none on an unread manifest", n)
-	}
-	keys := r.keys(t, shardfile.ShardPrefix(shardName(shard)))
-	if len(keys) != 1 {
-		t.Fatalf("objects %v, want the file kept", keys)
-	}
-	if r.leaks.Load() != 1 {
-		t.Fatalf("%d leaks, want one", r.leaks.Load())
-	}
-	if msg := r.log.String(); !strings.Contains(msg, keys[0]) {
-		t.Fatalf("the leak was not logged with its key:\n%s", msg)
-	}
-}
-
-// A best-effort delete that fails is reported as a leak and the write still
-// fails with its own error, the update's.
-func TestAFailedBestEffortDeleteReportsALeakAndKeepsTheUpdateError(t *testing.T) {
-	t.Parallel()
-	r := newGarbageRig(t)
-	ctx := context.Background()
-	app := r.StartApp(shard)
-	h, sh := r.NewShard(shard)
-	defer sh.Close(ctx)
-	ack(t, app, sh, 1)
-	r.ops.supersede.Store(true)
-	r.ops.failDrops = true
-
-	if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); !errors.Is(err, blob.ErrConflict) {
-		t.Fatalf("got %v, want the update's conflict, not the delete's failure", err)
-	}
-	keys := r.keys(t, shardfile.ShardPrefix(shardName(shard)))
-	if len(keys) != 1 {
-		t.Fatalf("objects %v, want the undeleted file", keys)
-	}
-	if r.leaks.Load() != 1 {
-		t.Fatalf("%d leaks, want one", r.leaks.Load())
-	}
-	if msg := r.log.String(); !strings.Contains(msg, keys[0]) {
-		t.Fatalf("the leak was not logged with its key:\n%s", msg)
 	}
 }
 

@@ -267,7 +267,9 @@ func merge(w io.Writer, files []capture.TailFile, rg Range) error {
 // starts (Node.adoptOwn). Nothing can list the file now, since a manifest only
 // ever adds files its own writer has just uploaded, so the file is garbage: it
 // is deleted and ours put in its place, which a delete that fails leaves to
-// the next write of the range as a leak (Files.leak).
+// the next write of the range as a leak (Files.leak). This is how a retry
+// after a manifest conflict (an adoption's) gets the name back: the conflict
+// left its first upload unlisted.
 func (h *Handle) putFile(ctx context.Context, f File, body blob.Body, hooks Hooks) error {
 	key := FileKey(h.Name, h.Manifest.Generation, f)
 	id, ok := h.writes[key]
@@ -359,13 +361,11 @@ func (h *Handle) putTail(ctx context.Context, tail []capture.TailFile, hooks Hoo
 		}
 	}
 	if err := h.update(ctx, "delta", next); err != nil {
-		// A conflict is the one outcome that means the file can never be
-		// listed: the manifest changed under the handle. An unknown outcome
-		// may have listed it, ErrMovedOn means it did, and any other failure
-		// is retried with the same name and write id.
-		if errors.Is(err, blob.ErrConflict) {
-			h.deleteUnlisted(ctx, file)
-		}
+		// A conflict deletes nothing: it can hide this handle's own update,
+		// landed and then replaced by another writer's, so the file may be
+		// listed. One that isn't goes at the shard's next rebase (sweep), or
+		// this range's next write replaces it (putFile). Any other failure is
+		// retried with the same name and write id.
 		return err
 	}
 	delete(h.writes, FileKey(h.Name, h.Manifest.Generation, file))
@@ -486,10 +486,7 @@ func (h *Handle) Rebase(ctx context.Context, sh *capture.Shard, hooks Hooks) (bo
 		}
 	}
 	if err := h.update(ctx, "rebase", next); err != nil {
-		// A conflict means the base can never be listed (see putTail).
-		if errors.Is(err, blob.ErrConflict) {
-			h.deleteUnlisted(ctx, base)
-		}
+		// A conflict leaves the base for the next sweep (see putTail).
 		return false, err
 	}
 	delete(h.writes, FileKey(h.Name, h.Manifest.Generation, base))

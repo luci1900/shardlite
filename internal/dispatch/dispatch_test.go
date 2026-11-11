@@ -96,7 +96,7 @@ func allLanes() []shard.Lane {
 // waits an hour between passes if a test serves it.
 func newRig(t *testing.T) *rig {
 	t.Helper()
-	return newRigOn(t, nil, Options{Rate: 1e6, Pace: time.Hour})
+	return newRigOn(t, nil, Options{Pace: time.Hour})
 }
 
 // newRigOn is a rig on clock (the rig's fixed one if nil) with the options. Its time
@@ -361,7 +361,7 @@ func TestTwoDispatchersLoseNothing(t *testing.T) {
 		v := r.manifest(s, "", shardfile.MinuteAt(r.now))
 		r.entry(s, v, r.now)
 	}
-	other := r.dispatcher(fixedClock{r}, Options{Rate: 1e6, Pace: time.Hour})
+	other := r.dispatcher(fixedClock{r}, Options{Pace: time.Hour})
 	var wg sync.WaitGroup
 	for _, p := range []*Dispatcher{r.p, other} {
 		wg.Go(func() {

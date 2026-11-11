@@ -32,19 +32,21 @@ import (
 // maxBackoff is how far an entry moves at most, in minutes.
 const maxBackoff = 16
 
+// The limits of a pass.
+const (
+	// maxRate is how many entries a second a pass handles at most.
+	maxRate = 1000
+	// maxInFlight is how many entries a pass handles at once.
+	maxInFlight = 256
+	// pageSize is how many due entries a pass lists over all its lanes together.
+	pageSize = 1000
+	// budget is how long a pass runs before it stops and leaves the rest to the next.
+	budget = 25 * time.Second
+)
+
 // Options are the dispatcher's own. Zero values take the defaults. They are the
-// node's own: each node runs its lanes at its own rate.
+// node's own: each node runs its lanes at its own pace.
 type Options struct {
-	// Rate is how many entries a second a pass handles at most, 1,000 if zero.
-	Rate float64
-	// InFlight is how many entries a pass handles at once, 256 if zero.
-	InFlight int
-	// Page is how many due entries a pass lists over all its lanes together, 1,000
-	// if zero.
-	Page int
-	// Budget is how long a pass runs before it stops and leaves the rest to the
-	// next, 25 s if zero.
-	Budget time.Duration
 	// Pace is the wait before the next pass when this one found due entries, when
 	// the node has no listing of the cluster yet and before a try again after a
 	// failed pass (doubling up to a minute), 1 s if zero.
@@ -56,18 +58,6 @@ type Options struct {
 }
 
 func (o Options) withDefaults() Options {
-	if o.Rate <= 0 {
-		o.Rate = 1000
-	}
-	if o.InFlight <= 0 {
-		o.InFlight = 256
-	}
-	if o.Page <= 0 {
-		o.Page = 1000
-	}
-	if o.Budget <= 0 {
-		o.Budget = 25 * time.Second
-	}
 	if o.Pace <= 0 {
 		o.Pace = time.Second
 	}
@@ -153,14 +143,14 @@ func (d *Dispatcher) Serve(ctx context.Context) error {
 }
 
 // pass lists one page of the due entries of lanes (the lanes in turn until the page
-// is full) and handles each, at most InFlight at once, at Rate and for at most
-// Budget. It reports whether the page held entries, which a next pass should not
+// is full) and handles each, at most maxInFlight at once, at maxRate and for at most
+// the budget. It reports whether the page held entries, which a next pass should not
 // wait for, and fails if the node's lease does at its end.
 func (d *Dispatcher) pass(ctx context.Context, lanes []shard.Lane) (busy bool, err error) {
 	now := d.Clock.Now()
 	var entries []shardfile.Reminder
 	for _, lane := range lanes {
-		left := d.opts.Page - len(entries)
+		left := pageSize - len(entries)
 		if left <= 0 {
 			break
 		}
@@ -170,11 +160,11 @@ func (d *Dispatcher) pass(ctx context.Context, lanes []shard.Lane) (busy bool, e
 		}
 		entries = append(entries, got...)
 	}
-	ctx, cancel := context.WithTimeout(ctx, d.opts.Budget)
+	ctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
-	lim := rate.NewLimiter(rate.Limit(d.opts.Rate), 1)
+	lim := rate.NewLimiter(rate.Limit(maxRate), 1)
 	var g errgroup.Group
-	g.SetLimit(d.opts.InFlight)
+	g.SetLimit(maxInFlight)
 	for _, e := range entries {
 		if lim.Wait(ctx) != nil {
 			break // the budget ended, or would before the next slot

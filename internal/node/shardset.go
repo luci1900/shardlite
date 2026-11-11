@@ -107,7 +107,7 @@ type Stats struct {
 	Placements           atomic.Int64   // claims this node sent to another node, picked at random
 	LetGoHeld            atomic.Int64   // shards a stop let go of though the app had their file open (the idle path never does)
 	HeldPastIdle         atomic.Int64   // holds of a shard's file by the app that outlasted an idle timeout and were warned of, once per hold (the shard stays active until the app closes it)
-	LeakedFiles          notify.Counter // LTX files the node knew no manifest lists and could not delete (a failed best-effort delete, a delete in a rebase's sweep or of a deleted shard's files), and each failed read that stopped such a delete (docs/internals.md, Garbage)
+	LeakedFiles          notify.Counter // LTX files the node knew no manifest lists and could not delete (a failed delete in a rebase's sweep, in a write of the same range or of a deleted shard's files), and each failed read that stopped such a delete (docs/internals.md, Garbage)
 }
 
 // Shardset owns the node's shards, which are the active ones (docs/internals.md,

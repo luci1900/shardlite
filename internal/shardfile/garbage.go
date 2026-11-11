@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"slices"
 	"strings"
 
 	"github.com/luci1900/shardlite/internal/blob"
@@ -12,12 +11,10 @@ import (
 	"github.com/luci1900/shardlite/internal/shard"
 )
 
-// The write path deletes the LTX files it knows can never be listed again
-// (docs/internals.md, Garbage): an upload whose manifest update lost its
-// compare-and-swap, and, once a rebase's swap has landed, every unlisted file
-// of the generation. What it cannot delete it reports here, since nothing else
-// notices: the file costs storage until the shard's next rebase or an
-// operator's walk takes it.
+// Once a rebase's swap has landed, the write path deletes every unlisted LTX
+// file of the generation (docs/internals.md, Garbage). What it cannot delete it
+// reports here, since nothing else notices: the file costs storage until the
+// shard's next rebase or an operator's walk takes it.
 
 // logger is Files.Log, or the default logger.
 func (f *Files) logger() *slog.Logger {
@@ -38,8 +35,8 @@ func (f *Files) leak(n shard.Name, key string, err error) {
 }
 
 // leakRead reports a read that failed before a delete of garbage, so the
-// files it would have deleted stay: the manifest read after a conflict
-// (deleteUnlisted), or the sweep's listing or its read of the lease. It counts once in Files.Leaked, like a file.
+// files it would have deleted stay: the sweep's listing or its read of the
+// lease. It counts once in Files.Leaked, like a file.
 func (f *Files) leakRead(n shard.Name, msg string, err error, attrs ...any) {
 	if f.Leaked != nil {
 		f.Leaked.Inc()
@@ -49,36 +46,6 @@ func (f *Files) leakRead(n shard.Name, msg string, err error, attrs ...any) {
 
 // sweepStays ends the message of a read that stopped a sweep.
 const sweepStays = ", so the shard's unlisted LTX files stay until its next rebase"
-
-// deleteUnlisted deletes a file this handle has just uploaded whose manifest
-// update was rejected with blob.ErrConflict: the manifest changed under the
-// handle, so no later update of its can list the file. The delete is best
-// effort, and the write keeps its own error whatever happened here: a failed
-// delete is a leak (leak), not the write's failure.
-//
-// The stored manifest is read first, because a conflict can hide an update of
-// this very handle that landed and was superseded (blob.Store cannot tell its
-// own landed attempt from a lost one once another writer has replaced the
-// object): a file the stored manifest lists in this generation is data, not
-// garbage, and stays. A manifest that is gone lists nothing. A read that fails
-// deletes nothing, since it cannot say which the file is, and is reported as a
-// leak (leakRead).
-func (h *Handle) deleteUnlisted(ctx context.Context, f File) {
-	key := FileKey(h.Name, h.Manifest.Generation, f)
-	m, _, err := h.F.manifests().Get(ctx, h.Name)
-	switch {
-	case errors.Is(err, blob.ErrNotFound): // gone: it lists nothing
-	case err != nil:
-		h.F.leakRead(h.Name, "could not read the shard's manifest, so an LTX file whose update lost stays", err, "key", key)
-		return
-	case m.Generation == h.Manifest.Generation && slices.Contains(m.Files, f):
-		return
-	}
-	delete(h.writes, key)
-	if err := h.F.Blob.Delete(ctx, key, ""); err != nil && !errors.Is(err, blob.ErrNotFound) {
-		h.F.leak(h.Name, key, err)
-	}
-}
 
 // sweep deletes the garbage of the shard's generation: every LTX file the
 // manifest doesn't list and the handle holds no write id for. A rebase runs it

@@ -145,8 +145,9 @@ func TestFaultStorage(t *testing.T) {
 }
 
 // Failing LTX file uploads: a delta or a rebase's base that fails or whose response is
-// lost is retried by the node's own loop, and nothing acknowledged is lost. A file
-// whose manifest update then loses leaks, which the rig's walk bounds by the kills.
+// lost is retried by the node's own loop, and nothing acknowledged is lost. A single
+// node never loses a manifest update to another writer, so a file left unlisted is a
+// kill's, which the rig's walk bounds.
 func TestFaultFiles(t *testing.T) {
 	t.Parallel()
 	for _, mode := range []string{"fail", "lost"} {
