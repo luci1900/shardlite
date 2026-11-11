@@ -62,7 +62,7 @@ type faultRig struct {
 	fire  string   // the file whose existence arms the kill point of this life
 	base  []string // the environment of every node of the rig
 
-	killed *proc           // the last node crash counted
+	killed *apptest.Proc   // the last node crash counted
 	kills  int             // nodes the rig has killed, the final crash included
 	logs   strings.Builder // what every node killed so far logged
 	// reportedLeaks is for a scenario that fails every delete of an LTX file:
@@ -140,18 +140,18 @@ func (r *faultRig) crash() {
 		// A scenario that fails deletes runs no kills: a kill mid-sweep leaks files
 		// silently, which is the crash's leak and not the failed delete's. The node
 		// stops the way a supervisor stops it, so a sweep ends and reports.
-		if err := r.s.node.term(30 * time.Second); err != nil {
+		if err := r.s.node.Term(30 * time.Second); err != nil {
 			r.t.Logf("the node did not stop cleanly: %v", err)
 		}
 	}
-	r.s.node.kill()
+	r.s.node.Kill()
 	if r.killed != r.s.node {
 		r.killed = r.s.node
 		r.kills++
-		r.logs.WriteString(r.s.node.out.String())
+		r.logs.WriteString(r.s.node.Output())
 	}
 	// The capture went wrong somewhere: the fault tests must never see it.
-	if out := r.s.node.out.String(); strings.Contains(out, "the capture went wrong somewhere") {
+	if out := r.s.node.Output(); strings.Contains(out, "the capture went wrong somewhere") {
 		r.t.Fatalf("the node logged a checksum error:\n%s", out)
 	}
 }
@@ -178,7 +178,7 @@ func (r *faultRig) fireNow() {
 func (r *faultRig) dies(point kill.Point) {
 	r.t.Helper()
 	select {
-	case <-r.s.node.done:
+	case <-r.s.node.Done:
 	case <-time.After(60 * time.Second):
 		r.t.Fatalf("the node did not die at %s", point)
 	}
@@ -245,7 +245,7 @@ func (r *faultRig) writeUntilDeath(point kill.Point) {
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		select {
-		case <-r.s.node.done:
+		case <-r.s.node.Done:
 			return
 		default:
 		}

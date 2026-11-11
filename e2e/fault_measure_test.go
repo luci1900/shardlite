@@ -32,8 +32,8 @@ func measureMB(t *testing.T) int {
 // maxrssMB kills the node and returns its peak resident memory in megabytes.
 func (s *stack) maxrssMB() float64 {
 	s.t.Helper()
-	s.node.kill()
-	ru, ok := s.node.cmd.ProcessState.SysUsage().(*syscall.Rusage)
+	s.node.Kill()
+	ru, ok := s.node.Cmd.ProcessState.SysUsage().(*syscall.Rusage)
 	if !ok {
 		s.t.Fatal("no resource usage for the node")
 	}
@@ -57,7 +57,7 @@ func (s *stack) buildShard(shard string, mb, rows, rowBytes int) int {
 			s.t.Fatalf("bulk: %d %q %v", st, body, err)
 		}
 	}
-	if err := s.node.term(5 * time.Minute); err != nil {
+	if err := s.node.Term(5 * time.Minute); err != nil {
 		s.t.Fatalf("stopping the node: %v", err)
 	}
 	apptest.Eventually(s.t, apptest.Timeout, "the app to finish its requests and close their databases", func() bool { return s.appDebug().Serving == 0 })
@@ -133,7 +133,7 @@ func TestFaultMeasureLargeShard(t *testing.T) {
 
 	// 1. Restore and activate.
 	s.startNode()
-	w := watch(tmp, s.node.cmd.Process.Pid)
+	w := watch(tmp, s.node.Cmd.Process.Pid)
 	took := s.activate(shard)
 	w.Stop()
 	t.Logf("1. restore and activate a %d MB shard: %v; %s", mb, took.Round(time.Millisecond), w)
@@ -143,7 +143,7 @@ func TestFaultMeasureLargeShard(t *testing.T) {
 	// 2. An import in one transaction into an empty shard, then a VACUUM.
 	s.startNode()
 	s.create(t, shard2)
-	w = watch(tmp, s.node.cmd.Process.Pid)
+	w = watch(tmp, s.node.Cmd.Process.Pid)
 	t0 := time.Now()
 	st, body, err := doRequest(longClient, "POST", "http://"+s.pub+at(shard2, fmt.Sprintf("/bulk?rows=%d&bytes=1000000", mb)), shard2, "")
 	if err != nil || st != 204 {
@@ -160,7 +160,7 @@ func TestFaultMeasureLargeShard(t *testing.T) {
 	apptest.Eventually(t, 10*time.Minute, "the import's delta", func() bool { return position() > 1 })
 	t.Logf("2b. through its delta: %v; %s", time.Since(t0).Round(time.Millisecond), w.Stop())
 	before := position()
-	w = watch(tmp, s.node.cmd.Process.Pid)
+	w = watch(tmp, s.node.Cmd.Process.Pid)
 	t0 = time.Now()
 	if st, body, err := doRequest(longClient, "POST", "http://"+s.pub+at(shard2, "/vacuum"), shard2, ""); err != nil || st != 204 {
 		t.Fatalf("vacuum: %d %q %v", st, body, err)

@@ -94,22 +94,22 @@ func (r *faultRig) faults(label string) {
 	r.t.Helper()
 	// At least 40 writes, and on until a fault has been injected (a temporary
 	// file is created rarely enough that a few writes can pass without one).
-	for i := 0; i < 40 || (i < 400 && !strings.Contains(r.s.node.out.String(), "fault: injected")); i++ {
+	for i := 0; i < 40 || (i < 400 && !strings.Contains(r.s.node.Output(), "fault: injected")); i++ {
 		r.retryCommit()
 		time.Sleep(10 * time.Millisecond)
 	}
 	select {
-	case <-r.s.node.done:
-		r.t.Fatalf("%s: the node died:\n%s", label, r.s.node.out.String())
+	case <-r.s.node.Done:
+		r.t.Fatalf("%s: the node died:\n%s", label, r.s.node.Output())
 	default:
 	}
 	r.t.Logf("%s: %d writes attempted, %d acknowledged", label, r.n, len(r.acked))
-	if !strings.Contains(r.s.node.out.String(), "fault: injected") {
-		r.t.Fatalf("%s: the node logged no injected fault, so none was tested:\n%s", label, r.s.node.out.String())
+	if !strings.Contains(r.s.node.Output(), "fault: injected") {
+		r.t.Fatalf("%s: the node logged no injected fault, so none was tested:\n%s", label, r.s.node.Output())
 	}
 	if r.reportedLeaks {
 		apptest.Eventually(r.t, apptest.Timeout, "the node to report a failed delete", func() bool {
-			return strings.Contains(r.s.node.out.String(), "could not delete an LTX file")
+			return strings.Contains(r.s.node.Output(), "could not delete an LTX file")
 		})
 	}
 	r.verify("with " + label)

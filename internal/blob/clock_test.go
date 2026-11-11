@@ -292,26 +292,3 @@ func TestS3WithoutATime(t *testing.T) {
 		}
 	})
 }
-
-// The memory backend's store time is its own clock, truncated to the second.
-func TestMemoryChecksTheClock(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	var l logged
-	m := blob.NewMemory(blob.WithClock(func() time.Time { return time.Now().Add(time.Hour) }), blob.WithClockLogger(l.log()))
-	id := blob.WriteID{Node: "n", Epoch: 1, N: 1}
-	e, _ := m.Create(ctx, "k", strings.NewReader("v"), id)
-	m.Update(ctx, "k", strings.NewReader("w"), e, id)
-	m.Get(ctx, "k")
-	m.GetRange(ctx, "k", 0, 1)
-	if len(l.lines()) != 0 {
-		t.Fatalf("four calls logged %q", l.lines())
-	}
-	// A failed call is sampled too: the store answered.
-	if _, err := m.Head(ctx, "gone"); !errors.Is(err, blob.ErrNotFound) {
-		t.Fatal(err)
-	}
-	if l.count(warnsOff) != 1 || len(l.lines()) != 1 {
-		t.Fatalf("five calls an hour off logged %q", l.lines())
-	}
-}

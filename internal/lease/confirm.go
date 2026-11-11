@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/notify"
 )
 
 // ErrConfirmerStopped means the Confirmer's service ended before a read began
@@ -41,7 +42,7 @@ type Confirmer struct {
 	next    *Round // the round waiters join, whose read has not begun
 	stopped bool
 
-	wake  chan struct{}
+	wake  *notify.Kick
 	reads atomic.Int64
 }
 
@@ -56,7 +57,7 @@ type Round struct {
 
 // NewConfirmer returns the Confirmer of keeper's life, reading through reg.
 func NewConfirmer(reg *Registry, keeper *Keeper) *Confirmer {
-	return &Confirmer{keeper: keeper, reg: reg, me: Incarnation{Node: keeper.Lease().Name, Epoch: keeper.Lease().Epoch}, wake: make(chan struct{}, 1)}
+	return &Confirmer{keeper: keeper, reg: reg, me: Incarnation{Node: keeper.Lease().Name, Epoch: keeper.Lease().Epoch}, wake: notify.NewKick()}
 }
 
 func (*Confirmer) String() string { return "confirmer" }
@@ -76,10 +77,7 @@ func (c *Confirmer) Join() *Round {
 		c.next = &Round{c: c, done: make(chan struct{})}
 	}
 	c.next.waiters++
-	select {
-	case c.wake <- struct{}{}:
-	default:
-	}
+	c.wake.Kick()
 	return c.next
 }
 
@@ -107,7 +105,7 @@ func (c *Confirmer) Serve(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-c.wake:
+		case <-c.wake.C():
 		}
 		c.mu.Lock()
 		r := c.next

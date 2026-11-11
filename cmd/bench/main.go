@@ -19,12 +19,9 @@ import (
 	"io"
 	"log"
 	"math/rand/v2"
-	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -34,7 +31,9 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/s3test"
 )
 
 var (
@@ -51,63 +50,33 @@ var (
 	s3Bucket = flag.String("s3-bucket", "shardlite-test", "bucket in the S3 store")
 )
 
-type proc struct {
-	cmd *exec.Cmd
-	out bytes.Buffer
-	mu  sync.Mutex
-}
-
-func (p *proc) Write(b []byte) (int, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.out.Write(b)
-}
-
-func (p *proc) String() string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.out.String()
-}
-
-func envOr(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return def
-}
-
-func start(bin string, env []string, args ...string) *proc {
-	p := &proc{}
-	p.cmd = exec.Command(bin, args...)
-	p.cmd.Env = append(os.Environ(), env...)
-	p.cmd.Stdout, p.cmd.Stderr = p, p
+// start runs a process whose output is shown when BENCH_LOG is set.
+func start(bin string, env []string, args ...string) *apptest.Proc {
+	var tee io.Writer
 	if os.Getenv("BENCH_LOG") != "" {
-		p.cmd.Stdout, p.cmd.Stderr = io.MultiWriter(p, os.Stderr), io.MultiWriter(p, os.Stderr)
+		tee = os.Stderr
 	}
-	if err := p.cmd.Start(); err != nil {
+	p, err := apptest.StartProc(filepath.Base(bin), bin, env, tee, args...)
+	if err != nil {
 		log.Fatal(err)
 	}
 	return p
 }
 
-func (p *proc) waitFor(re string, d time.Duration) []string {
-	rx := regexp.MustCompile(re)
-	for end := time.Now().Add(d); time.Now().Before(end); time.Sleep(10 * time.Millisecond) {
-		if m := rx.FindStringSubmatch(p.String()); m != nil {
-			return m
-		}
-	}
-	log.Fatalf("no %q in:\n%s", re, p.String())
-	return nil
-}
-
-func freeAddr() string {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+func waitFor(p *apptest.Proc, re string, d time.Duration) []string {
+	m, err := p.WaitFor(re, d)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer l.Close()
-	return l.Addr().String()
+	return m
+}
+
+func freeAddr() string {
+	a, err := apptest.FreeAddr()
+	if err != nil {
+		log.Fatal(err)
+	}
+	return a
 }
 
 type result struct {
@@ -123,9 +92,7 @@ func main() {
 	if *s3URL == "" {
 		log.Fatal("-s3-endpoint is required: the node needs an S3 store, so start RustFS with docker/compose.s3.yaml")
 	}
-	for _, k := range []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION"} {
-		os.Setenv(k, envOr(k, map[string]string{"AWS_ACCESS_KEY_ID": "shardlite", "AWS_SECRET_ACCESS_KEY": "shardlite-secret", "AWS_REGION": "us-east-1"}[k]))
-	}
+	s3test.Export() // the node inherits the emulator's keys too
 	if b, err := blob.NewS3(context.Background(), blob.S3Options{Bucket: *s3Bucket, Endpoint: *s3URL}); err != nil {
 		log.Fatal(err)
 	} else if err := b.EnsureBucket(context.Background()); err != nil {
@@ -198,17 +165,16 @@ func run(root, kind string) []result {
 	pub, ctl := freeAddr(), freeAddr()
 	// The app opens each shard's database for the length of a request, so the measurement includes that open.
 	app := start(*appBin, nil, "-listen", "127.0.0.1:0", "-control", ctl, "-declare", df)
-	defer app.cmd.Process.Kill()
-	appAddr := app.waitFor(`listening (\S+)`, 20*time.Second)[1]
+	defer app.Kill()
+	appAddr := waitFor(app, `listening (\S+)`, 20*time.Second)[1]
 	node := start(*nodeBin, []string{
 		"SHARDLITE_NODE=bench", "SHARDLITE_BLOB=s3://" + *s3Bucket, "SHARDLITE_S3_ENDPOINT=" + *s3URL, fmt.Sprintf("SHARDLITE_PREFIX=bench/%s/%d/", kind, time.Now().UnixNano()),
-		"AWS_ACCESS_KEY_ID=" + envOr("AWS_ACCESS_KEY_ID", "shardlite"), "AWS_SECRET_ACCESS_KEY=" + envOr("AWS_SECRET_ACCESS_KEY", "shardlite-secret"), "AWS_REGION=" + envOr("AWS_REGION", "us-east-1"),
 		"SHARDLITE_DATA=" + filepath.Join(d, "data"),
 		"SHARDLITE_APP=http://" + appAddr, "SHARDLITE_LISTEN_PUBLIC=" + pub, "SHARDLITE_LISTEN_CONTROL=" + ctl, "SHARDLITE_LISTEN_PEER=127.0.0.1:0",
 		"SHARDLITE_FLUSH=" + flush.String(), "SHARDLITE_LISTEN_PPROF=127.0.0.1:6060",
 	})
-	defer node.cmd.Process.Kill()
-	node.waitFor(`shardlite is up`, 30*time.Second)
+	defer node.Kill()
+	waitFor(node, `shardlite is up`, 30*time.Second)
 
 	client := &http.Client{Timeout: 60 * time.Second, Transport: &http.Transport{MaxIdleConnsPerHost: *clients * 2, MaxIdleConns: *clients * 2}}
 	do := func(method, path, target, body string) error {
@@ -249,7 +215,7 @@ func run(root, kind string) []result {
 					return nil
 				}
 				if err := do("POST", "/add", fmt.Sprintf("bench.%s/s%d", kind, i), "warm"); err != nil {
-					log.Fatalf("activating %s/s%d: %v\n%s", kind, i, err, node.String())
+					log.Fatalf("activating %s/s%d: %v\n%s", kind, i, err, node.Output())
 				}
 			}
 		})
@@ -258,7 +224,7 @@ func run(root, kind string) []result {
 	log.Printf("%s: %d shards active in %v", kind, *nShards, time.Since(t0).Round(time.Millisecond))
 
 	mappings := func(when string) {
-		if b, err := os.ReadFile(fmt.Sprintf("/proc/%d/maps", node.cmd.Process.Pid)); err == nil {
+		if b, err := os.ReadFile(fmt.Sprintf("/proc/%d/maps", node.Cmd.Process.Pid)); err == nil {
 			var shm, anon, guard, big int
 			for _, l := range strings.Split(string(b), "\n") {
 				f := strings.Fields(l)
@@ -283,18 +249,18 @@ func run(root, kind string) []result {
 	}
 	mappings("after activation")
 	if *hold > 0 {
-		log.Printf("%s: holding for %v, node pid %d", kind, *hold, node.cmd.Process.Pid)
+		log.Printf("%s: holding for %v, node pid %d", kind, *hold, node.Cmd.Process.Pid)
 		time.Sleep(*hold)
 		return nil
 	}
 	var out []result
 	for _, op := range []string{"idle", "read", "write", "trickle"} {
 		log.Printf("%s: measuring %s", kind, op)
-		ticks0, ok := cpuTicks(node.cmd.Process.Pid)
+		ticks0, ok := cpuTicks(node.Cmd.Process.Pid)
 		t0 := time.Now()
 		r := measure(kind, op, do)
 		r.cpu = -1
-		if ticks1, ok1 := cpuTicks(node.cmd.Process.Pid); ok && ok1 {
+		if ticks1, ok1 := cpuTicks(node.Cmd.Process.Pid); ok && ok1 {
 			r.cpu = float64(ticks1-ticks0) / 100 / time.Since(t0).Seconds() * 100
 		}
 		out = append(out, r)

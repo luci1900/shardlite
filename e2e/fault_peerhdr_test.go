@@ -55,7 +55,7 @@ func TestFaultPeerHeaders(t *testing.T) {
 					break
 				}
 				if time.Now().After(deadline) {
-					t.Fatalf("no call from a shard on n1 was placed on n2 in %d tries:\n%s", i+1, n1.node.out.String())
+					t.Fatalf("no call from a shard on n1 was placed on n2 in %d tries:\n%s", i+1, n1.node.Output())
 				}
 				time.Sleep(200 * time.Millisecond)
 			}
@@ -68,7 +68,7 @@ func TestFaultPeerHeaders(t *testing.T) {
 				transfer(s, from, fmt.Sprintf("wallet/to-%d", i), fmt.Sprintf("t%d", i))
 			}
 			for _, s := range []*stack{n1, n2} {
-				out := s.node.out.String()
+				out := s.node.Output()
 				if !strings.Contains(out, "fault: injected peer header") {
 					t.Errorf("a node logged no injected fault, so none was tested:\n%s", out)
 				}

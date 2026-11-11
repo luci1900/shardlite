@@ -248,7 +248,7 @@ func TestKillNodeUnderLoad(t *testing.T) {
 	for time.Now().Before(deadline) {
 		time.Sleep(time.Duration(300+rng.IntN(2200)) * time.Millisecond)
 		life.Add(1)
-		s.node.kill()
+		s.node.Kill()
 		kills++
 		time.Sleep(50 * time.Millisecond) // responses that left before the kill reach their clients
 		check(fmt.Sprintf("after kill %d", kills))
@@ -259,12 +259,12 @@ func TestKillNodeUnderLoad(t *testing.T) {
 	stop()
 	wg.Wait()
 	apptest.Eventually(t, apptest.Timeout, "the app to finish its requests and close their databases", func() bool { return s.appDebug().Serving == 0 })
-	if err := s.node.term(60 * time.Second); err != nil {
-		t.Fatalf("graceful stop: %v\n%s", err, s.node.out.String())
+	if err := s.node.Term(60 * time.Second); err != nil {
+		t.Fatalf("graceful stop: %v\n%s", err, s.node.Output())
 	}
 	check("after the graceful stop")
 	if l, err := v.files.Leases.Get(context.Background(), "n1"); err != nil || !l.Released {
-		t.Fatalf("lease after the graceful stop: %+v %v\n%s", l, err, s.node.out.String())
+		t.Fatalf("lease after the graceful stop: %+v %v\n%s", l, err, s.node.Output())
 	}
 	led.mu.Lock()
 	defer led.mu.Unlock()
@@ -272,7 +272,7 @@ func TestKillNodeUnderLoad(t *testing.T) {
 		kills, attempts.Load(), failures.Load(), led.counts, len(led.pending))
 	// The node's own error lines tell what the crashes exercised.
 	errLines := map[string]int{}
-	for _, line := range strings.Split(s.node.out.String(), "\n") {
+	for _, line := range strings.Split(s.node.Output(), "\n") {
 		if strings.Contains(line, "level=ERROR") || strings.Contains(line, "level=WARN") {
 			if i := strings.Index(line, "msg="); i >= 0 {
 				msg := line[i:]

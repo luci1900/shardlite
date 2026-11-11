@@ -32,6 +32,16 @@ func Env() []string {
 	}
 }
 
+// Export sets Env in this process, for a client that reads the standard
+// variables. It is for the whole process, not t.Setenv, which parallel tests
+// can't use.
+func Export() {
+	for _, kv := range Env() {
+		k, v, _ := strings.Cut(kv, "=")
+		os.Setenv(k, v)
+	}
+}
+
 func envOr(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
@@ -51,15 +61,7 @@ func Setup(t testing.TB) Store {
 	if endpoint == "" {
 		t.Skip("SHARDLITE_TEST_S3_ENDPOINT is not set: start RustFS with docker/compose.s3.yaml (this test runs nodes as separate processes)")
 	}
-	credsOnce.Do(func() {
-		// Set for the whole process, not with t.Setenv, which parallel tests can't use.
-		for _, kv := range Env() {
-			k, v, _ := strings.Cut(kv, "=")
-			if os.Getenv(k) == "" {
-				os.Setenv(k, v)
-			}
-		}
-	})
+	credsOnce.Do(Export)
 	s := Store{Endpoint: endpoint, Bucket: envOr("SHARDLITE_TEST_S3_BUCKET", "shardlite-test")}
 	var err error
 	bucketOnce.Do(func() {

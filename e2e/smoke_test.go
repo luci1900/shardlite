@@ -234,11 +234,11 @@ func TestProtocolsThroughTheNode(t *testing.T) {
 
 	// Graceful stop: every shard is let go of (the app closes each request's database when the request ends) and the lease is released.
 	apptest.Eventually(t, apptest.Timeout, "the app to finish its requests and close their databases", func() bool { return s.appDebug().Serving == 0 })
-	if err := s.node.term(30 * time.Second); err != nil {
-		t.Fatalf("node exit: %v\n%s", err, s.node.out.String())
+	if err := s.node.Term(30 * time.Second); err != nil {
+		t.Fatalf("node exit: %v\n%s", err, s.node.Output())
 	}
 	if l, err := v.files.Leases.Get(t.Context(), "n1"); err != nil || !l.Released {
-		t.Fatalf("lease after shutdown: %+v %v\n%s", l, err, s.node.out.String())
+		t.Fatalf("lease after shutdown: %+v %v\n%s", l, err, s.node.Output())
 	}
 	for _, shard := range v.shards() {
 		if _, ok, err := v.tokens(shard); err != nil || !ok {

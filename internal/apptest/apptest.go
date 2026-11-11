@@ -29,24 +29,31 @@ var (
 // (the fault build of ./cmd/shardlite passes "fault").
 func Build(tb testing.TB, pkg string, tags ...string) string {
 	tb.Helper()
+	_, file, _, _ := runtime.Caller(0)
+	return BuildIn(tb, filepath.Join(filepath.Dir(file), "..", ".."), pkg, tags...)
+}
+
+// BuildIn is Build for a package of the module in dir, which is how a test in
+// another module (such as e2e) builds its own app.
+func BuildIn(tb testing.TB, dir, pkg string, tags ...string) string {
+	tb.Helper()
 	buildMu.Lock()
 	defer buildMu.Unlock()
-	key := pkg + " " + strings.Join(tags, ",")
+	key := dir + " " + pkg + " " + strings.Join(tags, ",")
 	if p, ok := builds[key]; ok {
 		return p
 	}
-	dir, err := os.MkdirTemp("", "shardlite-build")
+	out, err := os.MkdirTemp("", "shardlite-build")
 	if err != nil {
 		tb.Fatal(err)
 	}
-	bin := filepath.Join(dir, filepath.Base(pkg))
-	_, file, _, _ := runtime.Caller(0)
+	bin := filepath.Join(out, filepath.Base(pkg))
 	args := []string{"build", "-o", bin}
 	if len(tags) > 0 {
 		args = append(args, "-tags", strings.Join(tags, ","))
 	}
 	cmd := exec.Command("go", append(args, pkg)...)
-	cmd.Dir = filepath.Join(filepath.Dir(file), "..", "..")
+	cmd.Dir = dir
 	if out, err := cmd.CombinedOutput(); err != nil {
 		tb.Fatalf("build %s: %v\n%s", pkg, err, out)
 	}

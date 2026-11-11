@@ -74,16 +74,16 @@ func TestFaultKillDuringStop(t *testing.T) {
 	if err := os.WriteFile(fire, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	n1.node.signal(syscall.SIGTERM)
+	n1.node.Signal(syscall.SIGTERM)
 	select {
-	case <-n1.node.done:
+	case <-n1.node.Done:
 	case <-time.After(60 * time.Second):
-		t.Fatalf("the node did not die at %s:\n%s", kill.StopLetGo, n1.node.out.String())
+		t.Fatalf("the node did not die at %s:\n%s", kill.StopLetGo, n1.node.Output())
 	}
-	if !killed(n1.node.err) {
-		t.Fatalf("the node stopped by itself (%v) and was not killed at %s:\n%s", n1.node.err, kill.StopLetGo, n1.node.out.String())
+	if !killed(n1.node.Err) {
+		t.Fatalf("the node stopped by itself (%v) and was not killed at %s:\n%s", n1.node.Err, kill.StopLetGo, n1.node.Output())
 	}
-	if out := n1.node.out.String(); !strings.Contains(out, "shutting down") {
+	if out := n1.node.Output(); !strings.Contains(out, "shutting down") {
 		t.Fatalf("the node was killed before it began to stop:\n%s", out)
 	}
 
@@ -97,7 +97,7 @@ func TestFaultKillDuringStop(t *testing.T) {
 	}
 	t.Logf("%d of %d shards released when the node died", released, shards)
 	if released == 0 {
-		t.Fatalf("no shard was released when the node died, so the kill was not during the stop:\n%s", n1.node.out.String())
+		t.Fatalf("no shard was released when the node died, so the kill was not during the stop:\n%s", n1.node.Output())
 	}
 	check := func(label string) {
 		t.Helper()

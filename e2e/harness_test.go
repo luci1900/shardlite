@@ -1,22 +1,16 @@
 package e2e
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
-	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -41,121 +35,35 @@ const declarationJSON = e2eapp.DefaultDeclaration
 // shardName is a shard's name in the tests that need the parsed type.
 func shardName(s string) shardpkg.Name { return shardpkg.MustParse(s) }
 
-type lockedBuf struct {
-	mu sync.Mutex
-	b  bytes.Buffer
-}
-
-func (l *lockedBuf) Write(p []byte) (int, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.b.Write(p)
-}
-
-func (l *lockedBuf) String() string {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.b.String()
-}
-
-// proc is a process whose output is kept.
-type proc struct {
-	name string
-	cmd  *exec.Cmd
-	out  *lockedBuf
-	done chan struct{}
-	err  error
-}
-
-func startProc(t testing.TB, name, bin string, env []string, args ...string) *proc {
+// startProc starts a process the test kills when it ends.
+func startProc(t testing.TB, name, bin string, env []string, args ...string) *apptest.Proc {
 	t.Helper()
-	p := &proc{name: name, out: &lockedBuf{}, done: make(chan struct{})}
-	p.cmd = exec.Command(bin, args...)
-	p.cmd.Env = append(os.Environ(), env...)
-	p.cmd.Stdout, p.cmd.Stderr = p.out, p.out
-	if err := p.cmd.Start(); err != nil {
+	p, err := apptest.StartProc(name, bin, env, nil, args...)
+	if err != nil {
 		t.Fatal(err)
 	}
-	go func() { p.err = p.cmd.Wait(); close(p.done) }()
-	t.Cleanup(func() { p.kill() })
+	t.Cleanup(p.Kill)
 	return p
-}
-
-// waitFor waits for a line of output matching re and returns its submatches.
-func (p *proc) waitFor(t testing.TB, re string, timeout time.Duration) []string {
-	t.Helper()
-	rx := regexp.MustCompile(re)
-	deadline := time.Now().Add(timeout)
-	for {
-		if m := rx.FindStringSubmatch(p.out.String()); m != nil {
-			return m
-		}
-		select {
-		case <-p.done:
-			t.Fatalf("%s exited (%v) before printing %q:\n%s", p.name, p.err, re, p.out.String())
-		case <-time.After(10 * time.Millisecond):
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("%s: no %q within %v:\n%s", p.name, re, timeout, p.out.String())
-		}
-	}
-}
-
-func (p *proc) kill() {
-	if p.cmd.Process != nil {
-		p.cmd.Process.Signal(syscall.SIGKILL)
-	}
-	<-p.done
-}
-
-func (p *proc) signal(s syscall.Signal) { p.cmd.Process.Signal(s) }
-
-// term asks the process to stop and waits for its exit status.
-func (p *proc) term(timeout time.Duration) error {
-	p.signal(syscall.SIGTERM)
-	select {
-	case <-p.done:
-		return p.err
-	case <-time.After(timeout):
-		p.kill()
-		return errors.New("did not stop on SIGTERM")
-	}
 }
 
 func freeAddr(t testing.TB) string {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	a, err := apptest.FreeAddr()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
-	return l.Addr().String()
+	return a
 }
 
-var (
-	appOnce sync.Once
-	appPath string
-	appErr  error
-)
-
-// buildApp builds the test app of this module once per test process.
-func buildApp(t testing.TB) string {
+// waitFor waits for a line of the process's output matching re and returns its
+// submatches.
+func waitFor(t testing.TB, p *apptest.Proc, re string, timeout time.Duration) []string {
 	t.Helper()
-	appOnce.Do(func() {
-		dir, err := os.MkdirTemp("", "e2eapp-build")
-		if err != nil {
-			appErr = err
-			return
-		}
-		appPath = filepath.Join(dir, "e2eapp")
-		if out, err := exec.Command("go", "build", "-o", appPath, "./cmd/e2eapp").CombinedOutput(); err != nil {
-			appErr = fmt.Errorf("build e2eapp: %v\n%s", err, out)
-		}
-	})
-	if appErr != nil {
-		t.Fatal(appErr)
+	m, err := p.WaitFor(re, timeout)
+	if err != nil {
+		t.Fatal(err)
 	}
-	return appPath
+	return m
 }
 
 // nodeTags are the build tags of the node's binary: the fault build (fault_rig_test.go)
@@ -167,9 +75,9 @@ type stack struct {
 	t       testing.TB
 	dir     string
 	nodeBin string
-	app     *proc
+	app     *apptest.Proc
 	appAddr string
-	node    *proc
+	node    *apptest.Proc
 	pub     string // host:port
 	ctl     string
 	env     []string     // extra environment for the node
@@ -188,13 +96,13 @@ func newStackOn(t testing.TB, store s3test.Store, nodeEnv ...string) *stack {
 	t.Helper()
 	s := &stack{t: t, store: store, dir: t.TempDir(), env: nodeEnv}
 	s.nodeBin = apptest.Build(t, "./cmd/shardlite", nodeTags...)
-	appBin := buildApp(t)
+	appBin := apptest.BuildIn(t, ".", "./cmd/e2eapp")
 	if err := os.WriteFile(s.declarePath(), []byte(declarationJSON), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	s.pub, s.ctl = freeAddr(t), freeAddr(t)
 	s.app = startProc(t, "e2eapp", appBin, nil, "-listen", "127.0.0.1:0", "-control", s.ctl, "-declare", s.declarePath())
-	s.appAddr = s.app.waitFor(t, `listening (\S+)`, 20*time.Second)[1]
+	s.appAddr = waitFor(t, s.app, `listening (\S+)`, 20*time.Second)[1]
 	s.startNode()
 	return s
 }
@@ -224,10 +132,10 @@ func (s *stack) nodeEnv() []string {
 func (s *stack) startNode() {
 	s.t.Helper()
 	s.node = startProc(s.t, "shardlite", s.nodeBin, s.nodeEnv())
-	s.node.waitFor(s.t, `shardlite is up`, 30*time.Second)
+	waitFor(s.t, s.node, `shardlite is up`, 30*time.Second)
 	defer func() {
 		if s.t.Failed() {
-			s.t.Logf("the node's output:\n%s", s.node.out.String())
+			s.t.Logf("the node's output:\n%s", s.node.Output())
 		}
 	}()
 	apptest.Eventually(s.t, 20*time.Second, "the node to become ready", func() bool {
