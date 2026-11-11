@@ -52,7 +52,7 @@ func startCluster(t *testing.T, b blob.Backend, name cluster.Node, live bool) *c
 		t.Fatal(err)
 	}
 	c := &cnode{Node: n, tails: &TailSet{}}
-	n.SetTails(c.tails)
+	n.SetTails(c.tails.Tails)
 	if live {
 		t.Cleanup(service.Background(slog.Default(), n.Writer, n.Keeper, n.Confirmer))
 	} else {

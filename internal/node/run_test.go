@@ -97,7 +97,7 @@ func TestRunLeavesNoGoroutines(t *testing.T) {
 	var mu sync.Mutex
 	opened := map[string]bool{}
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
-		if q.URL.Path == appReadyPath {
+		if q.URL.Path == readyPath {
 			io.WriteString(w, runKinds)
 			return
 		}
@@ -314,7 +314,7 @@ func TestRunEndsRequestsThatHoldShardsAtTheStop(t *testing.T) {
 	t.Parallel()
 	var started apptest.Log[string]
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
-		if q.URL.Path == appReadyPath {
+		if q.URL.Path == readyPath {
 			io.WriteString(w, `{"kinds": {"users": {"public": true, "sync": "none", "idle_timeout": "1h"}}}`)
 			return
 		}
@@ -533,7 +533,7 @@ func (r *runRig) ready() bool {
 func startRunUnready(t *testing.T, name string, vars map[string]string, opts ...RunOption) *runRig {
 	t.Helper()
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
-		if q.URL.Path == appReadyPath {
+		if q.URL.Path == readyPath {
 			io.WriteString(w, runKinds)
 		}
 	}))
@@ -996,7 +996,7 @@ func TestPeerAddressRefusesNoneOrSeveral(t *testing.T) {
 func TestRunStopsWhenTheAppIsLost(t *testing.T) {
 	t.Parallel()
 	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
-		if q.URL.Path == appReadyPath {
+		if q.URL.Path == readyPath {
 			io.WriteString(w, runKinds)
 		}
 	}))
@@ -1062,7 +1062,7 @@ func TestRunStopsWhenTheAppIsLost(t *testing.T) {
 	// Another node on the same store claims the shard at once, with no
 	// adoption of a journal to wait for.
 	live := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
-		if q.URL.Path == appReadyPath {
+		if q.URL.Path == readyPath {
 			io.WriteString(w, runKinds)
 		}
 	}))

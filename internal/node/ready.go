@@ -6,17 +6,17 @@ import (
 )
 
 // Ready reports whether the node should get traffic: the app has answered its
-// ready route with a declaration (a node with no app address skips this), and
+// ready route with a declaration, and
 // the node's lease is good, and the node is not draining.
 func (s *Server) Ready() (bool, string) {
 	if s.m.draining.Load() {
 		return false, "draining"
 	}
-	if s.declarations != nil && !s.declarations.ok.Load() {
-		if why := s.declarations.why.Load(); why != nil {
-			return false, *why
-		}
+	switch why := s.declarations.state.Load(); {
+	case why == nil:
 		return false, "waiting for the app's first declaration"
+	case *why != "":
+		return false, *why
 	}
 	if err := s.keeper.Check(); err != nil {
 		return false, "the node's lease is not valid"

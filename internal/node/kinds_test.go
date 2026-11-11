@@ -40,7 +40,7 @@ func TestParseTarget(t *testing.T) {
 func TestKindsUpdate(t *testing.T) {
 	t.Parallel()
 	k := NewKinds(0)
-	a, err := k.Parse([]byte(`{"kinds": {"users": {}}}`))
+	a, err := kind.ParseApp([]byte(`{"kinds": {"users": {}}}`), k.defaultIdle)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +55,7 @@ func TestKindsUpdate(t *testing.T) {
 
 	// A later declaration replaces the kinds: a kind that dropped out is
 	// unknown, and a changed setting is seen.
-	a, err = k.Parse([]byte(`{"kinds": {"users": {"sync": "none"}, "wallet": {}}}`))
+	a, err = kind.ParseApp([]byte(`{"kinds": {"users": {"sync": "none"}, "wallet": {}}}`), k.defaultIdle)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +66,7 @@ func TestKindsUpdate(t *testing.T) {
 	if got, _ := k.Lookup("users"); got.Sync != kind.SyncNone {
 		t.Fatal("new setting not seen")
 	}
-	a, err = k.Parse([]byte(`{"kinds": {"wallet": {}}}`))
+	a, err = kind.ParseApp([]byte(`{"kinds": {"wallet": {}}}`), k.defaultIdle)
 	if err != nil {
 		t.Fatal(err)
 	}

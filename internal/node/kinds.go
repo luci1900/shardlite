@@ -17,9 +17,6 @@ const DefaultIdleTimeout = 10 * time.Minute
 var (
 	// ErrUnknownKind: the kind isn't declared by an app.
 	ErrUnknownKind = errors.New("shard kind is not declared")
-	// ErrNotPublic: a client named a kind that isn't public. It is answered as
-	// ErrUnknownKind is, and only the node's journal says which it was.
-	ErrNotPublic = errors.New("shard kind is not public")
 	// ErrBadTarget: not a kind/id.
 	ErrBadTarget = errors.New("bad shard name")
 )
@@ -52,11 +49,6 @@ func NewKinds(defaultIdle time.Duration) *Kinds {
 	return &Kinds{defaultIdle: defaultIdle}
 }
 
-// Parse parses a declaration with the node's default idle timeout.
-func (k *Kinds) Parse(data []byte) (kind.App, error) {
-	return kind.ParseApp(data, k.defaultIdle)
-}
-
 // Update makes a the app's declaration current, for new activations and new
 // responses. It is the declaration poll's success path.
 func (k *Kinds) Update(a kind.App) { k.app.Store(&a) }
@@ -70,14 +62,4 @@ func (k *Kinds) Lookup(name shard.Kind) (kind.Kind, error) {
 		}
 	}
 	return kind.Kind{}, fmt.Errorf("%w: %q", ErrUnknownKind, name)
-}
-
-// CheckPublic is for a target a client named: a kind that isn't public gets
-// the same error as an undeclared one, so clients can't tell it exists. Other
-// errors (an undeclared kind) are left to Lookup.
-func (k *Kinds) CheckPublic(n shard.Name) error {
-	if c, err := k.Lookup(n.Kind()); err == nil && !c.Public {
-		return fmt.Errorf("%w: %q", ErrNotPublic, n.Kind())
-	}
-	return nil
 }

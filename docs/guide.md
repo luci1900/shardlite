@@ -59,7 +59,7 @@ The node polls the route, and a 2xx answer that parses as a valid declaration is
 
 - The version is an opaque string the node logs.
 - Kinds from libraries go in the app's declaration under names the app picks (`matchmaker.queue`). A kind named twice makes the node report not ready.
-- A node with [`SHARDLITE_APP`](deployment.md#environment-variables) serves every kind the app declares. One without serves no kinds and answers every request for a shard as undeclared, while still doing its share of the [dispatcher](#the-dispatcher)'s work.
+- A node serves every kind the app declares at its [`SHARDLITE_APP`](deployment.md#environment-variables).
 - Clients can only name kinds marked `public`. Any other kind gets the same answer as an undeclared one, so a client can't tell the kind exists. The node logs why.
 - Requests and calls for undeclared kinds are refused, which catches typos. A name that doesn't fit the [grammar](#shard-names) gets `400`.
 - A changed declaration takes effect at the next poll. A poll that fails changes nothing: the node keeps the last good kinds and reports not ready until a good declaration comes.

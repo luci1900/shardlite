@@ -55,14 +55,14 @@ func (e *unavailable) Error() string { return e.msg }
 // finds it dead, and this catches one added after that. The attempt after that
 // reads the manifest.
 func (s *Server) forward(w http.ResponseWriter, r *http.Request, info *reqInfo) {
-	if info.forwarded {
+	if info.origin.forwarded {
 		w.Header().Set(hdrOwner, string(info.owner))
-		writeError(w, r, true, http.StatusMisdirectedRequest, reasonNotOwner, fmt.Sprintf("%s is owned by %s", info.name, info.owner))
+		writePlain(w, r, http.StatusMisdirectedRequest, reasonNotOwner, fmt.Sprintf("%s is owned by %s", info.name, info.owner))
 		return
 	}
 	address, err := s.m.addrs.Address(r.Context(), info.owner)
 	if err != nil {
-		s.fail(w, r, info.own, fmt.Errorf("forwarding to %s, the owner of %s: %w", info.owner, info.name, err))
+		s.fail(w, r, fmt.Errorf("forwarding to %s, the owner of %s: %w", info.owner, info.name, err))
 		return
 	}
 	info.peer = address
@@ -71,9 +71,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, info *reqInfo) 
 	// forward is cancelled.
 	ctx, cancel := context.WithCancelCause(r.Context())
 	defer cancel(nil)
-	info.answer.Store(int32(answerAwaited))
-	info.unreachable = false
-	late := time.AfterFunc(s.opts.AnswerTimeout, func() {
+	late := time.AfterFunc(answerTimeout, func() {
 		if info.answer.CompareAndSwap(int32(answerAwaited), int32(answerLate)) {
 			cancel(errNoAnswer)
 		}
@@ -93,13 +91,13 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, info *reqInfo) 
 		if !s.m.isLive(info.owner) {
 			s.m.owners.Remove(info.name)
 		}
-		s.answer(w, r, info.own, &unavailable{reasonOwnerUnreachable, fmt.Sprintf("%s, the owner of %s, does not answer", info.owner, info.name), time.Second})
+		s.fail(w, r, &unavailable{reasonOwnerUnreachable, fmt.Sprintf("%s, the owner of %s, does not answer", info.owner, info.name), time.Second})
 	case info.moved:
 		s.m.owners.Remove(info.name)
 		if info.movedTo != "" && info.movedTo != s.m.n.Name {
 			s.m.owners.Add(info.name, info.movedTo)
 		}
-		s.answer(w, r, info.own, &unavailable{reasonMoved, fmt.Sprintf("%s is not owned by %s: try again", info.name, info.owner), 0})
+		s.fail(w, r, &unavailable{reasonMoved, fmt.Sprintf("%s is not owned by %s: try again", info.name, info.owner), 0})
 	}
 }
 
@@ -137,7 +135,6 @@ func (s *Server) forwardedResponse(resp *http.Response) error {
 	}
 	if rwc, ok := resp.Body.(io.ReadWriteCloser); ok && resp.StatusCode == http.StatusSwitchingProtocols {
 		resp.Body = gatedConn{rwc, nil, &info.gates}
-		return nil
 	}
 	return nil
 }

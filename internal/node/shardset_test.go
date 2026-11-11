@@ -32,6 +32,7 @@ import (
 	"github.com/luci1900/shardlite/internal/kind"
 	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/notify"
+	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
 	"github.com/luci1900/shardlite/internal/tempfile"
@@ -1183,4 +1184,14 @@ func TestActivationAfterAFailedOneStartsANewGeneration(t *testing.T) {
 	if got := r.dumpBlob("slow/f"); got != want {
 		t.Fatalf("restored after adoption:\n%s\nwant:\n%s", got, want)
 	}
+}
+
+// Acquire activates the shard if it is not active and holds it. However many
+// requests ask at once, the shard is activated once: the first adds its entry
+// and the others wait for it. The activation runs in the shard's own loop, so
+// one caller giving up doesn't fail the others. A shard another node owns is not
+// activated at all: the manifest is read before the entry is added, and the
+// owner is remembered (*shardfile.OwnedElsewhereError).
+func (m *Shardset) Acquire(ctx context.Context, n shard.Name) (*Hold, error) {
+	return m.take(ctx, n, acquireOpts{})
 }

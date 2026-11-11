@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -37,11 +38,10 @@ type declarations struct {
 	every  time.Duration
 	client *http.Client
 	log    *slog.Logger
-	clock  Clock          // the poll's period and the run of unanswered polls, the real one if nil
-	lost   func()         // called once, from the poll's goroutine, when the app is lost
-	polls  notify.Counter // the polls that have finished
-	ok     atomic.Bool
-	why    atomic.Pointer[string] // set while the last poll failed, with the reason
+	clock  Clock                  // the poll's period and the run of unanswered polls, the real one if nil
+	lost   func()                 // called once, from the poll's goroutine, when the app is lost
+	polls  notify.Counter         // the polls that have finished
+	state  atomic.Pointer[string] // nil until the first poll has finished, then why the last one failed ("" if it did not)
 	decl   kind.App               // the last declaration seen, so a change is logged once
 	first  bool                   // no declaration seen yet
 
@@ -64,13 +64,7 @@ func (r *declarations) Serve(ctx context.Context) error {
 		if ctx.Err() == nil { // a poll cut off by the stop says nothing of the app
 			r.observe(answered)
 		}
-		if why != "" {
-			r.why.Store(&why)
-			r.ok.Store(false)
-		} else {
-			r.why.Store(nil)
-			r.ok.Store(true)
-		}
+		r.state.Store(&why)
 		r.polls.Inc()
 	}
 	tick, stop := r.clock.NewTicker(r.every) // before the first poll, so a clock that moves after it is seen
@@ -130,7 +124,7 @@ func (r *declarations) poll(ctx context.Context) (why string, answered bool) {
 	if resp.StatusCode/100 != 2 {
 		return "the app answered " + resp.Status, true
 	}
-	a, err := r.kinds.Parse(body)
+	a, err := kind.ParseApp(body, r.kinds.defaultIdle)
 	if err != nil {
 		return "the app's declaration is not valid: " + err.Error(), true
 	}
@@ -143,15 +137,7 @@ func (r *declarations) poll(ctx context.Context) (why string, answered bool) {
 func (r *declarations) declared(a kind.App) {
 	first := r.first
 	r.first = false
-	changed := first || a.Version != r.decl.Version || len(a.Kinds) != len(r.decl.Kinds)
-	if !changed {
-		for name, k := range a.Kinds {
-			if old, ok := r.decl.Kinds[name]; !ok || old.Sync != k.Sync || old.IdleTimeout != k.IdleTimeout || old.Public != k.Public {
-				changed = true
-				break
-			}
-		}
-	}
+	changed := first || a.Version != r.decl.Version || !maps.Equal(a.Kinds, r.decl.Kinds)
 	r.decl = a
 	r.kinds.Update(a)
 	if changed {

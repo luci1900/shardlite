@@ -84,7 +84,7 @@ func (c *testCluster) newNode(name string) *clusterNode {
 		// The ready route is the app's own and the fake answers it for the
 		// node: a test's handler stands in for the app's shard routes and
 		// would not know what to do with the declaration.
-		if q.URL.Path == appReadyPath {
+		if q.URL.Path == readyPath {
 			if nd.sick.Load() {
 				w.WriteHeader(http.StatusInternalServerError)
 				return

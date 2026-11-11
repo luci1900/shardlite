@@ -1,8 +1,10 @@
 package lease_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -22,14 +24,16 @@ type confirmerRig struct {
 	lease  lease.Record
 	keeper *lease.Keeper
 	conf   *lease.Confirmer
+	log    *bytes.Buffer // what the keeper and the confirmer logged, read once a confirmation has returned
 }
 
 func newConfirmerRig(t *testing.T) *confirmerRig {
 	t.Helper()
 	b := newLocal(t)
 	reg, rec := acquire(t, b, "n1")
-	k := lease.NewKeeper(reg, rec, lease.KeeperOptions{})
-	return &confirmerRig{t: t, b: b, reg: reg, lease: rec, keeper: k, conf: lease.NewConfirmer(reg, k)}
+	var log bytes.Buffer
+	k := lease.NewKeeper(reg, rec, lease.KeeperOptions{Logger: slog.New(slog.NewTextHandler(&log, nil))})
+	return &confirmerRig{t: t, b: b, reg: reg, lease: rec, keeper: k, conf: lease.NewConfirmer(reg, k), log: &log}
 }
 
 // serve runs the confirmer until the test ends or stop is called.
@@ -186,8 +190,8 @@ func TestConfirmerFailsTheKeeperOnATakenLease(t *testing.T) {
 	}
 }
 
-// A store that cannot be reached fails the waiter and nothing else: the next
-// confirmation reads again.
+// A store that cannot be reached fails the waiter and nothing else, and says so
+// in the log: the next confirmation reads again.
 func TestConfirmerStoreErrorFailsOnlyTheWaiter(t *testing.T) {
 	t.Parallel()
 	r := newConfirmerRig(t)
@@ -200,6 +204,9 @@ func TestConfirmerStoreErrorFailsOnlyTheWaiter(t *testing.T) {
 	})
 	if err := r.confirm(); err == nil || !strings.Contains(err.Error(), "storage is down") || errors.Is(err, lease.ErrLost) {
 		t.Fatalf("confirmation: %v, want the store's error", err)
+	}
+	if msg := r.log.String(); !strings.Contains(msg, "could not read the node's lease") || !strings.Contains(msg, "storage is down") {
+		t.Fatalf("the failed read was not logged with its cause:\n%s", msg)
 	}
 	if err := r.keeper.Check(); err != nil {
 		t.Fatalf("the keeper failed: %v", err)

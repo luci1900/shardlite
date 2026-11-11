@@ -264,17 +264,15 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 	// own.
 	shardsetClosed := make(chan error, 1)
 	front := service.New(context.Background(), log)
-	front.Add(srv.publicServer(public))
-	if srv.declarations != nil {
-		front.Add(srv.declarations)
-	}
+	front.Add(srv.serverOn("public server", public, srv.PublicHandler()))
+	front.Add(srv.declarations)
 	front.Add(&expiry{journal: n.Journal, age: expireAge, log: log})
 	if pprof != nil {
-		front.Add(&httpServer{name: "pprof", log: log, lns: []net.Listener{pprof}, handler: http.DefaultServeMux, grace: ro.grace})
+		front.Add(&httpServer{name: "pprof", log: log, ln: pprof, handler: http.DefaultServeMux, grace: ro.grace})
 	}
 	callers := service.New(context.Background(), log)
-	callers.Add(srv.controlServer(control))
-	callers.Add(srv.peerServer(peer))
+	callers.Add(srv.serverOn("control server", control, srv.ControlHandler()))
+	callers.Add(srv.serverOn("peer server", peer, srv.PeerHandler()))
 	var callersErr error
 	stopCallers := sync.OnceFunc(func() { callersErr = stopStage(log, "the control and peer servers", callers) })
 	shardset := service.New(context.Background(), log)

@@ -91,7 +91,7 @@ The node passes W3C trace context (`traceparent`) through every hop unchanged, a
 | `SHARDLITE_BLOB` | required | `s3://bucket`, or `memory://` for an app's tests and local development only: one node on an in-memory store, lost when it stops, and the node warns at startup |
 | `SHARDLITE_S3_ENDPOINT` | AWS | the URL of an S3-compatible store |
 | `SHARDLITE_PREFIX` | | prefix of every object path, for example `staging/` |
-| `SHARDLITE_APP` | | the app's base URL, polled for its declaration. Without it the node serves no kinds |
+| `SHARDLITE_APP` | | the app's base URL, polled for its declaration. The node refuses to start without it |
 | `SHARDLITE_LISTEN_PUBLIC` | `:2280` | the public listener |
 | `SHARDLITE_LISTEN_PEER` | `:2281` | the listener for traffic from other nodes |
 | `SHARDLITE_LISTEN_CONTROL` | `127.0.0.1:2282` | the control API on localhost TCP |

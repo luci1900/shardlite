@@ -24,71 +24,60 @@ type statusError struct {
 
 func (e *statusError) Error() string { return e.msg }
 
-// answer writes the answer for an error from one of route's steps.
-func (s *Server) answer(w http.ResponseWriter, r *http.Request, own bool, err error) {
-	if se, ok := errors.AsType[*statusError](err); ok {
-		writeError(w, r, own, se.status, se.reason, se.msg)
-		return
-	}
-	if ue, ok := errors.AsType[*unavailable](err); ok {
-		w.Header().Set("Retry-After", strconv.Itoa(int((ue.retry+time.Second-1)/time.Second)))
-		writeError(w, r, own, http.StatusServiceUnavailable, ue.reason, ue.msg)
-		return
-	}
-	s.fail(w, r, own, err)
-}
-
-// fail answers with the status and the reason an error maps to.
-func (s *Server) fail(w http.ResponseWriter, r *http.Request, own bool, err error) {
-	status, why := http.StatusBadGateway, reasonInternal
-	if se, ok := errors.AsType[*statusError](err); ok {
-		status, why = se.status, se.reason
-	} else if ue, ok := errors.AsType[*unavailable](err); ok {
-		// A tier the node can't meet: the retry hint is the default one.
-		status, why = http.StatusServiceUnavailable, ue.reason
-	} else {
-		switch {
-		case errors.Is(err, ErrUnknownKind):
-			status, why = http.StatusNotFound, reasonUnknownShard
-		case errors.Is(err, ErrBadTarget):
-			status, why = http.StatusBadRequest, reasonBadRequest
-		case errors.Is(err, ErrAppHolds), errors.Is(err, errShardsStopped):
-			// A shard the node is no longer starting, or one the app committed to while
-			// the stop was letting go of it (the stop is letting go of its shards while
-			// it still answers).
-			status, why = http.StatusServiceUnavailable, reasonDraining
-		case errors.Is(err, errMoved):
-			status, why = http.StatusServiceUnavailable, reasonMoved
-		case errors.Is(err, lease.ErrLost), errors.Is(err, lease.ErrExpired):
-			// A shard the node may not serve yet.
-			status, why = http.StatusServiceUnavailable, reasonLeaseLost
-		case errors.Is(err, shardfile.ErrBadFile):
-			// A shard whose files are not the ones it holds cannot be served.
-			status, why = http.StatusServiceUnavailable, reasonBadFile
-		case errors.Is(err, context.DeadlineExceeded):
-			status, why = http.StatusGatewayTimeout, reasonTimeout
-		default:
-			// Only a proxy failure or a lookup of the owner's address is a 502 with a
-			// reason of its own (reasonError).
-			if re, ok := errors.AsType[*reasonError](err); ok {
-				why = re.reason
-			}
-			if neverReached(err) {
-				// The dial to the app failed, so the app never had the request and a
-				// retry is safe: a 502 with the default retry hint says so. A failure
-				// after the request went out is a bare 502, since the app may have
-				// acted on it.
-				w.Header().Set("Retry-After", "1")
-			}
+// fail answers with the status and the reason an error maps to. An unavailable
+// carries its own Retry-After, and every other 503 and a failed dial say 1.
+func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
+	status, why, msg, retry := http.StatusBadGateway, reasonInternal, err.Error(), ""
+	se, isStatus := errors.AsType[*statusError](err)
+	ue, isUnavailable := errors.AsType[*unavailable](err)
+	switch {
+	case isStatus:
+		status, why, msg = se.status, se.reason, se.msg
+	case isUnavailable:
+		status, why, msg = http.StatusServiceUnavailable, ue.reason, ue.msg
+		retry = strconv.Itoa(int((ue.retry + time.Second - 1) / time.Second))
+	case errors.Is(err, ErrUnknownKind):
+		status, why = http.StatusNotFound, reasonUnknownShard
+	case errors.Is(err, ErrBadTarget):
+		status, why = http.StatusBadRequest, reasonBadRequest
+	case errors.Is(err, ErrAppHolds), errors.Is(err, errShardsStopped):
+		// A shard the node is no longer starting, or one the app committed to while
+		// the stop was letting go of it (the stop is letting go of its shards while
+		// it still answers).
+		status, why = http.StatusServiceUnavailable, reasonDraining
+	case errors.Is(err, lease.ErrLost), errors.Is(err, lease.ErrExpired):
+		// A shard the node may not serve yet.
+		status, why = http.StatusServiceUnavailable, reasonLeaseLost
+	case errors.Is(err, shardfile.ErrBadFile):
+		// A shard whose files are not the ones it holds cannot be served.
+		status, why = http.StatusServiceUnavailable, reasonBadFile
+	case errors.Is(err, context.DeadlineExceeded):
+		status, why = http.StatusGatewayTimeout, reasonTimeout
+	default:
+		// Only a proxy failure or a lookup of the owner's address is a 502 with a
+		// reason of its own (reasonError).
+		if re, ok := errors.AsType[*reasonError](err); ok {
+			why = re.reason
+		}
+		if neverReached(err) {
+			// The dial to the app failed, so the app never had the request and a
+			// retry is safe: a 502 with the default retry hint says so. A failure
+			// after the request went out is a bare 502, since the app may have
+			// acted on it.
+			retry = "1"
 		}
 	}
-	if status >= 500 {
+	if status == http.StatusServiceUnavailable && retry == "" {
+		retry = "1"
+	}
+	if retry != "" {
+		w.Header().Set("Retry-After", retry)
+	}
+	// An unavailable is an answer the node means to give, so it is not logged.
+	if status >= 500 && !isUnavailable {
 		s.log.Warn("request failed", "method", r.Method, "path", r.URL.Path, "reason", why, "err", err)
-		if status == http.StatusServiceUnavailable {
-			w.Header().Set("Retry-After", "1")
-		}
 	}
-	writeError(w, r, own, status, why, err.Error())
+	writeError(w, r, status, why, msg)
 }
 
 // neverReached says err is a failed dial, which is the one transport error that
@@ -115,23 +104,28 @@ var grpcCodes = map[int]int{
 // writeError answers with an error the node produced itself, marked with its
 // reason in Shardlite-Error. For a request with content-type application/grpc it
 // is a gRPC status (a "trailers-only" response: HTTP 200 with grpc-status,
-// grpc-message and shardlite-error), which is what a gRPC client understands. own
-// says the request is the node's own (answered in process), which is not given a gRPC status.
-func writeError(w http.ResponseWriter, r *http.Request, own bool, status int, why reason, msg string) {
-	w.Header().Set(hdrError, string(why))
-	// The node's own requests read the status themselves, whatever it carries.
-	if isGRPC(r) && !own {
-		code, ok := grpcCodes[status]
-		if !ok {
-			code = 13 // INTERNAL
-		}
-		h := w.Header()
-		h.Set("Content-Type", "application/grpc")
-		h.Set("Grpc-Status", strconv.Itoa(code))
-		h.Set("Grpc-Message", grpcMessage(msg))
-		w.WriteHeader(http.StatusOK)
+// grpc-message and shardlite-error), which is what a gRPC client understands.
+func writeError(w http.ResponseWriter, r *http.Request, status int, why reason, msg string) {
+	if !isGRPC(r) {
+		writePlain(w, r, status, why, msg)
 		return
 	}
+	code, ok := grpcCodes[status]
+	if !ok {
+		code = 13 // INTERNAL
+	}
+	h := w.Header()
+	h.Set(hdrError, string(why))
+	h.Set("Content-Type", "application/grpc")
+	h.Set("Grpc-Status", strconv.Itoa(code))
+	h.Set("Grpc-Message", grpcMessage(msg))
+	w.WriteHeader(http.StatusOK)
+}
+
+// writePlain is writeError with the status always the HTTP one, for an answer
+// another node reads (a 421, or the refusal of a request that is no forward).
+func writePlain(w http.ResponseWriter, r *http.Request, status int, why reason, msg string) {
+	w.Header().Set(hdrError, string(why))
 	if strings.Contains(r.Header.Get("Accept"), "application/json") || strings.HasPrefix(r.URL.Path, apiPrefix) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)

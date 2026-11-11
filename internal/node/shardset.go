@@ -224,7 +224,7 @@ func NewShardset(n *Node, opts ShardsetOptions, newRouting func(*Shardset) routi
 		base: base,
 		sems: newSems(opts.limits),
 	}
-	n.SetTails(m)
+	n.SetTails(m.Tails)
 	return m, nil
 }
 
@@ -410,16 +410,6 @@ func (h *Hold) Sync() kind.Sync {
 // Release gives up the hold.
 func (h *Hold) Release() {
 	h.once.Do(func() { h.a.e.put(h.m.now()) })
-}
-
-// Acquire activates the shard if it is not active and holds it. However many
-// requests ask at once, the shard is activated once: the first adds its entry
-// and the others wait for it. The activation runs in the shard's own loop, so
-// one caller giving up doesn't fail the others. A shard another node owns is not
-// activated at all: the manifest is read before the entry is added, and the
-// owner is remembered (*shardfile.OwnedElsewhereError).
-func (m *Shardset) Acquire(ctx context.Context, n shard.Name) (*Hold, error) {
-	return m.take(ctx, n, acquireOpts{})
 }
 
 // acquireOpts say how a request acquires a shard.

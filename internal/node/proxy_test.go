@@ -163,7 +163,7 @@ func TestRewriteNamesTheShardByWhereItGoes(t *testing.T) {
 		return pr.Out.Header
 	}
 	call := func(peer string) *reqInfo {
-		return &reqInfo{name: shardName("slow/w1"), path: "/data/w1.db", peer: peer, caller: "users/c", callerName: shardName("users/c"), hops: 3}
+		return &reqInfo{origin: origin{kind: fromCall}, name: shardName("slow/w1"), path: "/data/w1.db", peer: peer, caller: "users/c", callerName: shardName("users/c"), hops: 3}
 	}
 	app := rewrite(call(""))
 	if got := app.Values(hdrContext); len(got) != 1 || got[0] != ctxOf("slow/w1", 3) || app.Get("Shardlite-Caller") != "users/c" || app.Get("Shardlite-Hops") != "" {
@@ -181,7 +181,7 @@ func TestRewriteNamesTheShardByWhereItGoes(t *testing.T) {
 	}
 	// A client's request has no context to carry, whatever the client sent.
 	client := call("n1.invalid:1")
-	client.public, client.caller, client.callerName, client.hops = true, "", shard.Name{}, 0
+	client.origin, client.caller, client.callerName, client.hops = origin{kind: fromClient}, "", shard.Name{}, 0
 	if h := rewrite(client); h.Get(hdrContext) != "" || h.Get("Shardlite-Caller") != "" || h.Get(hdrOrigin) != originClient {
 		t.Fatalf("a client's forward was sent %v", h)
 	}

@@ -29,7 +29,9 @@ var ErrConfirmerStopped = errors.New("lease: confirmer stopped")
 //
 // A lease read that finds the lease taken fails the keeper (ErrLost), so
 // the node stops as a lost renewal stops it. A read that cannot reach the store
-// fails only its waiters. It is a service; its loop owns the reads.
+// fails only its waiters, and is logged once for all of them, since the storage
+// answers it fails are refused rather than given unconfirmed. It is a service;
+// its loop owns the reads.
 type Confirmer struct {
 	keeper *Keeper
 	reg    *Registry
@@ -148,7 +150,9 @@ func (c *Confirmer) read(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ErrConfirmerStopped
 		}
-		return fmt.Errorf("confirming the lease: %w", err)
+		err = fmt.Errorf("confirming the lease: %w", err)
+		c.keeper.opts.Logger.Warn("could not read the node's lease to confirm its storage answers, failing them", "node", c.me.Node, "err", err)
+		return err
 	case l.Holds(c.me):
 		return nil
 	default:

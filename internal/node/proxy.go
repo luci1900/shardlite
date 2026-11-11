@@ -31,9 +31,9 @@ func (s *Server) rewrite(pr *httputil.ProxyRequest) {
 		s.m.placer.StampPlacement(pr.Out.Header)
 		origin := originCall
 		switch {
-		case info.public:
+		case info.origin.client():
 			origin = originClient
-		case info.node:
+		case info.origin.kind == fromNode:
 			origin = originNode
 			fallthrough
 		default:
@@ -46,7 +46,7 @@ func (s *Server) rewrite(pr *httputil.ProxyRequest) {
 		pr.Out.Header.Set(hdrOrigin, origin)
 		// A call's context goes on unchanged, for the owner's node to read as this one
 		// did. A client's has none: the public listener never reads one.
-		if v := pr.In.Header.Values(hdrContext); len(v) > 0 && !info.public {
+		if v := pr.In.Header.Values(hdrContext); len(v) > 0 && !info.origin.client() {
 			pr.Out.Header[hdrContext] = v
 		}
 	}
@@ -70,12 +70,12 @@ func (s *Server) rewrite(pr *httputil.ProxyRequest) {
 		pr.Out.Header.Set(hdrCaller, info.caller)
 	}
 	switch {
-	case info.forwarded:
+	case info.origin.forwarded:
 		// The forwarding node added the client: the app sees what it would have seen
 		// there. The control API is local and the app is trusted, so the node adds
 		// nothing of its own (the app's address would only lengthen the chain).
 		passOn(pr, "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto")
-	case info.public:
+	case info.origin.client():
 		// The load balancer is the trust boundary: its chain is extended with its
 		// address (httputil's documented way under Rewrite), and the protocol and
 		// host it saw are kept over SetXForwarded's view from inside the network.
@@ -140,6 +140,5 @@ func (s *Server) upstreamError(w http.ResponseWriter, r *http.Request, err error
 	if neverReached(err) {
 		why = unreached
 	}
-	info, _ := r.Context().Value(ctxKey{}).(*reqInfo)
-	s.fail(w, r, info != nil && info.own, &reasonError{why, err})
+	s.fail(w, r, &reasonError{why, err})
 }

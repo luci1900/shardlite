@@ -139,36 +139,30 @@ func (l *acceptCounter) Accept() (net.Conn, error) {
 	return c, err
 }
 
-// serveOn starts an httpServer with a long grace on two listeners (a server
-// may have several) and returns its listeners, a stop function that cancels
-// it and the channel Serve's result arrives on.
-func serveOn(t *testing.T, h http.Handler) ([]*acceptCounter, context.CancelFunc, <-chan error) {
+// serveOn starts an httpServer with a long grace and returns its listener, a
+// stop function that cancels it and the channel Serve's result arrives on.
+func serveOn(t *testing.T, h http.Handler) (*acceptCounter, context.CancelFunc, <-chan error) {
 	t.Helper()
-	var lns []*acceptCounter
-	var raw []net.Listener
-	for range 2 {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		c := &acceptCounter{Listener: ln}
-		lns, raw = append(lns, c), append(raw, c)
+	raw, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
 	}
-	srv := &httpServer{name: "test server", log: slog.New(slog.DiscardHandler), lns: raw, handler: h, grace: time.Minute}
+	ln := &acceptCounter{Listener: raw}
+	srv := &httpServer{name: "test server", log: slog.New(slog.DiscardHandler), ln: ln, handler: h, grace: time.Minute}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- srv.Serve(ctx) }()
 	t.Cleanup(cancel)
-	return lns, cancel, done
+	return ln, cancel, done
 }
 
 // A connection that has sent nothing does not hold up a stop: Shutdown alone
 // would wait for it until it is 5 seconds old.
 func TestServerStopDoesNotWaitForSilentConnections(t *testing.T) {
 	t.Parallel()
-	lns, cancel, done := serveOn(t, http.NotFoundHandler())
+	ln, cancel, done := serveOn(t, http.NotFoundHandler())
 	var conns []net.Conn
-	for _, ln := range lns {
+	for range 2 {
 		c, err := net.Dial("tcp", ln.Addr().String())
 		if err != nil {
 			t.Fatal(err)
@@ -177,7 +171,7 @@ func TestServerStopDoesNotWaitForSilentConnections(t *testing.T) {
 		conns = append(conns, c)
 	}
 	apptest.Eventually(t, 10*time.Second, "both connections to be accepted", func() bool {
-		return lns[0].n.Load() == 1 && lns[1].n.Load() == 1
+		return ln.n.Load() == 2
 	})
 	start := time.Now()
 	cancel()
@@ -205,19 +199,19 @@ func TestServerStopDoesNotWaitForSilentConnections(t *testing.T) {
 func TestServerStopLetsARequestInFlightFinish(t *testing.T) {
 	t.Parallel()
 	entered, release := make(chan struct{}), make(chan struct{})
-	lns, cancel, done := serveOn(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ln, cancel, done := serveOn(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		close(entered)
 		<-release
 		io.WriteString(w, "done")
 	}))
-	silent, err := net.Dial("tcp", lns[1].Addr().String())
+	silent, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer silent.Close()
 	answer := make(chan string, 1)
 	go func() {
-		res, err := http.Get("http://" + lns[0].Addr().String())
+		res, err := http.Get("http://" + ln.Addr().String())
 		if err != nil {
 			answer <- err.Error()
 			return

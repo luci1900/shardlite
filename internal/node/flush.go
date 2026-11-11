@@ -17,7 +17,6 @@ import (
 	"github.com/luci1900/shardlite/internal/kind"
 	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/notify"
-	"github.com/luci1900/shardlite/internal/shard"
 )
 
 // Defaults of the flush timing, chosen from the measurements in
@@ -180,17 +179,8 @@ func (f *Flusher) Serve(ctx context.Context) error {
 // GOMAXPROCS follows container CPU limits.
 func syncLimit() int { return runtime.GOMAXPROCS(0) }
 
-// syncTarget is one capture a cycle syncs: an active shard's, or the node
-// database's.
-type syncTarget struct {
-	name    shard.Name
-	cap     *captureState
-	closing func() bool // it is being let go of meanwhile, so a failure is no news
-	kick    func()      // after a capture: its new rows can be read, and are durable
-}
-
 type pendingSync struct {
-	t   syncTarget
+	a   *actor
 	h   capture.Header
 	ok  bool
 	err error // the sync's result
@@ -198,17 +188,9 @@ type pendingSync struct {
 
 // targets are what a cycle syncs: the active shards (shards being let go of are
 // left to their final sync).
-func (f *Flusher) targets() []syncTarget {
-	var out []syncTarget
-	f.tab.shards(func(a *actor) {
-		out = append(out, syncTarget{name: a.Name, cap: &a.cap,
-			closing: func() bool { return !a.e.is(entryActive) },
-			kick: func() {
-				if o := a.loop.load(); o != nil {
-					o.kick()
-				}
-			}})
-	}, entryActive)
+func (f *Flusher) targets() []*actor {
+	var out []*actor
+	f.tab.shards(func(a *actor) { out = append(out, a) }, entryActive)
 	return out
 }
 
@@ -223,16 +205,16 @@ func (f *Flusher) cycle(ctx context.Context) {
 	var ops []*pendingSync
 	var sg errgroup.Group
 	sg.SetLimit(syncLimit())
-	for _, t := range f.targets() {
-		sh := t.cap.load()
+	for _, a := range f.targets() {
+		sh := a.cap.load()
 		if sh == nil {
 			continue
 		}
-		h, ok, changed := t.cap.changed()
+		h, ok, changed := a.cap.changed()
 		if !changed {
 			continue
 		}
-		p := &pendingSync{t: t, h: h, ok: ok}
+		p := &pendingSync{a: a, h: h, ok: ok}
 		ops = append(ops, p)
 		sg.Go(func() error {
 			p.err = sh.Capture(ctx) // each shard's own result: one failing must not cancel the rest
@@ -268,15 +250,19 @@ func (f *Flusher) cycle(ctx context.Context) {
 			err = flushErr // queued, but never written
 		}
 		if err != nil {
-			p.t.cap.synced(err)
-			if ctx.Err() == nil && !p.t.closing() {
-				f.log.Error("capturing a shard failed", "shard", p.t.name, "err", err)
+			p.a.cap.synced(err)
+			// A shard being let go of meanwhile fails with no news.
+			if ctx.Err() == nil && p.a.e.is(entryActive) {
+				f.log.Error("capturing a shard failed", "shard", p.a.Name, "err", err)
 			}
 			continue
 		}
-		p.t.cap.synced(nil)
-		p.t.cap.captured(p.h, p.ok)
-		p.t.kick()
+		p.a.cap.synced(nil)
+		p.a.cap.captured(p.h, p.ok)
+		// Its new rows can be read, and are durable.
+		if o := p.a.loop.load(); o != nil {
+			o.kick()
+		}
 	}
 	f.done.Inc()
 }
@@ -379,7 +365,9 @@ func (f *Flusher) gate(ctx context.Context, c *captureState, sync kind.Sync, pro
 		return err
 	}
 	if !sync.Valid() {
-		return tierUnmet(fmt.Sprintf("sync is %d, which is not a durability tier", int(sync)))
+		err := tierUnmet(fmt.Sprintf("sync is %d, which is not a durability tier", int(sync)))
+		f.log.Error("an answer was gated on no durability tier, which is a bug", "err", err)
+		return err
 	}
 	mark := f.Mark()
 	if !c.hasNewFrames() {

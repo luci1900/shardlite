@@ -7,14 +7,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
 
 	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/cluster"
 	"github.com/luci1900/shardlite/internal/journal"
 	"github.com/luci1900/shardlite/internal/lease"
@@ -60,7 +58,7 @@ type Node struct {
 	// had no previous lease).
 	Adopted shardfile.AdoptReport
 
-	tails atomic.Pointer[Tails] // what the lease counts, nil until SetTails
+	tails atomic.Pointer[func() pos.Seg] // what the lease counts, nil until SetTails
 }
 
 // Err returns nil while the node may write: its lease is good and its journal's
@@ -198,17 +196,10 @@ func (n *Node) adoptOwn(ctx context.Context, rec lease.Record) (shardfile.AdoptR
 	return rep, k.Lease(), rep.Fence + 1, err
 }
 
-// Tails is where the lease's journal range comes from: whatever runs the
-// node's shards (the shardset, or a TailSet for programs that capture shards
-// themselves).
-type Tails interface {
-	// Tails returns the lowest segment number a captured shard's tail still
-	// needs (0 if none does).
-	Tails() pos.Seg
-}
-
-// SetTails makes t what the lease's journal range is read from.
-func (n *Node) SetTails(t Tails) { n.tails.Store(&t) }
+// SetTails makes tails what the lease's journal range is read from: it returns
+// the lowest segment number a captured shard's tail still needs (0 if none
+// does). The shardset sets it, and the tests of the node's journal set their own.
+func (n *Node) SetTails(tails func() pos.Seg) { n.tails.Store(&tails) }
 
 // Info is what the node publishes in its lease.
 func (n *Node) Info() lease.NodeInfo {
@@ -218,45 +209,9 @@ func (n *Node) Info() lease.NodeInfo {
 	next := n.Writer.NextSeq()
 	from := next
 	if t := n.tails.Load(); t != nil {
-		if f := (*t).Tails(); f != 0 && f < from {
+		if f := (*t)(); f != 0 && f < from {
 			from = f
 		}
 	}
 	return lease.NodeInfo{Name: n.Name, Address: n.Address, JournalFrom: from, JournalNext: next}
-}
-
-// TailSet is a set of captured shards as Tails, for programs that capture
-// shards without the shardset (tests of the node's journal).
-type TailSet struct {
-	mu sync.Mutex
-	m  map[*capture.Shard]struct{}
-}
-
-// Track remembers a shard, before its capture's first sync.
-func (s *TailSet) Track(sh *capture.Shard) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.m == nil {
-		s.m = map[*capture.Shard]struct{}{}
-	}
-	s.m[sh] = struct{}{}
-}
-
-// Untrack forgets a shard that is no longer active.
-func (s *TailSet) Untrack(sh *capture.Shard) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.m, sh)
-}
-
-func (s *TailSet) Tails() pos.Seg {
-	var from pos.Seg
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for sh := range s.m {
-		if f := sh.TailFrom(); f != 0 && (from == 0 || f < from) {
-			from = f
-		}
-	}
-	return from
 }

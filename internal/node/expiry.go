@@ -33,8 +33,8 @@ const maxExpireEvery = 10 * time.Minute
 type expiry struct {
 	journal journal.Store
 	age     time.Duration
-	below pos.Seg // only segments numbered below this, if set
-	log   *slog.Logger
+	below   pos.Seg // only segments numbered below this, if set
+	log     *slog.Logger
 }
 
 func (*expiry) String() string { return "journal expiry" }

@@ -59,7 +59,7 @@ func (r *rig) start(opts ...func(*node.Config)) (*node.Node, error) {
 			r.tails = map[*node.Node]*node.TailSet{}
 		}
 		r.tails[n] = &node.TailSet{}
-		n.SetTails(r.tails[n])
+		n.SetTails(r.tails[n].Tails)
 	}
 	return n, err
 }

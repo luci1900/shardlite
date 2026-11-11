@@ -52,7 +52,7 @@ func newSRigWith(t *testing.T, mutate func(*ShardsetOptions)) *srig {
 	r := &srig{mrig: newUnstartedMRig(t, nil), opened: map[string]bool{}}
 	r.decl.Store(testKinds)
 	r.fake = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
-		if q.URL.Path == appReadyPath {
+		if q.URL.Path == readyPath {
 			if r.sick.Load() {
 				w.WriteHeader(http.StatusInternalServerError)
 				return
@@ -107,8 +107,8 @@ func (r *srig) startServer() {
 	r.pub, r.ctl = "http://"+pub.Addr().String(), "http://"+ctl.Addr().String()
 	ctx, cancel := context.WithCancel(context.Background())
 	var g errgroup.Group
-	g.Go(func() error { return srv.publicServer(pub).Serve(ctx) })
-	g.Go(func() error { return srv.controlServer(ctl).Serve(ctx) })
+	g.Go(func() error { return srv.serverOn("public server", pub, srv.PublicHandler()).Serve(ctx) })
+	g.Go(func() error { return srv.serverOn("control server", ctl, srv.ControlHandler()).Serve(ctx) })
 	g.Go(func() error { return srv.declarations.Serve(ctx) })
 	var once sync.Once
 	r.stop = func() { once.Do(func() { cancel(); g.Wait() }) }

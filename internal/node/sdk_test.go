@@ -121,7 +121,7 @@ func TestSDKReasonsAreTheNodes(t *testing.T) {
 // call's options set and the sync path.
 func TestSDKNamesAreTheNodes(t *testing.T) {
 	t.Parallel()
-	if p, v := shardlite.ReadyPath, appReadyPath; p != v {
+	if p, v := shardlite.ReadyPath, readyPath; p != v {
 		t.Errorf("the SDK names the ready path %q where the node names %q", p, v)
 	}
 	if p, v := shardlite.RemindersPath, remindersPath; p != v {
@@ -177,7 +177,7 @@ func TestSDKReadyIsWhatTheNodeParses(t *testing.T) {
 			t.Fatal(err)
 		}
 		rec := httptest.NewRecorder()
-		app.Ready().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, appReadyPath, nil))
+		app.Ready().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, readyPath, nil))
 		body, _ := io.ReadAll(rec.Result().Body)
 		parsed, err := kind.ParseApp(body, time.Minute)
 		if err != nil {

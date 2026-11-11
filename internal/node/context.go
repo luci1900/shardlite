@@ -42,14 +42,14 @@ func parseContext(h http.Header) (c callContext, ok bool, err error) {
 	if err != nil {
 		return callContext{}, false, fmt.Errorf("does not parse: %w", err)
 	}
-	name, err := contextString(d, ctxShard)
+	name, err := contextValue[string](d, ctxShard, "a string")
 	if err != nil {
 		return callContext{}, false, err
 	}
 	if c.shard, err = ParseTarget(name); err != nil {
 		return callContext{}, false, fmt.Errorf("%s: %w", ctxShard, err)
 	}
-	hops, err := contextInt(d, ctxHops)
+	hops, err := contextValue[int64](d, ctxHops, "an integer")
 	if err != nil {
 		return callContext{}, false, err
 	}
@@ -60,36 +60,19 @@ func parseContext(h http.Header) (c callContext, ok bool, err error) {
 	return c, true, nil
 }
 
-func contextString(d *httpsfv.Dictionary, key string) (string, error) {
+// contextValue is the value under key as a T, which is what (an integer or a string) names in the error.
+func contextValue[T any](d *httpsfv.Dictionary, key, what string) (T, error) {
+	var v T
 	m, ok := d.Get(key)
 	if !ok {
-		return "", fmt.Errorf("%s is missing", key)
+		return v, fmt.Errorf("%s is missing", key)
 	}
-	item, ok := m.(httpsfv.Item)
-	if !ok {
-		return "", fmt.Errorf("%s is not a string", key)
+	if item, ok := m.(httpsfv.Item); ok {
+		if v, ok = item.Value.(T); ok {
+			return v, nil
+		}
 	}
-	s, ok := item.Value.(string)
-	if !ok {
-		return "", fmt.Errorf("%s is not a string", key)
-	}
-	return s, nil
-}
-
-func contextInt(d *httpsfv.Dictionary, key string) (int64, error) {
-	m, ok := d.Get(key)
-	if !ok {
-		return 0, fmt.Errorf("%s is missing", key)
-	}
-	item, ok := m.(httpsfv.Item)
-	if !ok {
-		return 0, fmt.Errorf("%s is not an integer", key)
-	}
-	n, ok := item.Value.(int64)
-	if !ok {
-		return 0, fmt.Errorf("%s is not an integer", key)
-	}
-	return n, nil
+	return v, fmt.Errorf("%s is not %s", key, what)
 }
 
 // badContext is the 400 for a context that was refused.

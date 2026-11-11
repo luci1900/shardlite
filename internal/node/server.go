@@ -14,22 +14,21 @@ import (
 
 // The headers the node and the app exchange (docs/guide.md, Reference).
 const (
-	hdrPrefix    = "Shardlite-"
-	hdrTarget    = "Shardlite-Target"
-	hdrOpened    = "Shardlite-Opened" // node to app: the shard the node opened for the request
-	hdrFile      = "Shardlite-File"
-	hdrCaller    = "Shardlite-Caller"
-	hdrSync      = "Shardlite-Sync"
-	hdrIfActive  = "Shardlite-If-Active"
-	hdrIfExists  = "Shardlite-If-Exists"
-	hdrOrigin    = "Shardlite-Origin" // on a forward: "client", "call" or "node"
-	hdrOwner     = "Shardlite-Owner"  // on a 421: the owner the node found
-	hdrError     = "Shardlite-Error"  // on an error the node made: its reason
-	queryTarget  = "shardlite-target"
-	apiPrefix    = "/_shardlite/"
-	readyPath    = "/_shardlite/ready" // the node's, to the load balancer
-	appReadyPath = "/_shardlite/ready" // the app's, which the node polls
-	callerApp    = "app"               // Shardlite-Caller of a call that has no shard behind it
+	hdrPrefix   = "Shardlite-"
+	hdrTarget   = "Shardlite-Target"
+	hdrOpened   = "Shardlite-Opened" // node to app: the shard the node opened for the request
+	hdrFile     = "Shardlite-File"
+	hdrCaller   = "Shardlite-Caller"
+	hdrSync     = "Shardlite-Sync"
+	hdrIfActive = "Shardlite-If-Active"
+	hdrIfExists = "Shardlite-If-Exists"
+	hdrOrigin   = "Shardlite-Origin" // on a forward: "client", "call" or "node"
+	hdrOwner    = "Shardlite-Owner"  // on a 421: the owner the node found
+	hdrError    = "Shardlite-Error"  // on an error the node made: its reason
+	queryTarget = "shardlite-target"
+	apiPrefix   = "/_shardlite/"
+	readyPath   = "/_shardlite/ready" // the node's, to the load balancer, and the app's, which the node polls
+	callerApp   = "app"               // Shardlite-Caller of a call that has no shard behind it
 )
 
 // ServerOptions configure a Server.
@@ -38,14 +37,9 @@ type ServerOptions struct {
 	ReadyEvery time.Duration // how often the ready route is polled, 1 s if zero
 	// MaxHops is the longest chain of hops allowed, DefaultMaxHops if zero.
 	MaxHops int
-	// ReminderTimeout is how long one wake of the app for a shard's reminders may take, 30 s if zero.
-	ReminderTimeout time.Duration
 	// Grace is how long stopping a server waits for requests in flight before it
 	// ends them, 10 s if zero.
 	Grace time.Duration
-	// AnswerTimeout is how long a forward waits for the owner's node to
-	// acknowledge it before the owner counts as unreachable, 1 s if zero.
-	AnswerTimeout time.Duration
 	// Clock is the declaration poll's period and its clock for telling that the app
 	// is lost, the real one if nil.
 	Clock Clock
@@ -68,6 +62,11 @@ const (
 	// swallowing forwards on its pooled connection.
 	h2cPingAfter = 15 * time.Second
 	h2cPingWait  = 5 * time.Second
+	// reminderTimeout is how long one wake of the app for a shard's reminders may take.
+	reminderTimeout = 30 * time.Second
+	// answerTimeout is how long a forward waits for the owner's node to
+	// acknowledge it before the owner counts as unreachable.
+	answerTimeout = time.Second
 	// serverIdleTimeout closes a keep-alive connection that has sat idle (in
 	// HTTP/2 it is how long the connection may have no open streams).
 	serverIdleTimeout = 2 * time.Minute
@@ -96,17 +95,14 @@ type Server struct {
 }
 
 // NewServer makes the node's servers. The app counts as unhealthy until its
-// ready route has answered with a declaration (once Run serves s.declarations). An
-// app address of nil (a node that serves no kinds) runs no poll.
+// ready route has answered with a declaration (once Run serves s.declarations).
 func NewServer(m *Shardset, kinds *Kinds, keeper *lease.Keeper, opts ServerOptions) *Server {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
 	orDefault(&opts.ReadyEvery, time.Second)
 	orDefault(&opts.MaxHops, DefaultMaxHops)
-	orDefault(&opts.ReminderTimeout, 30*time.Second)
 	orDefault(&opts.Grace, defaultGrace)
-	orDefault(&opts.AnswerTimeout, time.Second)
 	s := &Server{m: m, kinds: kinds, keeper: keeper, opts: opts, log: opts.Logger}
 
 	h1 := http.DefaultTransport.(*http.Transport).Clone()
@@ -116,13 +112,10 @@ func NewServer(m *Shardset, kinds *Kinds, keeper *lease.Keeper, opts ServerOptio
 	h1.Protocols = new(http.Protocols)
 	h1.Protocols.SetHTTP1(true)
 	h2c := newPeerTransport()
-	// The declaration poll shares h1 (the app's ready route speaks HTTP/1.1). A node
-	// without an app address serves no kinds and polls nothing.
-	if opts.App != nil {
-		u := *opts.App
-		u.Path = strings.TrimRight(u.Path, "/") + appReadyPath
-		s.declarations = &declarations{kinds: kinds, url: u.String(), every: opts.ReadyEvery, client: &http.Client{Transport: h1, Timeout: 2 * time.Second}, log: opts.Logger, clock: opts.Clock, lost: opts.AppLost}
-	}
+	// The declaration poll shares h1 (the app's ready route speaks HTTP/1.1).
+	u := *opts.App
+	u.Path = strings.TrimRight(u.Path, "/") + readyPath
+	s.declarations = &declarations{kinds: kinds, url: u.String(), every: opts.ReadyEvery, client: &http.Client{Transport: h1, Timeout: 2 * time.Second}, log: opts.Logger, clock: opts.Clock, lost: opts.AppLost}
 
 	s.proxy = &httputil.ReverseProxy{
 		Rewrite:        s.rewrite,
@@ -174,7 +167,7 @@ func (s *Server) PublicHandler() http.Handler {
 				s.readyRoute(w, r)
 				return
 			}
-			writeError(w, r, false, http.StatusNotFound, reasonNoEndpoint, "not found")
+			writeError(w, r, http.StatusNotFound, reasonNoEndpoint, "not found")
 			return
 		}
 		s.route(w, r, origin{kind: fromClient})
@@ -213,13 +206,13 @@ func (s *Server) PeerHandler() http.Handler {
 		case originNode:
 			o.kind = fromNode
 		default:
-			writeError(w, r, true, http.StatusNotFound, reasonNoEndpoint, "not found")
+			writePlain(w, r, http.StatusNotFound, reasonNoEndpoint, "not found")
 			return
 		}
 		// Only the node's own requests use paths under /_shardlite/ (the dispatcher's
 		// activation), and only another node forwards them here.
 		if isAPIPath(r.URL.Path) && o.kind != fromNode {
-			writeError(w, r, true, http.StatusNotFound, reasonNoEndpoint, "not found")
+			writePlain(w, r, http.StatusNotFound, reasonNoEndpoint, "not found")
 			return
 		}
 		// The forward has reached this node: the forwarding node can tell a slow app
@@ -271,12 +264,12 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == apiPrefix+"sync" && r.Method == http.MethodPost:
 		// Everything committed before the call is in blob storage when this returns.
 		if err := s.m.Barrier(r.Context()); err != nil {
-			s.fail(w, r, false, err)
+			s.fail(w, r, err)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 	default:
-		writeError(w, r, false, http.StatusNotFound, reasonNoEndpoint, "no such endpoint")
+		writeError(w, r, http.StatusNotFound, reasonNoEndpoint, "no such endpoint")
 	}
 }
 

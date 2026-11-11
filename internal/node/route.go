@@ -24,15 +24,11 @@ type reqInfo struct {
 	caller     string     // "" on a client request
 	callerName shard.Name // the calling shard, zero when the caller is the app
 	hold       *Hold
-	public     bool // a client's request to the public handler
-	own        bool // the node's own request (a delivery), answered in process
-	node       bool // the node's own request (fromNode): the dispatcher's activation of any shard
-	// forwarded is a request another node forwarded here. owner is the node that
-	// owns the target when that isn't this one, and peer the address it is
-	// forwarded to.
-	forwarded bool
-	owner     cluster.Node
-	peer      string
+	origin     origin // who asked, and whether another node forwarded it here
+	// owner is the node that owns the target when that isn't this one, and peer
+	// the address the request is forwarded to.
+	owner cluster.Node
+	peer  string
 	// moved is set when the owner answered a forward with 421 (the shard isn't
 	// its own), and movedTo is the owner it named: empty if it named none.
 	moved   bool
@@ -69,13 +65,13 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, o origin) {
 	if target != "" {
 		n, err := ParseTarget(target)
 		if err != nil {
-			s.answer(w, r, o.internal(), err)
+			s.fail(w, r, err)
 			return
 		}
 		name = n
 	}
-	info := &reqInfo{name: name, public: o.kind == fromClient, own: o.internal(), node: o.kind == fromNode, forwarded: o.forwarded}
-	activate := info.node && r.URL.Path == dispatch.Activate
+	info := &reqInfo{name: name, origin: o}
+	activate := o.kind == fromNode && r.URL.Path == dispatch.Activate
 	// The proxy can leave goroutines behind that are still reading through a gate
 	// when the handler returns: the second copier of an upgraded connection, or
 	// the transport writing a request body. Their gates end with the request's
@@ -90,16 +86,16 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, o origin) {
 		}
 	}()
 	if err := s.parseCall(r, o, info); err != nil {
-		s.answer(w, r, o.internal(), err)
+		s.fail(w, r, err)
 		return
 	}
 	if !info.name.IsZero() {
 		if err := s.checkTarget(r, o, info); err != nil {
-			s.answer(w, r, o.internal(), err)
+			s.fail(w, r, err)
 			return
 		}
 		if err := s.holdShards(r, o, info); err != nil {
-			s.answer(w, r, o.internal(), err)
+			s.fail(w, r, err)
 			return
 		}
 		if info.owner != "" {
@@ -164,12 +160,11 @@ func (s *Server) parseCall(r *http.Request, o origin, info *reqInfo) error {
 // another node owns it, it may be active there, and the call goes to it.
 func (s *Server) checkTarget(r *http.Request, o origin, info *reqInfo) error {
 	if o.client() {
-		if err := s.kinds.CheckPublic(info.name); err != nil {
-			if errors.Is(err, ErrNotPublic) {
-				s.log.Info(`a client named a kind that is not public (set "public": true in the declaration to allow it)`, "target", info.name)
-				err = fmt.Errorf("%w: %q", ErrUnknownKind, info.name.Kind())
-			}
-			return err
+		// A kind that isn't public gets the same error as an undeclared one, so
+		// clients can't tell it exists. Only the log says which it was.
+		if c, err := s.kinds.Lookup(info.name.Kind()); err == nil && !c.Public {
+			s.log.Info(`a client named a kind that is not public (set "public": true in the declaration to allow it)`, "target", info.name)
+			return fmt.Errorf("%w: %q", ErrUnknownKind, info.name.Kind())
 		}
 	}
 	if o.call() && strings.EqualFold(r.Header.Get(hdrIfActive), "true") && !s.m.IsActive(info.name) {
@@ -200,7 +195,7 @@ func (s *Server) holdShards(r *http.Request, o origin, info *reqInfo) error {
 	// Durability gates). The caller stays active until the call ends. The node's
 	// own requests aren't gated: their row is durable already. Nor is a forwarded
 	// call: the caller's node gates it.
-	if o.call() && info.caller != callerApp && !o.internal() && !o.forwarded {
+	if o.call() && info.caller != callerApp && o.kind != fromWake && !o.forwarded {
 		cg, err := s.gateCaller(r, info)
 		if err != nil {
 			return err

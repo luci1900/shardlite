@@ -20,34 +20,24 @@ import (
 const silentGrace = time.Second
 
 // httpServer is one of the node's HTTP servers: the public, control or peer
-// server. Each serves on its listeners. Every request's
-// context derives from a base context the server owns, not from the context it
-// serves on, and every handler is counted, so that stopping the server can end
-// what is left of its requests and join them.
+// server, or the pprof one. Every request's context derives from a base context
+// the server owns, not from the context it serves on, and every handler is
+// counted, so that stopping the server can end what is left of its requests and
+// join them.
 type httpServer struct {
 	name    string
 	log     *slog.Logger
-	lns     []net.Listener
+	ln      net.Listener
 	handler http.Handler
 	grace   time.Duration
 }
 
 func (h *httpServer) String() string { return h.name }
 
-// publicServer serves clients on ln (HTTP/1.1 and h2c, which gRPC clients
+// serverOn is a server for handler on ln (HTTP/1.1 and h2c, which gRPC clients
 // behind a load balancer use).
-func (s *Server) publicServer(ln net.Listener) *httpServer {
-	return &httpServer{name: "public server", log: s.log, lns: []net.Listener{ln}, handler: s.PublicHandler(), grace: s.opts.Grace}
-}
-
-// controlServer serves the control API on ln (localhost TCP).
-func (s *Server) controlServer(ln net.Listener) *httpServer {
-	return &httpServer{name: "control server", log: s.log, lns: []net.Listener{ln}, handler: s.ControlHandler(), grace: s.opts.Grace}
-}
-
-// peerServer serves other nodes on ln, which is only reachable from them.
-func (s *Server) peerServer(ln net.Listener) *httpServer {
-	return &httpServer{name: "peer server", log: s.log, lns: []net.Listener{ln}, handler: s.PeerHandler(), grace: s.opts.Grace}
+func (s *Server) serverOn(name string, ln net.Listener, handler http.Handler) *httpServer {
+	return &httpServer{name: name, log: s.log, ln: ln, handler: handler, grace: s.opts.Grace}
 }
 
 // Serve serves until ctx ends or a listener fails, then stops: it stops
@@ -65,7 +55,7 @@ func (h *httpServer) Serve(ctx context.Context) error {
 			// Read just as the server closed: its context has ended already.
 			w.Header().Set("Connection", "close")
 			w.Header().Set("Retry-After", "1")
-			writeError(w, r, false, http.StatusServiceUnavailable, reasonDraining, "the node is shutting down")
+			writeError(w, r, http.StatusServiceUnavailable, reasonDraining, "the node is shutting down")
 			return
 		}
 		defer handlers.leave()
@@ -74,56 +64,46 @@ func (h *httpServer) Serve(ctx context.Context) error {
 	protos := new(http.Protocols)
 	protos.SetHTTP1(true)
 	protos.SetUnencryptedHTTP2(true)
-	// One child per listener, and one that stops them all when the context ends
-	// or a listener fails (WithContext cancels the others then).
+	// One child serves, and one stops the server when the context ends or the
+	// listener fails (WithContext cancels the other then).
 	g, gctx := errgroup.WithContext(ctx)
-	servers := make([]*http.Server, 0, len(h.lns))
-	silent := make([]*silentConns, 0, len(h.lns))
-	for _, ln := range h.lns {
-		sc := &silentConns{conns: map[net.Conn]struct{}{}}
-		silent = append(silent, sc)
-		// No read or write timeouts: streams and upgraded connections live long.
-		srv := &http.Server{
-			Handler: counted, Protocols: protos, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: serverIdleTimeout,
-			// Warnings: net/http logs here for clients' protocol errors as well as its
-			// own failures (a handler that panicked, accepting that failed).
-			ErrorLog:    slog.NewLogLogger(h.log.Handler(), slog.LevelWarn),
-			BaseContext: func(net.Listener) context.Context { return base },
-			ConnState:   sc.track,
-		}
-		servers = append(servers, srv)
-		g.Go(func() error {
-			if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
-				return err
-			}
-			return nil
-		})
+	silent := &silentConns{conns: map[net.Conn]struct{}{}}
+	// No read or write timeouts: streams and upgraded connections live long.
+	srv := &http.Server{
+		Handler: counted, Protocols: protos, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: serverIdleTimeout,
+		// Warnings: net/http logs here for clients' protocol errors as well as its
+		// own failures (a handler that panicked, accepting that failed).
+		ErrorLog:    slog.NewLogLogger(h.log.Handler(), slog.LevelWarn),
+		BaseContext: func(net.Listener) context.Context { return base },
+		ConnState:   silent.track,
 	}
+	g.Go(func() error {
+		if err := srv.Serve(h.ln); !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+		return nil
+	})
 	g.Go(func() error {
 		<-gctx.Done()
 		sctx, cancel := context.WithTimeout(context.Background(), h.grace)
 		defer cancel()
+		// The closer ends when Shutdown does, so a quiet stop is not held up.
+		cctx, stopped := context.WithCancel(sctx)
 		var sg errgroup.Group
-		for i, srv := range servers {
-			// The closer ends when Shutdown does, so a quiet stop is not held up.
-			cctx, stopped := context.WithCancel(sctx)
-			sg.Go(func() error { srv.Shutdown(sctx); stopped(); return nil })
-			sg.Go(func() error {
-				select {
-				case <-time.After(silentGrace):
-					if n := silent[i].closeAll(); n > 0 {
-						h.log.Debug("closed connections that had sent nothing", "server", h.name, "n", n)
-					}
-				case <-cctx.Done():
+		sg.Go(func() error { srv.Shutdown(sctx); stopped(); return nil })
+		sg.Go(func() error {
+			select {
+			case <-time.After(silentGrace):
+				if n := silent.closeAll(); n > 0 {
+					h.log.Debug("closed connections that had sent nothing", "server", h.name, "n", n)
 				}
-				return nil
-			})
-		}
+			case <-cctx.Done():
+			}
+			return nil
+		})
 		sg.Wait()
 		cancelBase()
-		for _, srv := range servers {
-			srv.Close()
-		}
+		srv.Close()
 		handlers.close()
 		return nil
 	})

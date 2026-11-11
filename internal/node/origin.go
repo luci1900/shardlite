@@ -15,8 +15,7 @@ import (
 // origin says who asked for a request: the public handler (a client) and the
 // control handler (a call by the app) set it from the request. The node's own
 // requests say what they are. A wake of an app for a shard's reminders comes
-// from the shard's own file, so it isn't gated on the caller, and a gRPC failure
-// is read from its status rather than turned into a gRPC response. A wake is for
+// from the shard's own file, so it isn't gated on the caller. A wake is for
 // the node that owns the shard and is never forwarded. A request of the node's
 // own (the dispatcher's activation of any shard, which has no calling shard) is a
 // call like the app's, except that it may use paths under /_shardlite/, which
@@ -52,8 +51,6 @@ func (o origin) call() bool { return !o.client() }
 // client is true for a request held to a client's limits: one from a client.
 func (o origin) client() bool { return o.kind == fromClient }
 
-func (o origin) internal() bool { return o.kind == fromWake }
-
 // remindersPath is the path of the wake. The listeners refuse every path under
 // /_shardlite/, so a request for it reaches the app only from the node's own
 // routing, here.
@@ -64,7 +61,7 @@ const remindersPath = apiPrefix + "reminders"
 // over the control API, in process with no socket and with the reminder timeout
 // on its context.
 func (s *Server) wakeApp(ctx context.Context, a *actor) (int, error) {
-	ctx, cancel := context.WithTimeout(ctx, s.opts.ReminderTimeout)
+	ctx, cancel := context.WithTimeout(ctx, reminderTimeout)
 	defer cancel()
 	req := (&http.Request{Method: http.MethodPost, URL: &url.URL{Path: remindersPath}, Host: "localhost", Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1, Header: http.Header{}, Body: http.NoBody}).WithContext(ctx)
 	req.Header.Set(hdrTarget, a.Name.String())
