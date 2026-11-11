@@ -45,18 +45,20 @@ type Range struct{ Min, Max pos.Position }
 
 func (r Range) String() string { return fmt.Sprintf("%d-%d", r.Min, r.Max) }
 
-// File names one of a shard's LTX files: the positions it covers and the epoch
-// of the node that wrote it, so a crashed node's leftover file never collides
-// with a new one.
+// File names one of a shard's LTX files: the positions it covers and the
+// incarnation that wrote it. Epochs count per node, so the epoch alone would let
+// two nodes write the same name, and a writer that finds a file at its key takes
+// it for its own (Handle.putFile). With the writer's node and epoch in it, no
+// other process's file can have the name.
 type File struct {
 	Range
-	Epoch pos.Epoch
+	By lease.Incarnation
 }
 
-func (f File) String() string { return fmt.Sprintf("%s.%d", f.Range, f.Epoch) }
+func (f File) String() string { return fmt.Sprintf("%s.%s.%d", f.Range, f.By.Node, f.By.Epoch) }
 
-// MarshalText is the file's "min-max.epoch" name, so the manifest's JSON stays
-// the list of strings it was.
+// MarshalText is the file's "min-max.node.epoch" name, so the manifest's JSON
+// stays a list of strings.
 func (f File) MarshalText() ([]byte, error) { return []byte(f.String()), nil }
 
 // UnmarshalText parses a file's name (ParseFile). A manifest with an entry
@@ -70,15 +72,21 @@ func (f *File) UnmarshalText(b []byte) error {
 	return nil
 }
 
-// ParseFile parses "min-max.epoch".
+// ParseFile parses "min-max.node.epoch". A node's name may hold dots, so the
+// range ends at the first and the epoch starts after the last.
 func ParseFile(s string) (File, error) {
 	bad := fmt.Errorf("bad file name %q", s)
-	rg, ep, ok := strings.Cut(s, ".")
+	rg, rest, ok := strings.Cut(s, ".")
 	if !ok {
 		return File{}, bad
 	}
+	i := strings.LastIndex(rest, ".")
+	if i < 0 {
+		return File{}, bad
+	}
+	node, ep := rest[:i], rest[i+1:]
 	a, b, ok := strings.Cut(rg, "-")
-	if !ok {
+	if !ok || !cluster.ValidNode(node) {
 		return File{}, bad
 	}
 	min, err1 := strconv.ParseUint(a, 10, 64)
@@ -87,7 +95,7 @@ func ParseFile(s string) (File, error) {
 	if err1 != nil || err2 != nil || err3 != nil || min == 0 || max < min {
 		return File{}, bad
 	}
-	return File{Range{pos.Position(min), pos.Position(max)}, pos.Epoch(epoch)}, nil
+	return File{Range{pos.Position(min), pos.Position(max)}, lease.Incarnation{Node: cluster.Node(node), Epoch: pos.Epoch(epoch)}}, nil
 }
 
 // LastPosition is the last position in the manifest's files, or 0.

@@ -59,6 +59,8 @@ type Flusher struct {
 	min      time.Duration // shortest time between two cycle starts
 	coalesce time.Duration // delay of a cycle that was asked for, so output arriving together shares it
 	noEarly  bool          // tests: cycles run on the interval alone
+	// unconfirmed is the Unconfirmed fault: confirm proves nothing.
+	unconfirmed bool
 
 	kick      chan struct{} // output is waiting for a cycle (capacity 1)
 	waiting   atomic.Int64  // waiters in Wait that have not returned
@@ -402,7 +404,7 @@ func (f *Flusher) confirm(ctx context.Context, mark uint64) error {
 	if err := f.keeper.Check(); err != nil {
 		return err
 	}
-	if f.landed.Load() > mark {
+	if f.unconfirmed || f.landed.Load() > mark {
 		return f.keeper.Check()
 	}
 	round := f.conf.Join()

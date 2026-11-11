@@ -28,6 +28,10 @@ func TestUnknownFaultValueFailsTheStart(t *testing.T) {
 		{"SHARDLITE_FAULT_STORAGE", "fail:10:1ms:segments:x", "three fields"},
 		{"SHARDLITE_FAULT_STORAGE", "fail:2000:1ms", "permille"},
 		{"SHARDLITE_FAULT_STORAGE", "fail:10:soon", "duration"},
+		{"SHARDLITE_FAULT_STORAGE", "lost:5:1ms:segments,break:10:1ms", "mode is fail"},
+		{"SHARDLITE_FAULT_STORAGE", "lost:5:1ms:segments,", "three fields"},
+		{"SHARDLITE_FAULT_NO_LEASE_EXPIRY", "maybe", "true or false"},
+		{"SHARDLITE_FAULT_UNCONFIRMED", "yes", "true or false"},
 		{"SHARDLITE_FAULT_TEMP", "rename:10", "op is create"},
 		{"SHARDLITE_FAULT_TEMP", "append", "two fields"},
 		{"SHARDLITE_FAULT_TEMP", "append:x", "permille"},
@@ -50,7 +54,7 @@ func TestUnknownFaultValueFailsTheStart(t *testing.T) {
 
 func TestKnownFaultValuesArm(t *testing.T) {
 	t.Parallel()
-	env := map[string]string{"SHARDLITE_FAULT_KILL_AT": "segment-after", "SHARDLITE_FAULT_STORAGE": "lost:5:2ms:segments", "SHARDLITE_FAULT_TEMP": "dup:7", "SHARDLITE_FAULT_PEER_HEADER": "garble:300", "SHARDLITE_FAULT_MAX_FILES": "2"}
+	env := map[string]string{"SHARDLITE_FAULT_KILL_AT": "segment-after", "SHARDLITE_FAULT_STORAGE": "lost:5:2ms:segments,lost:5:0s:files", "SHARDLITE_FAULT_NO_LEASE_EXPIRY": "true", "SHARDLITE_FAULT_UNCONFIRMED": "false", "SHARDLITE_FAULT_TEMP": "dup:7", "SHARDLITE_FAULT_PEER_HEADER": "garble:300", "SHARDLITE_FAULT_MAX_FILES": "2"}
 	opts, err := faultOptions(func(k string) string { return env[k] })
 	if err != nil || len(opts) != 1 {
 		t.Fatalf("faultOptions: %d options, %v", len(opts), err)
@@ -129,7 +133,7 @@ func TestStorageFaultTargetsItsCalls(t *testing.T) {
 		{"fail:1000:0s:files", map[blobtest.Op]string{blobtest.OpCreate: file}},
 		{"fail:1000:0s:file-deletes", map[blobtest.Op]string{blobtest.OpDelete: file}},
 	} {
-		hook, err := storageFault(c.value, nil)
+		hook, err := storageFault(c.value)
 		if err != nil {
 			t.Fatal(err)
 		}

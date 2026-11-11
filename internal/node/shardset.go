@@ -200,6 +200,7 @@ func NewShardset(n *Node, opts ShardsetOptions, newRouting func(*Shardset) routi
 	rt := newRouting(m)
 	m.rem = newReminders(opts.Reminders, clk, log, st, rt.wake)
 	m.flush = newFlusher(m.tab, n.Writer, n.Keeper, n.Confirmer, log, opts.Flush)
+	m.flush.unconfirmed = n.Faults.Unconfirmed
 	self := func() lease.Incarnation { l := n.Keeper.Lease(); return l.Incarnation() }
 	ad := &adopter{reg: n.Registry, files: n.Files, self: self, nodeErr: n.Err, clock: clk, log: log, adopted: &st.Adoptions}
 	m.leases = &peers.Scan{
@@ -414,7 +415,7 @@ func (h *Hold) Release() {
 
 // acquireOpts say how a request acquires a shard.
 type acquireOpts struct {
-	// existing: a shard with no manifest is not created (blob.ErrNotFound).
+	// existing: a shard with no manifest is not created (errNoShard).
 	existing bool
 	// anywhere: a shard that is not active here and that nobody else owns
 	// is claimed on a node picked at random, which may not be this one. The error is
@@ -528,13 +529,21 @@ func (m *Shardset) lostClaim(ctx context.Context, n shard.Name, lost error) erro
 	return &unavailable{reasonMoved, fmt.Sprintf("%s was claimed by another node meanwhile: %v", n, lost), 0}
 }
 
+// errNoShard is acquire's error for a shard that must exist and has no
+// manifest. It is the only miss that means there is no such shard: any other
+// object found missing on the way is a fault, and fails as one.
+var errNoShard = errors.New("the shard does not exist")
+
 // readManifest reads the manifest of a shard that has no entry, for the
 // activation to start from, and fails if another node owns the shard. The
-// handle is nil for a shard with no manifest yet, which is
-// blob.ErrNotFound if it must exist.
+// handle is nil for a shard with no manifest yet, which is errNoShard if it
+// must exist.
 func (m *Shardset) readManifest(ctx context.Context, n shard.Name, existing bool) (*shardfile.Handle, error) {
 	h, err := m.n.Files.Attach(ctx, n)
-	if errors.Is(err, blob.ErrNotFound) && !existing {
+	if errors.Is(err, blob.ErrNotFound) {
+		if existing {
+			return nil, fmt.Errorf("%w: %s", errNoShard, n)
+		}
 		return nil, nil
 	}
 	if err != nil {

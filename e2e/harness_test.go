@@ -209,46 +209,60 @@ func newVerifier(t testing.TB, s *stack) *verifier {
 	}}
 }
 
-// tokens restores a shard from blob storage (every file's checksums are
-// verified on the way) and returns the tokens in it. ok is false if the shard
-// has nothing durable.
-func (v *verifier) tokens(shard string) (toks map[string]bool, ok bool, err error) {
+// restored restores a shard from blob storage (every file's checksums are
+// verified on the way), checks integrity_check and gives read the restored
+// database with its user_version. ok is false if the shard has nothing durable.
+func (v *verifier) restored(shard string, read func(db *sql.DB, version int) error) (ok bool, err error) {
 	dst := filepath.Join(v.t.TempDir(), "restore.db")
 	defer os.Remove(dst)
 	if _, err := v.files.Restore(context.Background(), shardName(shard), dst, shardfile.RestoreOptions{}); err != nil {
 		if errors.Is(err, blob.ErrNotFound) || errors.Is(err, shardfile.ErrNothingToRestore) {
-			return nil, false, nil
+			return false, nil
 		}
-		return nil, false, fmt.Errorf("restore %s: %w", shard, err)
+		return false, fmt.Errorf("restore %s: %w", shard, err)
 	}
 	db, err := sql.Open("sqlite", "file:"+dst+"?mode=ro&_pragma=busy_timeout(5000)")
 	if err != nil {
-		return nil, false, err
+		return false, err
 	}
 	defer db.Close()
 	var check string
 	if err := db.QueryRow(`PRAGMA integrity_check`).Scan(&check); err != nil || check != "ok" {
-		return nil, false, fmt.Errorf("%s: integrity_check: %q %v", shard, check, err)
+		return false, fmt.Errorf("%s: integrity_check: %q %v", shard, check, err)
 	}
 	var version int
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
-		return nil, false, err
+		return false, err
 	}
+	return true, read(db, version)
+}
+
+// tokens restores a shard and returns the tokens in it. ok is false if the
+// shard has nothing durable.
+func (v *verifier) tokens(shard string) (toks map[string]bool, ok bool, err error) {
 	toks = map[string]bool{}
-	if version == 0 {
-		return toks, true, nil
+	ok, err = v.restored(shard, func(db *sql.DB, version int) error {
+		if version == 0 {
+			return nil
+		}
+		rs, err := db.Query(`SELECT token FROM rows`)
+		if err != nil {
+			return err
+		}
+		defer rs.Close()
+		for rs.Next() {
+			var tok string
+			if err := rs.Scan(&tok); err != nil {
+				return err
+			}
+			toks[tok] = true
+		}
+		return rs.Err()
+	})
+	if !ok || err != nil {
+		return nil, ok, err
 	}
-	rs, err := db.Query(`SELECT token FROM rows`)
-	if err != nil {
-		return nil, false, err
-	}
-	defer rs.Close()
-	for rs.Next() {
-		var tok string
-		rs.Scan(&tok)
-		toks[tok] = true
-	}
-	return toks, true, rs.Err()
+	return toks, true, nil
 }
 
 // shards lists every shard that has a manifest.

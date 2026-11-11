@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -292,4 +293,41 @@ func TestConfirmerStopFailsWaiters(t *testing.T) {
 	if err := r.keeper.Check(); err != nil {
 		t.Fatalf("the stop failed the keeper: %v", err)
 	}
+}
+
+// With no lease expiry, a confirmation joined long past the lease's TTL still
+// reads the lease, as one would after a pause the node could not see: it passes
+// while the lease is the node's and fails with ErrLost once another life has
+// taken it, and no deadline cuts it off.
+func TestConfirmerWithNoExpiryReadsPastTheTTL(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		b := newLocal(t)
+		// The store gives up on a call whose context has ended, as S3's client does:
+		// a read with a deadline already past never reaches the lease.
+		b.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error { return ctx.Err() })
+		reg, rec := acquire(t, b, "n1")
+		k := lease.NewKeeper(reg, rec, lease.KeeperOptions{NoExpiry: true, Logger: slog.New(slog.DiscardHandler)})
+		conf := lease.NewConfirmer(reg, k)
+		ctx, cancel := context.WithCancel(context.Background())
+		var g errgroup.Group
+		g.Go(func() error { return conf.Serve(ctx) })
+		defer func() { cancel(); g.Wait() }()
+		confirm := func() error {
+			round := conf.Join()
+			<-round.Done()
+			return round.Err()
+		}
+
+		time.Sleep(3 * rec.TTL) // the keeper is not served, so nothing renews the lease
+		if err := confirm(); err != nil {
+			t.Fatalf("a confirmation past the TTL of a lease that still holds: %v", err)
+		}
+		if _, err := lease.NewRegistry(b, "n1", opts()).Acquire(context.Background(), lease.NodeInfo{Name: "n1"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := confirm(); !errors.Is(err, lease.ErrLost) {
+			t.Fatalf("a confirmation past the TTL of a lease another life took: %v, want ErrLost", err)
+		}
+	})
 }

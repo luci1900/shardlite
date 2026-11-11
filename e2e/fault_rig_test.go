@@ -43,8 +43,11 @@ var faultEnv = []string{"SHARDLITE_DELTA_AGE=" + faultDeltaAge.String(), "SHARDL
 // faultMaxFiles is how many files a manifest of the rig lists before a rebase.
 const faultMaxFiles = 2
 
-// faultDeltaAge is the delta age of every node of the rig.
-const faultDeltaAge = 300 * time.Millisecond
+// faultDeltaAge is the delta age of every node of the rig. A shard looks for a
+// delta every 2 s (LifecycleOptions.SnapshotEvery), so a healthy tail reaches
+// about this plus 2 s. At 1 s the tail alert (3 times this) stays quiet unless
+// deltas really stall.
+const faultDeltaAge = time.Second
 
 // activationPoints are where an activation of a restored shard can be killed
 // between the restore and the first sync: after the restore, as the node folds

@@ -35,7 +35,7 @@ func TestProtocolsThroughTheNode(t *testing.T) {
 		}
 	}
 
-	s.create(t, "users/u1", "wallet/w1", "wallet/w2", "wallet/w3", "wallet/w4", "wallet/w5", "wallet/w7", "wallet/w9")
+	s.create(t, "users/u1", "wallet/w1", "wallet/w2", "wallet/w3", "wallet/w4", "wallet/w5", "wallet/w7", "wallet/w9", "wallet/l1")
 
 	// Plain HTTP.
 	st, body, err := s.shardRequest("POST", "users/u1", "/add", "t1")
@@ -172,6 +172,23 @@ func TestProtocolsThroughTheNode(t *testing.T) {
 			t.Fatalf("a transfer at hop %d: %d %q, want %d", c.hops+1, resp.StatusCode, b, c.want)
 		}
 	}
+	// Lists: two appends on the list's shard and one relayed by a call from
+	// another shard, which records the value before it calls.
+	for _, v := range []string{"a", "b"} {
+		if st, body, _ := s.request("POST", at("wallet/l1", "/append")+"?list=x", "wallet/l1", v); st != 200 {
+			t.Fatalf("append %s: %d %q", v, st, body)
+		}
+	}
+	if st, body, _ := s.request("POST", at("wallet/w5", "/relay")+"?to=wallet/l1&list=x", "wallet/w5", "c"); st != 200 {
+		t.Fatalf("relay: %d %q", st, body)
+	}
+	if st, body, _ := s.shardRequest("GET", "wallet/l1", "/list?list=x", ""); st != 200 || strings.TrimSpace(body) != `["a","b","c"]` {
+		t.Fatalf("list: %d %q", st, body)
+	}
+	if st, body, _ := s.shardRequest("GET", "wallet/l1", "/list?list=empty", ""); st != 200 || strings.TrimSpace(body) != `[]` {
+		t.Fatalf("an empty list: %d %q", st, body)
+	}
+	mustHave("a relay", "wallet/w5", "relay:c")
 	// A durable send: the row, the call and its reminder are one transaction on
 	// the sender. The node wakes the sender's reminders handler once that is
 	// durable, and the handler calls the receiver, which does its work once.

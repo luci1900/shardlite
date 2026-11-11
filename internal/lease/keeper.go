@@ -15,6 +15,13 @@ type KeeperOptions struct {
 	Info     func() NodeInfo // what to publish at each renewal (the journal range)
 	Logger   *slog.Logger
 	Now      func() time.Time // time.Now if nil, for tests
+	// NoExpiry makes the holder never judge its own lease expired by time: only a
+	// renewal or a confirmation that finds the lease taken ends it. It is a
+	// fault for tests (a pause the node cannot see, a clock as wrong as it can
+	// be) and never safe. It lives in validUntil alone, so everything that
+	// counts down to the lease's end (the check, the expiry timer, the
+	// renewal's deadline and the confirmation's lease read) follows it.
+	NoExpiry bool
 }
 
 // Keeper renews a node's lease and answers the one question
@@ -68,7 +75,17 @@ func NewKeeper(reg *Registry, lease Record, opts KeeperOptions) *Keeper {
 	return k
 }
 
-func (k *Keeper) validUntil(l Record) time.Time { return l.Renewed.Add(l.TTL - k.opts.Margin) }
+// validUntil is when the holder stops trusting the lease: the margin before its
+// TTL runs out, or never with NoExpiry.
+func (k *Keeper) validUntil(l Record) time.Time {
+	if k.opts.NoExpiry {
+		return never
+	}
+	return l.Renewed.Add(l.TTL - k.opts.Margin)
+}
+
+// never is a time no lease reaches.
+var never = time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)
 
 // expired reports whether now is past until by either clock. A time with a
 // monotonic reading compares by it, and Round(0) drops it to compare the wall

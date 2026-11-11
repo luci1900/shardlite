@@ -249,6 +249,45 @@ func TestKeeperSurvivesBriefTroubleAndStopsWhenReplaced(t *testing.T) {
 	})
 }
 
+// A keeper with no expiry never judges its lease expired by time, however long storage
+// is away, and still stops once a renewal finds the lease taken.
+func TestKeeperWithNoExpiryOutlivesItsTTLUntilReplaced(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		l, ctx := newLocal(t), context.Background()
+		reg := lease.NewRegistry(l, "n1", opts())
+		rec, _ := reg.Acquire(ctx, lease.NodeInfo{Name: "n1"})
+		o := keeperOpts(nil)
+		o.NoExpiry = true
+		k := lease.NewKeeper(reg, rec, o)
+		defer serve(k)()
+
+		var down atomic.Bool
+		l.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+			if down.Load() {
+				return errors.New("storage down")
+			}
+			return nil
+		})
+		down.Store(true)
+		time.Sleep(3 * 10 * time.Second) // three TTLs without a renewal
+		if err := k.Check(); err != nil {
+			t.Fatalf("a keeper with no expiry expired: %v", err)
+		}
+
+		// Another life takes the lease, and the next renewal finds it taken.
+		other := lease.NewRegistry(l, "n1", opts())
+		down.Store(false)
+		if _, err := other.Acquire(ctx, lease.NodeInfo{Name: "n1"}); err != nil {
+			t.Fatal(err)
+		}
+		<-k.Lost()
+		if err := k.Check(); !errors.Is(err, lease.ErrLost) {
+			t.Fatalf("Check after replacement = %v, want ErrLost", err)
+		}
+	})
+}
+
 func TestKeeperReleases(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {

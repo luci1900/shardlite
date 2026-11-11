@@ -27,6 +27,14 @@ type Faults struct {
 	// receiver ignores a header that does not read, so placement only gets worse
 	// for it, never wrong.
 	PeerHeader func(name, value string) string
+	// NoLeaseExpiry makes the keeper never judge the lease expired by time
+	// (lease.KeeperOptions.NoExpiry), so a pause longer than the TTL is one the
+	// node cannot see.
+	NoLeaseExpiry bool
+	// Unconfirmed makes storage answers leave without confirming that the node
+	// still owns its shards (Flusher.confirm), as none answers do. It breaks
+	// the storage tier's promise, so a test can show its check catches that.
+	Unconfirmed bool
 }
 
 // WithFaults makes Run arm f.

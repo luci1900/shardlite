@@ -61,14 +61,14 @@ func (s store) manifest(name, gen string, files ...string) {
 // listed file, a young one, a file that isn't LTX.
 func TestUnlistedFindsOldFilesNoManifestLists(t *testing.T) {
 	s := newStore(t)
-	listed := key("users/a", "g1", "1-5.1")
-	unlisted := key("users/a", "g1", "6-8.1")
-	otherGeneration := key("users/a", "g0", "1-3.1")
-	noManifest := key("users/b", "g1", "1-2.1")
+	listed := key("users/a", "g1", "1-5.n1.1")
+	unlisted := key("users/a", "g1", "6-8.n1.1")
+	otherGeneration := key("users/a", "g0", "1-3.n1.1")
+	noManifest := key("users/b", "g1", "1-2.n1.1")
 	for _, k := range []string{listed, unlisted, otherGeneration, noManifest, shardfile.GenerationPrefix(shard.MustParse("users/a"), "g1") + "notes"} {
 		s.put(k)
 	}
-	s.manifest("users/a", "g1", "1-5.1")
+	s.manifest("users/a", "g1", "1-5.n1.1")
 
 	got, err := Unlisted(context.Background(), s.Store, age, stand)
 	if err != nil {
@@ -95,7 +95,7 @@ func TestUnlistedRefusesAKeyThatIsNoShardsFile(t *testing.T) {
 	s = newStore(t)
 	name := shard.MustParse("users/a")
 	other := shard.Lane((uint8(name.Lane()) + 1) % shard.Lanes)
-	s.put(shardfile.LanePrefix(other) + "users/a/g1/1-5.1.ltx")
+	s.put(shardfile.LanePrefix(other) + "users/a/g1/1-5.n1.1.ltx")
 	if _, err := Unlisted(context.Background(), s.Store, age, stand); err == nil {
 		t.Fatal("a file in another shard's lane passed")
 	}

@@ -214,7 +214,7 @@ func TestRestartAdoptsItsOwnJournal(t *testing.T) {
 				if m.Journal != "" || m.LastPosition() == 0 {
 					t.Fatalf("%s after adoption: %+v", name, m)
 				}
-				if last := m.Files; last[len(last)-1].Epoch != 2 {
+				if last := m.Files; last[len(last)-1].By.Epoch != 2 {
 					t.Fatalf("%s: the delta should carry the adopter's epoch: %+v", name, m.Files)
 				}
 			}

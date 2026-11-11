@@ -15,6 +15,7 @@ import (
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/kill"
+	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/tempfile"
 )
@@ -247,9 +248,10 @@ func merge(w io.Writer, files []capture.TailFile, rg Range) error {
 	return enc.Close()
 }
 
-// putFile writes an LTX file with Create. The name carries the writer's
-// epoch, so nobody else's file can be there: blob.Store recognises a lost
-// response to this very write, and any other "exists" is returned as it is.
+// putFile writes an LTX file with Create. The name carries the writer's node
+// and epoch (File), so nobody else's file can be there: blob.Store recognises
+// a lost response to this very write, and any other "exists" is returned as it
+// is.
 //
 // A retry of the same file in this process (after a failed manifest update,
 // say) is the same write: the handle keeps the write id until the manifest
@@ -257,7 +259,7 @@ func merge(w io.Writer, files []capture.TailFile, rg Range) error {
 // from somebody else's without comparing bytes.
 //
 // The one "exists" that is neither is a file this process itself left at the
-// key: the name carries its epoch, and one process writes a shard from one
+// key: the name carries its incarnation, and one process writes a shard from one
 // handle at a time, so it is an earlier handle's upload whose manifest update
 // never listed it. The node keeps to one handle: one actor per shard, whose
 // entry leaves the table only once its loop has ended (table.start and
@@ -324,7 +326,7 @@ func (h *Handle) putTail(ctx context.Context, tail []capture.TailFile, hooks Hoo
 		return err
 	}
 	r := Range{tail[0].Position, tail[len(tail)-1].Last()}
-	file := File{r, h.F.Blob.Epoch()}
+	file := File{r, h.F.writer()}
 	if slices.Contains(h.Manifest.Files, file) {
 		return nil // an earlier call's update landed, though its answer was lost
 	}
@@ -428,7 +430,7 @@ func (h *Handle) Rebase(ctx context.Context, sh *capture.Shard, hooks Hooks) (bo
 	if last := h.Manifest.LastPosition(); position < last {
 		return false, fmt.Errorf("rebase %s: snapshot at position %d is behind the manifest's %d", h.Name, position, last)
 	}
-	base := File{Range{1, position}, h.F.Blob.Epoch()}
+	base := File{Range{1, position}, h.F.writer()}
 	if len(h.Manifest.Files) == 1 && h.Manifest.Files[0].Max == position {
 		return false, nil // already one file that covers it
 	}
@@ -555,4 +557,9 @@ func (h *Handle) getFile(ctx context.Context, f File) (*tempfile.Log, error) {
 		return err
 	})
 	return log, err
+}
+
+// writer is the incarnation this Files writes as, which names its LTX files.
+func (f *Files) writer() lease.Incarnation {
+	return lease.Incarnation{Node: f.Node, Epoch: f.Blob.Epoch()}
 }

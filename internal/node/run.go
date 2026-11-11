@@ -156,7 +156,7 @@ func Run(ctx context.Context, env Env, log *slog.Logger, ready func(public, cont
 	n, err := Start(ctx, Config{
 		Name: env.Name, Address: address, Backend: backend, Data: env.Data,
 		Lease:   lease.RegistryOptions{TTL: env.LeaseTTL},
-		Keeper:  lease.KeeperOptions{Interval: env.LeaseTTL / 3, Margin: env.LeaseTTL / 5},
+		Keeper:  lease.KeeperOptions{Interval: env.LeaseTTL / 3, Margin: env.LeaseTTL / 5, NoExpiry: ro.faults.NoLeaseExpiry},
 		Logger:  log,
 		TempDir: tempDir,
 		Faults:  ro.faults,

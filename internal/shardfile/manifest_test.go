@@ -173,7 +173,7 @@ func TestDeleteShard(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	key := shardfile.FileKey(shardName("users/e1"), h.Manifest.Generation, shardfile.File{Range: shardfile.Range{Min: 1, Max: 1}, Epoch: 1})
+	key := shardfile.FileKey(shardName("users/e1"), h.Manifest.Generation, shardfile.File{Range: shardfile.Range{Min: 1, Max: 1}, By: lease.Incarnation{Node: "n1", Epoch: 1}})
 	if _, err := e.Files.Blob.Create(ctx, key, strings.NewReader("x")); err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +229,7 @@ func TestManifestBadFileEntry(t *testing.T) {
 func TestFileKeysPutTheLaneFirst(t *testing.T) {
 	t.Parallel()
 	name := shardName("users/1")
-	f := shardfile.File{Range: shardfile.Range{Min: 1, Max: 5}, Epoch: 2}
+	f := shardfile.File{Range: shardfile.Range{Min: 1, Max: 5}, By: lease.Incarnation{Node: "n1", Epoch: 2}}
 	lane := name.Lane().String()
 	if got, want := shardfile.FileKey(name, "g1", f), "data/shards/"+lane+"/users/1/g1/"+f.String()+".ltx"; got != want {
 		t.Fatalf("file key %q, want %q", got, want)

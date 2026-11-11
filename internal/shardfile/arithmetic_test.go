@@ -16,6 +16,8 @@ import (
 	"pgregory.net/rapid"
 
 	"github.com/luci1900/shardlite/internal/capture"
+	"github.com/luci1900/shardlite/internal/cluster"
+	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/pos"
 )
 
@@ -290,7 +292,7 @@ func manifestFiles(t *rapid.T, r run) (files []File, data [][]byte, groups [][]c
 		if err != nil {
 			t.Fatal(err)
 		}
-		files = append(files, File{rg, epoch + pos.Epoch(len(files))})
+		files = append(files, File{rg, lease.Incarnation{Node: "n1", Epoch: epoch + pos.Epoch(len(files))}})
 		data, groups = append(data, b), append(groups, r.specs[i:j])
 		i = j
 	}
@@ -336,7 +338,8 @@ func TestParseFileRoundTrip(t *testing.T) {
 	t.Parallel()
 	rapid.Check(t, func(t *rapid.T) {
 		min := pos.Position(rapid.Uint64Range(1, 1<<62).Draw(t, "min"))
-		f := File{Range{min, min + pos.Position(rapid.Uint64Range(0, 1<<40).Draw(t, "extra"))}, pos.Epoch(rapid.Uint64().Draw(t, "epoch"))}
+		node := rapid.SampledFrom([]cluster.Node{"n1", "a.b-c_d", "x.", "host-1.example.com"}).Draw(t, "node")
+		f := File{Range{min, min + pos.Position(rapid.Uint64Range(0, 1<<40).Draw(t, "extra"))}, lease.Incarnation{Node: node, Epoch: pos.Epoch(rapid.Uint64().Draw(t, "epoch"))}}
 		got, err := ParseFile(f.String())
 		if err != nil || got != f {
 			t.Fatalf("%q parses as %v, %v", f.String(), got, err)

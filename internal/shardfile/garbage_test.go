@@ -200,7 +200,7 @@ func TestADeltaWhoseUpdateLosesToAnotherWriterLeavesItsFileForTheNextRebase(t *t
 	if did, err := h2.Rebase(ctx, sh, shardfile.Hooks{}); !did || err != nil {
 		t.Fatalf("rebase %v %v", did, err)
 	}
-	base := shardfile.File{Range: shardfile.Range{Min: 1, Max: sh.Position()}, Epoch: r.Store.Epoch()}
+	base := shardfile.File{Range: shardfile.Range{Min: 1, Max: sh.Position()}, By: lease.Incarnation{Node: r.Node, Epoch: r.Store.Epoch()}}
 	want := []string{shardfile.FileKey(shardName(shard), h2.Manifest.Generation, base)}
 	if keys := r.keys(t, shardfile.ShardPrefix(shardName(shard))); !slices.Equal(keys, want) {
 		t.Fatalf("objects %v, want the base alone: the sweep takes the lost delta", keys)
@@ -396,7 +396,7 @@ func TestARebaseSweepsItsGeneration(t *testing.T) {
 		if err := h.WriteDelta(ctx, sh, shardfile.Hooks{AfterFileWrite: func() error { return crash }}); !errors.Is(err, crash) {
 			t.Fatalf("crashed delta: %v", err)
 		}
-		return shardfile.File{Range: shardfile.Range{Min: prev + 1, Max: sh.Position()}, Epoch: r.Store.Epoch()}
+		return shardfile.File{Range: shardfile.Range{Min: prev + 1, Max: sh.Position()}, By: lease.Incarnation{Node: r.Node, Epoch: r.Store.Epoch()}}
 	}
 	left := crashedDelta(h, 3) // this handle's leftover: no write id of h2's
 	if _, err := r.Store.Head(ctx, shardfile.FileKey(shardName(shard), h.Manifest.Generation, left)); err != nil {
@@ -408,7 +408,7 @@ func TestARebaseSweepsItsGeneration(t *testing.T) {
 	}
 	held := crashedDelta(h2, 4) // this handle's own write id is for the whole tail
 
-	other := shardfile.GenerationPrefix(shardName(shard), "other") + "1-1.9.ltx"
+	other := shardfile.GenerationPrefix(shardName(shard), "other") + "1-1.n1.9.ltx"
 	if _, err := r.Store.Create(ctx, other, strings.NewReader("junk")); err != nil {
 		t.Fatal(err)
 	}
@@ -417,7 +417,7 @@ func TestARebaseSweepsItsGeneration(t *testing.T) {
 		t.Fatalf("rebase %v %v", did, err)
 	}
 	gen := h2.Manifest.Generation
-	base := shardfile.File{Range: shardfile.Range{Min: 1, Max: sh.Position()}, Epoch: r.Store.Epoch()}
+	base := shardfile.File{Range: shardfile.Range{Min: 1, Max: sh.Position()}, By: lease.Incarnation{Node: r.Node, Epoch: r.Store.Epoch()}}
 	want := []string{other, shardfile.FileKey(shardName(shard), gen, base), shardfile.FileKey(shardName(shard), gen, held)}
 	slices.Sort(want)
 	if keys := r.keys(t, shardfile.ShardPrefix(shardName(shard))); !slices.Equal(keys, want) {
@@ -461,7 +461,7 @@ func TestASweepDeletesNothingOnceTheLeaseIsTaken(t *testing.T) {
 		if _, err := r.Reg.Adopt(ctx, *l, lease.Incarnation{Node: "n2", Epoch: 1}); err != nil {
 			return err
 		}
-		f := shardfile.File{Range: shardfile.Range{Min: sh.Position() + 1, Max: sh.Position() + 1}, Epoch: r.Store.Epoch() + 1}
+		f := shardfile.File{Range: shardfile.Range{Min: sh.Position() + 1, Max: sh.Position() + 1}, By: lease.Incarnation{Node: r.Node, Epoch: r.Store.Epoch() + 1}}
 		adopters = shardfile.FileKey(shardName(shard), h.Manifest.Generation, f)
 		_, err = r.Store.Create(ctx, adopters, strings.NewReader("an adopter's delta on its way to the manifest"))
 		return err

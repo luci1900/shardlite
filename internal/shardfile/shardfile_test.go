@@ -17,6 +17,7 @@ import (
 	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/harness"
+	"github.com/luci1900/shardlite/internal/lease"
 	shardpkg "github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/sqlitetest"
@@ -84,7 +85,7 @@ func TestDeltaEqualsReplayingTail(t *testing.T) {
 	if len(tailOf(t, sh).Files) != 0 {
 		t.Fatal("tail not dropped")
 	}
-	if got := h.Manifest.Files; len(got) != 1 || got[0].String() != fmt.Sprintf("1-%d.%d", tail[len(tail)-1].Last(), h.F.Blob.Epoch()) {
+	if got := h.Manifest.Files; len(got) != 1 || got[0].String() != fmt.Sprintf("1-%d.%s.%d", tail[len(tail)-1].Last(), h.F.Node, h.F.Blob.Epoch()) {
 		t.Fatalf("manifest files %v", got)
 	}
 	// The manifest was stored.
@@ -341,7 +342,7 @@ func TestLostResponses(t *testing.T) {
 		h, sh := e.NewShard(shard)
 		write(t, e, app, func() error { return sh.Sync(ctx) }, 0)
 		tail := tailOf(t, sh).Files
-		key := shardfile.FileKey(shardName(shard), h.Manifest.Generation, shardfile.File{Range: shardfile.Range{Min: tail[0].Position, Max: tail[len(tail)-1].Last()}, Epoch: h.F.Blob.Epoch()})
+		key := shardfile.FileKey(shardName(shard), h.Manifest.Generation, shardfile.File{Range: shardfile.Range{Min: tail[0].Position, Max: tail[len(tail)-1].Last()}, By: lease.Incarnation{Node: h.F.Node, Epoch: h.F.Blob.Epoch()}})
 		// The name carries this node's epoch, so only its own incarnation can
 		// have left a file there: an earlier handle's upload whose manifest
 		// update never listed it. Nothing can list it now, so the write takes
@@ -515,4 +516,70 @@ func TestManifestUpdateCancelledAfterLandingDoesNotLeaveAStaleHandle(t *testing.
 		t.Fatalf("release: %v", err)
 	}
 	sh.Close(context.Background())
+}
+
+// Epochs count per node, so two nodes at the same epoch can write a file of the
+// same range of a shard: here n1's delta, whose manifest update doesn't land (a
+// pause or a partition), and n2's delta of the same commits as it adopts n1's
+// journal. A writer that finds a file at its key takes it for its own leftover
+// upload and deletes it (putFile), so if the two files shared a name, n2 would
+// delete n1's upload, and in another order a file a manifest lists. A file's
+// name must say which incarnation wrote it, and no node deletes another's.
+func TestFilesOfTwoNodesAtOneEpochDoNotCollide(t *testing.T) {
+	t.Parallel()
+	e := harness.New(t)
+	ctx := context.Background()
+	app := e.StartApp(shard)
+	h, sh := e.NewShard(shard)
+	defer sh.Close(ctx)
+	write(t, e, app, func() error { return sh.Sync(ctx) }, 0)
+	e.SetJournalRange(1)
+
+	// n1's delta is uploaded, and its manifest update fails.
+	var n1Files []string
+	e.Blob.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		switch {
+		case op == blobtest.OpCreate && after && strings.HasSuffix(key, ".ltx"):
+			n1Files = append(n1Files, key)
+		case op == blobtest.OpUpdate && !after:
+			return errors.New("storage down")
+		}
+		return nil
+	})
+	if err := h.WriteDelta(ctx, sh, shardfile.Hooks{}); err == nil {
+		t.Fatal("want the manifest update to fail")
+	}
+	if len(n1Files) != 1 {
+		t.Fatalf("n1 uploaded %v, want one delta", n1Files)
+	}
+
+	// n2, at epoch 1 too, adopts n1's journal: a delta of the same commits.
+	p := e.Peer("n2")
+	if p.Lease.Epoch != e.Lease.Epoch {
+		t.Fatalf("n2 is at epoch %d and n1 at %d: the test needs them equal", p.Lease.Epoch, e.Lease.Epoch)
+	}
+	var deleted []string
+	e.Blob.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+		if op == blobtest.OpDelete && !after && strings.HasSuffix(key, ".ltx") {
+			deleted = append(deleted, key)
+		}
+		return nil
+	})
+	if _, err := p.Files.AdoptJournal(ctx, "n1", 1, e.W.NextSeq(), nil); err != nil {
+		t.Fatal(err)
+	}
+	e.Blob.SetHook(nil)
+	if len(deleted) != 0 {
+		t.Fatalf("n2's adoption deleted %v, which n1 uploaded", deleted)
+	}
+	m, _, err := e.Files.GetManifest(ctx, shardName(shard))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if listed := shardfile.FileKey(shardName(shard), m.Generation, m.Files[0]); listed == n1Files[0] {
+		t.Fatalf("n2's delta has the name of n1's upload: %s", listed)
+	}
+	if got, want := restoreDump(t, e, "adopted"), apptest.Dump(t, e.Path(shard)); got != want {
+		t.Fatal("the adopted shard restores differently")
+	}
 }

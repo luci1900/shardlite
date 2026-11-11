@@ -27,13 +27,18 @@ import (
 //
 //	SHARDLITE_FAULT_KILL_AT       a kill point (internal/kill): the process dies with SIGKILL when it reaches it
 //	SHARDLITE_FAULT_KILL_WHEN     a path: the kill point is armed only once a file exists there, so a test arms it after the node is up and settled
-//	SHARDLITE_FAULT_STORAGE       mode:permille:delay[:target], for the creates of the journal's
-//	                              segments (target "segments", the default), the creates of LTX
-//	                              files ("files") or the deletes of LTX files ("file-deletes"):
-//	                              mode "fail" (an error before the call), "lost" (the call happens
-//	                              and the caller sees an error) or "none", the permille how many in
-//	                              a thousand fail, and the delay (a Go duration) the longest random
-//	                              wait before each call
+//	SHARDLITE_FAULT_STORAGE       mode:permille:delay[:target], or several separated by commas, for
+//	                              the creates of the journal's segments (target "segments", the
+//	                              default), the creates of LTX files ("files") or the deletes of
+//	                              LTX files ("file-deletes"): mode "fail" (an error before the
+//	                              call), "lost" (the call happens and the caller sees an error) or
+//	                              "none", the permille how many in a thousand fail, and the delay
+//	                              (a Go duration) the longest random wait before each call
+//	SHARDLITE_FAULT_NO_LEASE_EXPIRY true: the node never judges its own lease expired by time, only
+//	                              by a renewal or a confirmation that finds it taken, so a SIGSTOP
+//	                              past the TTL is a pause it cannot see (lease.KeeperOptions.NoExpiry)
+//	SHARDLITE_FAULT_UNCONFIRMED   true: storage answers leave without confirming that the node still
+//	                              owns its shards, which breaks the storage tier, for a test to catch
 //	SHARDLITE_FAULT_TEMP          op:permille: "create", "append" or "dup" on the node's temporary files fails at that rate
 //	SHARDLITE_FAULT_PEER_HEADER   mode:permille: for that many in a thousand of the values of the peer
 //	                              headers the node sends (Shardlite-Node on its forwards and, while it drains,
@@ -63,22 +68,32 @@ func faultOptions(getenv func(string) string) ([]node.RunOption, error) {
 		}
 		f.At = at
 	}
+	// The storage hook runs the segments' kill points, then the storage faults.
+	var hooks []blobtest.Hook
+	if at != nil {
+		hooks = append(hooks, func(ctx context.Context, op blobtest.Op, key string, after bool) error {
+			segmentPoint(at, op, key, after)
+			return nil
+		})
+	}
 	if v := getenv("SHARDLITE_FAULT_STORAGE"); v != "" {
-		hook, err := storageFault(v, at)
-		if err != nil {
-			return nil, err
+		for one := range strings.SplitSeq(v, ",") {
+			hook, err := storageFault(one)
+			if err != nil {
+				return nil, err
+			}
+			hooks = append(hooks, hook)
 		}
-		f.Backend = func(b blob.Backend) blob.Backend {
-			h := blobtest.WithHook(b)
-			h.SetHook(hook)
-			return h
-		}
-	} else if at != nil {
-		// The segment points are in the storage hook, which is there to call them.
+	}
+	if len(hooks) > 0 {
 		f.Backend = func(b blob.Backend) blob.Backend {
 			h := blobtest.WithHook(b)
 			h.SetHook(func(ctx context.Context, op blobtest.Op, key string, after bool) error {
-				segmentPoint(at, op, key, after)
+				for _, hook := range hooks {
+					if err := hook(ctx, op, key, after); err != nil {
+						return err
+					}
+				}
 				return nil
 			})
 			return h
@@ -105,6 +120,15 @@ func faultOptions(getenv func(string) string) ([]node.RunOption, error) {
 		}
 		f.MaxFiles = n
 	}
+	for name, set := range map[string]*bool{"SHARDLITE_FAULT_NO_LEASE_EXPIRY": &f.NoLeaseExpiry, "SHARDLITE_FAULT_UNCONFIRMED": &f.Unconfirmed} {
+		if v := getenv(name); v != "" {
+			on, err := strconv.ParseBool(v)
+			if err != nil {
+				return nil, fmt.Errorf("%s is %q, want true or false", name, v)
+			}
+			*set = on
+		}
+	}
 	return []node.RunOption{node.WithFaults(f)}, nil
 }
 
@@ -120,7 +144,7 @@ func segmentPoint(at func(kill.Point), op blobtest.Op, key string, after bool) {
 	}
 }
 
-func storageFault(v string, at func(kill.Point)) (blobtest.Hook, error) {
+func storageFault(v string) (blobtest.Hook, error) {
 	bad := func(why string) error {
 		return fmt.Errorf("SHARDLITE_FAULT_STORAGE is %q, want mode:permille:delay[:target] such as fail:100:5ms (%s)", v, why)
 	}
@@ -156,9 +180,6 @@ func storageFault(v string, at func(kill.Point)) (blobtest.Hook, error) {
 		return nil, bad("delay is a duration")
 	}
 	return func(ctx context.Context, got blobtest.Op, key string, after bool) error {
-		if got == blobtest.OpCreate {
-			segmentPoint(at, got, key, after)
-		}
 		if got != op || !strings.HasPrefix(key, prefix) {
 			return nil
 		}

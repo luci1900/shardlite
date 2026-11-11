@@ -16,6 +16,7 @@ import (
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/cluster"
+	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 )
@@ -297,7 +298,7 @@ func TestPruning(t *testing.T) {
 	// Moved on without backing it.
 	v := r.manifest("a/1", "", 0)
 	e := r.entry("a/1", v, r.now)
-	if _, err := r.manifests.Put(ctx, shard.MustParse("a/1"), &shardfile.Manifest{Generation: "g", Files: []shardfile.File{{Range: shardfile.Range{Min: 1, Max: 1}, Epoch: 1}}}, &v); err != nil {
+	if _, err := r.manifests.Put(ctx, shard.MustParse("a/1"), &shardfile.Manifest{Generation: "g", Files: []shardfile.File{{Range: shardfile.Range{Min: 1, Max: 1}, By: lease.Incarnation{Node: "n1", Epoch: 1}}}}, &v); err != nil {
 		t.Fatal(err)
 	}
 	// No manifest.
@@ -330,7 +331,7 @@ func TestWriteAfterTheReadStillFindsItsEntry(t *testing.T) {
 		if op == blobtest.OpGet && after && key == shardfile.ManifestKey(shard.MustParse("a/1")) {
 			once.Do(func() {
 				r.hooked.SetHook(nil)
-				m := &shardfile.Manifest{Generation: "g", Owner: "n1", NodeEpoch: 1, Files: []shardfile.File{{Range: shardfile.Range{Min: 1, Max: 1}, Epoch: 1}}, NextReminder: later}
+				m := &shardfile.Manifest{Generation: "g", Owner: "n1", NodeEpoch: 1, Files: []shardfile.File{{Range: shardfile.Range{Min: 1, Max: 1}, By: lease.Incarnation{Node: "n1", Epoch: 1}}}, NextReminder: later}
 				if _, err := r.manifests.Put(ctx, shard.MustParse("a/1"), m, &v); err != nil {
 					t.Error(err)
 				}

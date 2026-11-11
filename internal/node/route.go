@@ -244,9 +244,10 @@ func (s *Server) holdShards(r *http.Request, o origin, info *reqInfo) error {
 		sendBack = o.from
 	}
 	hold, err := s.m.take(r.Context(), info.name, acquireOpts{existing: existing, anywhere: anywhere, sendBack: sendBack})
-	if errors.Is(err, blob.ErrNotFound) {
+	if errors.Is(err, errNoShard) {
 		// The same answer as a kind the client may not name, so it says nothing of
-		// kinds or ids. A flood of misses must not be a flood of log lines.
+		// kinds or ids. A flood of misses must not be a flood of log lines. Any
+		// other object found missing is a fault, answered and logged as one.
 		s.log.Debug("no shard to reach: it does not exist, and this request may not create it", "target", info.name)
 		return fmt.Errorf("%w: %q", ErrUnknownKind, info.name.Kind())
 	}

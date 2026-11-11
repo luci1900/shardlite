@@ -62,15 +62,26 @@ type Env struct {
 // (capture.Shard.Sync flushes it).
 func New(t testing.TB) *Env {
 	t.Helper()
-	local := blobtest.WithHook(blob.NewMemory())
-	reg := lease.NewRegistry(local, "n1", lease.RegistryOptions{})
-	rec, err := reg.Acquire(context.Background(), lease.NodeInfo{Name: "n1"})
+	return newEnv(t, blobtest.WithHook(blob.NewMemory()), "n1")
+}
+
+// Peer returns another node's Env on the same storage, with a lease of its own.
+// Its first lease has epoch 1, as every node's does.
+func (e *Env) Peer(node cluster.Node) *Env {
+	e.T.Helper()
+	return newEnv(e.T, e.Blob, node)
+}
+
+func newEnv(t testing.TB, local *blobtest.Hooked, node cluster.Node) *Env {
+	t.Helper()
+	reg := lease.NewRegistry(local, node, lease.RegistryOptions{})
+	rec, err := reg.Acquire(context.Background(), lease.NodeInfo{Name: node})
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := blob.NewStore(local, "n1", rec.Epoch, blob.Options{Backoff: time.Millisecond})
-	e := &Env{T: t, Dir: t.TempDir(), Blob: local, Store: store, Node: "n1", Reg: reg, Lease: rec,
-		Files: &shardfile.Files{Blob: store, Node: "n1", Leases: reg, Temp: tempfile.NewDir(t.TempDir())}}
+	store := blob.NewStore(local, node, rec.Epoch, blob.Options{Backoff: time.Millisecond})
+	e := &Env{T: t, Dir: t.TempDir(), Blob: local, Store: store, Node: node, Reg: reg, Lease: rec,
+		Files: &shardfile.Files{Blob: store, Node: node, Leases: reg, Temp: tempfile.NewDir(t.TempDir())}}
 	e.Journal = e.Files.Journal(e.Node)
 	e.W = journal.NewWriter(e.Journal, journal.WriterOptions{})
 	t.Cleanup(service.Background(slog.Default(), e.W))

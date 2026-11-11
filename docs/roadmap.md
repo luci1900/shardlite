@@ -14,8 +14,7 @@ What is left to make v1, in order, riskiest parts first. The one node and the cl
 - Protocol versions for rolling node upgrades: each node publishes the range it speaks in its lease, and every request between nodes names the highest version both sides speak.
 - Format versions for everything shardlite stores, with a marker per deployment that a node from an older release refuses.
 - The `shardlite` command for operators: `ls`, `export`, `import`, `verify` and `gc`. `gc` deletes the LTX files no manifest lists, past the journal's expiry, with the walk in `internal/audit`, and `verify` reports them.
-- A soak test: the fault rig running for hours against a cluster, with kills, pauses, partitions, slow storage and restarts, checking the same guarantees as the per-scenario tests.
-- A linearizability check of single shards under faults, as Jepsen does: clients record every read and write, and a checker (Porcupine, or Jepsen with Knossos) confirms the history per shard on the `storage` tier.
+- A soak test: the linearizability check (`TestFaultCluster`) run for hours, with slow storage beside its kills, pauses, cuts and drains.
 - Checking the cluster and dispatch models against the code, as capture's are by replay: the fault runs log the nodes' events (leases, fences, journal segments, manifest swaps, reminder entries) and a checker confirms each run's log is a behaviour of `cluster.qnt` or `dispatch.qnt`. Quint has no built-in support for checking a log, so this starts with a prototype on one fault scenario.
 - What a store outage does to the cluster: the lease lives in blob storage, so a store no node can reach stops every node until it returns. What is left: how fast the cluster comes back, what the operator sees, and whether a degraded mode is worth having. The fault rig should have a scenario for it.
 

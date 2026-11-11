@@ -56,6 +56,7 @@ const DefaultDeclaration = `{"version": "1", "kinds": {
 	"wallet": {"public": true, "idle_timeout": "2s"},
 	"lobby":  {"public": true, "idle_timeout": "2s"},
 	"arena":  {"public": true, "idle_timeout": "300ms"},
+	"linear": {"public": true, "idle_timeout": "10m"},
 	"audit":  {}
 }}`
 
@@ -127,10 +128,14 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /{kind}/{id}/vacuum", a.shard(pathShard, a.vacuum))
 	mux.HandleFunc("POST /{kind}/{id}/checkpoints", a.shard(pathShard, a.checkpoints))
 	mux.HandleFunc("POST /{kind}/{id}/churn", a.shard(pathShard, a.churn))
+	mux.HandleFunc("POST /{kind}/{id}/append", a.shard(pathShard, a.appendValue))
+	mux.HandleFunc("GET /{kind}/{id}/list", a.shard(pathShard, a.list))
+	mux.HandleFunc("POST /{kind}/{id}/relay", a.shard(pathShard, a.relay))
 	// Routes that only take calls, and the reminder wake, take the shard from
 	// what the node opened.
 	mux.HandleFunc("POST /credit", a.call(a.credit))
 	mux.HandleFunc("POST /receive", a.call(a.receive))
+	mux.HandleFunc("POST /append", a.call(a.appendValue))
 	mux.HandleFunc("POST "+shardlite.RemindersPath, a.call(a.reminders))
 	mux.HandleFunc("GET /debug", a.serveDebug)
 	// gRPC shares the listener: HTTP/2 requests with a gRPC content type go to
@@ -490,6 +495,115 @@ func (a *App) credit(w http.ResponseWriter, r *http.Request, s *shardReq) {
 	b, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if _, _, err := s.insert(r.Context(), "credit:"+string(b)); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	io.WriteString(w, "ok\n")
+}
+
+// listsVersion is the migration that adds the lists table.
+const listsVersion = 2
+
+// appendValue appends the body's value to a list of the shard, in one
+// transaction: ?list=l. Clients reach it on the shard's route, and a relay
+// reaches it by a call.
+func (a *App) appendValue(w http.ResponseWriter, r *http.Request, s *shardReq) {
+	list := r.URL.Query().Get("list")
+	b, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if list == "" || len(b) == 0 {
+		http.Error(w, "list and a value in the body are required", http.StatusBadRequest)
+		return
+	}
+	tx, err := s.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+	if err := s.migrate(r.Context(), tx); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	_, err = tx.ExecContext(r.Context(), `INSERT INTO lists (list, seq, value)
+		SELECT ?, coalesce(max(seq), 0) + 1, ? FROM lists WHERE list = ?`, list, string(b), list)
+	if err == nil {
+		err = tx.Commit()
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	io.WriteString(w, "ok\n")
+}
+
+// list answers a list of the shard as a JSON array: ?list=l. A list nothing was
+// appended to is empty.
+func (a *App) list(w http.ResponseWriter, r *http.Request, s *shardReq) {
+	list := r.URL.Query().Get("list")
+	if list == "" {
+		http.Error(w, "list is required", http.StatusBadRequest)
+		return
+	}
+	values, err := s.listOf(r.Context(), list)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, values)
+}
+
+// listOf reads a list in the order it was appended to (empty, never nil, if the
+// shard has no lists yet).
+func (s *shardReq) listOf(ctx context.Context, list string) ([]string, error) {
+	values := []string{}
+	var version int
+	if err := s.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil || version < listsVersion {
+		return values, err
+	}
+	rs, err := s.db.QueryContext(ctx, `SELECT value FROM lists WHERE list = ? ORDER BY seq`, list)
+	if err != nil {
+		return nil, err
+	}
+	defer rs.Close()
+	for rs.Next() {
+		var v string
+		if err := rs.Scan(&v); err != nil {
+			return nil, err
+		}
+		values = append(values, v)
+	}
+	return values, rs.Err()
+}
+
+// relay appends the body's value to a list of another shard by calling it:
+// ?to=storage/b&list=l. It records the value as the token relay:{value} first,
+// so the call is held until that commit is durable if this shard's kind has
+// sync on, and a value the target has is in this shard's storage too. It
+// answers 502 for any failed call.
+func (a *App) relay(w http.ResponseWriter, r *http.Request, s *shardReq) {
+	to, list := r.URL.Query().Get("to"), r.URL.Query().Get("list")
+	b, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if to == "" || list == "" || len(b) == 0 {
+		http.Error(w, "to, list and a value in the body are required", http.StatusBadRequest)
+		return
+	}
+	target, err := shardlite.ParseShard(to)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if _, _, err := s.insert(r.Context(), "relay:"+string(b)); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	resp, err := s.opened.Call(target, http.MethodPost, "/append?list="+url.QueryEscape(list), bytes.NewReader(b))
+	if err != nil {
+		http.Error(w, "append failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		http.Error(w, "append failed: "+resp.Status, http.StatusBadGateway)
 		return
 	}
 	io.WriteString(w, "ok\n")
