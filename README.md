@@ -148,3 +148,9 @@ curl -X POST localhost:2280/counter/bob
 - [Guide](docs/guide.md): writing an app.
 - [Deployment](docs/deployment.md): running it.
 - [Internals](docs/internals.md): how the node works.
+
+## License
+
+Copyright (C) 2026 Luci Brănescu
+
+Shardlite is licensed under the GNU Affero General Public License, version 3 only. See [LICENSE](LICENSE).
