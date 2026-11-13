@@ -21,9 +21,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/peers"
 	"github.com/luci1900/shardlite/internal/shard"
+	"github.com/luci1900/shardlite/internal/test/apptest"
 )
 
 // The load balancer is the trust boundary: the app sees the chain it sent with

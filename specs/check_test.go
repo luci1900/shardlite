@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/luci1900/shardlite/internal/quinttest"
+	"github.com/luci1900/shardlite/internal/test/quinttest"
 )
 
 // The checks of the models in this directory, one test file per model: each

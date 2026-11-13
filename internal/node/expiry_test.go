@@ -3,20 +3,20 @@ package node
 import (
 	"context"
 	"errors"
-	"github.com/luci1900/shardlite/internal/apptest"
+	"github.com/luci1900/shardlite/internal/test/apptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/cluster"
 	"github.com/luci1900/shardlite/internal/journal"
 	"github.com/luci1900/shardlite/internal/kind"
 	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/test/blobtest"
 )
 
 // segments counts the non-empty and empty (fence) objects under the journal prefix.

@@ -18,7 +18,7 @@ fi
 export SHARDLITE_TEST_S3_ENDPOINT="$endpoint" SHARDLITE_TEST_S3_BUCKET="${SHARDLITE_TEST_S3_BUCKET:-shardlite-test}" AWS_ACCESS_KEY_ID=shardlite AWS_SECRET_ACCESS_KEY=shardlite-secret AWS_REGION=us-east-1
 
 watch=$(mktemp); trap 'rm -f "$watch" "$watch.json" "$watch.rep"' EXIT
-go build -o "$watch" ./internal/tools/testwatch
+go build -o "$watch" ./internal/test/testwatch
 status=0
 
 # run TAG NAME DIR ENVS GO TEST ARGUMENTS runs the arguments through the

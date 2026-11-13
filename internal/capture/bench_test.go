@@ -7,11 +7,11 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/capture"
 	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/tempfile"
+	"github.com/luci1900/shardlite/internal/test/apptest"
 )
 
 // nowhere is a writer that queues nothing, so a capture costs only its own

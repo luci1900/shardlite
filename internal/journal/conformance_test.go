@@ -15,8 +15,8 @@ import (
 	"testing"
 
 	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/pos"
+	"github.com/luci1900/shardlite/internal/test/blobtest"
 )
 
 // The conformance suite: what every journal Store has to do, whatever sits

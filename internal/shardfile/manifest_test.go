@@ -10,11 +10,11 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/harness"
 	"github.com/luci1900/shardlite/internal/lease"
 	shardpkg "github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/tempfile"
+	"github.com/luci1900/shardlite/internal/test/harness"
 )
 
 func TestManifestStoreCompareAndSwap(t *testing.T) {

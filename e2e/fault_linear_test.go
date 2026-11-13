@@ -25,12 +25,12 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/cluster"
 	"github.com/luci1900/shardlite/internal/lease"
-	"github.com/luci1900/shardlite/internal/linear"
 	"github.com/luci1900/shardlite/internal/pos"
-	"github.com/luci1900/shardlite/internal/s3test"
+	"github.com/luci1900/shardlite/internal/test/apptest"
+	"github.com/luci1900/shardlite/internal/test/linear"
+	"github.com/luci1900/shardlite/internal/test/s3test"
 )
 
 // The cluster check: three nodes on one prefix, each reaching the store through
@@ -39,7 +39,7 @@ import (
 // time. Every node runs with no lease expiry, so every pause is one it cannot
 // see. Other clients set reminders throughout, some on shards left idle.
 // Afterwards every list is read through a node and from a restore, the history
-// of each list must be linearizable (internal/linear) and every reminder must
+// of each list must be linearizable (internal/test/linear) and every reminder must
 // have fired at least once in the restores.
 
 const (

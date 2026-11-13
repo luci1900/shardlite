@@ -11,9 +11,9 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/cluster"
-	"github.com/luci1900/shardlite/internal/harness"
 	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/notify"
+	"github.com/luci1900/shardlite/internal/test/harness"
 )
 
 // syncBuffer is a log buffer the placer can write to from any goroutine.

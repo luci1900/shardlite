@@ -14,13 +14,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/apptest"
-	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/cluster"
 	"github.com/luci1900/shardlite/internal/dispatch"
 	"github.com/luci1900/shardlite/internal/lease"
 	"github.com/luci1900/shardlite/internal/peers"
 	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/test/apptest"
+	"github.com/luci1900/shardlite/internal/test/blobtest"
 )
 
 // peerAnswer is what a node's peer listener answered: the 1xx responses it sent

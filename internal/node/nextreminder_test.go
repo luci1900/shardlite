@@ -3,8 +3,8 @@ package node
 import (
 	"context"
 	"errors"
-	"github.com/luci1900/shardlite/internal/apptest"
-	"github.com/luci1900/shardlite/internal/harness"
+	"github.com/luci1900/shardlite/internal/test/apptest"
+	"github.com/luci1900/shardlite/internal/test/harness"
 	"net/http"
 	"os"
 	"slices"
@@ -14,9 +14,9 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/dispatch"
 	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/test/blobtest"
 )
 
 func TestNeverWrittenWithAnAutoincrementSequence(t *testing.T) {

@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/capture"
+	"github.com/luci1900/shardlite/internal/test/apptest"
 )
 
 // tailBytes captures the same commits on a new database with the clock given

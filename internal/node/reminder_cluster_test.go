@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/apptest"
+	"github.com/luci1900/shardlite/internal/test/apptest"
 )
 
 // The durable send of docs/guide.md, Reminders, across two nodes. In the

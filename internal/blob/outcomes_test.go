@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/blobtest"
+	"github.com/luci1900/shardlite/internal/test/blobtest"
 )
 
 // The outcome table in blob.go, as cases. Each backend gets the same faults

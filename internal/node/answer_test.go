@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/apptest"
+	"github.com/luci1900/shardlite/internal/test/apptest"
 )
 
 // gRPC: h2c to the app, trailers passed through, streaming without buffering.

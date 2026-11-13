@@ -16,11 +16,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/audit"
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/kill"
 	"github.com/luci1900/shardlite/internal/pos"
+	"github.com/luci1900/shardlite/internal/test/apptest"
 )
 
 // The fault rig drives the real binary, built with the fault tag, through the

@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/lease"
+	"github.com/luci1900/shardlite/internal/test/apptest"
 )
 
 // A killed owner: every request for its shards gets 503 with Retry-After: 1,

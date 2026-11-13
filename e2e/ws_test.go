@@ -5,7 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/luci1900/shardlite/internal/apptest"
+	"github.com/luci1900/shardlite/internal/test/apptest"
 	"net"
 	"net/http"
 	"strings"

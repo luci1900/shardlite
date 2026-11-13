@@ -3,7 +3,7 @@ package node
 import (
 	"errors"
 	"fmt"
-	"github.com/luci1900/shardlite/internal/apptest"
+	"github.com/luci1900/shardlite/internal/test/apptest"
 	"net/http"
 	"os"
 	"sync/atomic"
@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/harness"
 	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/test/harness"
 )
 
 func withClock(c Clock) func(*ShardsetOptions) {

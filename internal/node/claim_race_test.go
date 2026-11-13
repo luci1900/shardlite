@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/test/blobtest"
 )
 
 // Two nodes that claim one unowned shard at the same moment: the one whose claim loses the compare-and-swap on the manifest reads it again and sends its request to the winner, as it would for any shard another node owns. Neither client is answered with an error, and the shard has one owner.

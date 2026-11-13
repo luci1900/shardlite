@@ -5,7 +5,7 @@ package e2e
 import (
 	"context"
 	"fmt"
-	"github.com/luci1900/shardlite/internal/apptest"
+	"github.com/luci1900/shardlite/internal/test/apptest"
 	"math/rand/v2"
 	"net/http"
 	"os"

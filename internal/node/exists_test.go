@@ -3,7 +3,7 @@ package node
 import (
 	"bytes"
 	"errors"
-	"github.com/luci1900/shardlite/internal/apptest"
+	"github.com/luci1900/shardlite/internal/test/apptest"
 	"io"
 	"log/slog"
 	"net/http"

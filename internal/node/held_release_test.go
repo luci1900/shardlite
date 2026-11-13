@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/harness"
 	"github.com/luci1900/shardlite/internal/kind"
+	"github.com/luci1900/shardlite/internal/test/harness"
 )
 
 // A release that did not go through (the app still has the shard open) leaves

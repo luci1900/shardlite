@@ -2,7 +2,7 @@ package node
 
 import (
 	"context"
-	"github.com/luci1900/shardlite/internal/apptest"
+	"github.com/luci1900/shardlite/internal/test/apptest"
 	"io"
 	"net/http"
 	"strings"
@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/test/blobtest"
 )
 
 // A client that goes away while its response is held at the gate: the node

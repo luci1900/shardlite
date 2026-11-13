@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/blobtest"
+	"github.com/luci1900/shardlite/internal/test/blobtest"
 )
 
 // newStore returns a Store over a fresh memory backend behind a fault hook,

@@ -16,9 +16,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/blobtest"
-	"github.com/luci1900/shardlite/internal/harness"
 	"github.com/luci1900/shardlite/internal/journal"
+	"github.com/luci1900/shardlite/internal/test/blobtest"
+	"github.com/luci1900/shardlite/internal/test/harness"
 )
 
 // cyclesUntil runs flush cycles until ch yields a value (or the test times

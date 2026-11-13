@@ -15,7 +15,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/luci1900/shardlite/internal/quinttest"
+	"github.com/luci1900/shardlite/internal/test/quinttest"
 )
 
 // The tests that need Quint. The model suite runs them (see the testwatch

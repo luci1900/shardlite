@@ -15,9 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/peers"
 	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/test/apptest"
 )
 
 var clusterClient = &http.Client{Timeout: 20 * time.Second}

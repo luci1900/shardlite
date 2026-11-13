@@ -2,7 +2,7 @@ package e2e
 
 import (
 	"fmt"
-	"github.com/luci1900/shardlite/internal/apptest"
+	"github.com/luci1900/shardlite/internal/test/apptest"
 	"io"
 	"strings"
 	"testing"

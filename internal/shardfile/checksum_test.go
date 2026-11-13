@@ -14,9 +14,9 @@ import (
 	"github.com/superfly/ltx"
 
 	"github.com/luci1900/shardlite/internal/capture"
-	"github.com/luci1900/shardlite/internal/harness"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/tempfile"
+	"github.com/luci1900/shardlite/internal/test/harness"
 )
 
 // shardWithDeltas is a shard with a base and a few deltas, and the manifest

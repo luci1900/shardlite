@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/luci1900/shardlite/internal/apptest"
+	"github.com/luci1900/shardlite/internal/test/apptest"
 	"io"
 	"log/slog"
 	"maps"
@@ -17,8 +17,8 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/lease"
+	"github.com/luci1900/shardlite/internal/test/blobtest"
 )
 
 // testCluster is several nodes in one process: Run on one in-memory store, each

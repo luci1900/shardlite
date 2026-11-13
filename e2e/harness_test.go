@@ -17,13 +17,13 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/luci1900/shardlite/e2e/e2eapp"
-	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/lease"
-	"github.com/luci1900/shardlite/internal/s3test"
 	shardpkg "github.com/luci1900/shardlite/internal/shard"
 	"github.com/luci1900/shardlite/internal/shardfile"
 	"github.com/luci1900/shardlite/internal/tempfile"
+	"github.com/luci1900/shardlite/internal/test/apptest"
+	"github.com/luci1900/shardlite/internal/test/s3test"
 )
 
 // declarationJSON is the declaration the app serves at its ready route

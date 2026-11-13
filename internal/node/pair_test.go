@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/apptest"
-	"github.com/luci1900/shardlite/internal/harness"
+	"github.com/luci1900/shardlite/internal/test/apptest"
+	"github.com/luci1900/shardlite/internal/test/harness"
 )
 
 // pairRig is two nodes whose apps say which node they are. clk is the nodes' clock

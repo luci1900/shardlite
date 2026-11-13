@@ -12,22 +12,18 @@
 package capture
 
 import (
-	"bufio"
 	"context"
 	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/superfly/ltx"
-	"golang.org/x/sync/errgroup"
 	"modernc.org/sqlite"
 
 	"github.com/luci1900/shardlite/internal/kill"
@@ -165,9 +161,6 @@ type Shard struct {
 // database is closed.
 var ErrClosed = errors.New("capture: the shard's database is closed")
 
-// errBusy says the write lock could not be had in time.
-var errBusy = errors.New("capture: the shard is being written")
-
 // New starts capturing cfg.Path. The file must exist: a new shard's is created
 // empty by the node, before the app gets it.
 func New(cfg Config) (sh *Shard, err error) {
@@ -237,6 +230,97 @@ func New(cfg Config) (sh *Shard, err error) {
 	s.note(info)
 	s.at(kill.ReadHeld)
 	return s, nil
+}
+
+// Close ends the activation: a final sync, then the connections and descriptors
+// are closed. It ends the activation whatever ctx says, and returns nil for a
+// shard that is closed or released already.
+func (s *Shard) Close(ctx context.Context) error {
+	open := false
+	var err error
+	if s.do(context.WithoutCancel(ctx), func() error {
+		if open = s.pool != nil; open {
+			err = s.syncing(context.WithoutCancel(ctx))
+			s.closeConns()
+		}
+		s.end()
+		return nil
+	}) != nil {
+		return nil
+	}
+	if !open {
+		return nil
+	}
+	if err == nil {
+		err = s.durable(ctx) // the final sync queued its files
+	}
+	return err
+}
+
+// Abandon ends the activation as a crash would, for a node that stops without
+// letting go of the shard: nothing is synced or written, and the shard's files
+// stay open until the process exits. Only the activation ends.
+func (s *Shard) Abandon() {
+	s.do(context.Background(), func() error { s.end(); return nil })
+}
+
+// Open reports whether capture has the shard open: false once it is closed
+// or released, or after a release that failed before capture was reopened.
+func (s *Shard) Open() bool { return !s.over.Load() }
+
+// Position is the shard's position after the last commit captured so far.
+func (s *Shard) Position() pos.Position { return s.tail.view.Load().position }
+
+// Checksums is the CRC of each page of the database and the running checksum
+// of the whole of it, as of the last commit captured. It is a copy: the
+// capture's own goes on with the next sync.
+func (s *Shard) Checksums() *Checksums {
+	var cks *Checksums
+	s.call(func() { cks = s.cks.Clone() })
+	return cks
+}
+
+// Use runs fn with capture's connection pool (never a descriptor of the node's
+// own), under the shard's lock. So it never runs during a sync, a snapshot or
+// the final sync of a release, and what fn commits is captured by the next
+// sync. fn must not call the shard.
+func (s *Shard) Use(ctx context.Context, fn func(*sql.DB) error) error {
+	return s.do(ctx, func() error { return s.use(fn) })
+}
+
+// UseAt is Use, and also reports the position fn's reads saw, if they saw
+// exactly a captured state. Under the same lock, a sync before fn captures what
+// is committed so far, and a sync after it that captures nothing new shows that
+// nothing was committed in between, so fn saw exactly the position the first
+// sync reached (no other sync runs meanwhile). at is 0 if the second sync
+// captured more: fn may have seen commits that weren't captured. A checkpoint
+// changes nothing here, since it commits nothing.
+func (s *Shard) UseAt(ctx context.Context, fn func(*sql.DB) error) (at pos.Position, err error) {
+	err = s.do(ctx, func() error {
+		if err := s.syncing(ctx); err != nil {
+			return err
+		}
+		before := s.tail.position()
+		if err := s.use(fn); err != nil {
+			return err
+		}
+		if err := s.sync(); err != nil {
+			return err
+		}
+		if s.tail.position() == before {
+			at = before
+		}
+		return nil
+	})
+	return at, err
+}
+
+// use runs fn on capture's connections. The caller holds the lock.
+func (s *Shard) use(fn func(*sql.DB) error) error {
+	if s.pool == nil {
+		return ErrClosed
+	}
+	return fn(s.pool)
 }
 
 // do runs fn holding the lock and returns its error, or ErrClosed once the
@@ -474,402 +558,6 @@ func (s *Shard) note(info Info) {
 	}
 }
 
-// ensureWAL opens the WAL file. A connection creates it, so it is there once
-// the app has written.
-func (s *Shard) ensureWAL() error {
-	if s.walF != nil {
-		return nil
-	}
-	f, err := s.side.openWAL()
-	if err != nil {
-		return err
-	}
-	s.walF = f
-	return nil
-}
-
-// readWAL reads the WAL the wal-index names and the frames it holds, and
-// returns a cursor for it with the window the frames hold.
-//
-// The wal-index and the WAL are separate files that SQLite updates in turn
-// when it restarts the WAL, so a read that straddles the restart sees them
-// name different WALs, or the frames of one where the other's are. That is
-// errRestarted, and the caller reads the pair again.
-//
-// Reading across a restart is safe: the WAL only restarts once every frame of
-// it is captured and in the database file (the read rule), so the frames it
-// held are in the tail already.
-func (s *Shard) readWAL(info Info) (walCursor, window, error) {
-	if info.MxFrame == 0 {
-		return walCursor{}, window{}, nil
-	}
-	if err := s.ensureWAL(); err != nil {
-		return walCursor{}, window{}, fmt.Errorf("capture: open the WAL of %s: %w", s.cfg.Name, err)
-	}
-	// A cursor for the WAL the wal-index names: the one capture was reading, if
-	// it is the same one, or a fresh one. A fresh one means SQLite restarted the
-	// WAL, and the read rule means every frame of the last one was read before
-	// that could happen.
-	c, err := walAt(s.walF, info, s.pageSize, s.cur)
-	if err != nil {
-		return walCursor{}, window{}, err
-	}
-	w, err := c.readTo(s.walF, info.MxFrame)
-	if err != nil {
-		return walCursor{}, window{}, err
-	}
-	return c, w, nil
-}
-
-// sync reads the frames the app has committed since the last one, and queues
-// them as one file. The caller holds the lock and the read transaction.
-func (s *Shard) sync() error {
-	first := s.tail.nextPos == 1 // the first file is a snapshot and has every page
-	c, info, w, err := walRead(s.wi.ReadInfo, s.readWAL)
-	if err != nil {
-		return err
-	}
-	if w.commits == 0 && (!first || s.dbPages == 0) {
-		s.note(info)
-		return nil
-	}
-	count, commit := pos.Count(w.commits), w.commit
-	if w.commits == 0 {
-		// A database that predates the WAL: the first file has its every page.
-		count, commit = 1, s.dbPages
-	}
-	if err := s.queueFile(count, commit, w.pf, c.h, first); err != nil {
-		return err
-	}
-	if info.MxFrame > 0 {
-		s.cur = &c
-	}
-	s.dbPages = commit
-	s.note(info)
-	return nil
-}
-
-// queueFile encodes a file of count commits, for the frames pf of the WAL h on
-// top of the database file, and queues it in the journal and the tail. With all
-// set every page of the database is in it, those the WAL has no frame for read
-// from the database file.
-//
-// The file carries the checksum of the database before it and the one after it,
-// which the pages it writes give: the CRCs of the pages capture has already
-// seen are in memory, so no page is read for this.
-func (s *Shard) queueFile(count pos.Count, commit Pages, pf pageFrames, h walHeader, all bool) error {
-	pos := s.tail.nextPos
-	log, err := s.tail.log(s.cfg.TempDir)
-	if err != nil {
-		return err
-	}
-	w, err := log.Append()
-	if err != nil {
-		return err
-	}
-	pg := pages{wal: s.walF, db: s.dbF, pageSize: s.pageSize, h: h, pf: pf}
-	hdr := ltx.Header{
-		Version:   ltx.Version,
-		PageSize:  uint32(s.pageSize),
-		Commit:    uint32(commit),
-		MinTXID:   ltx.TXID(pos),
-		MaxTXID:   ltx.TXID(pos.Add(count)),
-		Timestamp: s.cfg.Now().UnixMilli(),
-	}
-	// A snapshot has no database before it, so it has no pre-apply checksum.
-	// Every other file has the one the database has now.
-	if pos > 1 {
-		hdr.PreApplyChecksum = s.cks.Checksum()
-	}
-	p := newPending(s.cks, all)
-	if _, err := s.writeLTX(w, hdr, pg, p); err != nil {
-		w.Abort()
-		return err
-	}
-	body, err := w.Finish()
-	if err != nil {
-		return err
-	}
-	// The file is queued in the writer and recorded in the tail at once, without
-	// waiting for its segment. The writer never drops a queued file: it retries
-	// until the segment is written, or the node is fenced and has to stop. Whoever
-	// needs the commits durable flushes the writer after the sync.
-	//
-	// The lease reads the writer's next number before the shards' TailFrom, so
-	// TailFrom counts the file from before it is queued: a lease that reads the
-	// number after the file is queued finds it in TailFrom.
-	seg := s.cfg.Writer.NextSeq()
-	s.tail.publish(seg)
-	if err := s.cfg.Writer.AppendFile(s.cfg.Name, s.cfg.Generation, pos, body); err != nil {
-		s.tail.publish(0) // refused: the writer is closed or fenced
-		return err
-	}
-	s.tail.add(body, count, seg, s.cfg.Now())
-	// The file is in the journal, so the database it holds is the one capture
-	// has now: its checksums take the pages the file wrote.
-	s.cks.apply(p, commit)
-	return nil
-}
-
-// pages reads the pages of a database as of one point in its history: each
-// page from the newest frame of its WAL that pf names, or from the database
-// file, which the read transaction on mark 0 holds exactly as it was when it
-// began (the read rule, docs/internals.md): every page committed after that is
-// in the WAL, and no frame of the WAL is copied over or wiped while the
-// transaction is held. A page pf doesn't name and the file doesn't hold is
-// past the database's end.
-type pages struct {
-	wal      io.ReaderAt // the WAL, whose frames pf names (nil if none was read)
-	db       io.ReaderAt // the database file
-	pageSize PageSize    // the database's page size
-	h        walHeader   // which WAL wal is, zero with no WAL read
-	pf       pageFrames  // the newest frame of each page it covers
-	before   func()      // if set, called before each page is read
-}
-
-// page reads page pgno into buf, which is one page long.
-func (p pages) page(pgno Pgno, buf []byte) error {
-	if p.before != nil {
-		p.before()
-	}
-	if f := p.pf.frame(pgno); f != 0 {
-		if err := p.h.page(p.wal, f, buf); err != nil {
-			return fmt.Errorf("capture: page %d from WAL frame %d: %w", pgno, f, err)
-		}
-		return nil
-	}
-	if _, err := p.db.ReadAt(buf, int64(pgno-1)*int64(p.pageSize)); err != nil {
-		return fmt.Errorf("capture: page %d from the database file: %w", pgno, err)
-	}
-	return nil
-}
-
-// writeLTX writes the LTX file hdr to w, with the CRC of every page it writes
-// in p. With all set every page of the database up to hdr.Commit is in it,
-// those pf has no frame for read from the database file; otherwise only the
-// pages pf covers.
-//
-// It returns the file's post-apply checksum: the checksum of the database once
-// the file's pages are written.
-func (s *Shard) writeLTX(w io.Writer, hdr ltx.Header, pg pages, p *pending) (ltx.Checksum, error) {
-	enc, err := ltx.NewEncoder(w)
-	if err != nil {
-		return 0, err
-	}
-	if err := enc.EncodeHeader(hdr); err != nil {
-		return 0, err
-	}
-	page := make([]byte, hdr.PageSize)
-	put := func(pgno Pgno) error {
-		if err := pg.page(pgno, page); err != nil {
-			return err
-		}
-		if err := enc.EncodePage(ltx.PageHeader{Pgno: uint32(pgno)}, page); err != nil {
-			return err
-		}
-		p.add(pgno, ltx.ChecksumPageWithHasher(p.hasher, uint32(pgno), page))
-		return nil
-	}
-	if p.all {
-		lock := Pgno(ltx.LockPgno(hdr.PageSize))
-		for pgno := Pgno(1); pgno <= Pgno(hdr.Commit); pgno++ {
-			if pgno == lock {
-				continue
-			}
-			if err := put(pgno); err != nil {
-				return 0, err
-			}
-		}
-	} else {
-		for _, e := range pg.pf {
-			if pgno := e.pgno(); pgno <= Pgno(hdr.Commit) {
-				if err := put(pgno); err != nil {
-					return 0, err
-				}
-			}
-		}
-	}
-	post := p.cks.after(p, Pages(hdr.Commit))
-	enc.SetPostApplyChecksum(post)
-	if err := enc.Close(); err != nil {
-		return 0, err
-	}
-	return post, nil
-}
-
-// syncing is a sync that first makes sure the read transaction is held: after a
-// restart that failed part-way, or a release that did not go through, it is not,
-// and the app may have got a checkpoint and a restart in between.
-func (s *Shard) syncing(ctx context.Context) error {
-	if s.pool == nil {
-		return ErrClosed
-	}
-	if !s.reading {
-		if err := s.locked(ctx, true); err != nil {
-			return err
-		}
-	}
-	return s.sync()
-}
-
-// locked takes the database's write lock (BEGIN IMMEDIATE on one connection
-// of the pool): while it is held no writer can commit, so no frame is added
-// and nothing about the WAL can change. Under that lock it syncs, ends the
-// read transaction, has every frame copied into the database file and begins
-// a new transaction before it lets go, which gets read mark 0 because nothing
-// is left to copy; the app's next write then restarts the WAL. The write lock
-// is held for one sync and one checkpoint, which is also what the app's
-// writes wait on.
-//
-// The copy runs on another connection of the pool, PASSIVE, because RESTART
-// and TRUNCATE take the write lock themselves, which x already holds, and
-// frames committed in the gap of letting it go would be copied and wiped
-// unread. An app's reader can hold the copy back: the new transaction then
-// gets a nonzero read mark, which is as safe (everything up to it is
-// captured) and leaves the WAL as it is until the next sync tries again.
-//
-// With resume set the read transaction was not held (a release that did not
-// go through), so the WAL may not be the one capture was reading. Nothing can
-// change while the write lock is held, so the check against what the last sync
-// saw is exact: a WAL with the same salts and at least the frames capture had
-// read is the same one with the frames past what was read still in it, and
-// they are synced; any other WAL means the app checkpointed and restarted it
-// while the node held nothing, commits may have gone uncaptured, and the
-// whole database is written as one file instead. The two cases differ only in
-// what is read, never in what is held: both end with the checkpoint, the new
-// read transaction and the lock let go.
-func (s *Shard) locked(ctx context.Context, resume bool) (err error) {
-	x, err := s.pool.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer x.Close()
-	wait := 5000 // a release must conclude, so a resumed lock waits as the pool does
-	if !resume {
-		wait = 20 // a restart that cannot get the lock is tried again at the next sync
-	}
-	if _, err := x.ExecContext(ctx, fmt.Sprintf(`PRAGMA busy_timeout = %d`, wait)); err != nil {
-		return err
-	}
-	if _, err := x.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil { // the write lock
-		if isBusy(err) {
-			return errBusy
-		}
-		return err
-	}
-	defer x.ExecContext(context.Background(), `ROLLBACK`)
-
-	info, err := s.wi.ReadInfo()
-	if err != nil {
-		return err
-	}
-	if resume && (info.Salt != s.knownSalt || info.MxFrame < s.knownFrames) {
-		err = s.writeAll(info)
-	} else {
-		err = s.sync()
-	}
-	if err != nil {
-		return err
-	}
-	s.endRead() // our reader out of the way of the copy
-	var busy, logFrames, done int
-	if err := s.pool.QueryRowContext(ctx, `PRAGMA wal_checkpoint(PASSIVE)`).Scan(&busy, &logFrames, &done); err != nil {
-		s.cfg.Logger.Warn("checkpoint failed", "shard", s.cfg.Name, "err", err)
-	}
-	if err := s.beginRead(ctx); err != nil { // begun before the lock goes: everything is copied, so mark 0
-		return err
-	}
-	if info, err = s.wi.ReadInfo(); err == nil {
-		s.back = info.NBackfill
-	}
-	return nil
-}
-
-// isBusy reports whether err is SQLite's "database is locked".
-func isBusy(err error) bool {
-	return err != nil && (strings.Contains(err.Error(), "SQLITE_BUSY") || strings.Contains(err.Error(), "database is locked"))
-}
-
-// writeAll queues every page of the database as one file counted as one
-// commit, from the WAL and the database file as they are. The caller holds
-// the write lock, so the WAL is not restarted while it reads. The WAL is
-// read with a fresh cursor, never the one capture was reading (the WAL may
-// not be the one it was), and verified frame by frame like any sync.
-func (s *Shard) writeAll(info Info) error {
-	var (
-		c      walCursor
-		w      window
-		commit = s.dbPages
-		err    error
-	)
-	if info.MxFrame > 0 {
-		if err := s.ensureWAL(); err != nil {
-			return fmt.Errorf("capture: open the WAL of %s: %w", s.cfg.Name, err)
-		}
-		if c, err = walAt(s.walF, info, s.pageSize, nil); err != nil {
-			return err
-		}
-		if w, err = c.readTo(s.walF, info.MxFrame); err != nil {
-			return err
-		}
-		commit = w.commit
-	} else {
-		fi, err := s.dbF.Stat()
-		if err != nil {
-			return err
-		}
-		commit = Pages(fi.Size() / int64(s.pageSize))
-	}
-	if err := s.queueFile(1, commit, w.pf, c.h, true); err != nil {
-		return err
-	}
-	if info.MxFrame > 0 {
-		s.cur = &c
-	}
-	s.dbPages = commit
-	s.note(info)
-	return nil
-}
-
-// Capture syncs the shard: new commits become LTX files, and the files are
-// queued in the journal writer and in the shard's tail. It returns when they
-// are all queued, however many that is, without waiting for any segment. The
-// commits are durable once the writer has been flushed after this returns.
-//
-// It also restarts the WAL once it is large. Reading the WAL does no network
-// I/O (the writer only queues), so ctx only ends the wait for whatever holds the
-// shard's lock before it.
-func (s *Shard) Capture(ctx context.Context) error {
-	return s.do(ctx, func() error {
-		if err := s.syncing(ctx); err != nil {
-			return err
-		}
-		s.maybeRestart(ctx)
-		return nil
-	})
-}
-
-// maybeRestart restarts the WAL if it is large and nothing needs the database
-// file as it is. The commits are captured already, so a restart that fails is
-// only tried again at a later sync.
-func (s *Shard) maybeRestart(ctx context.Context) {
-	if s.snaps > 0 || s.cur == nil || s.cur.frames <= s.cfg.restartFrames() || s.back >= s.cur.frames {
-		return
-	}
-	if err := s.locked(ctx, false); err != nil && !errors.Is(err, errBusy) {
-		s.cfg.Logger.Warn("could not restart the WAL", "shard", s.cfg.Name, "err", err)
-	}
-}
-
-// Sync is Capture followed by a wait until the segments holding the commits are
-// in blob storage (it flushes the journal writer).
-func (s *Shard) Sync(ctx context.Context) error {
-	if err := s.Capture(ctx); err != nil {
-		return err
-	}
-	return s.cfg.Writer.Flush(ctx)
-}
-
 // durable waits until what is queued is in blob storage.
 func (s *Shard) durable(ctx context.Context) error {
 	if s.cfg.Durable != nil {
@@ -877,485 +565,3 @@ func (s *Shard) durable(ctx context.Context) error {
 	}
 	return s.cfg.Writer.Flush(ctx)
 }
-
-// closeForRelease is the first step of Release, under the lock: a final sync, the
-// connections and descriptors are closed, and what the database looked like just
-// after is read. The mapping is kept: Release compares this header with one read
-// after its -shm check. A mapping holds no locks, so keeping it costs nothing there.
-func (s *Shard) closeForRelease(ctx context.Context, read func(*sql.DB) error) (c closed, err error) {
-	if s.pool == nil {
-		return c, ErrClosed
-	}
-	// Whether the shard holds anything of the app's, and the caller's read, are
-	// read between two syncs. The first captures what was committed before the
-	// reads, so if the final sync captures anything more, something was written
-	// after them.
-	serr := s.syncing(ctx)
-	empty, marked, eerr := s.holdsNothing(ctx)
-	rerr := errors.New("no read")
-	if read != nil {
-		rerr = read(s.pool)
-	}
-	pos := s.tail.position()
-	err = s.sync()
-	s.closeConns()
-	exact := serr == nil && err == nil && s.tail.position() == pos
-	switch {
-	case exact && eerr == nil && empty:
-		c.Released = &Deleted{Marked: marked}
-	case exact && rerr == nil:
-		c.Released = &Kept{At: pos}
-	default:
-		c.Released = &Uncertain{}
-	}
-	c.hdr, c.hdrErr = s.header()
-	if eerr != nil && err == nil {
-		// A marked check that could not run (the app dropped _shardlite_delete)
-		// fails the release, so the shard is kept and the error is the caller's
-		// to report, rather than the shard reading as unmarked.
-		err = eerr
-	}
-	return c, err
-}
-
-// closed is what closeForRelease learned about the database just after it
-// closed.
-type closed struct {
-	// Released is what the release found about the shard's final state. It is a
-	// field and not an embedded interface, so that closed does not implement
-	// Released itself and show up as a variant of it.
-	Released Released
-	// hdr is the wal-index header, to tell whether the app committed after
-	// the final sync.
-	hdr    Header
-	hdrErr error
-}
-
-// MarkedQuery says whether the app has marked the shard for deletion (a row in
-// _shardlite_delete). It asks the table rather than sqlite_schema, so a shard
-// whose table is missing (the app dropped it) fails instead of reading as
-// unmarked.
-const MarkedQuery = `SELECT EXISTS (SELECT 1 FROM _shardlite_delete)`
-
-// holdsNothing reports whether the database holds nothing of the app's. Either
-// the app marked it for deletion (a row in _shardlite_delete, whatever else is
-// in it), or it has no tables or indexes besides shardlite's (the _shardlite_
-// tables, empty or not; an index counts as its table's, so the automatic one of
-// a reserved table's text key is ignored), user_version and application_id are
-// both 0, and _shardlite_reminders has no rows (a reminder the node gave up on
-// is the app's data too). marked says which it was. It asks through capture's
-// own connections, so the node opens nothing of the shard's (see walsidecar.go
-// for why that matters), and an _shardlite_delete that is missing fails the
-// marked check rather than reading the shard as unmarked.
-func (s *Shard) holdsNothing(ctx context.Context) (empty, marked bool, err error) {
-	sqldb := s.pool
-	if sqldb == nil {
-		return false, false, ErrClosed
-	}
-	if err := sqldb.QueryRowContext(ctx, MarkedQuery).Scan(&marked); err != nil || marked {
-		if err != nil {
-			err = fmt.Errorf("asking for the delete marker: %w", err)
-		}
-		return marked, marked, err
-	}
-	var objects, userVersion, applicationID int64
-	err = sqldb.QueryRowContext(ctx, `SELECT
-		(SELECT count(*) FROM sqlite_schema WHERE name NOT IN ('sqlite_sequence') AND tbl_name NOT LIKE '\_shardlite\_%' ESCAPE '\'),
-		(SELECT user_version FROM pragma_user_version),
-		(SELECT application_id FROM pragma_application_id)`).Scan(&objects, &userVersion, &applicationID)
-	if err != nil || objects != 0 || userVersion != 0 || applicationID != 0 {
-		return false, false, err
-	}
-	// Reminders (dead or not) are the app's data.
-	var exists bool
-	if err := sqldb.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE name = '_shardlite_reminders' AND type = 'table')`).Scan(&exists); err != nil {
-		return false, false, err
-	}
-	if !exists {
-		return true, false, nil
-	}
-	var rows bool
-	if err := sqldb.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM _shardlite_reminders)`).Scan(&rows); err != nil || rows {
-		return false, false, err
-	}
-	return true, false, nil
-}
-
-// Use runs fn with capture's connection pool (never a descriptor of the node's
-// own), under the shard's lock. So it never runs during a sync, a snapshot or
-// the final sync of a release, and what fn commits is captured by the next
-// sync. fn must not call the shard.
-func (s *Shard) Use(ctx context.Context, fn func(*sql.DB) error) error {
-	return s.do(ctx, func() error { return s.use(fn) })
-}
-
-// UseAt is Use, and also reports the position fn's reads saw, if they saw
-// exactly a captured state. Under the same lock, a sync before fn captures what
-// is committed so far, and a sync after it that captures nothing new shows that
-// nothing was committed in between, so fn saw exactly the position the first
-// sync reached (no other sync runs meanwhile). at is 0 if the second sync
-// captured more: fn may have seen commits that weren't captured. A checkpoint
-// changes nothing here, since it commits nothing.
-func (s *Shard) UseAt(ctx context.Context, fn func(*sql.DB) error) (at pos.Position, err error) {
-	err = s.do(ctx, func() error {
-		if err := s.syncing(ctx); err != nil {
-			return err
-		}
-		before := s.tail.position()
-		if err := s.use(fn); err != nil {
-			return err
-		}
-		if err := s.sync(); err != nil {
-			return err
-		}
-		if s.tail.position() == before {
-			at = before
-		}
-		return nil
-	})
-	return at, err
-}
-
-// use runs fn on capture's connections. The caller holds the lock.
-func (s *Shard) use(fn func(*sql.DB) error) error {
-	if s.pool == nil {
-		return ErrClosed
-	}
-	return fn(s.pool)
-}
-
-// Snapshot returns a full snapshot of the shard as an LTX file, and the
-// shard's position that it covers: every commit captured up to it, and none
-// after, though the app keeps writing while the snapshot is read. The reader
-// must be closed: until it is, the WAL is not restarted.
-//
-// Under the shard's lock a sync captures what is committed, and the position it
-// reaches is the snapshot's. The pages are then read without the lock, each from
-// the newest WAL frame up to that point that the database file doesn't hold yet,
-// or from the database file. The read transaction keeps the database file as it
-// was when the transaction began, and the WAL from being restarted, which is
-// what makes the pages exact. Later syncs add commits above the position.
-//
-// The snapshot carries the checksum of the database it holds, which is compared
-// with the capture's own at the same position: they are the same database, and
-// a difference means the capture went wrong somewhere.
-func (s *Shard) Snapshot(ctx context.Context) (position pos.Position, r io.ReadCloser, err error) {
-	err = s.do(ctx, func() error {
-		if err := s.syncing(ctx); err != nil {
-			return err
-		}
-		position = s.tail.position()
-		if position == 0 {
-			r = io.NopCloser(eofReader{})
-			return nil
-		}
-		var pf pageFrames
-		var h walHeader
-		if s.cur != nil && s.cur.frames > s.back {
-			var err error
-			if pf, err = s.cur.newestFrames(s.walF, s.back); err != nil {
-				return err
-			}
-			h = s.cur.h
-		}
-		s.snaps++
-		pr, pw := io.Pipe()
-		sr := &snapshotReader{PipeReader: pr, s: s}
-		hdr := ltx.Header{
-			Version:   ltx.Version,
-			PageSize:  uint32(s.pageSize),
-			Commit:    uint32(s.dbPages),
-			MinTXID:   1,
-			MaxTXID:   ltx.TXID(position),
-			Timestamp: s.cfg.Now().UnixMilli(),
-		}
-		pg := pages{wal: s.walF, db: s.dbF, pageSize: s.pageSize, h: h, pf: pf, before: func() { s.at(kill.SnapshotPage) }}
-		// The checksum of the database at the snapshot's position, which the
-		// snapshot's own checksum is compared with, and the checksums it is
-		// compared against: the pages are read without the shard's lock.
-		if s.cfg.SkewChecksum {
-			s.cks.sum ^= skewMask
-		}
-		want, cks := s.cks.Checksum(), s.cks
-		sr.eg.Go(func() error {
-			bw := bufio.NewWriterSize(pw, 1<<20)
-			// The pending is the goroutine's own: the pages are read without the
-			// shard's lock, and a sync may be computing CRCs at the same time.
-			p := newPending(cks, true)
-			post, err := s.writeLTX(bw, hdr, pg, p)
-			if err == nil {
-				err = bw.Flush()
-			}
-			if err == nil && post != want {
-				s.mismatch(want, post, p, Pages(hdr.Commit))
-			}
-			pw.CloseWithError(err) // the reader gets the error, so the goroutine has none
-			return nil
-		})
-		r = sr
-		return nil
-	})
-	return position, r, err
-}
-
-// mismatch is what a snapshot does when its checksum is not the capture's: the
-// capture went wrong somewhere, and the snapshot is the database as SQLite
-// reads it, so it is the truth. The error is logged and counted, and the
-// capture carries on from the snapshot's CRCs.
-func (s *Shard) mismatch(want, got ltx.Checksum, p *pending, commit Pages) {
-	s.cfg.Logger.Error("a snapshot's checksum is not the capture's: the capture went wrong somewhere",
-		"shard", s.cfg.Name, "capture", want.String(), "snapshot", got.String())
-	if s.cfg.ChecksumMismatch != nil {
-		s.cfg.ChecksumMismatch(want, got)
-	}
-	s.do(context.Background(), func() error {
-		cks := &Checksums{}
-		cks.apply(p, commit)
-		s.cks = cks
-		return nil
-	})
-}
-
-type eofReader struct{}
-
-func (eofReader) Read([]byte) (int, error) { return 0, io.EOF }
-
-// snapshotReader reads the LTX file a snapshot is writing. Closing it ends the
-// snapshot and lets the WAL be restarted again.
-type snapshotReader struct {
-	*io.PipeReader
-	eg   errgroup.Group // the goroutine writing the file
-	s    *Shard
-	once sync.Once
-}
-
-func (r *snapshotReader) Close() error {
-	r.once.Do(func() {
-		r.PipeReader.CloseWithError(io.ErrClosedPipe)
-		r.eg.Wait()
-		r.s.call(func() { r.s.snaps-- })
-	})
-	return nil
-}
-
-// Close ends the activation: a final sync, then the connections and descriptors
-// are closed. It ends the activation whatever ctx says, and returns nil for a
-// shard that is closed or released already.
-func (s *Shard) Close(ctx context.Context) error {
-	open := false
-	var err error
-	if s.do(context.WithoutCancel(ctx), func() error {
-		if open = s.pool != nil; open {
-			err = s.syncing(context.WithoutCancel(ctx))
-			s.closeConns()
-		}
-		s.end()
-		return nil
-	}) != nil {
-		return nil
-	}
-	if !open {
-		return nil
-	}
-	if err == nil {
-		err = s.durable(ctx) // the final sync queued its files
-	}
-	return err
-}
-
-// Abandon ends the activation as a crash would, for a node that stops without
-// letting go of the shard: nothing is synced or written, and the shard's files
-// stay open until the process exits. Only the activation ends.
-func (s *Shard) Abandon() {
-	s.do(context.Background(), func() error { s.end(); return nil })
-}
-
-// IfHeld says what Release does when another process still has the shard open.
-type IfHeld int
-
-const (
-	// ResumeIfHeld is the zero value: capture is reopened where it left off and
-	// Release reports the shard as not released.
-	ResumeIfHeld IfHeld = iota
-	// GoAheadIfHeld lets go though the other process keeps its handle, which the
-	// node does only at a stop (the app is stopping too, and a commit through
-	// the handle afterwards is lost). The wal-index header is still compared
-	// before and after, so a commit made during the release resumes capture
-	// as it does for ResumeIfHeld. OpenAtRelease says whether the file was open.
-	GoAheadIfHeld
-)
-
-// Release is how the node lets go of a shard (a deactivation or a stop).
-// It does a final sync and closes every connection and file handle the node has
-// on the shard, waits until the files the final sync queued are in blob storage,
-// and only then asks whether another process still has the shard open (see
-// walsidecar.go for why the order matters).
-//
-// If one does (and ifHeld is ResumeIfHeld), a commit was made after the final
-// sync, or the wait failed, capture is reopened where it left off and Release
-// returns false: the node must not let go. Otherwise the activation is
-// over and Release returns true. If the close or the reopen fails, the
-// activation is over too, and Release returns the error (Open says which).
-//
-// read, if not nil, reads the database at its final state, beside the check
-// for empty (see Released.At). An error from it only makes At 0.
-func (s *Shard) Release(ctx context.Context, read func(*sql.DB) error, ifHeld IfHeld) (released bool, f Released, err error) {
-	var c closed
-	if err := s.do(ctx, func() error {
-		var err error
-		if c, err = s.closeForRelease(ctx, read); err != nil && !errors.Is(err, ErrClosed) {
-			s.end() // capture is closed or half closed: it stays closed
-		}
-		return err
-	}); err != nil {
-		return false, f, err
-	}
-	// Without the lock: the flush cycle this waits for may be waiting for it to
-	// sync this shard, which finds the database closed and returns.
-	ferr := s.durable(ctx)
-
-	// The last step runs even if ctx ended: the shard has to end up in one state.
-	err = s.do(context.WithoutCancel(ctx), func() error {
-		var err error
-		released, err = s.settle(c, ferr, ifHeld)
-		return err
-	})
-	if err != nil || !released {
-		return false, f, err
-	}
-	return true, c.Released, nil
-}
-
-// Released is what Release found about the shard's final state. It is
-// meaningful when the shard was released.
-type Released interface {
-	released()
-}
-
-// Deleted says the shard holds nothing of the app's (the app never wrote to
-// it, removed everything it wrote or marked it for deletion), so it is deleted
-// rather than kept. Marked says the app marked the shard for deletion.
-type Deleted struct{ Marked bool }
-
-func (*Deleted) released() {}
-
-// Kept says the shard is kept, and the release's read saw exactly this
-// position, which is the shard's final position.
-type Kept struct{ At pos.Position }
-
-func (*Kept) released() {}
-
-// Uncertain says the shard is kept, and the read did not see exactly its final
-// state: the read failed, or the final sync captured more.
-type Uncertain struct{}
-
-func (*Uncertain) released() {}
-
-// OpenAtRelease says whether a Release told to go ahead (GoAheadIfHeld) let go of
-// the shard though another process still had it open. It is false for a shard that
-// was not released, or released with nobody holding it.
-func (s *Shard) OpenAtRelease() (open bool) {
-	s.call(func() { open = s.openAtRelease })
-	return open
-}
-
-// settle is the last step of Release, under the lock, with nothing of the node's
-// open on the shard: the -shm check, then the header compared with the one
-// read after the final sync. It ends the activation if the shard can be let
-// go of, and otherwise reopens capture.
-func (s *Shard) settle(c closed, ferr error, ifHeld IfHeld) (released bool, err error) {
-	held, perr := s.side.Held()
-	// A commit after the final sync changes the header, even if the app has
-	// closed the file since (the mapping outlives a deleted -shm). If the app
-	// opened it again, SQLite reset -shm and the header reads differently or not
-	// at all. Either way the commit isn't captured, so capture resumes, whether
-	// or not the node goes ahead over an open file.
-	hdr, herr := s.header()
-	s.unmap()
-	changed := herr != nil || c.hdrErr != nil || hdr != c.hdr
-	if ferr == nil && perr == nil && !changed && (!held || ifHeld == GoAheadIfHeld) {
-		s.openAtRelease = held
-		s.end()
-		return true, nil
-	}
-	// Resume where capture left off.
-	if err := s.mapWALIndex(); err != nil {
-		s.end()
-		return false, err
-	}
-	if err := s.open(context.Background()); err != nil {
-		s.end()
-		return false, err
-	}
-	// The read transaction comes with the write lock, which also decides whether
-	// the WAL is the one capture was reading (see locked). Without it, the app
-	// closing the file would be the last connection: SQLite would checkpoint and
-	// restart the WAL under capture. If it can't be had, the next sync tries again.
-	if err := s.locked(context.Background(), true); err != nil && ferr == nil && perr == nil {
-		return false, err
-	}
-	if ferr != nil {
-		return false, ferr
-	}
-	return false, perr
-}
-
-// Open reports whether capture has the shard open: false once it is closed
-// or released, or after a release that failed before capture was reopened.
-func (s *Shard) Open() bool { return !s.over.Load() }
-
-// Position is the shard's position after the last commit captured so far.
-func (s *Shard) Position() pos.Position { return s.tail.view.Load().position }
-
-// Checksums is the CRC of each page of the database and the running checksum
-// of the whole of it, as of the last commit captured. It is a copy: the
-// capture's own goes on with the next sync.
-func (s *Shard) Checksums() *Checksums {
-	var cks *Checksums
-	s.call(func() { cks = s.cks.Clone() })
-	return cks
-}
-
-// TailFrom is the lowest node journal segment that may hold one of the shard's
-// tail files (including files still being written, and one being queued), or
-// 0 if the shard has no tail. The node's lease records the lowest over all its
-// shards.
-func (s *Shard) TailFrom() pos.Seg { return s.tail.view.Load().from }
-
-// Tail returns the commits captured since the shard's last delta, in position
-// order (earlier activations first, then this one). The caller holds a dup of
-// each log the files are in, and closes them (TailFiles.Close) when done. It
-// fails if a log cannot be duplicated.
-func (s *Shard) Tail() (files TailFiles, err error) {
-	s.call(func() { files, err = s.tail.files.Retained() })
-	return files, err
-}
-
-// TakeTail hands the shard's tail itself to the caller, who closes it or gives
-// it to a new Shard (Restored.Tail). The shard holds no files afterwards. Unlike
-// Tail it duplicates nothing, so it cannot fail: it is how a resume carries the
-// tail over.
-func (s *Shard) TakeTail() (files TailFiles) {
-	s.call(func() { files = s.tail.take() })
-	return files
-}
-
-// TailInfo is how many files the tail has and the age of the oldest, without
-// duplicating its logs.
-func (s *Shard) TailInfo() (n int, oldest time.Time) {
-	v := s.tail.view.Load()
-	return v.files, v.oldest
-}
-
-// TailBytes is how many bytes the tail's files hold.
-func (s *Shard) TailBytes() int64 { return s.tail.view.Load().bytes }
-
-// Discard gives up the shard's tail without writing it anywhere: for a shard
-// that is finished with or whose tail has been handed to a new Shard (Tail).
-// Closing or releasing a shard leaves its tail, since the node still writes it
-// as a delta then.
-func (s *Shard) Discard() { s.call(s.tail.discard) }
-
-// DropTail forgets tail files that end at or before position, once a delta
-// holds them.
-func (s *Shard) DropTail(position pos.Position) { s.call(func() { s.tail.drop(position) }) }

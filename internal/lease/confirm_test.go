@@ -13,8 +13,8 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/lease"
+	"github.com/luci1900/shardlite/internal/test/blobtest"
 )
 
 // confirmerRig is a confirmer for n1's first life on a store the test can hook.

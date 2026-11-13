@@ -5,9 +5,9 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/luci1900/shardlite/internal/harness"
 	"github.com/luci1900/shardlite/internal/pos"
 	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/test/harness"
 )
 
 func storedFiles(t *testing.T, e *harness.Env) []shardfile.File {

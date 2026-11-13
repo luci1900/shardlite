@@ -198,3 +198,47 @@ func (t *tail) drop(position pos.Position) {
 	}
 	t.publish(0)
 }
+
+// TailFrom is the lowest node journal segment that may hold one of the shard's
+// tail files (including files still being written, and one being queued), or
+// 0 if the shard has no tail. The node's lease records the lowest over all its
+// shards.
+func (s *Shard) TailFrom() pos.Seg { return s.tail.view.Load().from }
+
+// Tail returns the commits captured since the shard's last delta, in position
+// order (earlier activations first, then this one). The caller holds a dup of
+// each log the files are in, and closes them (TailFiles.Close) when done. It
+// fails if a log cannot be duplicated.
+func (s *Shard) Tail() (files TailFiles, err error) {
+	s.call(func() { files, err = s.tail.files.Retained() })
+	return files, err
+}
+
+// TakeTail hands the shard's tail itself to the caller, who closes it or gives
+// it to a new Shard (Restored.Tail). The shard holds no files afterwards. Unlike
+// Tail it duplicates nothing, so it cannot fail: it is how a resume carries the
+// tail over.
+func (s *Shard) TakeTail() (files TailFiles) {
+	s.call(func() { files = s.tail.take() })
+	return files
+}
+
+// TailInfo is how many files the tail has and the age of the oldest, without
+// duplicating its logs.
+func (s *Shard) TailInfo() (n int, oldest time.Time) {
+	v := s.tail.view.Load()
+	return v.files, v.oldest
+}
+
+// TailBytes is how many bytes the tail's files hold.
+func (s *Shard) TailBytes() int64 { return s.tail.view.Load().bytes }
+
+// Discard gives up the shard's tail without writing it anywhere: for a shard
+// that is finished with or whose tail has been handed to a new Shard (Tail).
+// Closing or releasing a shard leaves its tail, since the node still writes it
+// as a delta then.
+func (s *Shard) Discard() { s.call(s.tail.discard) }
+
+// DropTail forgets tail files that end at or before position, once a delta
+// holds them.
+func (s *Shard) DropTail(position pos.Position) { s.call(func() { s.tail.drop(position) }) }

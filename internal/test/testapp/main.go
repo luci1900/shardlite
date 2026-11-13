@@ -33,7 +33,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/luci1900/shardlite/internal/capture"
-	"github.com/luci1900/shardlite/internal/sqlitetest"
+	"github.com/luci1900/shardlite/internal/test/sqlitetest"
 )
 
 type app struct {

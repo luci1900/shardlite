@@ -11,9 +11,9 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/cluster"
 	"github.com/luci1900/shardlite/internal/lease"
+	"github.com/luci1900/shardlite/internal/test/blobtest"
 )
 
 // acquire takes the lease of node on b.

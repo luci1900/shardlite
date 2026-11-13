@@ -1,7 +1,7 @@
 # The linter for the code's closed sets. See docs/internals.md.
 #
 # The test suites are more plumbing than a recipe line wants, so their logic
-# stays in scripts beside testwatch (internal/tools/testwatch/fast.sh and
+# stays in scripts beside testwatch (internal/test/testwatch/fast.sh and
 # long.sh) and these targets are only the way to call them from anywhere, as
 # CI does. The suites take their extra go test arguments in ARGS: one flag
 # bare, more than one word quoted on the assignment alone, as in
@@ -20,15 +20,15 @@ lint:
 	(cd sdk/ts && npm run lint --silent)
 
 test:
-	./internal/tools/testwatch/fast.sh $(ARGS)
+	./internal/test/testwatch/fast.sh $(ARGS)
 
 test-long:
-	./internal/tools/testwatch/long.sh $(ARGS)
+	./internal/test/testwatch/long.sh $(ARGS)
 
 # The spec checks wait on quint, which testwatch can't see. ARGS goes to the capture tests only.
 test-model:
 	status=0; \
-	./internal/tools/testwatch/fast.sh -tags=model ./internal/capture $(ARGS) || status=1; \
+	./internal/test/testwatch/fast.sh -tags=model ./internal/capture $(ARGS) || status=1; \
 	go tool -modfile=tools.mod gotestsum -- -tags=model -timeout 15m ./specs || status=1; \
 	exit $$status
 

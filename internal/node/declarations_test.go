@@ -3,7 +3,7 @@ package node
 import (
 	"context"
 	"errors"
-	"github.com/luci1900/shardlite/internal/apptest"
+	"github.com/luci1900/shardlite/internal/test/apptest"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,8 +15,8 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/luci1900/shardlite/internal/harness"
 	"github.com/luci1900/shardlite/internal/lease"
+	"github.com/luci1900/shardlite/internal/test/harness"
 )
 
 // The poll is both the health check and the source of the app's kinds: the

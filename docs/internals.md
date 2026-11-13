@@ -268,7 +268,7 @@ Each model in `specs/` is about one part of the code and assumes what the others
 
 Only capture's traces are replayed against the code: `internal/capture/replay_test.go` plays each trace in `internal/capture/testdata/traces/` (made by `quint run --mbt --out-itf`, from the witness table in `internal/capture/model_test.go`) against a real SQLite file, checking capture's outcomes after each step. The traces are committed so that `make test` needs no Quint. Among them are the first counterexamples of three broken variants. `lockNoSync` changes how far capture gets, so the replay must catch it. `noSalts` and `mapAll` change what capture reads, which the replay checks against the database rather than the model, so they must replay clean: the code stays correct along the paths where those designs lose commits.
 
-The model suite (`make test-model`, see the [testwatch README](../internal/tools/testwatch/README.md#the-model-suite)) checks that the committed traces are still what the model makes, replays a fresh batch of random traces each run, and runs every model's own checks (in the test file of the same name in `specs/`, so `shard.qnt` is checked by `specs/shard_test.go`), the broken variants among them, which must fail in the way each row names.
+The model suite (`make test-model`, see the [testwatch README](../internal/test/testwatch/README.md#the-model-suite)) checks that the committed traces are still what the model makes, replays a fresh batch of random traces each run, and runs every model's own checks (in the test file of the same name in `specs/`, so `shard.qnt` is checked by `specs/shard_test.go`), the broken variants among them, which must fail in the way each row names.
 
 ## Testing
 
@@ -278,7 +278,7 @@ The model suite (`make test-model`, see the [testwatch README](../internal/tools
 
 ### Linearizability
 
-Linearizability is checked on three real nodes (`TestFaultCluster` in `e2e/fault_linear_test.go`, the checker in `internal/linear`). Clients append unique values to lists in `storage` shards, some relayed by a call from another shard, and read them back through random nodes, while one node at a time is killed, paused, drained or cut off by a proxy in front of the store that delivers the held traffic late. Porcupine checks each list's history, which ends with a read through a node and one from a restore.
+Linearizability is checked on three real nodes (`TestFaultCluster` in `e2e/fault_linear_test.go`, the checker in `internal/test/linear`). Clients append unique values to lists in `storage` shards, some relayed by a call from another shard, and read them back through random nodes, while one node at a time is killed, paused, drained or cut off by a proxy in front of the store that delivers the held traffic late. Porcupine checks each list's history, which ends with a read through a node and one from a restore.
 
 Nodes run with no lease expiry, and a pause or a cut lasts until the node has been adopted and the new owners have acknowledged newer writes, then leaves the node awake and cut off from storage for a second while the test reads every shard through it. The clients stay off the node meanwhile and the lists' kind has a long idle timeout, so it has nothing to flush and its shards are still active, and only the confirmation stops a stale read: letting a shard go and waiting for a flush need storage too. `TestFaultLinearCatchesUnconfirmedReads` runs the same check with storage answers that skip the confirmation (`SHARDLITE_FAULT_UNCONFIRMED`) and only pauses and cuts, and must find a violation. The same run sets reminders, some on shards left inactive so the dispatcher wakes them, and once the clients end it waits, bounded at two minutes, until every one has fired at least once in the restores.
 
@@ -288,14 +288,15 @@ Nodes run with no lease expiry, and a pause or a cut lasts until the node has be
 |---|---|
 | `internal/pos`, `internal/shard`, `internal/cluster` | named types for positions, epochs and segments, and for shard, kind and node names |
 | `internal/lease` | node leases and the confirmer for the gates |
-| `internal/blob`, `internal/blobtest` | object storage with write ids, the startup check and the clock warning, and the in-memory store (`SHARDLITE_BLOB=memory://`) |
+| `internal/blob` | object storage with write ids, the startup check and the clock warning, and the in-memory store (`SHARDLITE_BLOB=memory://`) |
 | `internal/journal` | a node's journal: its segment store, writer and fencing |
 | `internal/capture` | reading a shard's WAL and the [read rule](#the-read-rule) |
 | `internal/shardfile` | the manifest, deltas, snapshots, restores and adoption, and the [reminder index](#reminder-index) |
 | `internal/dispatch` | the [dispatcher](#the-dispatcher) and the ranking of lanes |
 | `internal/peers` | the lease scan, the peers' addresses, placement and the peer headers |
 | `internal/node` | `Run` and everything it stages: shardset, actor, flusher, gates, routing, reminders, servers, adoption, local files |
-| `internal/kill`, `internal/audit`, `internal/harness` | the fault rig's kill points, the store walk and shared test pieces |
+| `internal/kill`, `internal/audit` | the fault rig's kill points and the store walk |
+| `internal/test/` | packages only the tests use: the shared harness, the blob fault decorator, the test app and its driver, the linearizability checker, the Quint and RustFS helpers and `testwatch` |
 | `specs/` | the Quint models |
 | `sdk/go`, `sdk/ts`, `sdk/testdata` | the SDKs (see the guide's [Using the SDK](guide.md#using-the-sdk)) and the node's app-visible reasons they check themselves against |
 | `migrate` | numbered SQL migrations run inside the app's own transaction (see the guide's [Schema migrations](guide.md#schema-migrations)), which the node never imports |

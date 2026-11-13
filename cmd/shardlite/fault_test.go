@@ -9,10 +9,10 @@ import (
 
 	"github.com/dunglas/httpsfv"
 
-	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/cluster"
 	"github.com/luci1900/shardlite/internal/journal"
 	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/test/blobtest"
 )
 
 // A fault setting that does not parse fails the start, so a test never runs

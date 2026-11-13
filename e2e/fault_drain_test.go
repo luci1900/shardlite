@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/apptest"
 	"github.com/luci1900/shardlite/internal/kill"
+	"github.com/luci1900/shardlite/internal/test/apptest"
 )
 
 // A node killed while it stops loses nothing. The node is told to stop with SIGTERM, drains

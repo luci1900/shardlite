@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/blobtest"
+	"github.com/luci1900/shardlite/internal/test/blobtest"
 )
 
 // loseResponse makes the first call of op that has reached the backend and

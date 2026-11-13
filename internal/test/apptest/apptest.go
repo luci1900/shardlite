@@ -1,4 +1,4 @@
-// Package apptest starts internal/testapp as a child process and talks to it,
+// Package apptest starts internal/test/testapp as a child process and talks to it,
 // along with the waiting helpers tests use (Eventually and Log). It differs
 // from harness, which builds the in-process shardlite pieces (the blob store,
 // the journal and the files layer) a test runs on and uses apptest for the app
@@ -24,13 +24,13 @@ var (
 	builds  = map[string]string{}
 )
 
-// Build builds a main package of this repository (such as ./internal/testapp)
+// Build builds a main package of this repository (such as ./internal/test/testapp)
 // once per test process and returns the binary's path. tags are build tags
 // (the fault build of ./cmd/shardlite passes "fault").
 func Build(tb testing.TB, pkg string, tags ...string) string {
 	tb.Helper()
 	_, file, _, _ := runtime.Caller(0)
-	return BuildIn(tb, filepath.Join(filepath.Dir(file), "..", ".."), pkg, tags...)
+	return BuildIn(tb, filepath.Join(filepath.Dir(file), "..", "..", ".."), pkg, tags...)
 }
 
 // BuildIn is Build for a package of the module in dir, which is how a test in
@@ -62,7 +62,7 @@ func BuildIn(tb testing.TB, dir, pkg string, tags ...string) string {
 }
 
 // Binary builds testapp.
-func Binary(tb testing.TB) string { return Build(tb, "./internal/testapp") }
+func Binary(tb testing.TB) string { return Build(tb, "./internal/test/testapp") }
 
 // App is one running testapp process.
 type App struct {

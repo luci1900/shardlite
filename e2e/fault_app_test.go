@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/apptest"
+	"github.com/luci1900/shardlite/internal/test/apptest"
 )
 
 var longClient = &http.Client{Timeout: 2 * time.Minute}

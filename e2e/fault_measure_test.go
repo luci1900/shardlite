@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/apptest"
+	"github.com/luci1900/shardlite/internal/test/apptest"
 )
 
 // The measurements run the real binary and read its peak memory from the

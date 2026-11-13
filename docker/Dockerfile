@@ -9,7 +9,7 @@ RUN go mod download
 COPY e2e/go.mod e2e/go.sum ./e2e/
 RUN cd e2e && go mod download
 COPY . .
-RUN go build -o /usr/local/bin/testapp ./internal/testapp \
+RUN go build -o /usr/local/bin/testapp ./internal/test/testapp \
  && go build -o /usr/local/bin/shardlite ./cmd/shardlite \
  && go build -o /usr/local/bin/bench ./cmd/bench \
  && (cd e2e && go build -o /usr/local/bin/e2eapp ./cmd/e2eapp) \

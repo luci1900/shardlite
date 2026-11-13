@@ -3,7 +3,7 @@ package node
 import (
 	"bytes"
 	"context"
-	"github.com/luci1900/shardlite/internal/apptest"
+	"github.com/luci1900/shardlite/internal/test/apptest"
 	"io"
 	"net/http"
 	"strings"

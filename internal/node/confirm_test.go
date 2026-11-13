@@ -3,7 +3,7 @@ package node
 import (
 	"context"
 	"errors"
-	"github.com/luci1900/shardlite/internal/apptest"
+	"github.com/luci1900/shardlite/internal/test/apptest"
 	"io"
 	"net/http"
 	"sync/atomic"
@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/blobtest"
 	"github.com/luci1900/shardlite/internal/lease"
+	"github.com/luci1900/shardlite/internal/test/blobtest"
 )
 
 // leaseProbe watches the node's lease in the store: it counts the reads of it,

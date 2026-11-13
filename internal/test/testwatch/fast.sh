@@ -10,7 +10,7 @@ root=$(pwd)
 unset SHARDLITE_MEASURE SHARDLITE_MEASURE_MB SHARDLITE_TEST_S3_ENDPOINT
 watch=$(mktemp); bindir=$(mktemp -d)
 trap 'rm -f "$watch" "$watch.json" "$watch.rep" "$watch.migrate.json" "$watch.migrate.rep" "$watch.sdk.json" "$watch.sdk.rep" "$watch.ts.rep"; rm -rf "$bindir"' EXIT
-go build -o "$watch" ./internal/tools/testwatch
+go build -o "$watch" ./internal/test/testwatch
 status=0
 
 # The arguments are go test flags and package patterns for the main module. The

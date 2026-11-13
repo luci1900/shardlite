@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/apptest"
+	"github.com/luci1900/shardlite/internal/test/apptest"
 )
 
 // Stopping the servers ends what is left of their requests and joins them: a
