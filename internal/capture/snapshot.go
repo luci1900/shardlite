@@ -9,8 +9,8 @@ import (
 	"github.com/superfly/ltx"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/luci1900/shardlite/internal/kill"
-	"github.com/luci1900/shardlite/internal/pos"
+	"github.com/luci1900/shardlite/internal/model/pos"
+	"github.com/luci1900/shardlite/internal/test/fault"
 )
 
 // Snapshot returns a full snapshot of the shard as an LTX file, and the
@@ -58,7 +58,7 @@ func (s *Shard) Snapshot(ctx context.Context) (position pos.Position, r io.ReadC
 			MaxTXID:   ltx.TXID(position),
 			Timestamp: s.cfg.Now().UnixMilli(),
 		}
-		pg := pages{wal: s.walF, db: s.dbF, pageSize: s.pageSize, h: h, pf: pf, before: func() { s.at(kill.SnapshotPage) }}
+		pg := pages{wal: s.walF, db: s.dbF, pageSize: s.pageSize, h: h, pf: pf, before: func() { s.at(fault.SnapshotPage) }}
 		// The checksum of the database at the snapshot's position, which the
 		// snapshot's own checksum is compared with, and the checksums it is
 		// compared against: the pages are read without the shard's lock.

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/kind"
+	"github.com/luci1900/shardlite/internal/model/kind"
 )
 
 // A sync that names no tier is refused, with and without commits waiting on

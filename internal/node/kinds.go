@@ -6,8 +6,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/kind"
-	"github.com/luci1900/shardlite/internal/shard"
+	"github.com/luci1900/shardlite/internal/model/kind"
+	"github.com/luci1900/shardlite/internal/model/shard"
 )
 
 // DefaultIdleTimeout is how long a shard stays active without requests when
@@ -22,7 +22,7 @@ var (
 )
 
 // ParseTarget parses a Shardlite-Target value: the kind and the id, joined by
-// a slash (users/42). The grammar is internal/shard's; ErrBadTarget is the
+// a slash (users/42). The grammar is internal/model/shard's; ErrBadTarget is the
 // node's answer for anything it refuses.
 func ParseTarget(target string) (shard.Name, error) {
 	n, err := shard.ParseName(target)

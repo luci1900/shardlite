@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/luci1900/shardlite/internal/kind"
-	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/model/kind"
+	"github.com/luci1900/shardlite/internal/storage/shardfile"
 )
 
 // A shard whose file is not the one it holds is not served: the request that

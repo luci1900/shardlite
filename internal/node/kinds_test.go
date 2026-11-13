@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/kind"
+	"github.com/luci1900/shardlite/internal/model/kind"
 )
 
 func TestParseTarget(t *testing.T) {

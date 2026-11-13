@@ -16,11 +16,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/audit"
-	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/kill"
-	"github.com/luci1900/shardlite/internal/pos"
+	"github.com/luci1900/shardlite/internal/model/pos"
+	"github.com/luci1900/shardlite/internal/storage/audit"
+	"github.com/luci1900/shardlite/internal/storage/blob"
 	"github.com/luci1900/shardlite/internal/test/apptest"
+	"github.com/luci1900/shardlite/internal/test/fault"
 )
 
 // The fault rig drives the real binary, built with the fault tag, through the
@@ -53,7 +53,7 @@ const faultDeltaAge = time.Second
 // between the restore and the first sync: after the restore, as the node folds
 // a leftover WAL into the database file, once the node holds its read
 // transaction over the database, and once the first sync is done.
-var activationPoints = []kill.Point{kill.Restored, kill.Folded, kill.ReadHeld, kill.FirstSyncDone}
+var activationPoints = []fault.Point{fault.Restored, fault.Folded, fault.ReadHeld, fault.FirstSyncDone}
 
 type faultRig struct {
 	t     *testing.T
@@ -98,7 +98,7 @@ func newFaultRig(t *testing.T, extra ...string) *faultRig {
 
 // audit is the end of every scenario, run as the rig's cleanup before the processes are
 // killed (they are older cleanups): it stops the node, so no upload is on its way to a
-// manifest, and walks the store for the LTX files no manifest lists (internal/audit).
+// manifest, and walks the store for the LTX files no manifest lists (internal/storage/audit).
 // A file a node logged is a leak it reported (a failed delete). The rest are allowed up
 // to what the kills explain: per node killed, each of the rig's two shards can leave one
 // upload on its way to the manifest (a delta, or a rebase's base) or, killed just after a
@@ -162,7 +162,7 @@ func (r *faultRig) crash() {
 // arm restarts the node with the kill point set but not yet armed: the point
 // fires once fireNow is called. The restart is a crash, so the next activation
 // of a shard restores it from blob storage.
-func (r *faultRig) arm(point kill.Point) {
+func (r *faultRig) arm(point fault.Point) {
 	r.t.Helper()
 	r.fires++
 	r.fire = filepath.Join(r.s.dir, fmt.Sprintf("fire-%d", r.fires))
@@ -178,7 +178,7 @@ func (r *faultRig) fireNow() {
 }
 
 // dies waits for the node to die at its armed point.
-func (r *faultRig) dies(point kill.Point) {
+func (r *faultRig) dies(point fault.Point) {
 	r.t.Helper()
 	select {
 	case <-r.s.node.Done:
@@ -243,7 +243,7 @@ func (r *faultRig) settle(n int) {
 }
 
 // writeUntilDeath keeps writing until the node dies at its armed point.
-func (r *faultRig) writeUntilDeath(point kill.Point) {
+func (r *faultRig) writeUntilDeath(point fault.Point) {
 	r.t.Helper()
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {

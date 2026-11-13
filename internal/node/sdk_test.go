@@ -16,7 +16,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
-	"github.com/luci1900/shardlite/internal/kind"
+	"github.com/luci1900/shardlite/internal/model/kind"
 	shardlite "github.com/luci1900/shardlite/sdk/go"
 )
 

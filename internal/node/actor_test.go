@@ -15,8 +15,8 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/luci1900/shardlite/internal/capture"
-	"github.com/luci1900/shardlite/internal/kind"
-	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/model/kind"
+	"github.com/luci1900/shardlite/internal/storage/shardfile"
 	"github.com/luci1900/shardlite/internal/test/blobtest"
 )
 

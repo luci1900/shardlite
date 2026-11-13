@@ -10,11 +10,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/cluster"
-	"github.com/luci1900/shardlite/internal/dispatch"
-	"github.com/luci1900/shardlite/internal/shard"
-	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/model/cluster"
+	"github.com/luci1900/shardlite/internal/model/shard"
+	"github.com/luci1900/shardlite/internal/node/dispatch"
+	"github.com/luci1900/shardlite/internal/storage/blob"
+	"github.com/luci1900/shardlite/internal/storage/shardfile"
 )
 
 // reqInfo is what the proxy needs to know about a request, kept in its context.

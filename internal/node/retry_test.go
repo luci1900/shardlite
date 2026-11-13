@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/cluster"
-	"github.com/luci1900/shardlite/internal/lease"
+	"github.com/luci1900/shardlite/internal/model/cluster"
+	"github.com/luci1900/shardlite/internal/storage/lease"
 )
 
 // echoes makes the node's app answer every request with its name and the body it got.

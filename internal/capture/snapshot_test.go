@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	"github.com/luci1900/shardlite/internal/capture"
-	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/storage/shardfile"
 	"github.com/luci1900/shardlite/internal/test/apptest"
 	"github.com/luci1900/shardlite/internal/test/harness"
 	"github.com/luci1900/shardlite/internal/test/sqlitetest"

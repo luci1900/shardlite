@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/storage/shardfile"
 	"github.com/luci1900/shardlite/internal/test/blobtest"
 )
 

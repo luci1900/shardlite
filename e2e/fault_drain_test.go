@@ -14,12 +14,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/kill"
 	"github.com/luci1900/shardlite/internal/test/apptest"
+	"github.com/luci1900/shardlite/internal/test/fault"
 )
 
 // A node killed while it stops loses nothing. The node is told to stop with SIGTERM, drains
-// and starts letting go of its shards, and dies right after the first one (kill.StopLetGo): by
+// and starts letting go of its shards, and dies right after the first one (fault.StopLetGo): by
 // then that shard is released and the others are still owned by the node, whose lease is not
 // released. Every write a `storage` request acknowledged is in blob storage, and every shard is
 // served by the other node once it has adopted the dead one (docs/internals.md, Takeover and
@@ -28,7 +28,7 @@ func TestFaultKillDuringStop(t *testing.T) {
 	t.Parallel()
 	const shards = 6
 	fire := filepath.Join(t.TempDir(), "fire")
-	n1 := newStack(t, faultEnv[0], "SHARDLITE_FAULT_KILL_AT="+string(kill.StopLetGo), "SHARDLITE_FAULT_KILL_WHEN="+fire)
+	n1 := newStack(t, faultEnv[0], "SHARDLITE_FAULT_KILL_AT="+string(fault.StopLetGo), "SHARDLITE_FAULT_KILL_WHEN="+fire)
 	n2 := newStackOn(t, n1.store, faultEnv[0], "SHARDLITE_NODE=n2")
 	v := newVerifier(t, n1)
 	client := &http.Client{Timeout: 10 * time.Second}
@@ -78,10 +78,10 @@ func TestFaultKillDuringStop(t *testing.T) {
 	select {
 	case <-n1.node.Done:
 	case <-time.After(60 * time.Second):
-		t.Fatalf("the node did not die at %s:\n%s", kill.StopLetGo, n1.node.Output())
+		t.Fatalf("the node did not die at %s:\n%s", fault.StopLetGo, n1.node.Output())
 	}
 	if !killed(n1.node.Err) {
-		t.Fatalf("the node stopped by itself (%v) and was not killed at %s:\n%s", n1.node.Err, kill.StopLetGo, n1.node.Output())
+		t.Fatalf("the node stopped by itself (%v) and was not killed at %s:\n%s", n1.node.Err, fault.StopLetGo, n1.node.Output())
 	}
 	if out := n1.node.Output(); !strings.Contains(out, "shutting down") {
 		t.Fatalf("the node was killed before it began to stop:\n%s", out)

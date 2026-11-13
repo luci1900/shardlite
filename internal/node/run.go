@@ -18,11 +18,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/dispatch"
-	"github.com/luci1900/shardlite/internal/lease"
-	"github.com/luci1900/shardlite/internal/peers"
-	"github.com/luci1900/shardlite/internal/service"
+	"github.com/luci1900/shardlite/internal/node/dispatch"
+	"github.com/luci1900/shardlite/internal/node/peers"
+	"github.com/luci1900/shardlite/internal/storage/blob"
+	"github.com/luci1900/shardlite/internal/storage/lease"
+	"github.com/luci1900/shardlite/internal/syncs/service"
 )
 
 // RunOption changes how Run is assembled. Tests use them to swap parts the

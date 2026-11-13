@@ -12,11 +12,11 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/luci1900/shardlite/internal/capture"
-	"github.com/luci1900/shardlite/internal/cluster"
-	"github.com/luci1900/shardlite/internal/journal"
-	"github.com/luci1900/shardlite/internal/kind"
-	"github.com/luci1900/shardlite/internal/lease"
-	"github.com/luci1900/shardlite/internal/notify"
+	"github.com/luci1900/shardlite/internal/model/cluster"
+	"github.com/luci1900/shardlite/internal/model/kind"
+	"github.com/luci1900/shardlite/internal/storage/journal"
+	"github.com/luci1900/shardlite/internal/storage/lease"
+	"github.com/luci1900/shardlite/internal/syncs/notify"
 )
 
 // Defaults of the flush timing, chosen from the measurements in

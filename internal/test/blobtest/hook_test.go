@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/storage/blob"
 )
 
 // The hook maps failures onto outcomes: before the operation is "not applied",

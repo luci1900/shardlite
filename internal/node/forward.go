@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/cluster"
+	"github.com/luci1900/shardlite/internal/model/cluster"
 )
 
 // errMoved is a forward's answer from a node that found the shard isn't its own.

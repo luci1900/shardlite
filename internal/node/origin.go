@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"net/url"
 
-	"github.com/luci1900/shardlite/internal/cluster"
+	"github.com/luci1900/shardlite/internal/model/cluster"
 )
 
 // origin says who asked for a request: the public handler (a client) and the

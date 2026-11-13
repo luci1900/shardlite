@@ -7,10 +7,10 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/luci1900/shardlite/internal/blob"
 	"github.com/luci1900/shardlite/internal/capture"
-	"github.com/luci1900/shardlite/internal/cluster"
-	"github.com/luci1900/shardlite/internal/lease"
+	"github.com/luci1900/shardlite/internal/model/cluster"
+	"github.com/luci1900/shardlite/internal/storage/blob"
+	"github.com/luci1900/shardlite/internal/storage/lease"
 	"github.com/luci1900/shardlite/internal/test/apptest"
 	"github.com/luci1900/shardlite/internal/test/harness"
 )

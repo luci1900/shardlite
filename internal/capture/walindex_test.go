@@ -11,9 +11,9 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/capture"
-	"github.com/luci1900/shardlite/internal/journal"
-	"github.com/luci1900/shardlite/internal/pos"
-	"github.com/luci1900/shardlite/internal/shard"
+	"github.com/luci1900/shardlite/internal/model/pos"
+	"github.com/luci1900/shardlite/internal/model/shard"
+	"github.com/luci1900/shardlite/internal/storage/journal"
 	"github.com/luci1900/shardlite/internal/tempfile"
 	"github.com/luci1900/shardlite/internal/test/apptest"
 )

@@ -9,8 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/kind"
-	"github.com/luci1900/shardlite/internal/notify"
+	"github.com/luci1900/shardlite/internal/model/kind"
+	"github.com/luci1900/shardlite/internal/syncs/notify"
 )
 
 // appLostAfter is how long the app may go without any HTTP answer to the

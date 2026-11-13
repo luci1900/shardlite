@@ -9,7 +9,7 @@ import (
 
 	"github.com/superfly/ltx"
 
-	"github.com/luci1900/shardlite/internal/pos"
+	"github.com/luci1900/shardlite/internal/model/pos"
 )
 
 // errBusy says the write lock could not be had in time.

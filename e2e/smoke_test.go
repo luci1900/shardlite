@@ -18,7 +18,7 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
-	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/storage/blob"
 	"github.com/luci1900/shardlite/internal/test/apptest"
 )
 

@@ -219,7 +219,7 @@ module cluster {
   // snapshot (the manifest names no journal, or the owner's node has had every epoch up to the owner's
   // adopted).
   // The owner is dead as the code sees it without comparing clocks: its node has a newer epoch, or another
-  // incarnation has marked the lease (ownerDead in internal/shardfile/manifest.go). An expired lease alone is not.
+  // incarnation has marked the lease (ownerDead in internal/storage/shardfile/manifest.go). An expired lease alone is not.
   def codeDead(st: State, inc: int): bool = {
     val l = st.leases.get(nodeOf(inc))
     l.epoch > epochOf(inc) or (l.adoptedBy >= 0 and l.adoptedBy != inc)

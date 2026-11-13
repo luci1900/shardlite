@@ -6,8 +6,8 @@ import (
 	"fmt"
 
 	"github.com/luci1900/shardlite/internal/capture"
-	"github.com/luci1900/shardlite/internal/pos"
-	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/model/pos"
+	"github.com/luci1900/shardlite/internal/storage/shardfile"
 )
 
 // A shard's next_reminder: when it next needs waking, read from its own tables at

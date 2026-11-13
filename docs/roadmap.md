@@ -13,7 +13,7 @@ What is left to make v1, in order, riskiest parts first. The one node and the cl
 - Metrics for everything the node does. Shards the app holds open past their idle timeout need a gauge beside the count of holds warned, so a leak shows as a level and not only in the logs.
 - Protocol versions for rolling node upgrades: each node publishes the range it speaks in its lease, and every request between nodes names the highest version both sides speak.
 - Format versions for everything shardlite stores, with a marker per deployment that a node from an older release refuses.
-- The `shardlite` command for operators: `ls`, `export`, `import`, `verify` and `gc`. `gc` deletes the LTX files no manifest lists, past the journal's expiry, with the walk in `internal/audit`, and `verify` reports them.
+- The `shardlite` command for operators: `ls`, `export`, `import`, `verify` and `gc`. `gc` deletes the LTX files no manifest lists, past the journal's expiry, with the walk in `internal/storage/audit`, and `verify` reports them.
 - A soak test: the linearizability check (`TestFaultCluster`) run for hours, with slow storage beside its kills, pauses, cuts and drains.
 - Checking the cluster and dispatch models against the code, as capture's are by replay: the fault runs log the nodes' events (leases, fences, journal segments, manifest swaps, reminder entries) and a checker confirms each run's log is a behaviour of `cluster.qnt` or `dispatch.qnt`. Quint has no built-in support for checking a log, so this starts with a prototype on one fault scenario.
 - What a store outage does to the cluster: the lease lives in blob storage, so a store no node can reach stops every node until it returns. What is left: how fast the cluster comes back, what the operator sees, and whether a degraded mode is worth having. The fault rig should have a scenario for it.
@@ -24,7 +24,7 @@ What is left to make v1, in order, riskiest parts first. The one node and the cl
 - Refusing commits through a connection an app kept open past a stop's let-go, which are lost today, by holding SQLite's WAL write lock on the deleted file until the app closes it. Blocked on making a lost POSIX lock visible.
 - Encryption and authentication of [traffic between nodes](#securing-traffic-between-nodes).
 - Checking tokens at the node, which closes the gap the [overview](overview.md#goal) names. It rewords "the node never inspects credentials" in the [guide](guide.md#routing-requests-to-shards), so it is a design decision of its own.
-- A journal store of its own, a tier that waits for a fast store instead of blob storage, behind the `journal.Store` interface (`internal/journal`) and its conformance suite. Candidates: Postgres with synchronous replication, S3 Express One Zone.
+- A journal store of its own, a tier that waits for a fast store instead of blob storage, behind the `journal.Store` interface (`internal/storage/journal`) and its conformance suite. Candidates: Postgres with synchronous replication, S3 Express One Zone.
 - Blob backends for GCS and Azure Blob behind `blob.Backend`, passing the conformance suite and the startup check. Until then, GCP or Azure runs its own RustFS (see [deployment](deployment.md#stores)).
 
 ## Later designs

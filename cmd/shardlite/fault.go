@@ -13,13 +13,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/journal"
-	"github.com/luci1900/shardlite/internal/kill"
 	"github.com/luci1900/shardlite/internal/node"
-	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/storage/blob"
+	"github.com/luci1900/shardlite/internal/storage/journal"
+	"github.com/luci1900/shardlite/internal/storage/shardfile"
 	"github.com/luci1900/shardlite/internal/tempfile"
 	"github.com/luci1900/shardlite/internal/test/blobtest"
+	"github.com/luci1900/shardlite/internal/test/fault"
 )
 
 // faultOptions arms the node's fault hooks from the SHARDLITE_FAULT_ settings,
@@ -50,14 +50,14 @@ import (
 // would leave a test passing without having tested anything.
 func faultOptions(getenv func(string) string) ([]node.RunOption, error) {
 	var f node.Faults
-	var at func(kill.Point)
+	var at func(fault.Point)
 	if v := getenv("SHARDLITE_FAULT_KILL_AT"); v != "" {
-		point, ok := kill.ByName(v)
+		point, ok := fault.ByName(v)
 		if !ok {
 			return nil, fmt.Errorf("SHARDLITE_FAULT_KILL_AT is %q, which is no kill point", v)
 		}
 		when := getenv("SHARDLITE_FAULT_KILL_WHEN")
-		at = func(p kill.Point) {
+		at = func(p fault.Point) {
 			if p != point {
 				return
 			}
@@ -133,14 +133,14 @@ func faultOptions(getenv func(string) string) ([]node.RunOption, error) {
 }
 
 // segmentPoint calls the kill points of a segment's write.
-func segmentPoint(at func(kill.Point), op blobtest.Op, key string, after bool) {
+func segmentPoint(at func(fault.Point), op blobtest.Op, key string, after bool) {
 	if at == nil || op != blobtest.OpCreate || !strings.HasPrefix(key, journal.Root) {
 		return
 	}
 	if after {
-		at(kill.SegmentAfter)
+		at(fault.SegmentAfter)
 	} else {
-		at(kill.SegmentBefore)
+		at(fault.SegmentBefore)
 	}
 }
 

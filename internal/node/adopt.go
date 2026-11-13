@@ -5,9 +5,9 @@ import (
 	"errors"
 	"log/slog"
 
-	"github.com/luci1900/shardlite/internal/lease"
-	"github.com/luci1900/shardlite/internal/notify"
-	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/storage/lease"
+	"github.com/luci1900/shardlite/internal/storage/shardfile"
+	"github.com/luci1900/shardlite/internal/syncs/notify"
 )
 
 // adopter adopts a dead node's journal on behalf of the lease scan, which finds

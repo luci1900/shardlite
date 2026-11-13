@@ -20,11 +20,11 @@ import (
 	"github.com/superfly/ltx"
 
 	"github.com/luci1900/shardlite/internal/capture"
-	"github.com/luci1900/shardlite/internal/journal"
-	"github.com/luci1900/shardlite/internal/kill"
-	"github.com/luci1900/shardlite/internal/pos"
-	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/model/pos"
+	"github.com/luci1900/shardlite/internal/storage/journal"
+	"github.com/luci1900/shardlite/internal/storage/shardfile"
 	"github.com/luci1900/shardlite/internal/test/apptest"
+	"github.com/luci1900/shardlite/internal/test/fault"
 	"github.com/luci1900/shardlite/internal/test/harness"
 )
 
@@ -156,7 +156,7 @@ type replayer struct {
 	haveSalt bool
 	gens     int
 
-	// The snapshot being read: the reads are held at kill.SnapshotPage until the
+	// The snapshot being read: the reads are held at fault.SnapshotPage until the
 	// model's step reads the next page, or until the snapshot's letGo closes
 	// (the replayer does that before it closes a snapshot the trace left open).
 	// abandoned closes when the test ends, for a goroutine left by a failure.
@@ -240,8 +240,8 @@ func newReplayer(t testing.TB) *replayer {
 }
 
 // at holds a snapshot's reads: each page waits for the model's step to read it.
-func (r *replayer) at(p kill.Point) {
-	if p != kill.SnapshotPage {
+func (r *replayer) at(p fault.Point) {
+	if p != fault.SnapshotPage {
 		return
 	}
 	select {

@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/luci1900/shardlite/internal/kill"
+	"github.com/luci1900/shardlite/internal/test/fault"
 )
 
 // TestFaultRandomCrashes runs the kill scenarios in a random order on one
@@ -29,12 +29,12 @@ func TestFaultRandomCrashes(t *testing.T) {
 	}
 	scenarios := []scenario{
 		{"unsynced", r.unsynced},
-		{"segment-before", func() { r.segment(kill.SegmentBefore) }},
-		{"segment-after", func() { r.segment(kill.SegmentAfter) }},
-		{"delta", func() { r.snapshot(kill.DeltaBeforeManifest, 1) }},
-		{"rebase-before-manifest", func() { r.snapshot(kill.RebaseBeforeManifest, 3) }},
-		{"rebase-after-swap", func() { r.snapshot(kill.RebaseAfterSwap, 3) }},
-		{"restore-before-rename", func() { r.activation(kill.RestoreBeforeRename) }},
+		{"segment-before", func() { r.segment(fault.SegmentBefore) }},
+		{"segment-after", func() { r.segment(fault.SegmentAfter) }},
+		{"delta", func() { r.snapshot(fault.DeltaBeforeManifest, 1) }},
+		{"rebase-before-manifest", func() { r.snapshot(fault.RebaseBeforeManifest, 3) }},
+		{"rebase-after-swap", func() { r.snapshot(fault.RebaseAfterSwap, 3) }},
+		{"restore-before-rename", func() { r.activation(fault.RestoreBeforeRename) }},
 	}
 	for _, point := range activationPoints {
 		scenarios = append(scenarios,

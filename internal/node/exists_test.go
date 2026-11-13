@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/storage/blob"
+	"github.com/luci1900/shardlite/internal/storage/shardfile"
 )
 
 // shardWrites counts the calls that would change a shard in blob storage.

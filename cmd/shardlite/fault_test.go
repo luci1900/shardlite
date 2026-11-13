@@ -9,9 +9,9 @@ import (
 
 	"github.com/dunglas/httpsfv"
 
-	"github.com/luci1900/shardlite/internal/cluster"
-	"github.com/luci1900/shardlite/internal/journal"
-	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/model/cluster"
+	"github.com/luci1900/shardlite/internal/storage/journal"
+	"github.com/luci1900/shardlite/internal/storage/shardfile"
 	"github.com/luci1900/shardlite/internal/test/blobtest"
 )
 

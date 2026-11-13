@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/cluster"
-	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/model/cluster"
+	"github.com/luci1900/shardlite/internal/storage/shardfile"
 )
 
 // Env is the node's configuration from environment variables (docs/deployment.md,

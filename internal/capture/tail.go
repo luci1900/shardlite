@@ -4,7 +4,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/pos"
+	"github.com/luci1900/shardlite/internal/model/pos"
 	"github.com/luci1900/shardlite/internal/tempfile"
 )
 

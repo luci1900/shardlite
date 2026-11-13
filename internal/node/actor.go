@@ -10,13 +10,13 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/capture"
-	"github.com/luci1900/shardlite/internal/journal"
-	"github.com/luci1900/shardlite/internal/kill"
-	"github.com/luci1900/shardlite/internal/notify"
-	"github.com/luci1900/shardlite/internal/service"
-	"github.com/luci1900/shardlite/internal/shard"
-	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/model/shard"
+	"github.com/luci1900/shardlite/internal/storage/journal"
+	"github.com/luci1900/shardlite/internal/storage/shardfile"
+	"github.com/luci1900/shardlite/internal/syncs/notify"
+	"github.com/luci1900/shardlite/internal/syncs/service"
 	"github.com/luci1900/shardlite/internal/tempfile"
+	"github.com/luci1900/shardlite/internal/test/fault"
 )
 
 // LifecycleOptions configure each shard's lifecycle loop: its idle and delta
@@ -32,7 +32,7 @@ type LifecycleOptions struct {
 	SnapshotEvery time.Duration // how often each active shard looks whether it needs a snapshot (a delta or a rebase), and the tail alert is checked, 2 s if zero
 	HoldOff       time.Duration // how long to leave a shard alone after it couldn't be deactivated, 5 s if zero (a shard the app holds open waits twice as long at each look, up to its kind's idle timeout)
 	// At is called at each kill point (see Faults), nil in production.
-	At          func(kill.Point)
+	At          func(fault.Point)
 	IdleRecheck time.Duration // the first wait before an idle shard that its reminders keep active is looked at again (it doubles up to 10 s), 1 s if zero
 }
 
@@ -529,7 +529,7 @@ func (a *actor) waitEnded(ctx context.Context) error {
 }
 
 // at calls the fault hook for a kill point, if there is one.
-func (d *actorDeps) at(p kill.Point) {
+func (d *actorDeps) at(p fault.Point) {
 	if d.opts.At != nil {
 		d.opts.At(p)
 	}

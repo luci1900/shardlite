@@ -15,9 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/journal"
-	"github.com/luci1900/shardlite/internal/lease"
+	"github.com/luci1900/shardlite/internal/storage/blob"
+	"github.com/luci1900/shardlite/internal/storage/journal"
+	"github.com/luci1900/shardlite/internal/storage/lease"
 	"github.com/luci1900/shardlite/internal/test/blobtest"
 )
 

@@ -5,8 +5,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/journal"
-	"github.com/luci1900/shardlite/internal/pos"
+	"github.com/luci1900/shardlite/internal/model/pos"
+	"github.com/luci1900/shardlite/internal/storage/journal"
 )
 
 // maxExpireEvery is the longest wait between two passes.

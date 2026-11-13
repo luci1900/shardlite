@@ -4,7 +4,7 @@ import (
 	"sync"
 
 	"github.com/luci1900/shardlite/internal/capture"
-	"github.com/luci1900/shardlite/internal/pos"
+	"github.com/luci1900/shardlite/internal/model/pos"
 )
 
 // TailSet is a set of captured shards for SetTails, for tests that capture

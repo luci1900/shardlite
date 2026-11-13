@@ -6,7 +6,7 @@ import (
 
 	"github.com/dunglas/httpsfv"
 
-	"github.com/luci1900/shardlite/internal/shard"
+	"github.com/luci1900/shardlite/internal/model/shard"
 )
 
 // hdrContext is what the node hands an app with every request it opens a shard for, and the app passes back unchanged on the calls it makes while serving it. It is a Structured Fields Dictionary (RFC 9651): the shard the request was opened for (shard, a string) and the request's hops (hops, an integer). The node keeps nothing, so the header is the whole of it. Keys the node does not know are ignored.

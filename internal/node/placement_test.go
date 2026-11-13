@@ -14,11 +14,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/cluster"
-	"github.com/luci1900/shardlite/internal/dispatch"
-	"github.com/luci1900/shardlite/internal/lease"
-	"github.com/luci1900/shardlite/internal/peers"
-	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/model/cluster"
+	"github.com/luci1900/shardlite/internal/node/dispatch"
+	"github.com/luci1900/shardlite/internal/node/peers"
+	"github.com/luci1900/shardlite/internal/storage/lease"
+	"github.com/luci1900/shardlite/internal/storage/shardfile"
 	"github.com/luci1900/shardlite/internal/test/apptest"
 	"github.com/luci1900/shardlite/internal/test/blobtest"
 )

@@ -11,7 +11,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/luci1900/shardlite/internal/shard"
+	"github.com/luci1900/shardlite/internal/model/shard"
 )
 
 // errShardsStopped is what a request gets once the shards have stopped.

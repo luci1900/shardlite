@@ -12,13 +12,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/dispatch"
-	"github.com/luci1900/shardlite/internal/kill"
-	"github.com/luci1900/shardlite/internal/lease"
-	"github.com/luci1900/shardlite/internal/peers"
-	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/node/dispatch"
+	"github.com/luci1900/shardlite/internal/node/peers"
+	"github.com/luci1900/shardlite/internal/storage/lease"
+	"github.com/luci1900/shardlite/internal/storage/shardfile"
 	"github.com/luci1900/shardlite/internal/test/apptest"
 	"github.com/luci1900/shardlite/internal/test/blobtest"
+	"github.com/luci1900/shardlite/internal/test/fault"
 )
 
 // newDrainRig is the pair rig with lease scans that list often, so that n0 and n1 soon know each other to place on.
@@ -265,12 +265,12 @@ func TestStopLetsGoOfEveryShardAndKeepsNone(t *testing.T) {
 	}
 }
 
-// The fault rig kills a node at kill.StopLetGo, so a stop has to reach it once for each shard it lets go of.
+// The fault rig kills a node at fault.StopLetGo, so a stop has to reach it once for each shard it lets go of.
 func TestStopReachesTheKillPoint(t *testing.T) {
 	var points atomic.Int64
 	r := newDrainRig(t, func(o *ShardsetOptions) {
-		o.Lifecycle.At = func(p kill.Point) {
-			if p == kill.StopLetGo {
+		o.Lifecycle.At = func(p fault.Point) {
+			if p == fault.StopLetGo {
 				points.Add(1)
 			}
 		}

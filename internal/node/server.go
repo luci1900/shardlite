@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/lease"
+	"github.com/luci1900/shardlite/internal/storage/lease"
 )
 
 // The headers the node and the app exchange (docs/guide.md, Reference).

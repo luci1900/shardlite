@@ -7,7 +7,7 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/luci1900/shardlite/internal/kind"
+	"github.com/luci1900/shardlite/internal/model/kind"
 )
 
 // gate holds back each chunk of a shard's output until the shard's earlier

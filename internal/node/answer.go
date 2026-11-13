@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/lease"
-	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/storage/lease"
+	"github.com/luci1900/shardlite/internal/storage/shardfile"
 )
 
 // statusError is an answer the node gives with a status of its own.

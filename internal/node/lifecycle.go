@@ -10,9 +10,9 @@ import (
 	"github.com/superfly/ltx"
 
 	"github.com/luci1900/shardlite/internal/capture"
-	"github.com/luci1900/shardlite/internal/kill"
-	"github.com/luci1900/shardlite/internal/pos"
-	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/model/pos"
+	"github.com/luci1900/shardlite/internal/storage/shardfile"
+	"github.com/luci1900/shardlite/internal/test/fault"
 )
 
 // The operations of a shard's lifecycle loop: activation, deactivation and the
@@ -57,7 +57,7 @@ func (a *actor) activate(ctx context.Context) error {
 		// own tails become deltas before a shard stops being active here, or are
 		// adopted at its next start. So its files are all of it, and the journal
 		// the claim names (this node's own) isn't read.
-		res, err := d.files.Restore(ctx, target, a.Path, shardfile.RestoreOptions{NoJournal: true, BeforeRename: func() error { d.at(kill.RestoreBeforeRename); return nil }})
+		res, err := d.files.Restore(ctx, target, a.Path, shardfile.RestoreOptions{NoJournal: true, BeforeRename: func() error { d.at(fault.RestoreBeforeRename); return nil }})
 		switch {
 		case errors.Is(err, shardfile.ErrNothingToRestore):
 			// A manifest with nothing durable behind it (its node died before the
@@ -74,7 +74,7 @@ func (a *actor) activate(ctx context.Context) error {
 		default:
 			a.h, restored = res.Handle, res.Capture
 		}
-		d.at(kill.Restored)
+		d.at(fault.Restored)
 		d.stats.Restores.Add(1)
 	}
 	return a.startCapture(ctx, restored)
@@ -137,7 +137,7 @@ func (a *actor) startCapture(ctx context.Context, restored *capture.Restored) er
 		return err
 	}
 	if restored != nil {
-		d.at(kill.FirstSyncDone)
+		d.at(fault.FirstSyncDone)
 	}
 	// The reserved tables go in after the first sync, before the app has the
 	// shard.

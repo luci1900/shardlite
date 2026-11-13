@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/luci1900/shardlite/internal/pos"
+	"github.com/luci1900/shardlite/internal/model/pos"
 )
 
 // IfHeld says what Release does when another process still has the shard open.

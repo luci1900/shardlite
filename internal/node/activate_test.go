@@ -4,8 +4,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/dispatch"
+	"github.com/luci1900/shardlite/internal/node/dispatch"
+	"github.com/luci1900/shardlite/internal/storage/blob"
 )
 
 // A node's request for the activate path makes an existing shard active where it

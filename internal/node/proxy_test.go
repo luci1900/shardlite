@@ -21,8 +21,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/peers"
-	"github.com/luci1900/shardlite/internal/shard"
+	"github.com/luci1900/shardlite/internal/model/shard"
+	"github.com/luci1900/shardlite/internal/node/peers"
 	"github.com/luci1900/shardlite/internal/test/apptest"
 )
 

@@ -15,18 +15,18 @@ import (
 	lru "github.com/hashicorp/golang-lru/v2"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/cluster"
-	"github.com/luci1900/shardlite/internal/dispatch"
-	"github.com/luci1900/shardlite/internal/kill"
-	"github.com/luci1900/shardlite/internal/kind"
-	"github.com/luci1900/shardlite/internal/lease"
-	"github.com/luci1900/shardlite/internal/notify"
-	"github.com/luci1900/shardlite/internal/peers"
-	"github.com/luci1900/shardlite/internal/pos"
-	"github.com/luci1900/shardlite/internal/service"
-	"github.com/luci1900/shardlite/internal/shard"
-	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/model/cluster"
+	"github.com/luci1900/shardlite/internal/model/kind"
+	"github.com/luci1900/shardlite/internal/model/pos"
+	"github.com/luci1900/shardlite/internal/model/shard"
+	"github.com/luci1900/shardlite/internal/node/dispatch"
+	"github.com/luci1900/shardlite/internal/node/peers"
+	"github.com/luci1900/shardlite/internal/storage/blob"
+	"github.com/luci1900/shardlite/internal/storage/lease"
+	"github.com/luci1900/shardlite/internal/storage/shardfile"
+	"github.com/luci1900/shardlite/internal/syncs/notify"
+	"github.com/luci1900/shardlite/internal/syncs/service"
+	"github.com/luci1900/shardlite/internal/test/fault"
 )
 
 var (
@@ -368,7 +368,7 @@ func (m *Shardset) letGoOf(ctx context.Context, a *actor) error {
 		if err != nil {
 			return fmt.Errorf("%s: %w", a.Name, err)
 		}
-		a.d.at(kill.StopLetGo)
+		a.d.at(fault.StopLetGo)
 		return nil
 	}
 }

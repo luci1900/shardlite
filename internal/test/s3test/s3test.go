@@ -11,7 +11,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/storage/blob"
 )
 
 // Store is where a test's objects live: a bucket on the emulator and a prefix

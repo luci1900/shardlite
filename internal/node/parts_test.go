@@ -8,7 +8,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/luci1900/shardlite/internal/service"
+	"github.com/luci1900/shardlite/internal/syncs/service"
 	"github.com/luci1900/shardlite/internal/test/harness"
 )
 

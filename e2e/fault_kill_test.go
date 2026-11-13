@@ -5,7 +5,7 @@ package e2e
 import (
 	"testing"
 
-	"github.com/luci1900/shardlite/internal/kill"
+	"github.com/luci1900/shardlite/internal/test/fault"
 )
 
 // The kill scenarios, each on a rig of its own. The random test composes the
@@ -22,7 +22,7 @@ func (r *faultRig) unsynced() {
 
 // A kill when a segment is about to be written, or has just been: the write that
 // was waiting is not acknowledged, and everything acknowledged before survives.
-func (r *faultRig) segment(point kill.Point) {
+func (r *faultRig) segment(point fault.Point) {
 	r.t.Helper()
 	r.arm(point)
 	r.settle(1)
@@ -36,7 +36,7 @@ func (r *faultRig) segment(point kill.Point) {
 
 // A kill between the file of a delta (or a rebase's base) and the manifest update
 // that adopts it.
-func (r *faultRig) snapshot(point kill.Point, deltas int) {
+func (r *faultRig) snapshot(point fault.Point, deltas int) {
 	r.t.Helper()
 	r.arm(point)
 	r.settle(deltas)
@@ -47,7 +47,7 @@ func (r *faultRig) snapshot(point kill.Point, deltas int) {
 
 // A kill during the first activation after a crash: the shard is restored from
 // blob storage and the node dies at point on the way.
-func (r *faultRig) activation(point kill.Point) {
+func (r *faultRig) activation(point fault.Point) {
 	r.t.Helper()
 	r.settle(2)
 	r.arm(point)
@@ -62,7 +62,7 @@ func (r *faultRig) activation(point kill.Point) {
 
 // A kill when a shard that was let go of when it went idle is activated again:
 // it is claimed and restored from blob storage, and the node dies at point on the way.
-func (r *faultRig) releasedActivation(point kill.Point) {
+func (r *faultRig) releasedActivation(point fault.Point) {
 	r.t.Helper()
 	r.arm(point)
 	r.settle(1)
@@ -95,7 +95,7 @@ func TestFaultKillAfterWriteBeforeSync(t *testing.T) {
 
 func TestFaultKillAtSegment(t *testing.T) {
 	t.Parallel()
-	for _, point := range []kill.Point{kill.SegmentBefore, kill.SegmentAfter} {
+	for _, point := range []fault.Point{fault.SegmentBefore, fault.SegmentAfter} {
 		t.Run(string(point), func(t *testing.T) {
 			t.Parallel()
 			newFaultRig(t).segment(point)
@@ -105,12 +105,12 @@ func TestFaultKillAtSegment(t *testing.T) {
 
 func TestFaultKillAfterDeltaFileBeforeManifest(t *testing.T) {
 	t.Parallel()
-	newFaultRig(t).snapshot(kill.DeltaBeforeManifest, 1)
+	newFaultRig(t).snapshot(fault.DeltaBeforeManifest, 1)
 }
 
 func TestFaultKillRebase(t *testing.T) {
 	t.Parallel()
-	for _, point := range []kill.Point{kill.RebaseBeforeManifest, kill.RebaseAfterSwap} {
+	for _, point := range []fault.Point{fault.RebaseBeforeManifest, fault.RebaseAfterSwap} {
 		t.Run(string(point), func(t *testing.T) {
 			t.Parallel()
 			newFaultRig(t).snapshot(point, 3)
@@ -120,7 +120,7 @@ func TestFaultKillRebase(t *testing.T) {
 
 func TestFaultKillDuringRestoreBeforeRename(t *testing.T) {
 	t.Parallel()
-	newFaultRig(t).activation(kill.RestoreBeforeRename)
+	newFaultRig(t).activation(fault.RestoreBeforeRename)
 }
 
 func TestFaultKillBetweenRestoreAndFirstSync(t *testing.T) {

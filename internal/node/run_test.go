@@ -22,10 +22,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/lease"
-	"github.com/luci1900/shardlite/internal/notify"
-	"github.com/luci1900/shardlite/internal/shardfile"
+	"github.com/luci1900/shardlite/internal/storage/blob"
+	"github.com/luci1900/shardlite/internal/storage/lease"
+	"github.com/luci1900/shardlite/internal/storage/shardfile"
+	"github.com/luci1900/shardlite/internal/syncs/notify"
 	"github.com/luci1900/shardlite/internal/test/apptest"
 	"github.com/luci1900/shardlite/internal/test/blobtest"
 	"github.com/luci1900/shardlite/internal/test/harness"
@@ -48,7 +48,7 @@ func nodeGoroutines() []string {
 		if i == 0 || strings.Contains(g, "_test.go") {
 			continue // the calling goroutine, and the test's helpers
 		}
-		for _, pkg := range []string{"internal/node.", "internal/capture.", "internal/journal.", "internal/lease.", "internal/shardfile.", "internal/blob."} {
+		for _, pkg := range []string{"internal/node.", "internal/capture.", "internal/storage/journal.", "internal/storage/lease.", "internal/storage/shardfile.", "internal/storage/blob."} {
 			if strings.Contains(g, "luci1900/shardlite/"+pkg) {
 				out = append(out, g)
 				break

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/kind"
+	"github.com/luci1900/shardlite/internal/model/kind"
 	"github.com/luci1900/shardlite/internal/test/harness"
 )
 

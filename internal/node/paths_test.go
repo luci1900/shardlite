@@ -9,8 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/luci1900/shardlite/internal/kill"
-	"github.com/luci1900/shardlite/internal/kind"
+	"github.com/luci1900/shardlite/internal/model/kind"
+	"github.com/luci1900/shardlite/internal/test/fault"
 )
 
 // Every new local file gets a path of its own: the id, the generation and a random part, so a path is never used twice.
@@ -65,9 +65,9 @@ func TestFailedActivationLeavesNoFiles(t *testing.T) {
 	var r *mrig
 	var armed atomic.Bool
 	r = newMRigWith(t, func(o *ShardsetOptions) {
-		o.Lifecycle.At = func(p kill.Point) {
+		o.Lifecycle.At = func(p fault.Point) {
 			// The file is restored: what is in it can't be opened as a database.
-			if p == kill.Restored && armed.CompareAndSwap(true, false) {
+			if p == fault.Restored && armed.CompareAndSwap(true, false) {
 				if err := os.WriteFile(r.shard(target).Path, []byte(strings.Repeat("not a database ", 500)), 0o644); err != nil {
 					t.Error(err)
 				}

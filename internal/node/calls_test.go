@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luci1900/shardlite/internal/journal"
+	"github.com/luci1900/shardlite/internal/storage/journal"
 	"github.com/luci1900/shardlite/internal/test/blobtest"
 	"github.com/luci1900/shardlite/internal/test/harness"
 )

@@ -26,10 +26,10 @@ import (
 	"github.com/superfly/ltx"
 	"modernc.org/sqlite"
 
-	"github.com/luci1900/shardlite/internal/kill"
-	"github.com/luci1900/shardlite/internal/pos"
-	"github.com/luci1900/shardlite/internal/shard"
+	"github.com/luci1900/shardlite/internal/model/pos"
+	"github.com/luci1900/shardlite/internal/model/shard"
 	"github.com/luci1900/shardlite/internal/tempfile"
+	"github.com/luci1900/shardlite/internal/test/fault"
 )
 
 // Restored describes a shard that was restored from its files before this
@@ -74,7 +74,7 @@ type Config struct {
 	RestartFrames Frame
 	// At, if set, is called at named points of an activation of a restored
 	// shard: Folded and ReadHeld. The fault tests kill the process at them.
-	At     func(kill.Point)
+	At     func(fault.Point)
 	Logger *slog.Logger
 	// ChecksumMismatch is called when a snapshot's checksum is not the
 	// capture's, which means the capture went wrong somewhere. The node counts
@@ -197,7 +197,7 @@ func New(cfg Config) (sh *Shard, err error) {
 		if err := foldWAL(cfg.Path); err != nil {
 			return nil, err
 		}
-		s.at(kill.Folded)
+		s.at(fault.Folded)
 	}
 	if err := s.mapWALIndex(); err != nil {
 		return nil, err
@@ -228,7 +228,7 @@ func New(cfg Config) (sh *Shard, err error) {
 		return nil, err
 	}
 	s.note(info)
-	s.at(kill.ReadHeld)
+	s.at(fault.ReadHeld)
 	return s, nil
 }
 
@@ -393,7 +393,7 @@ func (s *Shard) header() (Header, error) {
 	return h, err
 }
 
-func (s *Shard) at(point kill.Point) {
+func (s *Shard) at(point fault.Point) {
 	if s.cfg.At != nil {
 		s.cfg.At(point)
 	}

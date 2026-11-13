@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/luci1900/shardlite/internal/capture"
-	"github.com/luci1900/shardlite/internal/notify"
+	"github.com/luci1900/shardlite/internal/syncs/notify"
 )
 
 // Reminders (docs/guide.md, Reminders): rows a shard sets for itself in its own

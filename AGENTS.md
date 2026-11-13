@@ -44,7 +44,7 @@ Always use simulation for non-trivial Quint models (`quint run`): verification (
 ## Code
 
 - Every mechanism must be able to report its own failure, and every mechanism we write ourselves must be one the fault rig can make fail (docs/internals.md, Failing loudly).
-- Positions are named types (`pos.Position`, `pos.Epoch`, `pos.Seg` in `internal/pos`), so a shard's position, a lease's epoch and a journal's segment number can't be swapped.
+- Positions are named types (`pos.Position`, `pos.Epoch`, `pos.Seg` in `internal/model/pos`), so a shard's position, a lease's epoch and a journal's segment number can't be swapped.
 - A closed set of states is a named type with a constant per state, or a variant per state where the states carry different data, the interface of a variant set sealed with an unexported method so only its own package adds a variant. A switch over one covers every case, which the `exhaustive` linter checks (`make lint`).
 - Use `errgroup` for fork-join goroutines and library concurrency over hand-rolled machinery.
 - Name services by role, never with a `Service` or `Svc` suffix.

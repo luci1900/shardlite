@@ -1,16 +1,16 @@
 package node
 
 import (
-	"github.com/luci1900/shardlite/internal/blob"
-	"github.com/luci1900/shardlite/internal/kill"
+	"github.com/luci1900/shardlite/internal/storage/blob"
 	"github.com/luci1900/shardlite/internal/tempfile"
+	"github.com/luci1900/shardlite/internal/test/fault"
 )
 
 // Faults are the hooks a fault build of the binary arms (cmd/shardlite/fault.go).
 // Every one is nil in production, and nil means no fault.
 type Faults struct {
 	// At is called at each kill point the node reaches, and may end the process.
-	At func(kill.Point)
+	At func(fault.Point)
 	// Backend wraps the blob backend (after the prefix) so storage can fail.
 	// Run applies it, so a node started with Start takes the wrapped backend as Config.Backend.
 	Backend func(blob.Backend) blob.Backend

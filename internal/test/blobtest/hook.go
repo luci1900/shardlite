@@ -10,7 +10,7 @@ import (
 	"iter"
 	"sync/atomic"
 
-	"github.com/luci1900/shardlite/internal/blob"
+	"github.com/luci1900/shardlite/internal/storage/blob"
 )
 
 // Op names a backend operation for the fault hook.
